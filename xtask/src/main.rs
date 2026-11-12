@@ -1,4 +1,4 @@
-//! Check and packaging entry points for disktree.
+//! Check and packaging entry points for ruum.
 //!
 //! Each gate is reachable on its own (`cargo xtask fmt`) and through the
 //! aggregate CI runs (`cargo xtask lint`), mirroring how omatrack exposes every
@@ -21,7 +21,7 @@ tasks:
   clippy    clippy --workspace --all-targets -- -D warnings
   test      cargo test --workspace
   ci        lint, then test
-  portable  Linux: desktop executable with static x86_64/ARM64 scanners\n  bundle    macOS: target/bundle/disktree.app and its zip
+  portable  Linux: desktop executable with static x86_64/ARM64 scanners\n  bundle    macOS: target/bundle/ruum.app and its zip
               --sign IDENTITY   sign with a Developer ID (default: ad hoc)
               --notarize        notarize and staple; needs NOTARY_PROFILE, or
                                 NOTARY_KEY, NOTARY_KEY_ID and NOTARY_ISSUER

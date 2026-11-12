@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Check and packaging entry points for disktree: one command per gate"
+description = "Check and packaging entry points for ruum: one command per gate"
 
 [dependencies]
-disktree-core.workspace = true
+ruum-core.workspace = true
 
 [lints]
 workspace = true

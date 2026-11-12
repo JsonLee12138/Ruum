@@ -13,8 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const APP: &str = "disktree.app";
-const EXECUTABLE: &str = "disktree";
+const APP: &str = "ruum.app";
+const EXECUTABLE: &str = "ruum";
 /// What the binary is built for at least; `LSMinimumSystemVersion` in
 /// `packaging/macos/Info.plist.in` says the same, and GPUI needs 10.15.7.
 const DEPLOYMENT_TARGET: &str = "11.0";
@@ -88,7 +88,7 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     tool(
         Command::new(cargo)
             .current_dir(&root)
-            .args(["build", "--release", "--locked", "-p", "disktree-app"])
+            .args(["build", "--release", "--locked", "-p", "ruum-app"])
             .arg("--target-dir")
             .arg(&target)
             .env("MACOSX_DEPLOYMENT_TARGET", DEPLOYMENT_TARGET),
@@ -133,7 +133,7 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     sign(&app, options.identity.as_deref())?;
 
     let zip = out.join(format!(
-        "disktree-{version}-{}-macos.zip",
+        "ruum-{version}-{}-macos.zip",
         std::env::consts::ARCH
     ));
     archive(&app, &zip)?;

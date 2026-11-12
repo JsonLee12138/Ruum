@@ -1,1 +1,5 @@
 /target
+.artifacts/
+
+# code-review-graph AST database
+.code-review-graph/

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- disktree's mark (assets/disktree.svg) on the macOS icon grid: an 824 pt
+<!-- ruum's mark (assets/ruum.svg) on the macOS icon grid: an 824 pt
      rounded square centred on a 1024 pt canvas, the rest transparent. A
      full-bleed square would be shrunk into a grey tile on macOS 26. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">

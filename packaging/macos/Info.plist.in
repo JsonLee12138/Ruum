@@ -6,13 +6,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.tobi.disktree</string>
+	<string>io.github.tobi.ruum</string>
 	<key>CFBundleName</key>
-	<string>disktree</string>
+	<string>ruum</string>
 	<key>CFBundleDisplayName</key>
-	<string>disktree</string>
+	<string>ruum</string>
 	<key>CFBundleExecutable</key>
-	<string>disktree</string>
+	<string>ruum</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
@@ -35,14 +35,14 @@
 	     each of these. Full Disk Access has no prompt and no string: it is
 	     granted in System Settings, which the app links to. -->
 	<key>NSDesktopFolderUsageDescription</key>
-	<string>disktree measures the Desktop folder to show what is using your disk. It reads sizes and names only.</string>
+	<string>ruum measures the Desktop folder to show what is using your disk. It reads sizes and names only.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
-	<string>disktree measures the Documents folder to show what is using your disk. It reads sizes and names only.</string>
+	<string>ruum measures the Documents folder to show what is using your disk. It reads sizes and names only.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
-	<string>disktree measures the Downloads folder to show what is using your disk. It reads sizes and names only.</string>
+	<string>ruum measures the Downloads folder to show what is using your disk. It reads sizes and names only.</string>
 	<key>NSRemovableVolumesUsageDescription</key>
-	<string>disktree measures removable disks you scan to show what is using them. It reads sizes and names only.</string>
+	<string>ruum measures removable disks you scan to show what is using them. It reads sizes and names only.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
-	<string>disktree measures network disks you scan to show what is using them. It reads sizes and names only.</string>
+	<string>ruum measures network disks you scan to show what is using them. It reads sizes and names only.</string>
 </dict>
 </plist>

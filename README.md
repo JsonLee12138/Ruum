@@ -1,11 +1,11 @@
-# disktree
+# ruum
 
-![disktree: a home directory as a treemap, coloured by kind of data, with reclaimable space hatched and the selection, findings and free space in the side panel](assets/screenshot.png)
+![ruum: a home directory as a treemap, coloured by kind of data, with reclaimable space hatched and the selection, findings and free space in the side panel](assets/screenshot.png)
 
 Find what is filling a disk, mark what should go, and remove it — with the
 volume's free space in view the whole time.
 
-disktree is a treemap for Omarchy. Choose a local or SSH source, then a
+ruum is a treemap for Omarchy. Choose a local or SSH source, then a
 mounted volume or directory; no scan starts until you explicitly accept.
 It draws every directory as a nested mosaic sized by its real disk cost,
 and lets you walk into it with the keyboard or the mouse. Mark as much as you
@@ -18,22 +18,22 @@ Omarchy theme and behaves like the rest of the desktop.
 
 ## Install
 
-Download `disktree-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the
-[latest release](https://github.com/tobi/disktree/releases/latest), unpack
-it, and run `./install.sh` inside (or just copy `disktree` onto your
+Download `ruum-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the
+[latest release](https://github.com/tobi/ruum/releases/latest), unpack
+it, and run `./install.sh` inside (or just copy `ruum` onto your
 `PATH`). Or build it:
 
 ```sh
-git clone https://github.com/tobi/disktree
-cd disktree
+git clone https://github.com/tobi/ruum
+cd ruum
 make install
 ```
 
 `make install` builds a release binary and puts three things under `~/.local`
 (no root needed):
 
-- `~/.local/bin/disktree`
-- a desktop entry, so disktree is in the launcher and in a file manager's
+- `~/.local/bin/ruum`
+- a desktop entry, so ruum is in the launcher and in a file manager's
   **Open with** for a directory (it adds a handler; it never becomes the
   default)
 - an icon
@@ -41,14 +41,14 @@ make install
 `sudo make install PREFIX=/usr/local` installs system-wide; `make uninstall`
 removes exactly what was installed.
 
-On Arch, including Omarchy, disktree is in the AUR:
-[`disktree`](https://aur.archlinux.org/packages/disktree) builds each release
+On Arch, including Omarchy, ruum is in the AUR:
+[`ruum`](https://aur.archlinux.org/packages/ruum) builds each release
 from source, and
-[`disktree-bin`](https://aur.archlinux.org/packages/disktree-bin) installs
+[`ruum-bin`](https://aur.archlinux.org/packages/ruum-bin) installs
 the release binary:
 
 ```sh
-yay -S disktree-bin
+yay -S ruum-bin
 ```
 
 If another installed version wins on `PATH`, the installer warns which one.
@@ -70,16 +70,16 @@ first build even if `rustup default` points at something older.
 
 ### macOS
 
-Download `disktree-*-aarch64-macos.zip` (`x86_64-macos` for an Intel Mac)
-from the [latest release](https://github.com/tobi/disktree/releases/latest),
-unzip it, and drag `disktree.app` into Applications. macOS 11 or newer.
+Download `ruum-*-aarch64-macos.zip` (`x86_64-macos` for an Intel Mac)
+from the [latest release](https://github.com/tobi/ruum/releases/latest),
+unzip it, and drag `ruum.app` into Applications. macOS 11 or newer.
 
 A release that was not signed and notarized is stopped by Gatekeeper: macOS
 says it "is damaged and can't be opened" or "cannot be verified". The app is
 fine; the browser marked the download as quarantined. Clear the mark once:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/disktree.app
+xattr -dr com.apple.quarantine /Applications/ruum.app
 ```
 
 (Or open it once, then choose **Open Anyway** in System Settings › Privacy &
@@ -89,14 +89,14 @@ Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools.
 macOS does not come with Rust; install it with [rustup](https://rustup.rs).
 
 ```sh
-make install     # ~/Applications/disktree.app, and ~/.local/bin/disktree
+make install     # ~/Applications/ruum.app, and ~/.local/bin/ruum
 make uninstall
 ```
 
-To see everything, give disktree **Full Disk Access** in System Settings ›
+To see everything, give ruum **Full Disk Access** in System Settings ›
 Privacy & Security (the panel offers a button when it is missing), then
 reopen it. Without it macOS hides Mail, Messages, Safari, other apps' data
-and the Trash, and disktree counts them as unreadable. Started from a
+and the Trash, and ruum counts them as unreadable. Started from a
 terminal, it is the terminal that needs the access. macOS also asks once
 each for Desktop, Documents and Downloads.
 
@@ -122,16 +122,16 @@ NOTARY_PROFILE=<profile> cargo xtask bundle \
 
 ### Windows
 
-On Windows 10 or 11, download `disktree-*-x86_64-windows.zip`
+On Windows 10 or 11, download `ruum-*-x86_64-windows.zip`
 (`aarch64-windows` on ARM) from the same release, unpack it anywhere and run
-`disktree.exe`. Or build it with Rust 1.97 or newer, from
+`ruum.exe`. Or build it with Rust 1.97 or newer, from
 [rustup](https://rustup.rs), and the MSVC toolchain (Visual Studio Build
 Tools, C++ workload):
 
 ```powershell
-git clone https://github.com/tobi/disktree
-cd disktree
-cargo build --release    # target\release\disktree.exe
+git clone https://github.com/tobi/ruum
+cd ruum
+cargo build --release    # target\release\ruum.exe
 ```
 
 See [On Windows](#on-windows) for what differs there.
@@ -139,27 +139,27 @@ See [On Windows](#on-windows) for what differs there.
 ## Use
 
 ```sh
-disktree            # choose a local/SSH source and root
-disktree ~          # explicitly scan home
-disktree --disk     # the whole disk it lives on
-disktree ~/src      # or any directory
-disktree --help     # options: apparent size, follow links, skip hidden, …
+ruum            # choose a local/SSH source and root
+ruum ~          # explicitly scan home
+ruum --disk     # the whole disk it lives on
+ruum ~/src      # or any directory
+ruum --help     # options: apparent size, follow links, skip hidden, …
 ```
 
 ### Servers over SSH (read-only)
 
 ```sh
-disktree ssh dev                 # connect and choose a remote root
-disktree ssh user@server /var    # an explicit remote path
-disktree ssh dev --disk          # the disk containing the remote home
-disktree ssh dev -a /srv         # apparent size instead of allocated blocks
+ruum ssh dev                 # connect and choose a remote root
+ruum ssh user@server /var    # an explicit remote path
+ruum ssh dev --disk          # the disk containing the remote home
+ruum ssh dev -a /srv         # apparent size instead of allocated blocks
 ```
 
 Linux builds made with `make build` / `cargo xtask portable` include static
 **x86-64 and ARM64 Linux scanners appended to the executable**. SSH detects
 the server's OS/CPU and uploads the matching scanner only when its checked
 cache is missing or damaged. The cache is private and content-addressed under
-`~/.cache/disktree/ssh/<sha256>/` (or the server's `XDG_CACHE_HOME`).
+`~/.cache/ruum/ssh/<sha256>/` (or the server's `XDG_CACHE_HOME`).
 Uploads are checksum-verified and atomically installed; there is no sudo,
 system-package change or dependency on the server's glibc version.
 
@@ -172,9 +172,9 @@ You can extract a helper without opening a window, or test the entire
 SSH/deployment/scan path headlessly:
 
 ```sh
-disktree extract-scanner x86_64 ./disktree-scan
-disktree extract-scanner aarch64 ./disktree-scan-arm64
-disktree ssh dev --check /var/log
+ruum extract-scanner x86_64 ./ruum-scan
+ruum extract-scanner aarch64 ./ruum-scan-arm64
+ruum ssh dev --check /var/log
 ```
 
 The appended manifest stores architecture, byte ranges and SHA-256 hashes.
@@ -184,20 +184,20 @@ signed macOS/Windows executables needs platform-specific signature handling;
 those builds do not yet embed helpers.
 
 For a development or non-Linux desktop build without the trailer, install
-the small **disktree-scan** helper on the server first:
+the small **ruum-scan** helper on the server first:
 
 ```sh
 # On the server, inside the checkout:
-make install-scan               # ~/.local/bin/disktree-scan; no GUI deps
+make install-scan               # ~/.local/bin/ruum-scan; no GUI deps
 # Or:
-cargo install --path crates/disktree-scan --locked
+cargo install --path crates/ruum-scan --locked
 ```
 
 The helper can be on the server's **non-interactive SSH PATH** or at
-`~/.local/bin/disktree-scan` (the default install location); disktree tries
+`~/.local/bin/ruum-scan` (the default install location); ruum tries
 both. A binary copied from another machine must match the server's OS,
 architecture and runtime. The manually built native helper may need the
-server's libc; the embedded Linux helpers are static. Disktree never runs
+server's libc; the embedded Linux helpers are static. Ruum never runs
 sudo or changes the server's configuration.
 SSH keeps your normal authentication settings. When launched from a
 terminal, it can ask for a password or key passphrase there; GUI launches
@@ -262,7 +262,7 @@ Remote mode is **export-only**. Mark with Space, open review with `c`, then:
 - **Copy delete script** (`y`), or **Save delete script…** (`e`): a
   GNU/Linux shell script, copied to the clipboard or saved locally.
   Running it without arguments only previews the selection. After reviewing
-  it, `sh disktree-delete.sh --delete` connects to the named SSH host and
+  it, `sh ruum-delete.sh --delete` connects to the named SSH host and
   runs the exported commands there, never against the local paths.
 
 There are no trash/delete buttons or removal-mode choices in remote review.
@@ -312,7 +312,7 @@ what can be had back.
 
 The kinds come from directory names and a few shapes (a bare git repository,
 `target` beside a `Cargo.toml`). Some of the names are specific to one
-machine; see `crates/disktree-core/src/classify.rs`.
+machine; see `crates/ruum-core/src/classify.rs`.
 
 ### Marking
 
@@ -349,7 +349,7 @@ there, then choose:
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
 
-When it finishes, disktree scans again so the numbers on screen match the disk,
+When it finishes, ruum scans again so the numbers on screen match the disk,
 and shows how much free space was actually gained.
 
 ## Keys
@@ -432,7 +432,7 @@ host/path field or the highlighted mount. Escape cancels discovery and
 returns to the current scan, or the idle welcome screen at startup.
 
 During exploration, press `v`, click **Source…** beside the disk name,
-or click the disktree logo to reopen the same chooser. The source being
+or click the ruum logo to reopen the same chooser. The source being
 browsed is shown explicitly, and connecting never retargets an existing
 scan. Changing machines on acceptance clears the old machine's marks,
 identity and navigation history; an absolute path is not an identity
@@ -448,7 +448,7 @@ a root. Explicit command-line paths and `--disk` still start directly;
 ## The whole disk
 
 Click `/` (or any directory above the scanned root) in the trail, press
-`g`, run `disktree --disk`, or use the launcher's *Scan the whole disk*
+`g`, run `ruum --disk`, or use the launcher's *Scan the whole disk*
 action. `g` and `--disk` scan the disk your home directory lives on — `/`
 on Omarchy and on macOS. On macOS the Data volume's second mount,
 `/System/Volumes/Data`, is skipped: it is `/Users`, `/Applications` and the
@@ -492,10 +492,10 @@ The same program, with Windows' answers to the questions above:
   s for WizTree and about 20 s for the walk. It also sees what the walk is
   refused, such as System Volume Information. It is used only for a whole
   NTFS drive, since a folder would still cost the whole table, and not with
-  `-l`, whose links the table does not follow. disktree flushes the volume
+  `-l`, whose links the table does not follow. ruum flushes the volume
   after its own removals so the rescan shows them; changes other programs
   made seconds before may not show yet.
-  Started without admin rights, disktree walks as before. On a whole NTFS
+  Started without admin rights, ruum walks as before. On a whole NTFS
   drive without `-l`, or once Windows refuses the walk a folder, the side
   panel offers **Restart as Administrator**, which reopens the same folder
   and options through the UAC prompt; during a widening scan, the wider
@@ -508,7 +508,7 @@ The same program, with Windows' answers to the questions above:
   Settings turns off), any folder holding your profile, such as
   `C:\Users`, and every profile in the folder Windows keeps them in
   (`C:\Users\*`, `Public` and `Default` included), since an elevated
-  disktree may run as another account and can reach them all. What is
+  ruum may run as another account and can reach them all. What is
   inside a profile can still be removed, as under your own. Names compare
   without regard to case, as Windows compares them.
 - **Hidden** means a name starting with a dot, or the hidden attribute, so
@@ -518,7 +518,7 @@ The same program, with Windows' answers to the questions above:
 
 ## What it refuses to do
 
-The removal rules live in `crates/disktree-core/src/removal.rs`, and each one is
+The removal rules live in `crates/ruum-core/src/removal.rs`, and each one is
 tested:
 
 - only paths under the scanned root can be removed;
@@ -543,13 +543,13 @@ tested:
 
 ## On Hyprland
 
-Hyprland tiles new windows, so disktree opens into whatever tile it is given.
+Hyprland tiles new windows, so ruum opens into whatever tile it is given.
 It is designed for a roomy window; float it, or give it a rule. The window
-class is `disktree`.
+class is `ruum`.
 
 ```
-windowrule = float, class:^(disktree)$
-windowrule = size 1400 900, class:^(disktree)$
+windowrule = float, class:^(ruum)$
+windowrule = size 1400 900, class:^(ruum)$
 ```
 
 ## Develop
@@ -570,12 +570,12 @@ gone while their neighbours are not.
 
 | path | what lives there |
 | --- | --- |
-| `crates/disktree-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
-| `crates/disktree-app/src/state.rs` | every action the interface can take, and the key map |
-| `crates/disktree-app/src/views.rs` | the screens |
-| `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |
-| `crates/disktree-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
-| `crates/disktree-app/src/tests.rs` | end-to-end tests through a real window |
+| `crates/ruum-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
+| `crates/ruum-app/src/state.rs` | every action the interface can take, and the key map |
+| `crates/ruum-app/src/views.rs` | the screens |
+| `crates/ruum-app/src/treemap_view.rs` | painting the mosaic and its labels |
+| `crates/ruum-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
+| `crates/ruum-app/src/tests.rs` | end-to-end tests through a real window |
 | `packaging/`, `assets/`, `Makefile` | the desktop entry, the icon, and install |
 
 The interface follows the

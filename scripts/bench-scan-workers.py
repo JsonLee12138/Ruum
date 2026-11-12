@@ -97,7 +97,7 @@ def main():
     args = parser.parse_args()
 
     subprocess.run(
-        ["cargo", "build", "--release", "-p", "disktree-core", "--example", "scan_workers"],
+        ["cargo", "build", "--release", "-p", "ruum-core", "--example", "scan_workers"],
         cwd=REPO,
         check=True,
     )

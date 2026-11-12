@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install a disktree release: the binary, a desktop entry and an icon.
+# Install a ruum release: the binary, a desktop entry and an icon.
 #
 #   ./install.sh                  # into ~/.local, no root needed
 #   sudo PREFIX=/usr/local ./install.sh
@@ -16,24 +16,24 @@ ICONDIR=${ICONDIR:-"$PREFIX/share/icons/hicolor/scalable/apps"}
 VERSION=$(cat "$here/VERSION")
 
 install -d "$BINDIR" "$APPDIR" "$ICONDIR"
-install -m755 "$here/disktree" "$BINDIR/disktree"
-install -m644 "$here/disktree.svg" "$ICONDIR/disktree.svg"
+install -m755 "$here/ruum" "$BINDIR/ruum"
+install -m644 "$here/ruum.svg" "$ICONDIR/ruum.svg"
 sed -e "s|@BINDIR@|$BINDIR|" -e "s|@VERSION@|$VERSION|" \
-    "$here/disktree.desktop.in" > "$APPDIR/disktree.desktop"
-chmod 644 "$APPDIR/disktree.desktop"
+    "$here/ruum.desktop.in" > "$APPDIR/ruum.desktop"
+chmod 644 "$APPDIR/ruum.desktop"
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APPDIR" 2>/dev/null || true
 fi
 
-echo "installed disktree $VERSION:"
-echo "  $BINDIR/disktree"
-echo "  $APPDIR/disktree.desktop"
-echo "  $ICONDIR/disktree.svg"
-resolved=$(command -v disktree 2>/dev/null || true)
-if [ -z "$resolved" ] || ! [ "$resolved" -ef "$BINDIR/disktree" ]; then
+echo "installed ruum $VERSION:"
+echo "  $BINDIR/ruum"
+echo "  $APPDIR/ruum.desktop"
+echo "  $ICONDIR/ruum.svg"
+resolved=$(command -v ruum 2>/dev/null || true)
+if [ -z "$resolved" ] || ! [ "$resolved" -ef "$BINDIR/ruum" ]; then
     echo
     if [ -n "$resolved" ]; then
-        echo "warning: disktree still resolves to $resolved"
+        echo "warning: ruum still resolves to $resolved"
         echo "         that hides the build in $BINDIR"
     else
         echo "warning: $BINDIR is not on PATH"

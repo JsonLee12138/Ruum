@@ -1,0 +1,20 @@
+[package]
+name = "ruum-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only headless scanner for ruum SSH sessions"
+
+[lints]
+workspace = true
+
+[dependencies]
+ruum-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["process"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

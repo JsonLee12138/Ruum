@@ -1,4 +1,4 @@
-# disktree — agent guide
+# ruum — agent guide
 
 A GPUI + gpui-omarchy treemap explorer for disk usage on Omarchy. Read
 `README.md` for the product; this file is the working contract.
@@ -19,7 +19,7 @@ make run                        # build and open the source/root chooser
 make install                    # ~/.local: binary, desktop entry, icon
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
-make bundle                     # macOS: target/bundle/disktree.app and its zip
+make bundle                     # macOS: target/bundle/ruum.app and its zip
 make lint                       # rustfmt --check, then clippy --all-targets -D warnings
 make test                       # core and window-harness tests
 make ci                         # lint, then test
@@ -27,12 +27,12 @@ make fmt                        # format in place
 ```
 
 `make install` is the supported way to put this on a machine: it installs the
-release binary, `packaging/disktree.desktop.in` (rendered with the real install
-prefix and the crate version) and `assets/disktree.svg`. Keep the desktop
+release binary, `packaging/ruum.desktop.in` (rendered with the real install
+prefix and the crate version) and `assets/ruum.svg`. Keep the desktop
 entry's `Categories` to a single main category plus additional ones, or
 `desktop-file-validate` complains.
 
-On macOS `make install` installs `target/bundle/disktree.app` into
+On macOS `make install` installs `target/bundle/ruum.app` into
 `~/Applications` instead, built by `cargo xtask bundle` from
 `packaging/macos/` (the `Info.plist` template and the icon's SVG). The bundle
 identifier there keys every macOS permission grant; do not change it lightly.
@@ -53,9 +53,9 @@ and `cargo build --release` directly; CI runs the gate on both systems.
   with a warning instead of applying.
 * **Comments say why.** The code says what. Any non-obvious number, ordering or
   boundary deserves the reason next to it.
-* **Tests live beside the promise they make.** `disktree-core` tests size
+* **Tests live beside the promise they make.** `ruum-core` tests size
   accounting, layout and deletion guards against real temporary trees;
-  `disktree-app/src/tests.rs` drives the real window harness — draw a frame,
+  `ruum-app/src/tests.rs` drives the real window harness — draw a frame,
   press keys — so a screen that panics while painting fails a test.
 * **Never delete anything outside a marked path.** See `removal.rs`; the guards
   are load-bearing and are covered by tests.
@@ -115,7 +115,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
     records and never retains the tree.
 
 11. **A live overview is not an actionable tree.** Keep provisional,
-    bounded display summaries separate from `Disktree::tree` and all path,
+    bounded display summaries separate from `Ruum::tree` and all path,
     mark and removal APIs. Only a complete scan may replace the real tree.
     Counters and sampled paths belong in fixed, monospace progress lanes.
 
@@ -123,26 +123,26 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 
 | change | where |
 | --- | --- |
-| bounded Unix SSH traversal | `crates/disktree-core/src/remote_walk.rs` |
-| SSH protocol, discovery and transport | `crates/disktree-core/src/remote.rs` |
-| measurement, filtering, parallelism | `crates/disktree-core/src/scan.rs` |
-| what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
-| tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
-| anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
-| free space and projections | `crates/disktree-core/src/space.rs` |
-| what macOS lists and measures in bulk | `crates/disktree-core/src/macos.rs` — `unsafe` for `getattrlistbulk` |
-| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — `unsafe` for Win32 |
-| reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
-| a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
-| spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
-| the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
-| layout of a screen | `crates/disktree-app/src/views.rs` |
-| colours derived from the theme | `crates/disktree-app/src/palette.rs` |
+| bounded Unix SSH traversal | `crates/ruum-core/src/remote_walk.rs` |
+| SSH protocol, discovery and transport | `crates/ruum-core/src/remote.rs` |
+| measurement, filtering, parallelism | `crates/ruum-core/src/scan.rs` |
+| what a node is, or a derived total | `crates/ruum-core/src/tree.rs` |
+| tile geometry, nesting, the merged tail | `crates/ruum-core/src/treemap.rs` |
+| anything that deletes, or refuses to | `crates/ruum-core/src/removal.rs` |
+| free space and projections | `crates/ruum-core/src/space.rs` |
+| what macOS lists and measures in bulk | `crates/ruum-core/src/macos.rs` — `unsafe` for `getattrlistbulk` |
+| what Windows lists, measures and compares differently | `crates/ruum-core/src/windows.rs` — `unsafe` for Win32 |
+| reading a whole NTFS drive from its file table | `crates/ruum-core/src/mft.rs` |
+| a key, a screen transition, a mark | `crates/ruum-app/src/state.rs` |
+| spacing, type and size | `crates/ruum-app/src/ui.rs` — tokens only, no `px` in layout |
+| the mosaic's painting or labels | `crates/ruum-app/src/treemap_view.rs` |
+| layout of a screen | `crates/ruum-app/src/views.rs` |
+| colours derived from the theme | `crates/ruum-app/src/palette.rs` |
 
 ## Verification expectations
 
 * Size accounting, hardlinks, symlinks, hidden entries, depth limits, the
-  removal guards and squarified layout are covered by `disktree-core` tests
+  removal guards and squarified layout are covered by `ruum-core` tests
   against real temporary trees.
 * The screens are covered by window-harness tests that draw frames and press
   keys, including one that marks a directory, confirms the removal and checks

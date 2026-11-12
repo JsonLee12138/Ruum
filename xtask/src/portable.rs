@@ -6,7 +6,7 @@ pub fn build() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err("portable packaging currently runs on Linux".into());
     }
-    super::run(&["build", "--release", "--locked", "-p", "disktree-app"])?;
+    super::run(&["build", "--release", "--locked", "-p", "ruum-app"])?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| root.join("target"), PathBuf::from);
@@ -43,7 +43,7 @@ pub fn build() -> Result<(), String> {
                 "--release",
                 "--locked",
                 "-p",
-                "disktree-scan",
+                "ruum-scan",
                 "--target",
                 &triple,
             ])
@@ -56,15 +56,13 @@ pub fn build() -> Result<(), String> {
                  aarch64-unknown-linux-musl"
                 .into());
         }
-        helpers.push((
-            arch.into(),
-            target.join(triple).join("release/disktree-scan"),
-        ));
+        helpers
+            .push((arch.into(), target.join(triple).join("release/ruum-scan")));
     }
-    let output = target.join("portable/disktree");
+    let output = target.join("portable/ruum");
     std::fs::create_dir_all(output.parent().unwrap())
         .map_err(|e| e.to_string())?;
-    std::fs::copy(target.join("release/disktree"), &output)
+    std::fs::copy(target.join("release/ruum"), &output)
         .map_err(|e| e.to_string())?;
     // strip rewrites ELF and discards overlays, so it must precede embedding.
     let status = Command::new("strip")
@@ -74,8 +72,7 @@ pub fn build() -> Result<(), String> {
     if !status.success() {
         return Err("strip failed".into());
     }
-    disktree_core::payload::append(&output, &helpers)
-        .map_err(|e| e.to_string())?;
+    ruum_core::payload::append(&output, &helpers).map_err(|e| e.to_string())?;
     println!("Portable app: {}", output.display());
     Ok(())
 }

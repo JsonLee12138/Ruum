@@ -54,7 +54,7 @@ jobs:
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --draft --verify-tag \
-              --title "disktree ${TAG#v}" --generate-notes
+              --title "ruum ${TAG#v}" --generate-notes
           fi
 
   linux:
@@ -101,12 +101,12 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
-          name="disktree-$VERSION-$ARCH-linux"
+          name="ruum-$VERSION-$ARCH-linux"
           mkdir -p "dist/$name"
           # portable strips before appending; stripping again loses helpers.
-          cp target/portable/disktree "dist/$name/"
-          cp packaging/install.sh packaging/disktree.desktop.in \
-             assets/disktree.svg README.md LICENSE "dist/$name/"
+          cp target/portable/ruum "dist/$name/"
+          cp packaging/install.sh packaging/ruum.desktop.in \
+             assets/ruum.svg README.md LICENSE "dist/$name/"
           echo "$VERSION" > "dist/$name/VERSION"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
@@ -198,7 +198,7 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
-          zip="target/bundle/disktree-$VERSION-$ARCH-macos.zip"
+          zip="target/bundle/ruum-$VERSION-$ARCH-macos.zip"
           (cd "$(dirname "$zip")" && shasum -a 256 "$(basename "$zip")" \
             > "$(basename "$zip").sha256")
           gh release upload "$TAG" "$zip" "$zip.sha256" --clobber
@@ -213,7 +213,7 @@ jobs:
           - { runner: windows-11-arm, arch: aarch64 }
     runs-on: ${{ matrix.runner }}
     env:
-      # The C runtime linked in, so disktree.exe also runs where the Visual
+      # The C runtime linked in, so ruum.exe also runs where the Visual
       # C++ runtime was never installed. For the tests too, so both steps
       # share one build.
       RUSTFLAGS: -C target-feature=+crt-static
@@ -234,7 +234,7 @@ jobs:
         run: cargo xtask test
 
       - name: Build
-        run: cargo build --release --locked -p disktree-app
+        run: cargo build --release --locked -p ruum-app
 
       - name: Package
         id: package
@@ -243,9 +243,9 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
-          $name = "disktree-$env:VERSION-$env:ARCH-windows"
+          $name = "ruum-$env:VERSION-$env:ARCH-windows"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/disktree.exe, README.md, LICENSE "dist/$name/"
+          Copy-Item target/release/ruum.exe, README.md, LICENSE "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           # The format `sha256sum -c` reads, with a Unix line ending.

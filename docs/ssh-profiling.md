@@ -58,24 +58,24 @@ attributing its wall time to any one of these synthetic results.
 ## Reproduce safely
 
 ```sh
-cargo build -p disktree-core --example profile_remote --release \
+cargo build -p ruum-core --example profile_remote --release \
   --config profile.release.debug=1
 
-target/release/examples/profile_remote generate /tmp/disktree-wire.jsonl
+target/release/examples/profile_remote generate /tmp/ruum-wire.jsonl
 hyperfine --warmup 1 --runs 7 \
-  'target/release/examples/profile_remote decode /tmp/disktree-wire.jsonl'
+  'target/release/examples/profile_remote decode /tmp/ruum-wire.jsonl'
 perf record -g --call-graph dwarf -- \
-  target/release/examples/profile_remote decode /tmp/disktree-wire.jsonl
+  target/release/examples/profile_remote decode /tmp/ruum-wire.jsonl
 perf report
 ```
 
 For an explicitly created disposable fixture under
-`/tmp/disktree-profile-*`, compare `scan PATH` and `stream PATH >/dev/null`
+`/tmp/ruum-profile-*`, compare `scan PATH` and `stream PATH >/dev/null`
 with that example. It refuses non-temporary paths; it has no default root.
 The SSH profiler uses the existing isolated test harness:
 
 ```sh
-DISKTREE_PROFILE_ROOT=/tmp/disktree-profile-fixture \
+RUUM_PROFILE_ROOT=/tmp/ruum-profile-fixture \
   bun scripts/test-ssh.ts
 ```
 
@@ -87,9 +87,9 @@ it runs the normal four SSH integration tests instead.
 Memory/failure regressions against the actual helper executable:
 
 ```sh
-cargo test -p disktree-scan --test stdio \
+cargo test -p ruum-scan --test stdio \
   external_hardlinks_have_bounded_resident_memory -- --ignored --nocapture
-cargo test -p disktree-scan --test stdio \
+cargo test -p ruum-scan --test stdio \
   wide_stream_has_bounded_resident_memory -- --ignored --nocapture
 ```
 

@@ -1,0 +1,47 @@
+{
+  "harness-contract-approval-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "../scripts/harness-approval-gate.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "swarm",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "../scripts/harness-approval-gate.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "crg-transaction-sync": {
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file|create_file|replace_file_content|multi_replace_file_content|delete_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "../scripts/crg-hook.sh mark-dirty",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "../scripts/crg-hook.sh sync-on-stop",
+        "timeout": 15
+      }
+    ]
+  }
+}

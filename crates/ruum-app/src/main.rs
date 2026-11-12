@@ -67,14 +67,15 @@ Remote sessions are read-only: mark, export list/prompt/delete script.
 Use --check with ssh to deploy and scan without opening a window.
 
 arguments:
-  PATH              explicit directory to scan; omitted opens root selection
+  PATH              explicit directory to scan; omitted defaults to ~ (home)
 
-Without PATH, choose this computer or SSH, then a mount or directory.
-No scan starts before explicit acceptance. Nested mounts are excluded.
-With PATH the window scans it directly, largest first. Space marks the
-selected tile, Enter opens it, c reviews the marked list, ? lists every key.
+Without PATH, ruum scans the home directory directly, largest first.
+Use --choose to select a local mount or SSH source before scanning.
+Nested mounts are excluded. Space marks the selected tile, Enter opens it,
+c reviews the marked list, ? lists every key.
 
 options:
+      --choose          open the source and mount selection dialog before scanning
   -a, --apparent-size   measure apparent length instead of allocated blocks
   -l, --follow-links    follow symlinks (local scans only)
   -H, --no-hidden       skip dotfiles and dot-directories
@@ -365,6 +366,7 @@ fn parse_args_with_power(
             .with_context(|| need.to_owned())
     };
     let mut check = false;
+    let mut choose_root = false;
     let mut args = args.peekable();
     let remote = if args.peek().is_some_and(|arg| arg == "ssh") {
         args.next();
@@ -390,6 +392,7 @@ fn parse_args_with_power(
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
             "-D" | "--disk" => disk = true,
             "--check" => check = true,
+            "--choose" => choose_root = true,
             "-d" | "--depth" => {
                 let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
@@ -479,7 +482,11 @@ fn parse_args_with_power(
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let choose_root = root.is_none() && !disk && !check;
+    let choose_root = if remote.is_some() {
+        choose_root || (root.is_none() && !disk && !check)
+    } else {
+        choose_root && root.is_none() && !disk && !check
+    };
     if remote.is_some() {
         return Ok(Args {
             root: root.unwrap_or_default(),
@@ -499,7 +506,7 @@ fn parse_args_with_power(
             .and_then(ruum_core::space::volume_root_for)
             .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
-        None => home.unwrap_or_default(),
+        None => home.context("no path given and no home directory")?,
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
@@ -604,11 +611,12 @@ mod argument_tests {
     }
 
     #[test]
-    fn no_implicit_root_requires_selection_but_explicit_scans_do_not() {
+    fn default_scans_home_and_choose_requires_selection() {
         let parse = |args: &[&str]| {
             parse_args(args.iter().map(std::ffi::OsString::from)).unwrap()
         };
-        assert!(parse(&[]).choose_root);
+        assert!(!parse(&[]).choose_root);
+        assert!(parse(&["--choose"]).choose_root);
         assert!(parse(&["ssh", "dev"]).choose_root);
         assert!(!parse(&["."]).choose_root);
         assert!(!parse(&["--disk"]).choose_root);

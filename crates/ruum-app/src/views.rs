@@ -454,22 +454,15 @@ fn explore(
     let width_rems = window.viewport_size().width.as_f32() / app.rem;
     // The panel is where the selection, the marks and the disk live; it
     // only gives way when the mosaic would be too narrow to read.
-    let panel = (app.show_selection || app.is_indexing())
-        && width_rems >= PANEL_SHOWN_REMS;
+    let panel = app.show_selection && width_rems >= PANEL_SHOWN_REMS;
     if panel && let Some(path) = selection_checkout(app) {
         app.ensure_git(&path, cx);
     }
 
     let viewport = if app.tree().is_none() {
-        // The first walk of a home directory takes long enough that an
-        // empty viewport would look broken; count the work instead.
-        if app.scan_error.is_none()
-            && let Some(preview) = &app.scan_preview
-        {
-            treemap_view::preview(preview, app, window, cx).into_any_element()
-        } else {
-            scanning_panel(app, &theme, cx).into_any_element()
-        }
+        // The first walk takes long enough that an empty viewport
+        // would look broken; count the work with the loading panel instead.
+        scanning_panel(app, &theme, cx).into_any_element()
     } else {
         treemap_view::mosaic(mosaic, app, window, cx).into_any_element()
     };
@@ -519,12 +512,6 @@ fn explore(
                 )
                 .children(panel.then(|| side_panel(app, &theme, cx))),
         )
-        .children((app.is_indexing() && !panel).then(|| {
-            div()
-                .px(space::LG)
-                .py(space::SM)
-                .child(indexing_compact(app, &theme, cx))
-        }))
         .child(key_bar(app, &theme, cx))
 }
 
@@ -1336,12 +1323,6 @@ fn trail_and_legend(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 /// What the whole scan found, as one quiet line; unreadable paths are
 /// flagged in the warning colour when there are any.
 fn scan_totals(app: &Ruum, theme: &Theme) -> Div {
-    if app.is_indexing() {
-        return div()
-            .text_size(text::CAPTION)
-            .text_color(theme.secondary)
-            .child("Live overview · incomplete · top-level contributions");
-    }
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
     let files = tree.map_or(app.progress.files, |node| node.files);
@@ -1460,9 +1441,7 @@ fn side_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         .border_color(theme.divider())
         .bg(theme.surface)
         .child(handle)
-        .child(if app.is_indexing() {
-            indexing_progress(app, theme, cx)
-        } else { selection_section(app, theme, cx) })
+        .child(selection_section(app, theme, cx))
         .child(rule())
         // The lists scroll; the selection above and the disk below stay put,
         // so the two numbers that matter never leave the screen.
@@ -2374,8 +2353,12 @@ fn key_bar(app: &Ruum, theme: &Theme, cx: &App) -> Div {
                 .child(format!("{:.1}\u{00d7}", app.view.scale)),
         );
     }
-    let scan = if app.scan.is_some() || app.remote_scan.is_some() {
-        "Indexing · incomplete".to_string()
+    let scan = if app.is_indexing() {
+        format!(
+            "scanning \u{00b7} {} entries \u{00b7} {}",
+            widgets::human_count(app.progress.files),
+            human_bytes(app.progress.bytes)
+        )
     } else if app.progress.cancelled {
         format!(
             "scan cancelled \u{00b7} {} entries \u{00b7} r scans again",
@@ -2402,203 +2385,177 @@ fn key_bar(app: &Ruum, theme: &Theme, cx: &App) -> Div {
 
 /// What the viewport shows while the first scan is running.
 fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
-    let error = app.scan_error.as_ref();
-    div()
-        .debug_selector(move || {
-            if error.is_some() {
-                "scan-error"
-            } else {
-                "scan-reading"
-            }
-            .into()
-        })
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_h_0()
-        .items_start()
-        .justify_start()
-        .p(space::XL)
-        .gap(space::MD)
-        .bg(theme.inset)
-        .text_size(text::BODY)
-        .text_color(theme.secondary)
-        .child(if error.is_some() {
-            "Scan failed"
-        } else if app.progress.cancelled {
-            "Indexing stopped"
-        } else {
-            "Waiting for the first indexed entries…"
-        })
-        .children(error.map(|error| {
-            div()
-                .max_w(size::HELP)
-                .text_color(theme.danger)
-                .child(error.clone())
-        }))
-        .when(!app.is_indexing(), |panel| {
-            panel.child(
-                button("scan-again", "Scan again", ButtonVariant::Outline, cx)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.start_scan(cx);
-                        window.focus(&this.focus, cx);
-                    })),
-            )
-        })
-}
-
-/// Narrow windows retain the essential counters in a compact footer.
-fn indexing_compact(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
-    div()
-        .debug_selector(|| "indexing-compact".into())
-        .flex()
-        .items_center()
-        .gap(space::MD)
-        .min_w_0()
-        .text_size(text::BODY)
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .font_family(theme.mono_font.clone())
-                .child(format!(
-                    "{} files",
-                    widgets::human_count(app.progress.files)
-                )),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .font_family(theme.mono_font.clone())
-                .child(format!("{} measured", human_bytes(app.progress.bytes))),
-        )
-        .child(
-            button("cancel-scan", "Stop", ButtonVariant::Outline, cx).on_click(
-                cx.listener(|this, _, window, cx| {
-                    this.cancel_scan(cx);
-                    window.focus(&this.focus, cx);
-                }),
-            ),
-        )
-}
-
-/// Progress has one owner. Stable rows and mono values prevent digit,
-// unit and path changes from pushing the rest of the screen around.
-fn indexing_progress(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
-    let elapsed = app.scan_started.map_or(0, |at| at.elapsed().as_secs());
-    let row = |label: &'static str, value: String, id: &'static str| {
-        div()
+    if let Some(error) = &app.scan_error {
+        return div()
+            .debug_selector(|| "scan-error".into())
             .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .items_center()
-            .justify_between()
-            .h(size::PROGRESS_ROW)
-            .child(div().text_color(theme.secondary).child(label))
+            .justify_center()
+            .gap(space::LG)
+            .bg(theme.inset)
+            .child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::X)
+                    .size(icon::LG)
+                    .text_color(theme.danger),
+            )
             .child(
                 div()
-                    .debug_selector(move || id.into())
-                    .w(size::PROGRESS_VALUE)
-                    .text_right()
-                    .font_family(theme.mono_font.clone())
-                    .child(value),
+                    .text_size(text::TITLE)
+                    .text_color(theme.bright)
+                    .child("Scan failed"),
             )
-    };
-    let path = if app.remote.is_some() {
+            .child(
+                div()
+                    .max_w(size::HELP)
+                    .p(space::MD)
+                    .border_1()
+                    .border_color(theme.danger)
+                    .text_color(theme.danger)
+                    .text_size(text::BODY)
+                    .child(error.clone()),
+            )
+            .children(app.remote_progress.directory.as_ref().map(|path| {
+                div()
+                    .max_w(size::HELP)
+                    .truncate()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(format!("Last directory: {}", path.display()))
+            }))
+            .child(widgets::hint("r", "retry scan", cx));
+    }
+    let progress = &app.progress;
+    let cancelled =
+        app.scan.is_none() && app.remote_scan.is_none() && progress.cancelled;
+    let recent_dir = if app.remote.is_some() {
         app.remote_progress.directory.as_ref()
     } else {
         app.scan_preview
             .as_ref()
             .and_then(|preview| preview.directory.as_ref())
     };
-    let full_path = path.map_or_else(
-        || "Directory not reported yet".into(),
-        |path| path.display().to_string(),
-    );
-    let mut parts = path
-        .map(|path| {
-            path.components()
-                .rev()
-                .take(3)
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    parts.reverse();
-    let short_path = if path.is_some_and(|path| path.components().count() > 3) {
-        format!("…/{}", parts.join("/"))
-    } else {
-        full_path.clone()
-    };
     div()
-        .debug_selector(|| "indexing-progress".into())
+        .debug_selector(|| "scan-reading".into())
         .flex()
         .flex_col()
-        .min_w_0()
-        .gap(space::XS)
-        .text_size(text::BODY)
-        .text_color(theme.foreground)
-        .child(widgets::eyebrow("Indexing", cx))
-        .child(div().h(size::PROGRESS_ROW).truncate().child(
-            if app.remote.is_some() {
-                app.remote_progress.stage.label()
-            } else {
-                "Reading this computer"
-            },
-        ))
-        .child(row(
-            "Files",
-            widgets::human_count(app.progress.files),
-            "indexing-files",
-        ))
-        .child(row(
-            "Directories",
-            widgets::human_count(app.progress.dirs),
-            "indexing-dirs",
-        ))
-        .child(row(
-            "Measured",
-            human_bytes(app.progress.bytes),
-            "indexing-bytes",
-        ))
-        .child(row(
-            "Read errors",
-            widgets::human_count(app.progress.errors),
-            "indexing-errors",
-        ))
-        .child(row("Elapsed", format!("{elapsed} s"), "indexing-elapsed"))
+        .flex_1()
+        .min_h_0()
+        .items_center()
+        .justify_center()
+        .gap(space::LG)
+        .bg(theme.inset)
+        .when(!cancelled, |panel| {
+            panel.child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::Loader)
+                    .size(icon::LG)
+                    .text_color(theme.accent),
+            )
+        })
         .child(
             div()
-                .h(size::PROGRESS_ROW)
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child("Recent directory"),
+                .text_size(text::TITLE)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.bright)
+                .child(if cancelled {
+                    format!("Stopped reading {}", widgets::display_root(app))
+                } else {
+                    format!("Reading {}", widgets::display_root(app))
+                }),
         )
-        .child(with_tooltip(
+        .child(
             div()
-                .id("indexing-directory")
+                .flex()
+                .flex_row()
+                .gap(space::XL)
+                .child(widgets::stat(
+                    "files",
+                    widgets::human_count(progress.files),
+                    cx,
+                ))
+                .child(widgets::stat(
+                    "directories",
+                    widgets::human_count(progress.dirs),
+                    cx,
+                ))
+                .child(widgets::stat(
+                    "measured",
+                    human_bytes(progress.bytes),
+                    cx,
+                ))
+                .child(widgets::stat_colored(
+                    "unreadable",
+                    widgets::human_count(progress.errors),
+                    if progress.errors > 0 {
+                        theme.warning
+                    } else {
+                        theme.secondary
+                    },
+                    cx,
+                )),
+        )
+        .when(!cancelled, |panel| {
+            panel.child(
+                div()
+                    .debug_selector(|| "scan-meter".into())
+                    .w(size::SCANNING_METER)
+                    .child(widgets::meter_row(
+                        "",
+                        "",
+                        progress_estimate(progress.files),
+                        theme.accent,
+                        cx,
+                    )),
+            )
+        })
+        .children(recent_dir.map(|path| {
+            div()
                 .debug_selector(|| "scan-directory".into())
-                .h(size::PROGRESS_ROW)
+                .max_w(size::HELP)
                 .min_w_0()
                 .truncate()
-                .font_family(theme.mono_font.clone())
-                .child(short_path),
-            full_path,
-        ))
-        .child(
-            div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Preview only · provisional totals"),
-        )
+                .child(format!("Recent directory: {}", path.display()))
+        }))
         .child(
-            button("cancel-scan", "Stop indexing", ButtonVariant::Outline, cx)
+            div()
+                .text_size(text::BODY)
+                .text_color(theme.secondary)
+                .child(if cancelled {
+                    "Nothing is shown from a scan that did not finish."
+                } else {
+                    "Marking, zooming and the free-space meter all work as soon as it lands."
+                }),
+        )
+        // A failed scan has nothing left to cancel either.
+        .child(if app.scan.is_none() && app.remote_scan.is_none() {
+            button("scan-again", "Scan again", ButtonVariant::Outline, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_scan(cx);
+                    window.focus(&this.focus, cx);
+                }))
+        } else {
+            button("cancel-scan", "Cancel", ButtonVariant::Outline, cx)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.cancel_scan(cx);
                     window.focus(&this.focus, cx);
-                })),
-        )
+                }))
+        })
+}
+
+/// A scan has no total to measure against, so the meter shows the work done
+/// rather than pretending to know how far along it is.
+fn progress_estimate(files: u64) -> f32 {
+    if files == 0 {
+        0.06
+    } else {
+        // Asymptotic: the bar keeps moving while the walk continues.
+        let scaled = files as f32 / (files as f32 + 20_000.0);
+        (0.1 + scaled * 0.85).min(0.99)
+    }
 }
 
 fn find_field(app: &Ruum, theme: &Theme) -> Div {
@@ -3415,7 +3372,7 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
         body = body.child(widgets::meter_row(
             "re-scanning",
             format!("{} files", widgets::human_count(app.progress.files)),
-            0.0,
+            progress_estimate(app.progress.files),
             theme.accent,
             cx,
         ));

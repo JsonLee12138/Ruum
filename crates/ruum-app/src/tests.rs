@@ -89,7 +89,7 @@ fn read<R>(view: &Entity<Ruum>, cx: &Window, f: impl FnOnce(&Ruum) -> R) -> R {
 }
 
 #[gpui_kit::test]
-fn remote_indexing_draws_live_activity_and_the_sampled_directory(
+fn remote_indexing_draws_reading_meter_and_the_sampled_directory(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_omarchy::init);
@@ -98,10 +98,6 @@ fn remote_indexing_draws_live_activity_and_the_sampled_directory(
     update(&view, cx, |app, _| {
         app.tree = None;
         app.remote = Some("fixture-only".into());
-        app.scan = Some(ruum_core::scan::ScanHandle::spawn(
-            temp.path().into(),
-            options(),
-        ));
         app.scan_started = Some(std::time::Instant::now());
         app.progress.files = 1234;
         app.progress.bytes = 123_456;
@@ -109,102 +105,15 @@ fn remote_indexing_draws_live_activity_and_the_sampled_directory(
         app.remote_progress.directory = Some(temp.path().join("junk/deeper"));
     });
     draw(cx);
-    assert!(cx.debug_bounds("indexing-progress").is_some());
+    assert!(cx.debug_bounds("scan-meter").is_some());
     assert!(cx.debug_bounds("scan-directory").is_some());
+    assert!(cx.debug_bounds("scan-reading").is_some());
     update(&view, cx, |app, _| {
         app.scan_error = Some("fixture scan failed".into());
     });
     draw(cx);
     assert!(cx.debug_bounds("scan-error").is_some());
     assert!(cx.debug_bounds("scan-reading").is_none());
-}
-
-#[gpui_kit::test]
-fn loading_values_and_paths_do_not_move_the_sidebar(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
-    let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
-    update(&view, cx, |app, _| {
-        app.tree = None;
-        app.scan = Some(ruum_core::scan::ScanHandle::spawn(
-            temp.path().into(),
-            options(),
-        ));
-        app.scan_preview =
-            Some(std::sync::Arc::new(ruum_core::scan_preview::Preview {
-                entries: vec![ruum_core::scan_preview::Entry {
-                    name: "junk".into(),
-                    bytes: 100,
-                    files: 1,
-                }],
-                directory: Some(temp.path().join("short")),
-            }));
-    });
-    draw(cx);
-    draw(cx);
-    let panel = cx.debug_bounds("indexing-progress").unwrap();
-    let files = cx.debug_bounds("indexing-files").unwrap();
-    let path = cx.debug_bounds("scan-directory").unwrap();
-    assert!(cx.debug_bounds("scan-preview").is_some());
-    assert!(cx.debug_bounds("scan-reading").is_none());
-    update(&view, cx, |app, _| {
-        app.progress.files = 99_999_999;
-        app.progress.bytes = u64::MAX / 2;
-        app.remote = Some("fixture-only".into());
-        app.remote_progress.directory = Some(PathBuf::from(
-            "/a/very/long/directory/whose/text/must/not/move/the/layout",
-        ));
-    });
-    draw(cx);
-    assert_eq!(panel, cx.debug_bounds("indexing-progress").unwrap());
-    assert_eq!(files, cx.debug_bounds("indexing-files").unwrap());
-    assert_eq!(path, cx.debug_bounds("scan-directory").unwrap());
-    let preview = cx.debug_bounds("scan-preview").unwrap();
-    cx.simulate_click(preview.center(), gpui_kit::Modifiers::none());
-    press(cx, "space");
-    read(&view, cx, |app| {
-        assert!(app.marks.is_empty());
-        assert!(app.tree.is_none());
-    });
-    update(&view, cx, Ruum::cancel_scan);
-    draw(cx);
-    assert!(cx.debug_bounds("scan-preview").is_none());
-    assert!(read(&view, cx, |app| app.scan_preview.is_none()));
-}
-
-#[gpui_kit::test]
-fn narrow_indexing_keeps_a_preview_and_compact_progress_in_bounds(
-    cx: &mut TestAppContext,
-) {
-    cx.update(gpui_omarchy::init);
-    let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
-    update(&view, cx, |app, _| {
-        app.tree = None;
-        app.scan = Some(ruum_core::scan::ScanHandle::spawn(
-            temp.path().into(),
-            options(),
-        ));
-        app.scan_preview =
-            Some(std::sync::Arc::new(ruum_core::scan_preview::Preview {
-                entries: vec![ruum_core::scan_preview::Entry {
-                    name: "junk".into(),
-                    bytes: 100,
-                    files: 1,
-                }],
-                directory: None,
-            }));
-    });
-    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
-    cx.update(|window, _| window.set_rem_size(px(28.)));
-    draw(cx);
-    draw(cx);
-    let compact = cx.debug_bounds("indexing-compact").unwrap();
-    assert!(compact.origin.x >= px(0.) && compact.right() <= px(900.));
-    assert!(compact.origin.y >= px(0.) && compact.bottom() <= px(600.));
-    let preview = cx.debug_bounds("scan-preview").unwrap();
-    assert!(preview.size.height > px(50.), "{preview:?}");
-    assert!(preview.bottom() <= compact.origin.y, "{preview:?}");
 }
 
 #[gpui_kit::test]

@@ -70,6 +70,7 @@ pub fn mosaic(
 }
 
 /// A coarse, explicitly non-actionable picture of measured contributions.
+#[allow(dead_code, reason = "kept for optional live scan preview rendering")]
 pub fn preview(
     preview: &ruum_core::scan_preview::Preview,
     app: &Ruum,

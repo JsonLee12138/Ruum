@@ -15,6 +15,11 @@ use ruum_core::tree::{Metric, Node};
 
 use crate::ui::{space, text};
 
+/// The scanned root, shortened to `~` where it is the home directory.
+pub fn display_root(app: &crate::state::Ruum) -> String {
+    crate::marks::display_path(&app.root_path, app.home.as_deref())
+}
+
 /// File counts, which is what a directory count is too.
 pub fn human_count(value: u64) -> String {
     ruum_core::size::human_count(value)

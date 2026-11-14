@@ -12,13 +12,17 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, NavigationDirection, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, Size, Window, px, size,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    NavigationDirection, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    Size, Window, px, size,
 };
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 use ruum_core::access::file_table_readable;
+use ruum_core::confirm::{
+    CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+};
 use ruum_core::filter::{Keep, Matches, filter};
 use ruum_core::insights::{Candidate, worth_a_look};
 use ruum_core::removal::{
@@ -31,6 +35,11 @@ use ruum_core::tree::{Metric, Node, path_of};
 use ruum_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
 };
+use ruum_core::watchdog::ServiceStatus;
+use ruum_core::watchdog_config::{
+    MIN_FREE_GB_FLOOR, ProposalItem, WatchdogConfig, WatchdogState,
+};
+use std::collections::BTreeSet;
 
 use crate::git::GitState;
 
@@ -107,6 +116,12 @@ pub enum Screen {
     /// Walk the treemap and mark what should go.
     #[default]
     Explore,
+    /// Choose a local mount or remote SSH source and root.
+    Sources,
+    /// Volume free space monitor and AI cleanup proposals.
+    Watchdog,
+    /// Application preferences and watchdog configuration.
+    Settings,
     /// Review every marked path and choose how to remove them.
     Review,
     /// A removal is running.
@@ -320,6 +335,130 @@ pub struct RunSummary {
     pub failed: usize,
 }
 
+/// Interactive modal state holding proposed items for user review and confirmation.
+#[derive(Debug)]
+pub struct CleanupConfirmModal {
+    pub request: CleanupConfirmRequest,
+    pub checked_paths: BTreeSet<PathBuf>,
+    pub responder: Option<std::sync::mpsc::Sender<CleanupConfirmDecision>>,
+    pub response_file: Option<PathBuf>,
+    pub decided: bool,
+}
+
+impl CleanupConfirmModal {
+    /// Create a new modal with all candidate paths checked by default.
+    #[must_use]
+    pub fn new(
+        request: CleanupConfirmRequest,
+        responder: Option<std::sync::mpsc::Sender<CleanupConfirmDecision>>,
+        response_file: Option<PathBuf>,
+    ) -> Self {
+        let mut checked_paths = BTreeSet::new();
+        for item in &request.items {
+            checked_paths.insert(item.path.clone());
+        }
+        Self {
+            request,
+            checked_paths,
+            responder,
+            response_file,
+            decided: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_checked(&self, path: &Path) -> bool {
+        self.checked_paths.contains(path)
+    }
+
+    pub fn toggle_path(&mut self, path: &Path) {
+        if self.checked_paths.contains(path) {
+            self.checked_paths.remove(path);
+        } else {
+            self.checked_paths.insert(path.to_path_buf());
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        for item in &self.request.items {
+            self.checked_paths.insert(item.path.clone());
+        }
+    }
+
+    pub fn select_none(&mut self) {
+        self.checked_paths.clear();
+    }
+
+    #[must_use]
+    pub fn selected_count(&self) -> usize {
+        self.checked_paths.len()
+    }
+
+    #[must_use]
+    pub fn selected_bytes(&self) -> u64 {
+        self.request
+            .items
+            .iter()
+            .filter(|i| self.checked_paths.contains(&i.path))
+            .map(|i| i.bytes)
+            .sum()
+    }
+
+    pub fn confirm(&mut self) -> CleanupConfirmDecision {
+        self.decided = true;
+        let selected_paths: Vec<PathBuf> = self
+            .request
+            .items
+            .iter()
+            .filter(|i| self.checked_paths.contains(&i.path))
+            .map(|i| i.path.clone())
+            .collect();
+        let decision = CleanupConfirmDecision::Confirmed { selected_paths };
+        if let Some(resp) = self.responder.take() {
+            let _ = resp.send(decision.clone());
+        }
+        if let Some(ref path) = self.response_file {
+            let _ = write_decision_file(path, &decision);
+        }
+        decision
+    }
+
+    pub fn cancel(&mut self) -> CleanupConfirmDecision {
+        self.decided = true;
+        let decision = CleanupConfirmDecision::Cancelled;
+        if let Some(resp) = self.responder.take() {
+            let _ = resp.send(decision.clone());
+        }
+        if let Some(ref path) = self.response_file {
+            let _ = write_decision_file(path, &decision);
+        }
+        decision
+    }
+}
+
+impl Drop for CleanupConfirmModal {
+    fn drop(&mut self) {
+        if !self.decided {
+            let decision = CleanupConfirmDecision::Cancelled;
+            if let Some(resp) = self.responder.take() {
+                let _ = resp.send(decision.clone());
+            }
+            if let Some(ref path) = self.response_file {
+                let _ = write_decision_file(path, &decision);
+            }
+        }
+    }
+}
+
+fn write_decision_file(
+    path: &Path,
+    decision: &CleanupConfirmDecision,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(decision)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
 /// Everything the app knows and everything it can do.
 pub struct Ruum {
     /// The directory the tree was scanned from.
@@ -469,6 +608,60 @@ pub struct Ruum {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
+    /// Whether this window was launched purely to confirm cleanup and exit.
+    pub confirm_only: bool,
+    /// Active interactive cleanup confirmation modal, if open.
+    pub confirm_modal: Option<CleanupConfirmModal>,
+    /// Watchdog monitoring configuration.
+    pub watchdog_config: WatchdogConfig,
+    /// Watchdog persistent runtime state.
+    pub watchdog_state: WatchdogState,
+    /// Settings input: threshold minimum free gigabytes.
+    pub watchdog_input_min_free: Option<Entity<InputState>>,
+    /// Settings input: custom AI CLI command.
+    pub watchdog_input_custom_cmd: Option<Entity<InputState>>,
+    /// Settings input: custom AI CLI extra arguments.
+    pub watchdog_input_extra_args: Option<Entity<InputState>>,
+    /// Settings input: optional AI model override.
+    pub watchdog_input_model: Option<Entity<InputState>>,
+    /// Monotonic generation counter for auto-dismissing toast notices.
+    pub toast_epoch: u64,
+    /// True while testing AI CLI connectivity.
+    pub watchdog_testing: bool,
+    /// Generation counter for discarding stale AI connection tests.
+    pub watchdog_test_epoch: u64,
+    /// True while fetching available models from the selected AI CLI.
+    pub watchdog_fetching_models: bool,
+    /// Generation counter for discarding stale model list fetches.
+    pub watchdog_fetch_epoch: u64,
+    /// Models discovered for the active AI CLI provider.
+    pub watchdog_models: Vec<ruum_core::ai_cli::DiscoveredModel>,
+    /// Model IDs currently running a speed benchmark (or `(default)`).
+    pub watchdog_benchmarking_models: FxHashSet<String>,
+    /// Generation counter for discarding stale model speed probes on switch.
+    pub watchdog_benchmark_epoch: u64,
+    /// Latest per-model speed test results in milliseconds.
+    pub watchdog_speed_results: Vec<ruum_core::ai_cli::ModelSpeedResult>,
+    /// True while saving settings / updating OS background service.
+    pub watchdog_saving: bool,
+    /// True while a manual Watchdog AI analysis runs in the background.
+    pub watchdog_analyzing: bool,
+    /// Generation counter for Watchdog AI analysis jobs.
+    pub watchdog_analysis_epoch: u64,
+    /// Unix seconds when disk space was last checked on Watchdog page.
+    pub watchdog_space_checked_at: Option<u64>,
+    /// Background daemon OS service status.
+    pub watchdog_service_status: Option<ServiceStatus>,
+    /// IPC event receiver for incoming confirmation requests.
+    pub ipc_rx: Option<
+        std::sync::mpsc::Receiver<crate::watchdog_runtime::WatchdogIpcEvent>,
+    >,
+    /// IPC server handle keeping background thread alive.
+    #[allow(
+        dead_code,
+        reason = "keeps background IPC server alive until Ruum drops"
+    )]
+    pub ipc_server: Option<crate::watchdog_runtime::WatchdogIpcServer>,
 }
 
 impl Ruum {
@@ -520,6 +713,27 @@ impl Ruum {
             None
         };
         let trash_backend = detect_trash_backend();
+        let watchdog_config =
+            ruum_core::watchdog_config::watchdog_config_path()
+                .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
+                .unwrap_or_default();
+        let watchdog_state = ruum_core::watchdog_config::watchdog_state_path()
+            .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
+            .unwrap_or_default();
+        let watchdog_space_checked_at = watchdog_state.last_checked_secs;
+        let watchdog_service_status = ruum_core::watchdog::service_status(
+            &ruum_core::ai_cli::DefaultCommandRunner,
+        )
+        .ok();
+        let (ipc_server, ipc_rx) = if cfg!(test) {
+            (None, None)
+        } else {
+            match crate::watchdog_runtime::WatchdogIpcServer::start() {
+                Ok((srv, rx)) => (Some(srv), Some(rx)),
+                Err(_) => (None, None),
+            }
+        };
+
         let mut tree = Self {
             root_path,
             remote,
@@ -619,6 +833,30 @@ impl Ruum {
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
+            confirm_only: false,
+            confirm_modal: None,
+            watchdog_config,
+            watchdog_state,
+            watchdog_input_min_free: None,
+            watchdog_input_custom_cmd: None,
+            watchdog_input_extra_args: None,
+            watchdog_input_model: None,
+            toast_epoch: 0,
+            watchdog_testing: false,
+            watchdog_test_epoch: 0,
+            watchdog_fetching_models: false,
+            watchdog_fetch_epoch: 0,
+            watchdog_models: Vec::new(),
+            watchdog_benchmarking_models: FxHashSet::default(),
+            watchdog_benchmark_epoch: 0,
+            watchdog_speed_results: Vec::new(),
+            watchdog_saving: false,
+            watchdog_analyzing: false,
+            watchdog_analysis_epoch: 0,
+            watchdog_space_checked_at,
+            watchdog_service_status,
+            ipc_rx,
+            ipc_server,
         };
         if local && start {
             tree.device = device_for(&tree.root_path);
@@ -638,6 +876,9 @@ impl Ruum {
             tree.open_volumes(cx);
         }
         Self::start_space_ticker(cx);
+        if tree.ipc_rx.is_some() {
+            Self::start_ipc_poll(cx);
+        }
         tree
     }
 
@@ -734,9 +975,13 @@ impl Ruum {
     /// is left alone until a volume is picked; picking calls [`set_root`],
     /// which cancels it.
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        if self.run.is_some() || self.screen != Screen::Explore {
+        if self.run.is_some()
+            || (self.screen != Screen::Explore
+                && self.screen != Screen::Sources)
+        {
             return;
         }
+        self.screen = Screen::Sources;
         self.volumes_open = true;
         self.picker_host = None;
         self.picker_path = None;
@@ -890,6 +1135,874 @@ impl Ruum {
         }
     }
 
+    /// Whether any text input currently owns keyboard focus.
+    pub fn is_editing(&self, window: &Window, cx: &App) -> bool {
+        let inputs = [
+            &self.picker_host,
+            &self.picker_path,
+            &self.watchdog_input_min_free,
+            &self.watchdog_input_custom_cmd,
+            &self.watchdog_input_extra_args,
+            &self.watchdog_input_model,
+        ];
+        inputs
+            .into_iter()
+            .flatten()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// Create a Ruum instance purely to display a cleanup confirmation modal.
+    pub fn confirm_only(
+        request: CleanupConfirmRequest,
+        response_file: PathBuf,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let mut app = Self::build(
+            home,
+            ScanOptions::default(),
+            3,
+            None,
+            false,
+            false,
+            cx,
+        );
+        app.confirm_only = true;
+        app.volumes_open = false;
+        app.awaiting_root = false;
+        app.confirm_modal =
+            Some(CleanupConfirmModal::new(request, None, Some(response_file)));
+        app
+    }
+
+    /// Background polling loop draining local IPC events.
+    fn start_ipc_poll(cx: &Context<'_, Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let keep_going =
+                    this.update(cx, Self::poll_ipc).unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Poll incoming IPC events once without blocking the UI thread.
+    pub fn poll_ipc(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        let Some(rx) = &self.ipc_rx else {
+            return false;
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        for event in events {
+            match event {
+                crate::watchdog_runtime::WatchdogIpcEvent::Confirm {
+                    request,
+                    responder,
+                } => {
+                    self.confirm_modal = Some(CleanupConfirmModal::new(
+                        request,
+                        Some(responder),
+                        None,
+                    ));
+                    cx.notify();
+                }
+                crate::watchdog_runtime::WatchdogIpcEvent::WatchdogUpdated => {
+                    self.reload_watchdog_state();
+                    cx.notify();
+                }
+            }
+        }
+        true
+    }
+
+    /// Re-read watchdog persistent state from disk.
+    pub fn reload_watchdog_state(&mut self) {
+        if let Some(path) = ruum_core::watchdog_config::watchdog_state_path()
+            && let Ok(st) = ruum_core::watchdog_config::load_state(&path)
+        {
+            self.watchdog_state = st;
+        }
+    }
+
+    /// Initialize text input entities for the Settings page if absent.
+    pub fn ensure_watchdog_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.watchdog_input_min_free.is_none() {
+            let val = self.watchdog_config.min_free_gb.to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("20")
+                    .default_value(val)
+            });
+            self.watchdog_input_min_free = Some(input);
+        }
+        if self.watchdog_input_custom_cmd.is_none() {
+            let val = self.watchdog_config.custom_command.clone();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("e.g. /usr/local/bin/my-ai")
+                    .default_value(val)
+            });
+            self.watchdog_input_custom_cmd = Some(input);
+        }
+        if self.watchdog_input_extra_args.is_none() {
+            let val = self.watchdog_config.extra_args.clone();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("e.g. --timeout 60")
+                    .default_value(val)
+            });
+            self.watchdog_input_extra_args = Some(input);
+        }
+        if self.watchdog_input_model.is_none() {
+            let val = self.watchdog_config.model.clone().unwrap_or_default();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("optional model override")
+                    .default_value(val)
+            });
+            self.watchdog_input_model = Some(input);
+        }
+    }
+
+    /// Read current Watchdog settings including any unsaved text input values.
+    fn snapshot_watchdog_config(&self, cx: &App) -> WatchdogConfig {
+        let mut cfg = self.watchdog_config.clone();
+        if let Some(ref input) = self.watchdog_input_min_free {
+            let text = input.read(cx).value();
+            if let Ok(val) = text.trim().parse::<u64>() {
+                cfg.min_free_gb = val.max(MIN_FREE_GB_FLOOR);
+            }
+        }
+        if let Some(ref input) = self.watchdog_input_custom_cmd {
+            cfg.custom_command = input.read(cx).value().trim().to_string();
+        }
+        if let Some(ref input) = self.watchdog_input_extra_args {
+            cfg.extra_args = input.read(cx).value().trim().to_string();
+        }
+        if let Some(ref input) = self.watchdog_input_model {
+            let text = input.read(cx).value().trim().to_string();
+            cfg.model = (!text.is_empty()).then_some(text);
+        }
+        cfg
+    }
+
+    /// Show a floating toast notification that auto-dismisses after 4 seconds.
+    pub fn push_toast(
+        &mut self,
+        message: impl Into<String>,
+        status: Status,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.toast_epoch = self.toast_epoch.wrapping_add(1);
+        let epoch = self.toast_epoch;
+        self.notice = Some((message.into(), status));
+        cx.notify();
+
+        if cfg!(test) {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.toast_epoch == epoch {
+                    this.notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Dismiss the active floating toast notification immediately.
+    pub fn dismiss_toast(&mut self, cx: &mut Context<'_, Self>) {
+        self.toast_epoch = self.toast_epoch.wrapping_add(1);
+        if self.notice.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Switch the configured AI CLI provider and reset stale model/speed state.
+    pub fn set_watchdog_provider(
+        &mut self,
+        provider: ruum_core::watchdog_config::AiCliProvider,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.watchdog_config.ai_provider != provider {
+            self.watchdog_config.ai_provider = provider;
+            self.watchdog_test_epoch += 1;
+            self.watchdog_fetch_epoch += 1;
+            self.watchdog_benchmark_epoch += 1;
+            self.watchdog_testing = false;
+            self.watchdog_fetching_models = false;
+            self.watchdog_benchmarking_models.clear();
+            self.watchdog_models.clear();
+            self.watchdog_speed_results.clear();
+            cx.notify();
+        }
+    }
+
+    /// Populate the model override input from a discovered model choice.
+    pub fn select_watchdog_model(
+        &mut self,
+        model_id: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let trimmed = model_id.trim();
+        self.watchdog_config.model =
+            (!trimmed.is_empty()).then(|| trimmed.to_string());
+        if let Some(ref input) = self.watchdog_input_model {
+            input.update(cx, |inp, cx| {
+                inp.set_value(trimmed.to_string(), window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Save watchdog settings from inputs to `watchdog.json` and sync OS service.
+    pub fn save_watchdog_settings(&mut self, cx: &mut Context<'_, Self>) {
+        self.watchdog_config = self.snapshot_watchdog_config(cx);
+
+        if let Some(path) = ruum_core::watchdog_config::watchdog_config_path()
+            && let Err(err) = ruum_core::watchdog_config::save_config(
+                &path,
+                &self.watchdog_config,
+            )
+        {
+            self.push_toast(
+                format!("Failed to save settings: {err}"),
+                Status::Error,
+                cx,
+            );
+            return;
+        }
+
+        if cfg!(test) {
+            self.push_toast("Settings saved", Status::Success, cx);
+            return;
+        }
+
+        let enable_service = self.watchdog_config.background_service;
+        let current_exe =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        self.watchdog_saving = true;
+        self.push_toast(
+            "Settings saved; updating background service…",
+            Status::Success,
+            cx,
+        );
+
+        let task = cx.background_executor().spawn(async move {
+            let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                Duration::from_secs(10),
+            );
+            let sync_res = if enable_service {
+                ruum_core::watchdog::install_service(&runner, &current_exe)
+            } else {
+                ruum_core::watchdog::uninstall_service(&runner)
+            };
+            let status = ruum_core::watchdog::service_status(&runner).ok();
+            (sync_res, status)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let (sync_res, status) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.watchdog_saving = false;
+                this.watchdog_service_status = status;
+                match sync_res {
+                    Ok(()) => {
+                        let service_note = match status {
+                            Some(ServiceStatus::Active) => "Service: Active",
+                            Some(ServiceStatus::Inactive) => {
+                                "Service: Inactive"
+                            }
+                            Some(ServiceStatus::NotInstalled) | None => {
+                                "Service: Off"
+                            }
+                            Some(ServiceStatus::Unsupported) => {
+                                "Service: Unsupported"
+                            }
+                        };
+                        this.push_toast(
+                            format!("Settings saved ({service_note})"),
+                            Status::Success,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            format!("Settings saved; service error: {err}"),
+                            Status::Warning,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Test AI CLI connectivity off the UI thread (separate from model fetch).
+    pub fn test_watchdog_ai_cli(&mut self, cx: &mut Context<'_, Self>) {
+        if self.watchdog_testing {
+            return;
+        }
+        let temp_cfg = self.snapshot_watchdog_config(cx);
+        let provider_label = temp_cfg.ai_provider.label();
+        self.watchdog_testing = true;
+        self.watchdog_test_epoch += 1;
+        let epoch = self.watchdog_test_epoch;
+        self.push_toast(
+            format!("Testing {provider_label} CLI connection…"),
+            Status::Neutral,
+            cx,
+        );
+
+        let task = cx.background_executor().spawn(async move {
+            let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                Duration::from_secs(
+                    ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
+                ),
+            );
+            ruum_core::ai_cli::test_connection(&temp_cfg, &runner)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch != this.watchdog_test_epoch {
+                    return;
+                }
+                this.watchdog_testing = false;
+                match res {
+                    Ok(version_msg) => {
+                        this.push_toast(version_msg, Status::Success, cx);
+                    }
+                    Err(err) => {
+                        this.push_toast(err, Status::Error, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Discover available models from the selected AI CLI provider.
+    pub fn fetch_watchdog_models(&mut self, cx: &mut Context<'_, Self>) {
+        if self.watchdog_fetching_models {
+            return;
+        }
+        let temp_cfg = self.snapshot_watchdog_config(cx);
+        let provider_label = temp_cfg.ai_provider.label();
+        self.watchdog_fetching_models = true;
+        self.watchdog_fetch_epoch += 1;
+        let epoch = self.watchdog_fetch_epoch;
+        self.push_toast(
+            format!("Fetching {provider_label} models…"),
+            Status::Neutral,
+            cx,
+        );
+
+        let task = cx.background_executor().spawn(async move {
+            let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                Duration::from_secs(
+                    ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
+                ),
+            );
+            ruum_core::ai_cli::discover_models(&temp_cfg, &runner)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch != this.watchdog_fetch_epoch {
+                    return;
+                }
+                this.watchdog_fetching_models = false;
+                match res {
+                    Ok((models, note)) => {
+                        let count = models.len();
+                        this.watchdog_models = models;
+                        let (msg, status) = match (count, note) {
+                            (0, Some(n)) => (n, Status::Warning),
+                            (0, None) => (
+                                format!(
+                                    "No models discovered for {provider_label}"
+                                ),
+                                Status::Warning,
+                            ),
+                            (n, Some(n_note)) => (
+                                format!("Loaded {n} models ({n_note})"),
+                                Status::Success,
+                            ),
+                            (n, None) => (
+                                format!(
+                                    "Loaded {n} models for {provider_label}"
+                                ),
+                                Status::Success,
+                            ),
+                        };
+                        this.push_toast(msg, status, cx);
+                    }
+                    Err(err) => {
+                        this.watchdog_models.clear();
+                        this.push_toast(err, Status::Error, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn upsert_speed_result(
+        &mut self,
+        result: ruum_core::ai_cli::ModelSpeedResult,
+    ) {
+        if let Some(existing) = self
+            .watchdog_speed_results
+            .iter_mut()
+            .find(|item| item.model == result.model)
+        {
+            *existing = result;
+        } else {
+            self.watchdog_speed_results.insert(0, result);
+        }
+    }
+
+    /// Measure response latency in milliseconds for a chosen or configured model.
+    pub fn benchmark_watchdog_model(
+        &mut self,
+        model_override: Option<String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let temp_cfg = self.snapshot_watchdog_config(cx);
+        let target_key = model_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| temp_cfg.model.clone())
+            .unwrap_or_else(|| "(default)".to_string());
+        if self.watchdog_benchmarking_models.contains(&target_key) {
+            return;
+        }
+        self.watchdog_benchmarking_models.insert(target_key.clone());
+        let epoch = self.watchdog_benchmark_epoch;
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                Duration::from_secs(
+                    ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
+                ),
+            );
+            ruum_core::ai_cli::benchmark_model(
+                &temp_cfg,
+                model_override.as_deref(),
+                &runner,
+            )
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.watchdog_benchmarking_models.remove(&target_key);
+                if epoch != this.watchdog_benchmark_epoch {
+                    cx.notify();
+                    return;
+                }
+                let failed = (!result.ok).then(|| {
+                    format!(
+                        "Model {} speed test failed: {}",
+                        result.model, result.detail
+                    )
+                });
+                this.upsert_speed_result(result);
+                if let Some(err) = failed {
+                    this.push_toast(err, Status::Error, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Benchmark latency sequentially for every discovered model.
+    pub fn benchmark_all_watchdog_models(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let temp_cfg = self.snapshot_watchdog_config(cx);
+        let models_to_test: Vec<String> = self
+            .watchdog_models
+            .iter()
+            .filter(|m| !self.watchdog_benchmarking_models.contains(&m.id))
+            .map(|m| m.id.clone())
+            .collect();
+        if models_to_test.is_empty() {
+            if self.watchdog_models.is_empty() {
+                self.push_toast(
+                    "Fetch models first before testing all models",
+                    Status::Warning,
+                    cx,
+                );
+            }
+            return;
+        }
+        for model_id in &models_to_test {
+            self.watchdog_benchmarking_models.insert(model_id.clone());
+        }
+        let epoch = self.watchdog_benchmark_epoch;
+        let total = models_to_test.len();
+        self.push_toast(
+            format!("Benchmarking {total} models…"),
+            Status::Neutral,
+            cx,
+        );
+
+        cx.spawn(async move |this, cx| {
+            let mut ok_count = 0usize;
+            let mut fail_count = 0usize;
+            for model_id in models_to_test {
+                let cfg_clone = temp_cfg.clone();
+                let id_for_task = model_id.clone();
+                let task = cx.background_executor().spawn(async move {
+                    let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                        Duration::from_secs(
+                            ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
+                        ),
+                    );
+                    ruum_core::ai_cli::benchmark_model(
+                        &cfg_clone,
+                        Some(&id_for_task),
+                        &runner,
+                    )
+                });
+                let result = task.await;
+                let keep_going = this.update(cx, |this, cx| {
+                    this.watchdog_benchmarking_models.remove(&model_id);
+                    if epoch != this.watchdog_benchmark_epoch {
+                        cx.notify();
+                        return false;
+                    }
+                    if result.ok {
+                        ok_count += 1;
+                    } else {
+                        fail_count += 1;
+                    }
+                    this.upsert_speed_result(result);
+                    cx.notify();
+                    true
+                });
+                if !matches!(keep_going, Ok(true)) {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                if epoch != this.watchdog_benchmark_epoch {
+                    return;
+                }
+                let status = if fail_count == 0 {
+                    Status::Success
+                } else if ok_count == 0 {
+                    Status::Error
+                } else {
+                    Status::Warning
+                };
+                this.push_toast(
+                    format!(
+                        "Speed test finished: {ok_count}/{total} succeeded"
+                    ),
+                    status,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Trigger manual space refresh on Watchdog page.
+    pub fn refresh_watchdog_space(&mut self, cx: &mut Context<'_, Self>) {
+        let target = std::env::home_dir()
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| self.root_path.clone());
+        self.reload_watchdog_state();
+
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        match space_info(&target) {
+            Ok(info) => {
+                self.space = Some(info);
+                self.watchdog_space_checked_at = Some(now_secs);
+                let thresh_bytes = self
+                    .watchdog_config
+                    .min_free_gb
+                    .saturating_mul(1024 * 1024 * 1024);
+                let breached = info.available < thresh_bytes;
+                let free = ruum_core::size::human_bytes(info.available);
+                let total = ruum_core::size::human_bytes(info.total);
+                let msg = if breached {
+                    format!(
+                        "Checked: {free} free of {total} — below {} GB \
+                         threshold",
+                        self.watchdog_config.min_free_gb
+                    )
+                } else {
+                    format!(
+                        "Checked: {free} free of {total} — healthy (above {} \
+                         GB threshold)",
+                        self.watchdog_config.min_free_gb
+                    )
+                };
+                let status = if breached {
+                    Status::Warning
+                } else {
+                    Status::Success
+                };
+                self.push_toast(msg, status, cx);
+            }
+            Err(err) => {
+                self.push_toast(
+                    format!("Failed to check disk space: {err}"),
+                    Status::Error,
+                    cx,
+                );
+            }
+        }
+
+        if !cfg!(test) {
+            let task = cx.background_executor().spawn(async {
+                let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                    Duration::from_secs(5),
+                );
+                ruum_core::watchdog::service_status(&runner).ok()
+            });
+            cx.spawn(async move |this, cx| {
+                let status = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.watchdog_service_status = status;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Trigger manual AI analysis off the UI thread and open confirmation modal.
+    pub fn run_ai_analysis_now(&mut self, cx: &mut Context<'_, Self>) {
+        if self.watchdog_analyzing {
+            return;
+        }
+        let Some(home) = std::env::home_dir() else {
+            self.push_toast("Cannot find home directory", Status::Error, cx);
+            return;
+        };
+        let cfg = self.snapshot_watchdog_config(cx);
+        let provider_label = cfg.ai_provider.label();
+        let current_exe =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        let existing_tree = (self.remote.is_none() && self.root_path == home)
+            .then(|| self.tree.clone())
+            .flatten();
+
+        self.watchdog_analyzing = true;
+        self.watchdog_analysis_epoch += 1;
+        let epoch = self.watchdog_analysis_epoch;
+        self.push_toast(
+            format!("Running AI analysis via {provider_label}…"),
+            Status::Neutral,
+            cx,
+        );
+
+        let task = cx.background_executor().spawn(async move {
+            let runner = ruum_core::ai_cli::DefaultCommandRunner;
+            let res = ruum_core::ai_cli::run_analysis_with_tree(
+                &cfg,
+                &home,
+                &current_exe,
+                now_secs,
+                existing_tree.as_deref(),
+                &runner,
+            );
+            (home, now_secs, res)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let (home, completed_secs, res) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch != this.watchdog_analysis_epoch {
+                    return;
+                }
+                this.watchdog_analyzing = false;
+                match res {
+                    Ok(proposal) => {
+                        this.watchdog_state.last_proposal =
+                            Some(proposal.clone());
+                        this.watchdog_state.last_triggered_secs =
+                            Some(completed_secs);
+                        if let Some(path) =
+                            ruum_core::watchdog_config::watchdog_state_path()
+                        {
+                            let _ = ruum_core::watchdog_config::save_state(
+                                &path,
+                                &this.watchdog_state,
+                            );
+                        }
+                        if proposal.items.is_empty() {
+                            this.push_toast(
+                                "AI analysis found no reclaimable files",
+                                Status::Success,
+                                cx,
+                            );
+                        } else {
+                            let count = proposal.items.len();
+                            let confirm_items: Vec<CleanupConfirmItem> =
+                                proposal
+                                    .items
+                                    .into_iter()
+                                    .map(|item| CleanupConfirmItem {
+                                        path: item.path,
+                                        bytes: item.bytes,
+                                        mode: item.mode,
+                                        reason: item.reason,
+                                        git_warning: item.git_warning,
+                                    })
+                                    .collect();
+                            let request = CleanupConfirmRequest {
+                                root: home,
+                                title: "AI Cleanup Proposal".to_string(),
+                                summary: Some(proposal.summary),
+                                items: confirm_items,
+                            };
+                            this.confirm_modal = Some(
+                                CleanupConfirmModal::new(request, None, None),
+                            );
+                            this.push_toast(
+                                format!(
+                                    "AI proposed {count} candidate items for \
+                                     review"
+                                ),
+                                Status::Success,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            format!("AI analysis error: {err}"),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Open confirmation dialog for the most recently saved proposal.
+    pub fn open_last_proposal(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(proposal) = &self.watchdog_state.last_proposal else {
+            return;
+        };
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let confirm_items: Vec<CleanupConfirmItem> = proposal
+            .items
+            .iter()
+            .map(|item| CleanupConfirmItem {
+                path: item.path.clone(),
+                bytes: item.bytes,
+                mode: item.mode,
+                reason: item.reason.clone(),
+                git_warning: item.git_warning.clone(),
+            })
+            .collect();
+        let request = CleanupConfirmRequest {
+            root: home,
+            title: "AI Cleanup Proposal".to_string(),
+            summary: Some(proposal.summary.clone()),
+            items: confirm_items,
+        };
+        self.confirm_modal =
+            Some(CleanupConfirmModal::new(request, None, None));
+        cx.notify();
+    }
+
+    /// Confirm the cleanup modal, executing removal or returning IPC decision.
+    pub fn confirm_cleanup_modal(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(mut modal) = self.confirm_modal.take() {
+            let decision = modal.confirm();
+            if modal.responder.is_none()
+                && modal.response_file.is_none()
+                && let CleanupConfirmDecision::Confirmed { selected_paths } =
+                    decision
+            {
+                let approved_items: Vec<ProposalItem> = modal
+                    .request
+                    .items
+                    .iter()
+                    .filter(|i| selected_paths.contains(&i.path))
+                    .map(|i| {
+                        ProposalItem::new(
+                            i.path.clone(),
+                            i.bytes,
+                            i.mode,
+                            i.reason.clone(),
+                            i.git_warning.clone(),
+                        )
+                    })
+                    .collect();
+                if let Some(home) = std::env::home_dir() {
+                    let (bytes, count) =
+                        ruum_core::watchdog::execute_confirmed_cleanup(
+                            &approved_items,
+                            &home,
+                        );
+                    self.notice = Some((
+                        format!(
+                            "Cleaned {} items, freeing {}",
+                            count,
+                            ruum_core::size::human_bytes(bytes)
+                        ),
+                        Status::Success,
+                    ));
+                }
+            }
+            if self.confirm_only {
+                cx.quit();
+            } else {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Cancel the cleanup modal, returning Cancelled decision.
+    pub fn cancel_cleanup_modal(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(mut modal) = self.confirm_modal.take() {
+            modal.cancel();
+            if self.confirm_only {
+                cx.quit();
+            } else {
+                cx.notify();
+            }
+        }
+    }
+
     pub fn picker_source_matches(&self, cx: &Context<'_, Self>) -> bool {
         self.picker_host.as_ref().is_none_or(|input| {
             input.read(cx).value().trim()
@@ -999,6 +2112,9 @@ impl Ruum {
         self.roots_job = None;
         self.volumes_loading = false;
         self.volumes_open = false;
+        if self.screen == Screen::Sources {
+            self.screen = Screen::Explore;
+        }
         self.focus_request = Some(FocusTarget::Root);
         cx.notify();
     }
@@ -3043,6 +4159,16 @@ impl Ruum {
         let shift = event.keystroke.modifiers.shift;
         let alt = event.keystroke.modifiers.alt;
 
+        // The cleanup confirmation modal owns keys while open:
+        if self.confirm_modal.is_some() {
+            match key {
+                "escape" => self.cancel_cleanup_modal(cx),
+                "enter" => self.confirm_cleanup_modal(cx),
+                _ => {}
+            }
+            return;
+        }
+
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
         if self.confirm_open {
@@ -3051,7 +4177,7 @@ impl Ruum {
 
         // The volume picker owns its keys while open: arrows move, Enter
         // picks, Escape closes, and nothing behind it acts.
-        if self.volumes_open {
+        if self.volumes_open || self.screen == Screen::Sources {
             match key {
                 "escape" => self.close_volumes(cx),
                 "enter" => self.choose_volume(cx),
@@ -3063,6 +4189,15 @@ impl Ruum {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Escape on Watchdog or Settings returns to Explore:
+        if (self.screen == Screen::Watchdog || self.screen == Screen::Settings)
+            && key == "escape"
+        {
+            self.screen = Screen::Explore;
+            cx.notify();
             return;
         }
 
@@ -3124,6 +4259,11 @@ impl Ruum {
             Screen::Explore if alt && key == "left" => self.go_back(cx),
             Screen::Explore if alt && key == "right" => self.go_forward(cx),
             Screen::Explore => self.on_explore_key(key, control, shift, cx),
+            Screen::Watchdog | Screen::Settings if key == "escape" => {
+                self.screen = Screen::Explore;
+                cx.notify();
+            }
+            Screen::Sources | Screen::Watchdog | Screen::Settings => {}
             Screen::Review => self.on_review_key(key, cx),
             Screen::Running => {
                 if key == "escape"

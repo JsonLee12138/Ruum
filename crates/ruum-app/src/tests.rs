@@ -973,8 +973,10 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     let viewport = cx.update(|window, _| window.viewport_size());
     let rows = cx.debug_bounds("volume-rows").expect("the rows are drawn");
     let centre = rows.center();
+    let rail = crate::ui::size::ICON_RAIL.to_pixels(px(16.));
+    let expected_center_x = rail + (viewport.width - rail) / 2.0;
     assert!(
-        (centre.x - viewport.width / 2.0).abs() < px(4.),
+        (centre.x - expected_center_x).abs() < px(4.),
         "the popup is not centred across: {centre:?} in {viewport:?}"
     );
     assert!(
@@ -982,10 +984,9 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
         "the popup is not centred down: {centre:?} in {viewport:?}"
     );
 
-    // The wrapper that centres the popup must not swallow the backdrop's
-    // clicks: a click in the corner, outside the popup, still closes it.
+    // Clicking outside the popup on the page backdrop closes it.
     cx.simulate_click(
-        gpui_kit::point(px(4.), px(4.)),
+        gpui_kit::point(px(100.), px(100.)),
         gpui_kit::Modifiers::none(),
     );
     draw(cx);
@@ -2259,4 +2260,529 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     cx.simulate_click(toggle.center(), Modifiers::none());
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
+}
+
+#[gpui_kit::test]
+fn icon_rail_switches_pages_and_settings_shortcut(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Initial page is Explore
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    assert!(cx.debug_bounds("icon-rail").is_some());
+    assert!(cx.debug_bounds("rail-explore").is_some());
+    assert!(cx.debug_bounds("rail-sources").is_some());
+    assert!(cx.debug_bounds("rail-watchdog").is_some());
+    assert!(cx.debug_bounds("rail-settings").is_some());
+
+    // Click rail-sources
+    let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
+    cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
+    assert!(cx.debug_bounds("sources-page").is_some());
+
+    // Click rail-watchdog
+    let watchdog_btn = cx.debug_bounds("rail-watchdog").expect("rail-watchdog");
+    cx.simulate_click(watchdog_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Watchdog);
+    assert!(cx.debug_bounds("watchdog-page").is_some());
+
+    // Click rail-settings
+    let settings_btn = cx.debug_bounds("rail-settings").expect("rail-settings");
+    cx.simulate_click(settings_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Settings);
+    assert!(cx.debug_bounds("settings-page").is_some());
+
+    // Press Escape to return to Explore
+    press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+
+    // Press OpenSettings shortcut action
+    cx.dispatch_action(crate::app_menu::OpenSettings);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Settings);
+}
+
+#[test]
+fn cleanup_confirm_modal_selection_and_decision() {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+    };
+    use std::sync::mpsc::channel;
+
+    let path_a = PathBuf::from("/tmp/a.cache");
+    let path_b = PathBuf::from("/tmp/b.log");
+    let path_c = PathBuf::from("/tmp/c.tmp");
+
+    let request = CleanupConfirmRequest {
+        root: PathBuf::from("/tmp"),
+        title: "Test Cleanup".into(),
+        summary: Some("Summary".into()),
+        items: vec![
+            CleanupConfirmItem {
+                path: path_a.clone(),
+                bytes: 100,
+                mode: RemovalMode::Trash,
+                reason: Some("cache".into()),
+                git_warning: None,
+            },
+            CleanupConfirmItem {
+                path: path_b.clone(),
+                bytes: 200,
+                mode: RemovalMode::Permanent,
+                reason: Some("old log".into()),
+                git_warning: Some("untracked file".into()),
+            },
+            CleanupConfirmItem {
+                path: path_c.clone(),
+                bytes: 300,
+                mode: RemovalMode::Trash,
+                reason: Some("temporary".into()),
+                git_warning: None,
+            },
+        ],
+    };
+
+    let (resp_tx, resp_rx) = channel();
+    let mut modal =
+        crate::state::CleanupConfirmModal::new(request, Some(resp_tx), None);
+
+    // Invariant: all items checked by default
+    assert!(modal.is_checked(&path_a));
+    assert!(modal.is_checked(&path_b));
+    assert!(modal.is_checked(&path_c));
+    assert_eq!(modal.selected_count(), 3);
+    assert_eq!(modal.selected_bytes(), 600);
+
+    // Uncheck item B (e.g. user unchecks untracked file)
+    modal.toggle_path(&path_b);
+    assert!(!modal.is_checked(&path_b));
+    assert_eq!(modal.selected_count(), 2);
+    assert_eq!(modal.selected_bytes(), 400);
+
+    // Confirm: only checked paths are returned
+    let decision = modal.confirm();
+    assert_eq!(
+        decision,
+        CleanupConfirmDecision::Confirmed {
+            selected_paths: vec![path_a, path_c],
+        }
+    );
+
+    // IPC responder received the matching decision
+    let received = resp_rx.recv().expect("recv decision");
+    assert_eq!(received, decision);
+}
+
+#[test]
+fn cleanup_confirm_modal_fail_closed_on_drop() {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let resp_file = temp.path().join("decision.json");
+
+    let request = CleanupConfirmRequest {
+        root: PathBuf::from("/tmp"),
+        title: "Test Cleanup".into(),
+        summary: None,
+        items: vec![CleanupConfirmItem {
+            path: PathBuf::from("/tmp/test"),
+            bytes: 50,
+            mode: RemovalMode::Trash,
+            reason: None,
+            git_warning: None,
+        }],
+    };
+
+    {
+        let _modal = crate::state::CleanupConfirmModal::new(
+            request,
+            None,
+            Some(resp_file.clone()),
+        );
+        // Dropped without explicit confirm or cancel
+    }
+
+    assert!(resp_file.exists());
+    let content = std::fs::read_to_string(&resp_file).expect("read");
+    let decision: CleanupConfirmDecision =
+        serde_json::from_str(&content).expect("parse");
+    assert_eq!(decision, CleanupConfirmDecision::Cancelled);
+}
+
+#[gpui_kit::test]
+fn watchdog_and_settings_pages_rendering_and_modal_flow(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::ProposalItem;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // 1. Navigate to Settings page
+    update(&view, cx, |app, _| app.screen = Screen::Settings);
+    draw(cx);
+    assert!(cx.debug_bounds("settings-page").is_some());
+    assert!(cx.debug_bounds("setting-enable-watchdog").is_some());
+    assert!(cx.debug_bounds("setting-save-btn").is_some());
+
+    // Toggle watchdog setting and save
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.watchdog_config.enabled = true;
+            if let Some(ref input) = app.watchdog_input_min_free {
+                input.update(cx, |inp, cx| inp.set_value("35", window, cx));
+            }
+            app.save_watchdog_settings(cx);
+        });
+    });
+    assert!(read(&view, cx, |app| app.watchdog_config.enabled));
+    assert_eq!(read(&view, cx, |app| app.watchdog_config.min_free_gb), 35);
+
+    // 2. Navigate to Watchdog page
+    update(&view, cx, |app, _| app.screen = Screen::Watchdog);
+    draw(cx);
+    assert!(cx.debug_bounds("watchdog-page").is_some());
+    assert!(cx.debug_bounds("watchdog-check-space").is_some());
+    assert!(cx.debug_bounds("watchdog-ai-analyze").is_some());
+
+    // 3. Inject mock proposal into watchdog state and open confirmation modal
+    let target_file = temp.path().join("junk/blob.bin");
+    update(&view, cx, |app, cx| {
+        app.watchdog_state.last_proposal =
+            Some(ruum_core::watchdog_config::CleanupProposal {
+                timestamp_secs: 1000,
+                summary: "AI recommends removing junk blobs".into(),
+                items: vec![ProposalItem::new(
+                    target_file.clone(),
+                    200_000,
+                    RemovalMode::Trash,
+                    Some("junk test file".into()),
+                    None,
+                )],
+            });
+        app.open_last_proposal(cx);
+    });
+    draw(cx);
+
+    // Modal popup is rendered on top of the window
+    assert!(cx.debug_bounds("cleanup-confirm-backdrop").is_some());
+    assert!(cx.debug_bounds("cleanup-confirm-popup").is_some());
+    assert!(cx.debug_bounds("confirm-cancel").is_some());
+    assert!(cx.debug_bounds("confirm-clean").is_some());
+
+    // Escape cancels modal dialog
+    press(cx, "escape");
+    assert!(read(&view, cx, |app| app.confirm_modal.is_none()));
+    draw(cx);
+    assert!(cx.debug_bounds("cleanup-confirm-backdrop").is_none());
+
+    // In Watchdog screen, Escape returns to Explore
+    press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+}
+
+#[gpui_kit::test]
+fn confirm_only_standalone_mode(cx: &mut TestAppContext) {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let resp_file = temp.path().join("resp.json");
+
+    let req = CleanupConfirmRequest {
+        root: PathBuf::from("/tmp"),
+        title: "Standalone Confirm".into(),
+        summary: Some("Standalone mode".into()),
+        items: vec![CleanupConfirmItem {
+            path: PathBuf::from("/tmp/standalone.tmp"),
+            bytes: 512,
+            mode: RemovalMode::Trash,
+            reason: None,
+            git_warning: None,
+        }],
+    };
+
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        Ruum::confirm_only(req, resp_file.clone(), cx)
+    });
+    draw(cx);
+
+    assert!(cx.debug_bounds("cleanup-confirm-popup").is_some());
+    assert!(!resp_file.exists());
+
+    // Press Enter to confirm
+    press(cx, "enter");
+    assert!(resp_file.exists());
+    let content = std::fs::read_to_string(&resp_file).expect("read");
+    let decision: CleanupConfirmDecision =
+        serde_json::from_str(&content).expect("parse");
+    match decision {
+        CleanupConfirmDecision::Confirmed { selected_paths } => {
+            assert_eq!(
+                selected_paths,
+                vec![PathBuf::from("/tmp/standalone.tmp")]
+            );
+        }
+        CleanupConfirmDecision::Cancelled => panic!("expected confirmed"),
+    }
+}
+
+#[gpui_kit::test]
+fn settings_feedback_model_selection_and_watchdog_refresh_ui(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::ai_cli::{DiscoveredModel, ModelSpeedResult};
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // 1. Settings page: save feedback shows floating Toast (no inline notice).
+    update(&view, cx, |app, _| {
+        app.notice = None;
+        app.screen = Screen::Settings;
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("toast-notification").is_none());
+    assert!(cx.debug_bounds("setting-test-cli").is_some());
+    assert!(cx.debug_bounds("setting-fetch-models").is_some());
+    assert!(cx.debug_bounds("setting-save-status").is_none());
+    assert!(cx.debug_bounds("settings-notice-line").is_none());
+
+    update(&view, cx, Ruum::save_watchdog_settings);
+    draw(cx);
+    assert!(cx.debug_bounds("toast-notification").is_some());
+    assert!(cx.debug_bounds("setting-save-status").is_none());
+    assert!(cx.debug_bounds("settings-notice-line").is_none());
+
+    // Clicking the toast close button dismisses the notification.
+    let close_btn = cx.debug_bounds("toast-close").expect("toast close button");
+    cx.simulate_click(close_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.notice.is_none()));
+    assert!(cx.debug_bounds("toast-notification").is_none());
+
+    // Inject discovered models & speed test output and verify UI + selection.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.watchdog_models = vec![
+                DiscoveredModel {
+                    id: "gemini-4-hydrogen-high".into(),
+                    label: "Gemini 4 Hydrogen (High)".into(),
+                    provider: None,
+                },
+                DiscoveredModel {
+                    id: "claude-sonnet-4-6".into(),
+                    label: "Claude Sonnet 4.6".into(),
+                    provider: None,
+                },
+            ];
+            app.watchdog_speed_results = vec![ModelSpeedResult {
+                model: "gemini-4-hydrogen-high".into(),
+                elapsed_ms: 420,
+                ok: true,
+                detail: "OK".into(),
+            }];
+            app.select_watchdog_model("gemini-4-hydrogen-high", window, cx);
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("setting-model-list").is_some());
+    assert!(cx.debug_bounds("setting-speed-all-btn").is_some());
+    assert!(cx.debug_bounds("setting-model-row-0").is_some());
+    assert!(cx.debug_bounds("setting-model-row-1").is_some());
+    assert!(cx.debug_bounds("setting-model-speed-0").is_some());
+    assert!(cx.debug_bounds("setting-model-speed-1").is_some());
+    assert!(cx.debug_bounds("setting-model-select-0").is_some());
+    assert!(cx.debug_bounds("setting-model-select-1").is_some());
+    assert!(cx.debug_bounds("setting-speed-results").is_none());
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.model.clone()),
+        Some("gemini-4-hydrogen-high".to_string())
+    );
+    let input_model = read(&view, cx, |app| app.watchdog_input_model.clone())
+        .expect("model input initialized");
+    assert_eq!(
+        cx.update(|_, cx| input_model.read(cx).value().to_string()),
+        "gemini-4-hydrogen-high"
+    );
+
+    // Clicking the trailing Select button switches the selected model.
+    let select_second = cx
+        .debug_bounds("setting-model-select-1")
+        .expect("select second model");
+    cx.simulate_click(select_second.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.model.clone()),
+        Some("claude-sonnet-4-6".to_string())
+    );
+
+    // Switching providers clears stale models and speed history cleanly.
+    update(&view, cx, |app, cx| {
+        app.set_watchdog_provider(AiCliProvider::Pi, cx);
+    });
+    assert!(read(&view, cx, |app| app.watchdog_models.is_empty()));
+    assert!(read(&view, cx, |app| app.watchdog_speed_results.is_empty()));
+    assert!(read(&view, cx, |app| {
+        app.watchdog_benchmarking_models.is_empty()
+    }));
+
+    // 2. Watchdog page: Check Disk Space Now produces a floating Toast.
+    update(&view, cx, |app, _| {
+        app.notice = None;
+        app.screen = Screen::Watchdog;
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("watchdog-last-checked").is_some());
+    assert!(cx.debug_bounds("watchdog-action-status").is_none());
+    assert!(cx.debug_bounds("toast-notification").is_none());
+
+    update(&view, cx, Ruum::refresh_watchdog_space);
+    draw(cx);
+    assert!(read(&view, cx, |app| {
+        app.watchdog_space_checked_at.is_some()
+    }));
+    assert!(cx.debug_bounds("toast-notification").is_some());
+    assert!(cx.debug_bounds("watchdog-action-status").is_none());
+    assert!(cx.debug_bounds("watchdog-notice-line").is_none());
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn watchdog_cli_discovery_speed_test_and_analysis_are_nonblocking(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let fake_cli = temp.path().join("fake-agy");
+    std::fs::write(
+        &fake_cli,
+        b"#!/bin/sh
+case \"$1\" in
+  --version)
+    echo \"agy 1.5.8\"
+    ;;
+  models)
+    echo \"gemini-4-hydrogen-high  Gemini 4 Hydrogen (High)\"
+    echo \"claude-sonnet-4-6  Claude Sonnet 4.6\"
+    ;;
+  *)
+    echo '{\"summary\":\"All clean\",\"items\":[]}'
+    ;;
+esac
+",
+    )
+    .expect("write fake cli");
+    std::fs::set_permissions(&fake_cli, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake cli");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(900.)));
+    update(&view, cx, |app, _| {
+        app.screen = Screen::Settings;
+        app.watchdog_config.ai_provider = AiCliProvider::Agy;
+        app.watchdog_config.custom_command =
+            fake_cli.to_string_lossy().to_string();
+    });
+
+    // 1. Test connection only (without auto-fetching models).
+    update(&view, cx, Ruum::test_watchdog_ai_cli);
+    assert!(read(&view, cx, |app| app.watchdog_testing));
+    cx.run_until_parked();
+    assert!(!read(&view, cx, |app| app.watchdog_testing));
+    assert!(read(&view, cx, |app| app.watchdog_models.is_empty()));
+    assert_eq!(
+        read(&view, cx, |app| {
+            app.notice.as_ref().map(|(m, _)| m.clone())
+        }),
+        Some(format!("CLI ready at {}: agy 1.5.8", fake_cli.display()))
+    );
+
+    // 2. Fetch available models separately off the UI thread.
+    update(&view, cx, Ruum::fetch_watchdog_models);
+    assert!(read(&view, cx, |app| app.watchdog_fetching_models));
+    cx.run_until_parked();
+    assert!(!read(&view, cx, |app| app.watchdog_fetching_models));
+    assert_eq!(read(&view, cx, |app| app.watchdog_models.len()), 2);
+
+    // 3. Benchmark single model (verify in-flight spinning state, then click re-test).
+    update(&view, cx, |app, cx| {
+        app.benchmark_watchdog_model(Some("gemini-4-hydrogen-high".into()), cx);
+    });
+    assert!(read(&view, cx, |app| {
+        app.watchdog_benchmarking_models
+            .contains("gemini-4-hydrogen-high")
+    }));
+    draw(cx);
+    cx.run_until_parked();
+    assert!(read(&view, cx, |app| {
+        app.watchdog_benchmarking_models.is_empty()
+    }));
+    let speeds = read(&view, cx, |app| app.watchdog_speed_results.clone());
+    assert_eq!(speeds.len(), 1);
+    assert!(speeds[0].ok);
+    assert_eq!(speeds[0].model, "gemini-4-hydrogen-high");
+
+    // Clicking the latency badge re-tests that model.
+    update(&view, cx, |app, _| {
+        app.watchdog_speed_results[0].elapsed_ms = 999_999;
+    });
+    draw(cx);
+    let retest_btn_0 = cx
+        .debug_bounds("setting-model-speed-0")
+        .expect("model speed retest button 0");
+    cx.simulate_click(retest_btn_0.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    assert!(read(&view, cx, |app| {
+        app.watchdog_benchmarking_models.is_empty()
+    }));
+    assert!(read(&view, cx, |app| {
+        app.watchdog_speed_results[0].elapsed_ms < 999_999
+    }));
+
+    // 4. Click header lightning icon to benchmark all models.
+    draw(cx);
+    let speed_all_btn = cx
+        .debug_bounds("setting-speed-all-btn")
+        .expect("benchmark all models button");
+    cx.simulate_click(speed_all_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    assert!(read(&view, cx, |app| {
+        app.watchdog_benchmarking_models.is_empty()
+    }));
+    assert_eq!(read(&view, cx, |app| app.watchdog_speed_results.len()), 2);
+
+    // 5. Watchdog Run AI Analysis Now returns immediately and settles via Toast.
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Watchdog;
+        app.run_ai_analysis_now(cx);
+    });
+    assert!(read(&view, cx, |app| app.watchdog_analyzing));
+    draw(cx);
+    assert!(cx.debug_bounds("toast-notification").is_some());
+
+    cx.run_until_parked();
+    assert!(!read(&view, cx, |app| app.watchdog_analyzing));
+    let msg =
+        read(&view, cx, |app| app.notice.as_ref().map(|(m, _)| m.clone()));
+    assert_eq!(
+        msg.as_deref(),
+        Some("AI analysis found no reclaimable files")
+    );
 }

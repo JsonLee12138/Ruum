@@ -14,6 +14,10 @@ use serde_json::{Value, json};
 
 use crate::auth::{AuthAdapter, AuthFactory, AuthRequest};
 use crate::classify::{Category, Reclaim};
+use crate::confirm::{
+    CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmItem,
+    CleanupConfirmRequest, GuiCleanupConfirm,
+};
 use crate::filter::{Keep, filter};
 use crate::git::{self, GitState};
 use crate::identity::HostIdentity;
@@ -71,6 +75,8 @@ impl CachedScan {
 pub struct McpServer {
     cache: FxHashMap<(Option<String>, PathBuf), CachedScan>,
     auth: Box<dyn AuthAdapter>,
+    confirm: Box<dyn CleanupConfirmAdapter>,
+    read_only: bool,
 }
 
 impl fmt::Debug for McpServer {
@@ -78,6 +84,8 @@ impl fmt::Debug for McpServer {
         f.debug_struct("McpServer")
             .field("cached_roots", &self.cache.len())
             .field("auth_os", &self.auth.os_kind())
+            .field("confirm", &self.confirm)
+            .field("read_only", &self.read_only)
             .finish()
     }
 }
@@ -91,10 +99,34 @@ impl Default for McpServer {
 impl McpServer {
     #[must_use]
     pub fn new(auth: Box<dyn AuthAdapter>) -> Self {
+        Self::with_confirm(auth, Box::new(GuiCleanupConfirm::new()))
+    }
+
+    #[must_use]
+    pub fn with_confirm(
+        auth: Box<dyn AuthAdapter>,
+        confirm: Box<dyn CleanupConfirmAdapter>,
+    ) -> Self {
         Self {
             cache: FxHashMap::default(),
             auth,
+            confirm,
+            read_only: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub const fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    pub fn set_confirm(&mut self, confirm: Box<dyn CleanupConfirmAdapter>) {
+        self.confirm = confirm;
     }
 
     #[must_use]
@@ -217,7 +249,7 @@ impl McpServer {
             "tools/list" => write_result(
                 writer,
                 &request_id,
-                &json!({ "tools": tool_definitions() }),
+                &json!({ "tools": tool_definitions(self.read_only) }),
             ),
             "tools/call" => self.handle_tool_call(&request_id, &params, writer),
             _ => write_error(
@@ -262,6 +294,18 @@ impl McpServer {
                 -32601,
                 &format!("Unknown tool: {name}"),
             );
+        }
+        if self.read_only
+            && matches!(name, "trash_paths" | "delete_permanently")
+        {
+            let body = json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Tool '{name}' is unavailable: server is running in read-only mode")
+                }],
+                "isError": true,
+            });
+            return write_result(writer, request_id, &body);
         }
         let outcome = self.dispatch_tool(name, &args);
         let body = match outcome {
@@ -624,17 +668,67 @@ impl McpServer {
                     &remote_plan.blocked,
                 ));
             }
-            execute_remote_trash(&host, &remote_plan.targets, &header)
+            let confirm_items: Vec<CleanupConfirmItem> = remote_plan
+                .targets
+                .iter()
+                .map(|t| CleanupConfirmItem {
+                    path: t.path.clone(),
+                    bytes: t.bytes,
+                    mode: RemovalMode::Trash,
+                    reason: None,
+                    git_warning: None,
+                })
+                .collect();
+            let req = CleanupConfirmRequest {
+                root: remote_plan.root.clone(),
+                title: format!("Trash items on {host}"),
+                summary: Some(format!(
+                    "Moving {} items ({}) to Trash",
+                    remote_plan.targets.len(),
+                    human_bytes(remote_plan.reclaim())
+                )),
+                items: confirm_items,
+            };
+            let decision = self
+                .confirm
+                .confirm(&req)
+                .map_err(|err| format!("Cleanup confirmation failed: {err}"))?;
+            let selected_paths = match decision {
+                CleanupConfirmDecision::Confirmed { selected_paths } => {
+                    selected_paths
+                }
+                CleanupConfirmDecision::Cancelled => {
+                    return Err("cleanup cancelled by user".to_owned());
+                }
+            };
+            let approved_targets: Vec<Target> = remote_plan
+                .targets
+                .into_iter()
+                .filter(|t| selected_paths.contains(&t.path))
+                .collect();
+            if approved_targets.is_empty() {
+                return Err("cleanup cancelled by user".to_owned());
+            }
+
+            execute_remote_trash(&host, &approved_targets, &header)
                 .map_err(|err| err.to_string())?;
             self.invalidate_overlapping(Some(&host), &root_path);
+            let reclaim: u64 = approved_targets.iter().map(|t| t.bytes).sum();
+            let skipped_by_user: Vec<String> = targets
+                .iter()
+                .filter(|t| !selected_paths.contains(&t.path))
+                .map(|t| t.path.display().to_string())
+                .collect();
             return Ok(json!({
                 "mode": "trash",
                 "target": host,
                 "ssh_host": host,
                 "root": remote_plan.root.display().to_string(),
-                "removed_count": remote_plan.targets.len(),
-                "reclaim_bytes": remote_plan.reclaim(),
-                "human_reclaim": human_bytes(remote_plan.reclaim()),
+                "removed_count": approved_targets.len(),
+                "reclaim_bytes": reclaim,
+                "human_reclaim": human_bytes(reclaim),
+                "skipped_count": skipped_by_user.len(),
+                "skipped_by_user": skipped_by_user,
             }));
         }
 
@@ -651,14 +745,72 @@ impl McpServer {
                 &local_plan.blocked,
             ));
         }
+        let confirm_items: Vec<CleanupConfirmItem> = local_plan
+            .targets
+            .iter()
+            .map(|t| {
+                let git_warning = git::state(&t.path).and_then(|st| {
+                    if st.is_clean() {
+                        None
+                    } else {
+                        Some(st.summary())
+                    }
+                });
+                CleanupConfirmItem {
+                    path: t.path.clone(),
+                    bytes: t.bytes,
+                    mode: RemovalMode::Trash,
+                    reason: None,
+                    git_warning,
+                }
+            })
+            .collect();
+        let req = CleanupConfirmRequest {
+            root: local_plan.root.clone(),
+            title: "Move items to Trash".to_owned(),
+            summary: Some(format!(
+                "Moving {} items ({}) to Trash",
+                local_plan.targets.len(),
+                human_bytes(local_plan.reclaim())
+            )),
+            items: confirm_items,
+        };
+        let decision = self
+            .confirm
+            .confirm(&req)
+            .map_err(|err| format!("Cleanup confirmation failed: {err}"))?;
+        let selected_paths = match decision {
+            CleanupConfirmDecision::Confirmed { selected_paths } => {
+                selected_paths
+            }
+            CleanupConfirmDecision::Cancelled => {
+                return Err("cleanup cancelled by user".to_owned());
+            }
+        };
+        let approved_targets: Vec<Target> = local_plan
+            .targets
+            .into_iter()
+            .filter(|t| selected_paths.contains(&t.path))
+            .collect();
+        if approved_targets.is_empty() {
+            return Err("cleanup cancelled by user".to_owned());
+        }
+
+        let skipped_by_user: Vec<String> = targets
+            .iter()
+            .filter(|t| !selected_paths.contains(&t.path))
+            .map(|t| t.path.display().to_string())
+            .collect();
+
         let backend = detect_trash_backend();
         if matches!(backend, TrashBackend::Unavailable) {
             return Err(
                 "trash backend is unavailable on this system".to_owned()
             );
         }
+        let approved_plan = plan(&approved_targets, &root_path);
         let space_before = space_info(&root_path).ok();
-        let summary = run_local_removal(local_plan, RemovalMode::Trash);
+        let summary = run_local_removal(approved_plan, RemovalMode::Trash);
         self.invalidate_overlapping(None, &root_path);
         let space_after = space_info(&root_path).ok();
         if !summary.errors.is_empty() || summary.failed_count > 0 {
@@ -677,6 +829,8 @@ impl McpServer {
             "removed_count": summary.removed_count,
             "removed_bytes": summary.removed_bytes,
             "human_removed": human_bytes(summary.removed_bytes),
+            "skipped_count": skipped_by_user.len(),
+            "skipped_by_user": skipped_by_user,
             "errors": summary.errors,
             "space_before": space_before.map(format_space),
             "space_after": space_after.map(format_space),
@@ -710,8 +864,66 @@ impl McpServer {
                 &local_plan.blocked,
             ));
         }
+        let confirm_items: Vec<CleanupConfirmItem> = local_plan
+            .targets
+            .iter()
+            .map(|t| {
+                let git_warning = git::state(&t.path).and_then(|st| {
+                    if st.is_clean() {
+                        None
+                    } else {
+                        Some(st.summary())
+                    }
+                });
+                CleanupConfirmItem {
+                    path: t.path.clone(),
+                    bytes: t.bytes,
+                    mode: RemovalMode::Permanent,
+                    reason: caller_reason.map(str::to_owned),
+                    git_warning,
+                }
+            })
+            .collect();
+        let req = CleanupConfirmRequest {
+            root: local_plan.root.clone(),
+            title: "Permanently delete items".to_owned(),
+            summary: Some(format!(
+                "Permanently deleting {} items ({})",
+                local_plan.targets.len(),
+                human_bytes(local_plan.reclaim())
+            )),
+            items: confirm_items,
+        };
+        let decision = self
+            .confirm
+            .confirm(&req)
+            .map_err(|err| format!("Cleanup confirmation failed: {err}"))?;
+        let selected_paths = match decision {
+            CleanupConfirmDecision::Confirmed { selected_paths } => {
+                selected_paths
+            }
+            CleanupConfirmDecision::Cancelled => {
+                return Err("permanent deletion cancelled by user".to_owned());
+            }
+        };
+        let approved_targets: Vec<Target> = local_plan
+            .targets
+            .into_iter()
+            .filter(|t| selected_paths.contains(&t.path))
+            .collect();
+        if approved_targets.is_empty() {
+            return Err("permanent deletion cancelled by user".to_owned());
+        }
+
+        let skipped_by_user: Vec<String> = targets
+            .iter()
+            .filter(|t| !selected_paths.contains(&t.path))
+            .map(|t| t.path.display().to_string())
+            .collect();
+
+        let approved_plan = plan(&approved_targets, &root_path);
         let request = AuthRequest::for_permanent_delete_with_reason(
-            &local_plan,
+            &approved_plan,
             caller_reason,
         );
         match self.auth.authenticate(&request) {
@@ -724,7 +936,7 @@ impl McpServer {
             }
         }
         let space_before = space_info(&root_path).ok();
-        let summary = run_local_removal(local_plan, RemovalMode::Permanent);
+        let summary = run_local_removal(approved_plan, RemovalMode::Permanent);
         self.invalidate_overlapping(None, &root_path);
         let space_after = space_info(&root_path).ok();
         if !summary.errors.is_empty() || summary.failed_count > 0 {
@@ -742,6 +954,8 @@ impl McpServer {
             "removed_count": summary.removed_count,
             "removed_bytes": summary.removed_bytes,
             "human_removed": human_bytes(summary.removed_bytes),
+            "skipped_count": skipped_by_user.len(),
+            "skipped_by_user": skipped_by_user,
             "errors": summary.errors,
             "space_before": space_before.map(format_space),
             "space_after": space_after.map(format_space),
@@ -854,11 +1068,21 @@ pub fn serve(
 /// Serve MCP requests over process `stdin` and `stdout` using the host OS
 /// authentication adapter.
 pub fn serve_stdio() -> io::Result<()> {
+    serve_stdio_with_options(false)
+}
+
+/// Serve MCP requests in read-only mode, omitting and rejecting destructive tools.
+pub fn serve_stdio_read_only() -> io::Result<()> {
+    serve_stdio_with_options(true)
+}
+
+/// Serve MCP requests over `stdin`/`stdout` with configurable read-only flag.
+pub fn serve_stdio_with_options(read_only: bool) -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
-    let mut server = McpServer::default();
+    let mut server = McpServer::default().with_read_only(read_only);
     server.serve(&mut reader, &mut writer)
 }
 
@@ -1409,8 +1633,8 @@ fn is_known_tool(name: &str) -> bool {
     )
 }
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
+fn tool_definitions(read_only: bool) -> Vec<Value> {
+    let mut tools = vec![
         json!({
             "name": "list_volumes",
             "description": "List mounted volumes and free space on the local machine or a remote SSH host.",
@@ -1498,7 +1722,9 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-        json!({
+    ];
+    if !read_only {
+        tools.push(json!({
             "name": "trash_paths",
             "description": "Move validated paths under a scanned root to the system Trash (local or guarded remote SSH).",
             "inputSchema": {
@@ -1514,8 +1740,8 @@ fn tool_definitions() -> Vec<Value> {
                     "ssh_host": { "type": "string", "description": "Optional SSH destination." }
                 }
             }
-        }),
-        json!({
+        }));
+        tools.push(json!({
             "name": "delete_permanently",
             "description": "Permanently delete local paths under a scanned root after out-of-band OS native authentication.",
             "inputSchema": {
@@ -1532,8 +1758,9 @@ fn tool_definitions() -> Vec<Value> {
                     "ssh_host": { "type": "string", "description": "Forbidden for permanent deletion." }
                 }
             }
-        }),
-    ]
+        }));
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -1555,6 +1782,38 @@ mod tests {
 
         fn authenticate(&self, _request: &AuthRequest) -> io::Result<bool> {
             Ok(false)
+        }
+    }
+
+    #[derive(Debug)]
+    struct AutoConfirmAll;
+
+    impl CleanupConfirmAdapter for AutoConfirmAll {
+        fn confirm(
+            &self,
+            request: &CleanupConfirmRequest,
+        ) -> io::Result<CleanupConfirmDecision> {
+            Ok(CleanupConfirmDecision::Confirmed {
+                selected_paths: request
+                    .items
+                    .iter()
+                    .map(|i| i.path.clone())
+                    .collect(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockDecisionConfirm {
+        decision: CleanupConfirmDecision,
+    }
+
+    impl CleanupConfirmAdapter for MockDecisionConfirm {
+        fn confirm(
+            &self,
+            _request: &CleanupConfirmRequest,
+        ) -> io::Result<CleanupConfirmDecision> {
+            Ok(self.decision.clone())
         }
     }
 
@@ -2043,11 +2302,14 @@ mod tests {
         let deny_calls =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let deny_reason = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let mut deny_server = McpServer::new(Box::new(CountingAuth {
-            calls: std::sync::Arc::clone(&deny_calls),
-            last_reason: std::sync::Arc::clone(&deny_reason),
-            decision: Ok(false),
-        }));
+        let mut deny_server = McpServer::with_confirm(
+            Box::new(CountingAuth {
+                calls: std::sync::Arc::clone(&deny_calls),
+                last_reason: std::sync::Arc::clone(&deny_reason),
+                decision: Ok(false),
+            }),
+            Box::new(AutoConfirmAll),
+        );
         let resp_deny = run_session(
             &mut deny_server,
             &[json!({
@@ -2078,11 +2340,14 @@ mod tests {
         // 2. OS auth prompt errors (Err(...)).
         let err_calls =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut err_server = McpServer::new(Box::new(CountingAuth {
-            calls: std::sync::Arc::clone(&err_calls),
-            last_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            decision: Err("no display server available"),
-        }));
+        let mut err_server = McpServer::with_confirm(
+            Box::new(CountingAuth {
+                calls: std::sync::Arc::clone(&err_calls),
+                last_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                decision: Err("no display server available"),
+            }),
+            Box::new(AutoConfirmAll),
+        );
         let resp_err = run_session(
             &mut err_server,
             &[json!({
@@ -2105,11 +2370,14 @@ mod tests {
         let ok_calls =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ok_reason = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let mut ok_server = McpServer::new(Box::new(CountingAuth {
-            calls: std::sync::Arc::clone(&ok_calls),
-            last_reason: std::sync::Arc::clone(&ok_reason),
-            decision: Ok(true),
-        }));
+        let mut ok_server = McpServer::with_confirm(
+            Box::new(CountingAuth {
+                calls: std::sync::Arc::clone(&ok_calls),
+                last_reason: std::sync::Arc::clone(&ok_reason),
+                decision: Ok(true),
+            }),
+            Box::new(AutoConfirmAll),
+        );
         let resp_ok = run_session(
             &mut ok_server,
             &[
@@ -2224,5 +2492,281 @@ mod tests {
                 .unwrap_or_default()
                 .contains("No cached remote scan")
         );
+    }
+
+    #[test]
+    fn read_only_mode_hides_and_rejects_destructive_tools() {
+        let mut server = McpServer::default().with_read_only(true);
+        let responses = run_session(
+            &mut server,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "trash_paths",
+                        "arguments": { "root": "/", "targets": ["/tmp"] }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "delete_permanently",
+                        "arguments": { "root": "/", "targets": ["/tmp"] }
+                    }
+                }),
+            ],
+        )
+        .expect("serve succeeds");
+
+        // 1. tools/list must omit trash_paths and delete_permanently
+        let tools = responses[0]["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 6);
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            assert_ne!(name, "trash_paths");
+            assert_ne!(name, "delete_permanently");
+        }
+
+        // 2. tools/call for trash_paths must report unavailable in read-only mode
+        let (err_trash, payload_trash) = parse_tool_payload(&responses[1]);
+        assert!(err_trash);
+        assert!(
+            payload_trash
+                .as_str()
+                .unwrap_or_default()
+                .contains("read-only mode")
+        );
+
+        // 3. tools/call for delete_permanently must report unavailable in read-only mode
+        let (err_del, payload_del) = parse_tool_payload(&responses[2]);
+        assert!(err_del);
+        assert!(
+            payload_del
+                .as_str()
+                .unwrap_or_default()
+                .contains("read-only mode")
+        );
+    }
+
+    #[test]
+    fn trash_paths_partial_selection_with_skipped_by_user() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let file1 = root.join("file1.log");
+        let file2 = root.join("file2.log");
+        fs::write(&file1, b"log1").expect("write file1");
+        fs::write(&file2, b"log2").expect("write file2");
+
+        let confirm = MockDecisionConfirm {
+            decision: CleanupConfirmDecision::Confirmed {
+                selected_paths: vec![file1.clone()],
+            },
+        };
+        let mut server =
+            McpServer::with_confirm(Box::new(DenyAuth), Box::new(confirm));
+        let root_str = root.to_str().expect("utf8");
+        let f1_str = file1.to_str().expect("utf8");
+        let f2_str = file2.to_str().expect("utf8");
+
+        let responses = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "trash_paths",
+                    "arguments": {
+                        "root": root_str,
+                        "targets": [f1_str, f2_str]
+                    }
+                }
+            })],
+        )
+        .expect("serve succeeds");
+
+        let (err, payload) = parse_tool_payload(&responses[0]);
+        assert!(!err);
+        assert_eq!(payload["removed_count"], 1);
+        assert_eq!(payload["skipped_count"], 1);
+        let skipped = payload["skipped_by_user"].as_array().expect("skipped");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0], f2_str);
+
+        // file1 trashed/removed, file2 untouched
+        assert!(!file1.exists(), "selected target must be removed");
+        assert!(file2.exists(), "unselected target must be untouched");
+    }
+
+    #[test]
+    fn trash_paths_cancelled_by_user_leaves_all_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let file1 = root.join("file1.log");
+        fs::write(&file1, b"log1").expect("write file1");
+
+        let confirm = MockDecisionConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let mut server =
+            McpServer::with_confirm(Box::new(DenyAuth), Box::new(confirm));
+        let root_str = root.to_str().expect("utf8");
+        let f1_str = file1.to_str().expect("utf8");
+
+        let responses = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "trash_paths",
+                    "arguments": {
+                        "root": root_str,
+                        "targets": [f1_str]
+                    }
+                }
+            })],
+        )
+        .expect("serve succeeds");
+
+        let (err, payload) = parse_tool_payload(&responses[0]);
+        assert!(err);
+        assert!(
+            payload
+                .as_str()
+                .unwrap_or_default()
+                .contains("cleanup cancelled by user")
+        );
+        assert!(
+            file1.exists(),
+            "cancelled deletion must leave target intact"
+        );
+    }
+
+    #[test]
+    fn delete_permanently_whitelist_prevents_unauthorized_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let target_a = root.join("target_a.bin");
+        let target_b = root.join("target_b.bin");
+        fs::write(&target_a, b"a").expect("write a");
+        fs::write(&target_b, b"b").expect("write b");
+
+        // The mock confirm tries to sneak in target_b which was NOT in the caller request
+        let confirm = MockDecisionConfirm {
+            decision: CleanupConfirmDecision::Confirmed {
+                selected_paths: vec![target_a.clone(), target_b.clone()],
+            },
+        };
+        let mut server = McpServer::with_confirm(
+            Box::new(CountingAuth {
+                calls: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+                last_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                decision: Ok(true),
+            }),
+            Box::new(confirm),
+        );
+
+        let root_str = root.to_str().expect("utf8");
+        let a_str = target_a.to_str().expect("utf8");
+
+        let responses = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "delete_permanently",
+                    "arguments": {
+                        "root": root_str,
+                        "targets": [a_str]
+                    }
+                }
+            })],
+        )
+        .expect("serve succeeds");
+
+        let (err, payload) = parse_tool_payload(&responses[0]);
+        assert!(!err);
+        assert_eq!(payload["removed_count"], 1);
+
+        // target_a was authorized and deleted; target_b was NOT authorized and MUST stay
+        assert!(!target_a.exists());
+        assert!(
+            target_b.exists(),
+            "unrequested path injected by confirm must NOT be deleted"
+        );
+    }
+
+    #[test]
+    fn delete_permanently_cancelled_before_os_auth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let target = root.join("target.bin");
+        fs::write(&target, b"target").expect("write");
+
+        let auth_calls =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let confirm = MockDecisionConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let mut server = McpServer::with_confirm(
+            Box::new(CountingAuth {
+                calls: std::sync::Arc::clone(&auth_calls),
+                last_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                decision: Ok(true),
+            }),
+            Box::new(confirm),
+        );
+
+        let root_str = root.to_str().expect("utf8");
+        let target_str = target.to_str().expect("utf8");
+
+        let responses = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "delete_permanently",
+                    "arguments": {
+                        "root": root_str,
+                        "targets": [target_str]
+                    }
+                }
+            })],
+        )
+        .expect("serve succeeds");
+
+        let (err, payload) = parse_tool_payload(&responses[0]);
+        assert!(err);
+        assert!(
+            payload
+                .as_str()
+                .unwrap_or_default()
+                .contains("permanent deletion cancelled by user")
+        );
+        assert_eq!(
+            auth_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "OS auth must not be invoked when user cancels at the confirm popup"
+        );
+        assert!(target.exists());
     }
 }

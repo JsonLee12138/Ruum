@@ -17,12 +17,14 @@ pub use ruum_core::git;
 mod marks;
 mod palette;
 mod power;
+mod rail_pages;
 mod state;
 #[cfg(test)]
 mod tests;
 mod treemap_view;
 mod ui;
 mod views;
+mod watchdog_runtime;
 mod widgets;
 
 use std::path::PathBuf;
@@ -56,7 +58,9 @@ ruum — a treemap of what is using your disk
 
 usage: ruum [OPTIONS] [PATH]
        ruum ssh HOST [OPTIONS] [PATH]
-       ruum mcp
+       ruum mcp [--read-only]
+       ruum watchdog [--once]
+       ruum --confirm-cleanup REQ --response RESP
        ruum extract-scanner ARCH OUTPUT
 
 Linux packaged builds deploy an embedded static scanner over SSH on demand.
@@ -108,8 +112,13 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    if extract_scanner()? || run_mcp()? {
+    if extract_scanner()? || run_mcp()? || run_watchdog()? {
         return Ok(());
+    }
+    if let Some(dialog_args) =
+        parse_confirm_dialog_args(std::env::args_os().skip(1))
+    {
+        return run_confirm_dialog(dialog_args);
     }
     let saved = power::settings_path()
         .map_or_else(
@@ -296,7 +305,7 @@ fn extract_scanner() -> Result<bool> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum McpCommand {
     NotMcp,
-    Serve,
+    Serve { read_only: bool },
     Help,
 }
 
@@ -312,13 +321,19 @@ where
     if first != "mcp" {
         return Ok(McpCommand::NotMcp);
     }
-    let Some(second) = iter.next() else {
-        return Ok(McpCommand::Serve);
-    };
-    if iter.next().is_none() && (second == "-h" || second == "--help") {
-        return Ok(McpCommand::Help);
+    let mut read_only = false;
+    for arg in iter {
+        if arg == "-h" || arg == "--help" {
+            return Ok(McpCommand::Help);
+        } else if arg == "--read-only" {
+            read_only = true;
+        } else {
+            anyhow::bail!(
+                "unknown option for `ruum mcp`; try `ruum mcp --help`"
+            );
+        }
     }
-    anyhow::bail!("unknown option for `ruum mcp`; try `ruum mcp --help`")
+    Ok(McpCommand::Serve { read_only })
 }
 
 /// Serve the Model Context Protocol over stdio without initializing GPUI.
@@ -328,15 +343,168 @@ fn run_mcp() -> Result<bool> {
         McpCommand::Help => {
             println!(
                 "ruum mcp — Model Context Protocol (MCP) server over \
-                 stdio\n\nusage: ruum mcp"
+                 stdio\n\nusage: ruum mcp [--read-only]"
             );
             Ok(true)
         }
-        McpCommand::Serve => {
-            ruum_core::mcp::serve_stdio()?;
+        McpCommand::Serve { read_only } => {
+            if read_only {
+                ruum_core::mcp::serve_stdio_read_only()?;
+            } else {
+                ruum_core::mcp::serve_stdio()?;
+            }
             Ok(true)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchdogCommand {
+    NotWatchdog,
+    RunLoop,
+    RunOnce,
+    Help,
+}
+
+fn parse_watchdog_command<I, S>(args: I) -> Result<WatchdogCommand>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut iter = args.into_iter().map(Into::into);
+    let Some(first) = iter.next() else {
+        return Ok(WatchdogCommand::NotWatchdog);
+    };
+    if first != "watchdog" {
+        return Ok(WatchdogCommand::NotWatchdog);
+    }
+    let mut once = false;
+    for arg in iter {
+        if arg == "-h" || arg == "--help" {
+            return Ok(WatchdogCommand::Help);
+        } else if arg == "--once" {
+            once = true;
+        } else {
+            anyhow::bail!(
+                "unknown option for `ruum watchdog`; try `ruum watchdog --help`"
+            );
+        }
+    }
+    if once {
+        Ok(WatchdogCommand::RunOnce)
+    } else {
+        Ok(WatchdogCommand::RunLoop)
+    }
+}
+
+/// Run volume monitoring and AI cleanup poller without initializing GPUI.
+fn run_watchdog() -> Result<bool> {
+    match parse_watchdog_command(std::env::args_os().skip(1))? {
+        WatchdogCommand::NotWatchdog => Ok(false),
+        WatchdogCommand::Help => {
+            println!(
+                "ruum watchdog — background volume monitor and AI cleanup \
+                 poller\n\nusage: ruum watchdog [--once]"
+            );
+            Ok(true)
+        }
+        WatchdogCommand::RunOnce => {
+            let _ = ruum_core::watchdog::run_default_once()?;
+            Ok(true)
+        }
+        WatchdogCommand::RunLoop => {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            ruum_core::watchdog::run_default_loop(&cancel)?;
+            Ok(true)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConfirmDialogArgs {
+    req_path: PathBuf,
+    resp_path: PathBuf,
+}
+
+fn parse_confirm_dialog_args<I, S>(args: I) -> Option<ConfirmDialogArgs>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut iter = args.into_iter().map(Into::into);
+    let mut req_path = None;
+    let mut resp_path = None;
+    while let Some(arg) = iter.next() {
+        if arg == "--confirm-cleanup" {
+            req_path = iter.next().map(PathBuf::from);
+        } else if arg == "--response" {
+            resp_path = iter.next().map(PathBuf::from);
+        }
+    }
+    match (req_path, resp_path) {
+        (Some(r), Some(s)) => Some(ConfirmDialogArgs {
+            req_path: r,
+            resp_path: s,
+        }),
+        _ => None,
+    }
+}
+
+fn run_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
+    let req_content = std::fs::read_to_string(&args.req_path)
+        .context("read confirm request file")?;
+    let request: ruum_core::confirm::CleanupConfirmRequest =
+        serde_json::from_str(&req_content)
+            .context("parse confirm request JSON")?;
+
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_omarchy::init(cx);
+            let home = std::env::home_dir();
+            let native_look = appearance::follows_system(home.as_deref());
+            if native_look {
+                appearance::apply(cx.window_appearance(), cx);
+            }
+            let resp_file = args.resp_path.clone();
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(gpui_kit::WindowBounds::Windowed(
+                            gpui_kit::Bounds::new(
+                                gpui_kit::point(px(200.), px(150.)),
+                                size(px(800.), px(600.)),
+                            ),
+                        )),
+                        titlebar: Some(gpui_kit::TitlebarOptions {
+                            title: Some("ruum · Confirm Cleanup".into()),
+                            ..Default::default()
+                        }),
+                        window_min_size: Some(size(px(600.), px(400.))),
+                        ..Default::default()
+                    },
+                    move |window, cx| {
+                        if native_look {
+                            appearance::follow(window);
+                        }
+                        cx.new(|cx| {
+                            Ruum::confirm_only(
+                                request.clone(),
+                                resp_file.clone(),
+                                cx,
+                            )
+                        })
+                    },
+                )
+                .expect("open confirm window");
+
+            let _ = window.update(cx, |this, window, cx| {
+                let focus = this.focus.clone();
+                window.focus(&focus, cx);
+            });
+            cx.activate(true);
+        });
+    Ok(())
 }
 
 /// Read the command line, program name already skipped.
@@ -739,7 +907,11 @@ mod argument_tests {
         );
         assert_eq!(
             parse_mcp_command(["mcp"]).expect("mcp serve"),
-            McpCommand::Serve
+            McpCommand::Serve { read_only: false }
+        );
+        assert_eq!(
+            parse_mcp_command(["mcp", "--read-only"]).expect("mcp read-only"),
+            McpCommand::Serve { read_only: true }
         );
         assert_eq!(
             parse_mcp_command(["mcp", "--help"]).expect("mcp --help"),
@@ -750,7 +922,60 @@ mod argument_tests {
             McpCommand::Help
         );
         assert!(parse_mcp_command(["mcp", "--unknown"]).is_err());
-        assert!(parse_mcp_command(["mcp", "--help", "extra"]).is_err());
         assert!(USAGE.contains("ruum mcp"));
+    }
+
+    #[test]
+    fn watchdog_subcommand_dispatches_and_rejects_unknown_flags() {
+        assert_eq!(
+            parse_watchdog_command(Vec::<&str>::new()).expect("empty"),
+            WatchdogCommand::NotWatchdog
+        );
+        assert_eq!(
+            parse_watchdog_command(["watchdog"]).expect("watchdog loop"),
+            WatchdogCommand::RunLoop
+        );
+        assert_eq!(
+            parse_watchdog_command(["watchdog", "--once"])
+                .expect("watchdog once"),
+            WatchdogCommand::RunOnce
+        );
+        assert_eq!(
+            parse_watchdog_command(["watchdog", "--help"])
+                .expect("watchdog help"),
+            WatchdogCommand::Help
+        );
+        assert_eq!(
+            parse_watchdog_command(["watchdog", "-h"]).expect("watchdog -h"),
+            WatchdogCommand::Help
+        );
+        assert!(parse_watchdog_command(["watchdog", "--invalid"]).is_err());
+        assert!(USAGE.contains("ruum watchdog"));
+    }
+
+    #[test]
+    fn confirm_cleanup_arguments_parse_and_require_both_paths() {
+        assert_eq!(parse_confirm_dialog_args(Vec::<&str>::new()), None);
+        assert_eq!(
+            parse_confirm_dialog_args(["--confirm-cleanup", "req.json"]),
+            None
+        );
+        assert_eq!(
+            parse_confirm_dialog_args(["--response", "resp.json"]),
+            None
+        );
+        assert_eq!(
+            parse_confirm_dialog_args([
+                "--confirm-cleanup",
+                "req.json",
+                "--response",
+                "resp.json",
+            ]),
+            Some(ConfirmDialogArgs {
+                req_path: PathBuf::from("req.json"),
+                resp_path: PathBuf::from("resp.json"),
+            })
+        );
+        assert!(USAGE.contains("--confirm-cleanup"));
     }
 }

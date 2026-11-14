@@ -16,10 +16,11 @@ rustc-hash = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 
 # rustix has no filesystem calls on Windows; `windows.rs` covers them there.
 [target.'cfg(not(windows))'.dependencies]
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 # The Recycle Bin, through the shell's own file operation.
@@ -38,9 +39,6 @@ windows-sys = { version = "0.61", features = [
 # Linux and Windows code is not built.
 [target.'cfg(target_os = "macos")'.dependencies]
 trash = { version = "5.2.9", default-features = false }
-
-[dev-dependencies]
-tempfile = "3"
 
 # CPU-only sampling; the GUI dependency graph already pins this version.
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]

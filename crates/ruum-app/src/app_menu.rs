@@ -39,6 +39,8 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
+            /// Open the Settings page.
+            OpenSettings,
         ]
     );
 }
@@ -70,6 +72,7 @@ pub fn install(cx: &mut App) {
             KeyBinding::new("ctrl-r", Rescan, None),
             KeyBinding::new("f5", Rescan, None),
             KeyBinding::new("ctrl-shift-r", ShowInFinder, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
         ]);
         return;
     }
@@ -89,9 +92,12 @@ pub fn install(cx: &mut App) {
         // Finder's and Safari's back and forward; alt-arrows work too.
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-]", GoForward, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
     cx.set_menus([
         Menu::new("ruum").items([
+            MenuItem::action("Settings\u{2026}", OpenSettings),
+            MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Hide ruum", Hide),

@@ -7,15 +7,15 @@
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
-    Focusable as _, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
+    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
 use gpui_omarchy::{
-    ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
-    button_group, checkbox, dialog_button, dialog_description, dialog_popup,
-    dialog_title, separator, with_tooltip,
+    ActiveTheme, ButtonVariant, ChoiceItem, IconName, Status, Theme,
+    alert_dialog, button, button_group, checkbox, dialog_button,
+    dialog_description, dialog_popup, dialog_title, separator, with_tooltip,
 };
 use ruum_core::classify::Category;
 use ruum_core::insights::{Candidate, Finding, STALE_DAYS};
@@ -41,23 +41,60 @@ pub fn root(
     window: &mut Window,
     cx: &mut Context<'_, Ruum>,
 ) -> Stateful<Div> {
-    if app.volumes_open {
+    if app.volumes_open && app.screen == Screen::Explore {
+        app.screen = Screen::Sources;
+    }
+    if app.volumes_open || app.screen == Screen::Sources {
         app.prepare_picker_inputs(window, cx);
+    }
+    if app.screen == Screen::Settings {
+        app.ensure_watchdog_inputs(window, cx);
     }
     app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
     let body = match app.screen {
-        Screen::Explore => explore(app, window, cx),
-        Screen::Review => review(app, window, cx),
-        Screen::Running => running(app, cx),
-        Screen::Done => done(app, cx),
+        Screen::Explore => explore(app, window, cx).into_any_element(),
+        Screen::Sources => {
+            crate::rail_pages::sources_page(app, window, cx).into_any_element()
+        }
+        Screen::Watchdog => {
+            crate::rail_pages::watchdog_page(app, window, cx).into_any_element()
+        }
+        Screen::Settings => {
+            crate::rail_pages::settings_page(app, window, cx).into_any_element()
+        }
+        Screen::Review => review(app, window, cx).into_any_element(),
+        Screen::Running => running(app, cx).into_any_element(),
+        Screen::Done => done(app, cx).into_any_element(),
     };
+
+    let content = div()
+        .flex()
+        .flex_row()
+        .size_full()
+        .child(crate::rail_pages::icon_rail(app, cx))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .size_full()
+                .overflow_hidden()
+                .child(body),
+        );
 
     let mut root = div()
         .id("ruum-root")
         .debug_selector(|| "ruum-root".into())
         .track_focus(&app.focus)
         .key_context("Ruum")
+        .on_action(cx.listener(|this, _: &crate::app_menu::OpenSettings, _, cx| {
+            this.screen = Screen::Settings;
+            this.volumes_open = false;
+            this.crumb_menu = None;
+            this.power_menu = None;
+            cx.notify();
+        }))
         .on_action(cx.listener(|this, _: &crate::app_menu::Rescan, _, cx| {
             // Where `r` would: not behind the confirmation, and not under
             // the review list or a removal that is still running.
@@ -95,10 +132,8 @@ pub fn root(
                 cx.notify();
                 return;
             }
-            if this.volumes_open {
-                let editing = [&this.picker_host, &this.picker_path].into_iter()
-                    .flatten().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
-                if editing && event.keystroke.key != "escape" { return; }
+            if this.is_editing(window, cx) && event.keystroke.key != "escape" {
+                return;
             }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
@@ -111,183 +146,25 @@ pub fn root(
         .text_color(theme.foreground)
         .font_family(theme.font)
         .text_size(text::BODY)
-        .child(body);
+        .child(content);
     if let Some(tip) = cursor_tooltip(app, window, cx) {
         root = root.child(tip);
     }
     if app.show_help {
         root = root.child(help_overlay(app, cx));
     }
-    if app.volumes_open {
-        root = root.child(volumes_dialog(app, window, cx));
-    }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
     }
+    if let Some(modal) = &app.confirm_modal {
+        root = root.child(crate::rail_pages::cleanup_confirm_dialog(
+            app, modal, window, cx,
+        ));
+    }
+    if let Some(toast) = toast_overlay(app, cx) {
+        root = root.child(toast);
+    }
     root
-}
-
-/// Discovery is lightweight; a separate, explicit action starts the walk.
-fn volumes_dialog(
-    app: &Ruum,
-    window: &Window,
-    cx: &mut Context<'_, Ruum>,
-) -> impl IntoElement {
-    let theme = cx.omarchy().clone();
-    let cancel = cx.entity().downgrade();
-    let source_ready = app.picker_source_matches(cx);
-    let source = app.volumes_source.as_ref().map_or_else(
-        || "This computer".to_owned(),
-        |host| format!("{host} · SSH · read-only"),
-    );
-    let mut rows = div()
-        .id("volume-rows")
-        .debug_selector(|| "volume-rows".into())
-        .flex()
-        .flex_col()
-        .gap(space::XS)
-        .max_h(size::SOURCE_LIST_HEIGHT)
-        .overflow_y_scroll();
-    if app.volumes_loading {
-        rows = rows.child(dialog_description(
-            "Listing mounts, not scanning files…",
-            cx,
-        ));
-    } else if let Some(error) = &app.volumes_error {
-        rows = rows.child(div().text_color(theme.danger).child(error.clone()));
-    } else if app.volumes.is_empty() {
-        rows = rows.child(dialog_description(
-            "No mounts listed. Enter a directory below.",
-            cx,
-        ));
-    }
-    for (index, volume) in app.volumes.iter().enumerate() {
-        let highlighted = index == app.volume_highlight;
-        let label = format!(
-            "{}  ·  {}",
-            volume.point.display(),
-            volume.device.as_deref().unwrap_or("Mounted volume")
-        );
-        rows = rows.child(
-            div()
-                .id(ElementId::Name(format!("volume-{index}").into()))
-                .debug_selector(move || format!("volume-{index}"))
-                .px(space::MD)
-                .py(space::SM)
-                .text_size(text::BODY)
-                .text_color(if highlighted {
-                    theme.bright
-                } else {
-                    theme.foreground
-                })
-                .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
-                .hover(|row| row.bg(theme.accent.opacity(0.1)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.volume_highlight = index;
-                    window.focus(&this.confirm_focus, cx);
-                    cx.notify();
-                })),
-        );
-    }
-    let host = app
-        .picker_host
-        .as_ref()
-        .expect("picker prepared before rendering");
-    let path = app
-        .picker_path
-        .as_ref()
-        .expect("picker prepared before rendering");
-    let popup = dialog_popup(cx).w_full()
-        .child(dialog_title("Choose what to scan", cx))
-        .child(dialog_description(
-            "Connect, then select a mount or directory. No new scan starts until you choose Scan.",
-            cx))
-        .child(div().flex().flex_row().gap(space::SM)
-            .child(button("source-local", "This computer", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, window, cx| this.choose_local_source(window, cx))))
-            .child(gpui_omarchy::input("source-host", host, window, cx)
-                .debug_selector(|| "source-host".into()).flex_1())
-            .child(button("source-connect", "Connect SSH", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, _, cx| this.connect_picker(cx)))))
-        .child(div().text_color(theme.bright).child(source))
-        .child(rows)
-        .child(dialog_description(
-            "Nested mounts and symlinks are not traversed. Space is measured only after selection.", cx))
-        .child(div().flex().flex_row().gap(space::SM)
-            .child(gpui_omarchy::input("source-path", path, window, cx)
-                .debug_selector(|| "source-path".into()).flex_1())
-            .child(button("source-scan-path", "Scan directory", ButtonVariant::Secondary, cx)
-                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some())
-                .on_click(cx.listener(|this, _, _, cx| this.choose_picker_path(cx)))))
-        .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(error.clone())))
-        .child(div().flex().flex_row().justify_end().gap(space::SM)
-            .child(dialog_button("source-cancel", "Cancel", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.close_volumes(cx); this.apply_focus(window, cx);
-                })))
-            .child(dialog_button("source-scan", "Scan selected root", ButtonVariant::Primary, cx)
-                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.choose_volume(cx); this.apply_focus(window, cx);
-                }))));
-    let popup = div()
-        .id("source-picker-scroll")
-        .debug_selector(|| "source-picker".into())
-        .w(size::SOURCE_PICKER)
-        .max_w(Rems(
-            window.viewport_size().width.as_f32() / app.rem
-                * size::SOURCE_VIEWPORT_FRACTION,
-        ))
-        .max_h(Rems(
-            window.viewport_size().height.as_f32() / app.rem
-                * size::SOURCE_VIEWPORT_FRACTION,
-        ))
-        .overflow_y_scroll()
-        .child(popup);
-    let centred = centred_popup(popup, {
-        let close = cancel.clone();
-        move |_, window, cx| {
-            let _ = close.update(cx, |this, cx| {
-                this.close_volumes(cx);
-                this.apply_focus(window, cx);
-            });
-        }
-    });
-    let accept = cx.entity().downgrade();
-    alert_dialog(&app.confirm_focus, cx)
-        .open(true)
-        .on_ok(move |_, window, cx| {
-            let _ = accept.update(cx, |this, cx| {
-                let host_focused =
-                    this.picker_host.as_ref().is_some_and(|input| {
-                        input.read(cx).focus_handle(cx).is_focused(window)
-                    });
-                let path_focused =
-                    this.picker_path.as_ref().is_some_and(|input| {
-                        input.read(cx).focus_handle(cx).is_focused(window)
-                    });
-                if this.volumes_open {
-                    if host_focused {
-                        this.connect_picker(cx);
-                    } else if path_focused {
-                        this.choose_picker_path(cx);
-                    } else {
-                        this.choose_volume(cx);
-                    }
-                }
-                this.apply_focus(window, cx);
-            });
-            false
-        })
-        .on_cancel(move |_, window, cx| {
-            let _ = cancel.update(cx, |this, cx| {
-                this.close_volumes(cx);
-                this.apply_focus(window, cx);
-            });
-            false
-        })
-        .popup(centred)
 }
 
 /// Put a dialog's popup in the middle of the window, and close it when a
@@ -1458,7 +1335,6 @@ fn side_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .child(rule())
                 .child(marked_section(app, theme, cx)),
         )
-        .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
         .child(disk_section(app, theme, cx))
@@ -1954,23 +1830,67 @@ fn marked_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 /// Marked rows the panel lists before pointing at the review screen.
 const MARKED_ROWS: usize = 6;
 
-/// The last thing that happened, or a scan error, above the disk.
-fn notice_line(app: &Ruum, theme: &Theme, cx: &App) -> Option<Div> {
-    let (message, color) = if let Some(error) = &app.scan_error {
-        (error.clone(), theme.danger)
-    } else {
-        let (message, status) = app.notice.as_ref()?;
-        (message.clone(), widgets::alert_color(*status, cx))
+/// Floating toast notification rendered above the active screen.
+fn toast_overlay(app: &Ruum, cx: &Context<'_, Ruum>) -> Option<Stateful<Div>> {
+    let (message, status) = app.notice.as_ref()?;
+    let theme = cx.omarchy().clone();
+    let color = widgets::alert_color(*status, cx);
+    let badge_icon = match status {
+        Status::Success => IconName::CircleCheck,
+        Status::Warning => IconName::TriangleAlert,
+        Status::Error => IconName::CircleX,
+        Status::Neutral => IconName::Info,
     };
     Some(
         div()
-            .px(space::SM)
-            .py(space::XS)
+            .id("toast-notification")
+            .debug_selector(|| "toast-notification".into())
+            .occlude()
+            .absolute()
+            .bottom(space::MD)
+            .left(Rems(size::ICON_RAIL.0 + space::MD.0))
+            .max_w(size::TOAST)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .px(space::MD)
+            .py(space::SM)
+            .rounded(space::XS)
+            .bg(theme.surface)
             .border_1()
-            .border_color(color.opacity(0.5))
-            .text_color(color)
-            .text_size(text::CAPTION)
-            .child(message),
+            .border_color(color.opacity(0.6))
+            .shadow_lg()
+            .child(
+                gpui_omarchy::icon(badge_icon)
+                    .size(icon::MD)
+                    .flex_shrink_0()
+                    .text_color(color),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(text::BODY)
+                    .text_color(theme.bright)
+                    .child(message.clone()),
+            )
+            .child(
+                div()
+                    .id("toast-close")
+                    .debug_selector(|| "toast-close".into())
+                    .cursor_pointer()
+                    .p(space::XXS)
+                    .rounded(space::XXS)
+                    .hover(|s| s.bg(theme.normal_fill()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dismiss_toast(cx);
+                    }))
+                    .child(
+                        gpui_omarchy::icon(IconName::Close)
+                            .size(icon::SM)
+                            .text_color(theme.secondary),
+                    ),
+            ),
     )
 }
 
@@ -2998,7 +2918,6 @@ fn review_summary(
 
     panel
         .child(div().flex_1())
-        .children(notice_line(app, theme, cx))
         .child(export_controls(plan, cx))
         .children(app.remote.is_none().then(|| commit_controls(app, plan, cx)))
 }

@@ -105,6 +105,10 @@ pub mod size {
     pub const HELP: Rems = Rems(32.5);
     /// The key column of the keyboard overlay.
     pub const KEY_LANE: Rems = Rems(7.0);
+    /// Global left icon rail width.
+    pub const ICON_RAIL: Rems = Rems(3.25);
+    /// Floating toast notification max width.
+    pub const TOAST: Rems = Rems(26.0);
 }
 
 /// Interface zoom steps, as a factor of the 16 px default rem.

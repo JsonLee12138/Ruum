@@ -6,8 +6,10 @@
 //! be built and tested without GPUI, a display, or a GPU.
 
 pub mod access;
+pub mod ai_cli;
 pub mod auth;
 pub mod classify;
+pub mod confirm;
 pub mod deployment;
 pub mod export;
 pub mod filter;
@@ -33,5 +35,7 @@ pub mod size;
 pub mod space;
 pub mod tree;
 pub mod treemap;
+pub mod watchdog;
+pub mod watchdog_config;
 #[cfg(windows)]
 mod windows;

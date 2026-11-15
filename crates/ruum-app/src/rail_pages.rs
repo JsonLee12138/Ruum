@@ -8,10 +8,10 @@ use std::time::Duration;
 use gpui_kit::base::CheckboxState;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Animation, AnimationExt as _, Context, ElementId, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Rems,
-    StatefulInteractiveElement as _, Styled, Svg, Transformation, Window, div,
-    radians, svg,
+    Animation, AnimationExt as _, Context, Div, ElementId, FocusHandle, Hsla,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
+    Rems, Stateful, StatefulInteractiveElement as _, Styled, Svg,
+    Transformation, Window, div, radians, svg,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, IconName, button, checkbox, dialog_button,
@@ -114,7 +114,7 @@ fn rail_button(
 }
 
 /// Global left navigation rail.
-pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
+pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
     let theme = cx.omarchy().clone();
     let is_explore = app.screen == Screen::Explore && !app.volumes_open;
     let is_sources = app.screen == Screen::Sources || app.volumes_open;
@@ -146,9 +146,7 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                     "Explore treemap",
                     is_explore,
                     |this, _, cx| {
-                        this.screen = Screen::Explore;
-                        this.volumes_open = false;
-                        cx.notify();
+                        this.navigate_rail(Screen::Explore, cx);
                     },
                     cx,
                 ))
@@ -158,7 +156,7 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                     "Sources & Drives · v",
                     is_sources,
                     |this, _, cx| {
-                        this.open_volumes(cx);
+                        this.navigate_rail(Screen::Sources, cx);
                     },
                     cx,
                 ))
@@ -168,9 +166,7 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                     "Watchdog",
                     is_watchdog,
                     |this, _, cx| {
-                        this.screen = Screen::Watchdog;
-                        this.volumes_open = false;
-                        cx.notify();
+                        this.navigate_rail(Screen::Watchdog, cx);
                     },
                     cx,
                 )),
@@ -185,15 +181,13 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
             },
             is_settings,
             |this, _, cx| {
-                this.screen = Screen::Settings;
-                this.volumes_open = false;
-                cx.notify();
+                this.navigate_rail(Screen::Settings, cx);
             },
             cx,
         )))
 }
 
-/// Full-page Sources and Mounts view migrated from `volumes_dialog`.
+/// Full-page Sources and Drives selection screen.
 pub fn sources_page(
     app: &Ruum,
     window: &Window,
@@ -242,6 +236,7 @@ pub fn sources_page(
                 .debug_selector(move || format!("volume-{index}"))
                 .px(space::MD)
                 .py(space::SM)
+                .rounded(space::XS)
                 .text_size(text::BODY)
                 .text_color(if highlighted {
                     theme.bright
@@ -268,12 +263,11 @@ pub fn sources_page(
         .as_ref()
         .expect("picker prepared before rendering");
 
-    let card = dialog_popup(cx)
+    let source_card = dialog_popup(cx)
         .w_full()
-        .child(dialog_title("Choose what to scan", cx))
+        .child(dialog_title("Source", cx))
         .child(dialog_description(
-            "Connect, then select a mount or directory. No new scan starts \
-             until you choose Scan.",
+            "Choose this computer or connect to a remote host over SSH.",
             cx,
         ))
         .child(
@@ -313,68 +307,53 @@ pub fn sources_page(
                     )),
                 ),
         )
-        .child(div().text_color(theme.bright).child(source))
-        .child(rows)
-        .child(dialog_description(
-            "Nested mounts and symlinks are not traversed. Space is measured \
-             only after selection.",
-            cx,
-        ))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap(space::SM)
-                .child(
-                    gpui_omarchy::input("source-path", path, window, cx)
-                        .debug_selector(|| "source-path".into())
-                        .flex_1(),
-                )
-                .child(
-                    button(
-                        "source-scan-path",
-                        "Scan directory",
-                        ButtonVariant::Secondary,
-                        cx,
+        .child(div().text_color(theme.bright).child(source));
+
+    let mounts_card =
+        dialog_popup(cx)
+            .w_full()
+            .child(dialog_title("Mounts & Root Directory", cx))
+            .child(dialog_description(
+                "Select a mount or enter an absolute directory path. Nested \
+             mounts and symlinks are not traversed; space is measured only \
+             after selection.",
+                cx,
+            ))
+            .child(rows)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(space::SM)
+                    .child(
+                        gpui_omarchy::input("source-path", path, window, cx)
+                            .debug_selector(|| "source-path".into())
+                            .flex_1(),
                     )
-                    .disabled(
-                        !source_ready
-                            || app.volumes_loading
-                            || app.volumes_error.is_some(),
-                    )
-                    .on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.choose_picker_path(cx);
-                        },
-                    )),
-                ),
-        )
-        .children(
-            app.picker_error.as_ref().map(|error| {
+                    .child(
+                        button(
+                            "source-scan-path",
+                            "Scan directory",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .disabled(
+                            !source_ready
+                                || app.volumes_loading
+                                || app.volumes_error.is_some(),
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.choose_picker_path(cx);
+                            },
+                        )),
+                    ),
+            )
+            .children(app.picker_error.as_ref().map(|error| {
                 div().text_color(theme.danger).child(error.clone())
-            }),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .gap(space::SM)
-                .child(
-                    dialog_button(
-                        "source-cancel",
-                        "Cancel",
-                        ButtonVariant::Secondary,
-                        cx,
-                    )
-                    .on_click(cx.listener(
-                        |this, _, window, cx| {
-                            this.close_volumes(cx);
-                            this.apply_focus(window, cx);
-                        },
-                    )),
-                )
-                .child(
+            }))
+            .child(
+                div().flex().flex_row().justify_end().gap(space::SM).child(
                     dialog_button(
                         "source-scan",
                         "Scan selected root",
@@ -394,9 +373,22 @@ pub fn sources_page(
                         },
                     )),
                 ),
-        );
+            );
 
-    let mut outer = div()
+    let subtitle = if app.awaiting_root {
+        "Choose a source. Then choose a root to start scanning."
+    } else {
+        "Connect, then select a mount or directory. No new scan starts until \
+         you choose Scan."
+    };
+
+    let mut subtitle_row = div().text_color(theme.secondary).child(subtitle);
+    if app.awaiting_root {
+        subtitle_row =
+            subtitle_row.debug_selector(|| "choose-root-idle".into());
+    }
+
+    div()
         .id("sources-page")
         .debug_selector(|| "sources-page".into())
         .track_focus(&app.confirm_focus)
@@ -404,48 +396,25 @@ pub fn sources_page(
         .flex_col()
         .flex_1()
         .size_full()
-        .items_center()
-        .justify_center()
-        .p(space::XL)
-        .overflow_y_scroll()
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.close_volumes(cx);
-            this.apply_focus(window, cx);
-        }));
-
-    if app.awaiting_root {
-        outer = outer.child(
+        .p(space::XXL)
+        .gap(space::LG)
+        .overflow_hidden()
+        .child(div().text_size(text::TITLE).child("Sources & Drives"))
+        .child(subtitle_row)
+        .child(
             div()
-                .debug_selector(|| "choose-root-idle".into())
+                .id("source-picker")
+                .debug_selector(|| "source-picker".into())
                 .flex()
                 .flex_col()
-                .items_center()
-                .gap(space::SM)
-                .mb(space::LG)
-                .child(
-                    div()
-                        .text_size(text::HEADING)
-                        .child("Choose a source. Then choose a root."),
-                ),
-        );
-    }
-
-    let rail_px = size::ICON_RAIL.0 * app.rem;
-    let available_w =
-        (window.viewport_size().width.as_f32() - rail_px).max(0.0);
-    let available_h = window.viewport_size().height.as_f32();
-
-    outer.child(
-        div()
-            .id("source-picker")
-            .debug_selector(|| "source-picker".into())
-            .w(size::SOURCE_PICKER)
-            .max_w(Rems(available_w / app.rem * size::SOURCE_VIEWPORT_FRACTION))
-            .max_h(Rems(available_h / app.rem * size::SOURCE_VIEWPORT_FRACTION))
-            .overflow_y_scroll()
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .child(card),
-    )
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .gap(space::LG)
+                .overflow_y_scroll()
+                .child(source_card)
+                .child(mounts_card),
+        )
 }
 
 /// Watchdog monitor and recommendation page.
@@ -1325,20 +1294,14 @@ pub fn settings_page(
         .child(save_bar)
 }
 
-/// Interactive confirmation dialog for cleanup proposals.
-pub fn cleanup_confirm_dialog(
-    app: &Ruum,
+/// Standalone interactive confirmation window content for cleanup proposals.
+pub fn cleanup_confirm_view(
     modal: &CleanupConfirmModal,
-    window: &Window,
-    cx: &Context<'_, Ruum>,
+    focus: &FocusHandle,
+    cx: &Context<'_, crate::CleanupConfirmWindow>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let home = std::env::home_dir();
-
-    let rail_px = size::ICON_RAIL.0 * app.rem;
-    let available_w =
-        (window.viewport_size().width.as_f32() - rail_px).max(0.0);
-    let available_h = window.viewport_size().height.as_f32();
 
     let mut rows = div()
         .id("confirm-item-rows")
@@ -1346,7 +1309,8 @@ pub fn cleanup_confirm_dialog(
         .flex()
         .flex_col()
         .gap(space::XS)
-        .max_h(Rems(16.0))
+        .flex_1()
+        .min_h_0()
         .overflow_y_scroll();
 
     if modal.request.items.is_empty() {
@@ -1403,26 +1367,33 @@ pub fn cleanup_confirm_dialog(
                     .justify_between()
                     .gap(space::SM)
                     .child(
-                        checkbox(
-                            ElementId::Name(
-                                format!("check-item-{index}").into(),
+                        div()
+                            .debug_selector(move || {
+                                format!("check-item-{index}")
+                            })
+                            .child(
+                                checkbox(
+                                    ElementId::Name(
+                                        format!("check-item-{index}").into(),
+                                    ),
+                                    display_name,
+                                    check_state,
+                                    cx,
+                                )
+                                .tab_stop(false)
+                                .on_change(
+                                    move |_, _, _, cx| {
+                                        let _ = entity_item.update(
+                                            cx,
+                                            |this, cx| {
+                                                this.modal
+                                                    .toggle_path(&path_clone);
+                                                cx.notify();
+                                            },
+                                        );
+                                    },
+                                ),
                             ),
-                            display_name,
-                            check_state,
-                            cx,
-                        )
-                        .tab_stop(false)
-                        .on_change(
-                            move |_, _, _, cx| {
-                                let _ = entity_item.update(cx, |this, cx| {
-                                    if let Some(ref mut m) = this.confirm_modal
-                                    {
-                                        m.toggle_path(&path_clone);
-                                    }
-                                    cx.notify();
-                                });
-                            },
-                        ),
                     )
                     .child(
                         div()
@@ -1475,137 +1446,139 @@ pub fn cleanup_confirm_dialog(
         human_bytes(modal.selected_bytes())
     );
 
-    let card = dialog_popup(cx)
+    let card = div()
+        .id("cleanup-confirm-popup")
+        .debug_selector(|| "cleanup-confirm-popup".into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
         .w_full()
-        .child(dialog_title(modal.request.title.clone(), cx))
-        .child(dialog_description(
-            modal
-                .request
-                .summary
-                .as_deref()
-                .unwrap_or("Review and uncheck any items you wish to keep."),
-            cx,
-        ))
         .child(
-            div()
+            dialog_popup(cx)
+                .w_full()
                 .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .py(space::XS)
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(dialog_title(modal.request.title.clone(), cx))
+                .child(dialog_description(
+                    modal.request.summary.as_deref().unwrap_or(
+                        "Review and uncheck any items you wish to keep.",
+                    ),
+                    cx,
+                ))
                 .child(
                     div()
                         .flex()
                         .flex_row()
-                        .gap(space::XS)
+                        .items_center()
+                        .justify_between()
+                        .py(space::XS)
                         .child(
-                            button(
-                                "select-all-btn",
-                                "Select All",
-                                ButtonVariant::Secondary,
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    if let Some(ref mut m) = this.confirm_modal
-                                    {
-                                        m.select_all();
-                                    }
-                                    cx.notify();
-                                },
-                            )),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(space::XS)
+                                .child(
+                                    button(
+                                        "select-all-btn",
+                                        "Select All",
+                                        ButtonVariant::Secondary,
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.modal.select_all();
+                                        cx.notify();
+                                    })),
+                                )
+                                .child(
+                                    button(
+                                        "select-none-btn",
+                                        "Select None",
+                                        ButtonVariant::Secondary,
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.modal.select_none();
+                                        cx.notify();
+                                    })),
+                                ),
                         )
                         .child(
-                            button(
-                                "select-none-btn",
-                                "Select None",
-                                ButtonVariant::Secondary,
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    if let Some(ref mut m) = this.confirm_modal
-                                    {
-                                        m.select_none();
-                                    }
-                                    cx.notify();
-                                },
-                            )),
+                            div()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.bright)
+                                .child(summary_text),
                         ),
                 )
+                .child(rows)
                 .child(
                     div()
-                        .text_size(text::CAPTION)
-                        .text_color(theme.bright)
-                        .child(summary_text),
-                ),
-        )
-        .child(rows)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .gap(space::SM)
-                .child(
-                    div().debug_selector(|| "confirm-cancel".into()).child(
-                        dialog_button(
-                            "confirm-cancel",
-                            "Cancel",
-                            ButtonVariant::Secondary,
-                            cx,
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(space::SM)
+                        .child(
+                            div()
+                                .debug_selector(|| "confirm-cancel".into())
+                                .child(
+                                    dialog_button(
+                                        "confirm-cancel",
+                                        "Cancel",
+                                        ButtonVariant::Secondary,
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.cancel(window, cx);
+                                        },
+                                    )),
+                                ),
                         )
-                        .on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.cancel_cleanup_modal(cx);
-                            },
-                        )),
-                    ),
-                )
-                .child(
-                    div().debug_selector(|| "confirm-clean".into()).child(
-                        dialog_button(
-                            "confirm-clean",
-                            format!(
-                                "Confirm & Clean ({})",
-                                modal.selected_count()
-                            ),
-                            ButtonVariant::Danger,
-                            cx,
-                        )
-                        .disabled(modal.selected_count() == 0)
-                        .on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.confirm_cleanup_modal(cx);
-                            },
-                        )),
-                    ),
+                        .child(
+                            div()
+                                .debug_selector(|| "confirm-clean".into())
+                                .child(
+                                    dialog_button(
+                                        "confirm-clean",
+                                        format!(
+                                            "Confirm & Clean ({})",
+                                            modal.selected_count()
+                                        ),
+                                        ButtonVariant::Danger,
+                                        cx,
+                                    )
+                                    .disabled(modal.selected_count() == 0)
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.confirm(window, cx);
+                                        },
+                                    )),
+                                ),
+                        ),
                 ),
         );
 
     div()
-        .id("cleanup-confirm-backdrop")
-        .debug_selector(|| "cleanup-confirm-backdrop".into())
-        .absolute()
-        .inset_0()
-        .bg(theme.background.opacity(0.85))
+        .id("cleanup-confirm-window")
+        .debug_selector(|| "cleanup-confirm-window".into())
+        .track_focus(focus)
+        .key_context("CleanupConfirm")
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            match event.keystroke.key.as_str() {
+                "escape" => this.cancel(window, cx),
+                "enter" => this.confirm(window, cx),
+                _ => {}
+            }
+        }))
         .flex()
-        .items_center()
-        .justify_center()
+        .flex_col()
+        .size_full()
         .p(space::XL)
-        .child(
-            div()
-                .id("cleanup-confirm-popup")
-                .debug_selector(|| "cleanup-confirm-popup".into())
-                .w(size::SOURCE_PICKER)
-                .max_w(Rems(
-                    available_w / app.rem * size::SOURCE_VIEWPORT_FRACTION,
-                ))
-                .max_h(Rems(
-                    available_h / app.rem * size::SOURCE_VIEWPORT_FRACTION,
-                ))
-                .overflow_y_scroll()
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(card),
-        )
+        .bg(theme.background)
+        .text_color(theme.foreground)
+        .font_family(theme.font)
+        .text_size(text::BODY)
+        .child(card)
 }

@@ -44,7 +44,7 @@ pub fn root(
     if app.volumes_open && app.screen == Screen::Explore {
         app.screen = Screen::Sources;
     }
-    if app.volumes_open || app.screen == Screen::Sources {
+    if app.screen == Screen::Sources {
         app.prepare_picker_inputs(window, cx);
     }
     if app.screen == Screen::Settings {
@@ -72,13 +72,14 @@ pub fn root(
         .flex()
         .flex_row()
         .size_full()
-        .child(crate::rail_pages::icon_rail(app, cx))
+        .child(crate::rail_pages::icon_rail(app, cx).flex_shrink_0())
         .child(
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
-                .size_full()
+                .min_w_0()
+                .h_full()
                 .overflow_hidden()
                 .child(body),
         );
@@ -88,13 +89,22 @@ pub fn root(
         .debug_selector(|| "ruum-root".into())
         .track_focus(&app.focus)
         .key_context("Ruum")
-        .on_action(cx.listener(|this, _: &crate::app_menu::OpenSettings, _, cx| {
-            this.screen = Screen::Settings;
-            this.volumes_open = false;
-            this.crumb_menu = None;
-            this.power_menu = None;
-            cx.notify();
+        .on_action(cx.listener(|this, _: &crate::app_menu::OpenExplore, _, cx| {
+            this.navigate_rail(Screen::Explore, cx);
         }))
+        .on_action(cx.listener(|this, _: &crate::app_menu::OpenSources, _, cx| {
+            this.navigate_rail(Screen::Sources, cx);
+        }))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::OpenWatchdog, _, cx| {
+                this.navigate_rail(Screen::Watchdog, cx);
+            },
+        ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::OpenSettings, _, cx| {
+                this.navigate_rail(Screen::Settings, cx);
+            },
+        ))
         .on_action(cx.listener(|this, _: &crate::app_menu::Rescan, _, cx| {
             // Where `r` would: not behind the confirmation, and not under
             // the review list or a removal that is still running.
@@ -155,11 +165,6 @@ pub fn root(
     }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
-    }
-    if let Some(modal) = &app.confirm_modal {
-        root = root.child(crate::rail_pages::cleanup_confirm_dialog(
-            app, modal, window, cx,
-        ));
     }
     if let Some(toast) = toast_overlay(app, cx) {
         root = root.child(toast);

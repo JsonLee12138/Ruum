@@ -96,11 +96,8 @@ pub mod size {
     pub const SIZE_LANE: Rems = Rems(5.0);
     /// The cursor tooltip.
     pub const TOOLTIP: Rems = Rems(16.75);
-    /// Source/root chooser, with room for host, path and mount labels.
-    pub const SOURCE_PICKER: Rems = Rems(40.0);
+    /// Height of the volume and root picker list on the Sources page.
     pub const SOURCE_LIST_HEIGHT: Rems = Rems(18.0);
-    /// Leave a visible backdrop even at large interface zoom.
-    pub const SOURCE_VIEWPORT_FRACTION: f32 = 0.92;
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
     /// The key column of the keyboard overlay.

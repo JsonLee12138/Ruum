@@ -21,6 +21,7 @@ mod rail_pages;
 mod state;
 #[cfg(test)]
 mod tests;
+mod tray_menu;
 mod treemap_view;
 mod ui;
 mod views;
@@ -28,6 +29,12 @@ mod watchdog_runtime;
 mod widgets;
 
 use std::path::PathBuf;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, Sender, channel},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "macos")]
 use std::{
     io::IsTerminal as _,
@@ -36,9 +43,15 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use gpui_kit::{AppContext as _, WindowOptions, px, size};
+use gpui_kit::{
+    App, AppContext as _, FocusHandle, Global, IntoElement, Render, Window,
+    WindowHandle, WindowOptions, px, size,
+};
+use ruum_core::confirm::{
+    CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmRequest,
+};
 use ruum_core::scan::ScanOptions;
-use state::Ruum;
+use state::{CleanupConfirmModal, Ruum, Screen};
 
 /// What the command line asked for.
 #[derive(Debug)]
@@ -185,93 +198,935 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let root = args.root.clone();
     let depth = args.depth;
-    let title_root = root.clone();
+    let title_root = args.root.clone();
+    let home_at_boot = std::env::home_dir();
+    let native_look = appearance::follows_system(home_at_boot.as_deref());
+    let launch = LaunchConfig {
+        root: args.root,
+        options: args.options.clone(),
+        depth,
+        remote: args.remote.clone(),
+        remote_disk: args.remote_disk,
+        choose_root: args.choose_root,
+        power: args.power,
+        native_look,
+    };
 
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx| {
-            gpui_omarchy::init(cx);
-            app_menu::install(cx);
-            let home = std::env::home_dir();
-            let native_look = appearance::follows_system(home.as_deref());
-            if native_look {
-                appearance::apply(cx.window_appearance(), cx);
-            }
-            let options = args.options.clone();
-            let root_for_app = root.clone();
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(gpui_kit::WindowBounds::Windowed(
-                            gpui_kit::Bounds::new(
-                                gpui_kit::point(px(120.), px(90.)),
-                                size(px(1440.), px(900.)),
-                            ),
-                        )),
-                        titlebar: Some(gpui_kit::TitlebarOptions {
-                            title: Some(
-                                format!(
-                                    "ruum · {}",
-                                    marks::display_path(
-                                        &title_root,
-                                        home.as_deref(),
-                                    )
-                                )
-                                .into(),
-                            ),
-                            ..Default::default()
-                        }),
-                        // Wayland app id. Hyprland reports it as the window
-                        // class, and the desktop entry's StartupWMClass and
-                        // the documented window rule both match `ruum`.
-                        // Left unset, the class is empty and that rule never
-                        // matches.
-                        app_id: Some("ruum".to_owned()),
-                        // Below this the treemap stops being readable, so ask
-                        // the compositor not to go there.
-                        window_min_size: Some(size(px(900.), px(600.))),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        if native_look {
-                            appearance::follow(window);
-                        }
-                        cx.new(|cx| {
-                            let mut app = if args.choose_root {
-                                Ruum::choose(
-                                    options.clone(),
-                                    depth,
-                                    args.remote.clone(),
-                                    cx,
-                                )
-                            } else {
-                                Ruum::open(
-                                    root_for_app.clone(),
-                                    options.clone(),
-                                    depth,
-                                    args.remote.clone(),
-                                    args.remote_disk,
-                                    cx,
-                                )
-                            };
-                            app.power_choice = args.power;
-                            app
-                        })
-                    },
-                )
-                .expect("open the ruum window");
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    app.on_reopen(|cx| {
+        open_or_navigate_main_window(None, cx);
+    });
+    app.run(move |cx| {
+        gpui_omarchy::init(cx);
+        app_menu::install(cx);
+        if native_look {
+            appearance::apply(cx.window_appearance(), cx);
+        }
 
-            // The treemap owns the keyboard from the first frame; there is no
-            // text field to focus first.
-            let _ = window.update(cx, |this, window, cx| {
-                let focus = this.focus.clone();
-                window.focus(&focus, cx);
-            });
-            cx.activate(true);
+        let (ipc_server, ipc_rx) =
+            match watchdog_runtime::WatchdogIpcServer::start() {
+                Ok((srv, rx)) => (Some(srv), Some(rx)),
+                Err(err) => {
+                    eprintln!("ruum: watchdog IPC listener unavailable: {err}");
+                    (None, None)
+                }
+            };
+        let (in_proc_tx, in_proc_rx) = channel();
+        cx.set_global(AppRuntime {
+            launch,
+            main_window: None,
+            confirm_window: None,
+            tray: None,
+            ipc_rx,
+            ipc_server,
+            in_proc_confirm_tx: in_proc_tx,
+            in_proc_confirm_rx: in_proc_rx,
+            last_watchdog_poll: None,
+            background_analysis_in_flight: false,
         });
+
+        cx.on_action(|_: &app_menu::OpenExplore, cx| {
+            open_or_navigate_main_window(Some(Screen::Explore), cx);
+        });
+        cx.on_action(|_: &app_menu::OpenSources, cx| {
+            open_or_navigate_main_window(Some(Screen::Sources), cx);
+        });
+        cx.on_action(|_: &app_menu::OpenWatchdog, cx| {
+            open_or_navigate_main_window(Some(Screen::Watchdog), cx);
+        });
+        cx.on_action(|_: &app_menu::OpenSettings, cx| {
+            open_or_navigate_main_window(Some(Screen::Settings), cx);
+        });
+        cx.on_action(|_: &app_menu::ShowMainWindow, cx| {
+            open_or_navigate_main_window(None, cx);
+        });
+
+        let window = open_main_window(cx, Some(title_root));
+        with_runtime_mut(cx, |rt| rt.main_window = Some(window));
+
+        // Install tray icon on the next GUI loop turn once platform status
+        // bar integration is initialized. Failure keeps tray inactive so
+        // closing the main window still quits normally.
+        let tray_signal = Arc::new(AsyncSignal::default());
+        let waker_signal = Arc::clone(&tray_signal);
+        cx.defer(move |cx| match tray_menu::TrayMenu::install() {
+            Ok(tray) => {
+                tray.set_event_waker(move || waker_signal.notify());
+                app_menu::set_tray_active(cx, true);
+                with_runtime_mut(cx, |rt| rt.tray = Some(tray));
+                refresh_tray_status(cx);
+            }
+            Err(err) => {
+                eprintln!("ruum: tray icon unavailable: {err}");
+                app_menu::set_tray_active(cx, false);
+            }
+        });
+
+        let tray_wait_signal = Arc::clone(&tray_signal);
+        cx.spawn(async move |cx| {
+            loop {
+                tray_wait_signal.wait().await;
+                let keep_going = cx.update(|cx| {
+                    drain_tray_actions(cx);
+                    !app_menu::is_quitting(cx)
+                });
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let keep_going = cx.update(|cx| {
+                    if app_menu::is_quitting(cx) {
+                        return false;
+                    }
+                    poll_app_runtime(cx);
+                    true
+                });
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.activate(true);
+    });
     Ok(())
+}
+
+/// Standalone window presenting an AI or watchdog cleanup proposal.
+#[derive(Debug)]
+pub struct CleanupConfirmWindow {
+    pub modal: CleanupConfirmModal,
+    pub focus: FocusHandle,
+    pub confirm_only: bool,
+    pub handled: bool,
+}
+
+impl CleanupConfirmWindow {
+    pub fn new(
+        request: CleanupConfirmRequest,
+        responder: Option<Sender<CleanupConfirmDecision>>,
+        response_file: Option<PathBuf>,
+        confirm_only: bool,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> Self {
+        Self {
+            modal: CleanupConfirmModal::new(request, responder, response_file),
+            focus: cx.focus_handle(),
+            confirm_only,
+            handled: false,
+        }
+    }
+
+    pub fn replace_request(
+        &mut self,
+        request: CleanupConfirmRequest,
+        responder: Option<Sender<CleanupConfirmDecision>>,
+        response_file: Option<PathBuf>,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        self.ensure_cancelled();
+        self.modal =
+            CleanupConfirmModal::new(request, responder, response_file);
+        self.handled = false;
+        cx.notify();
+    }
+
+    pub fn ensure_cancelled(&mut self) {
+        if !self.handled {
+            self.handled = true;
+            let _ = self.modal.cancel();
+        }
+    }
+
+    pub fn cancel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        self.ensure_cancelled();
+        let confirm_only = self.confirm_only;
+        window.remove_window();
+        if confirm_only {
+            app_menu::request_quit(cx);
+        }
+    }
+
+    pub fn confirm(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        if self.handled || self.modal.selected_count() == 0 {
+            return;
+        }
+        self.handled = true;
+        // Read before calling `modal.confirm()`, which consumes `responder`.
+        let is_in_app = self.modal.responder.is_none()
+            && self.modal.response_file.is_none();
+        let decision = self.modal.confirm();
+        let confirm_only = self.confirm_only;
+        if is_in_app
+            && let CleanupConfirmDecision::Confirmed { selected_paths } =
+                decision
+        {
+            let approved_items: Vec<ruum_core::watchdog_config::ProposalItem> =
+                self.modal
+                    .request
+                    .items
+                    .iter()
+                    .filter(|i| selected_paths.contains(&i.path))
+                    .map(|i| {
+                        ruum_core::watchdog_config::ProposalItem::new(
+                            i.path.clone(),
+                            i.bytes,
+                            i.mode,
+                            i.reason.clone(),
+                            i.git_warning.clone(),
+                        )
+                    })
+                    .collect();
+            if !approved_items.is_empty() {
+                let root = self.modal.request.root.clone();
+                let task = cx.background_executor().spawn(async move {
+                    ruum_core::watchdog::execute_confirmed_cleanup(
+                        &approved_items,
+                        &root,
+                    )
+                });
+                cx.spawn(async move |_, cx| {
+                    let (bytes, count) = task.await;
+                    let summary = format!(
+                        "Cleaned {} items, freeing {}",
+                        count,
+                        ruum_core::size::human_bytes(bytes)
+                    );
+                    if !cfg!(test) && count > 0 {
+                        let _ = ruum_core::watchdog::send_os_notification(
+                            "ruum Cleanup Complete",
+                            &summary,
+                        );
+                    }
+                    cx.update(|cx| {
+                        refresh_tray_status(cx);
+                        update_open_main_window(cx, |app, cx| {
+                            app.reload_watchdog_state();
+                            app.notice =
+                                Some((summary, gpui_omarchy::Status::Success));
+                            cx.notify();
+                        });
+                    });
+                })
+                .detach();
+            }
+        }
+        window.remove_window();
+        if confirm_only {
+            app_menu::request_quit(cx);
+        }
+    }
+}
+
+impl Render for CleanupConfirmWindow {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> impl IntoElement {
+        rail_pages::cleanup_confirm_view(&self.modal, &self.focus, cx)
+    }
+}
+
+/// Open (or update and focus) the standalone foreground cleanup confirm window.
+pub fn open_confirm_window(
+    request: CleanupConfirmRequest,
+    responder: Option<Sender<CleanupConfirmDecision>>,
+    response_file: Option<PathBuf>,
+    cx: &mut App,
+) -> Option<WindowHandle<CleanupConfirmWindow>> {
+    open_confirm_window_with_mode(request, responder, response_file, false, cx)
+}
+
+fn open_confirm_window_with_mode(
+    request: CleanupConfirmRequest,
+    responder: Option<Sender<CleanupConfirmDecision>>,
+    response_file: Option<PathBuf>,
+    confirm_only: bool,
+    cx: &mut App,
+) -> Option<WindowHandle<CleanupConfirmWindow>> {
+    let windows = cx.windows();
+    let existing = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.confirm_window)
+        .filter(|h| windows.contains(&(*h).into()));
+
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(Some((
+        request,
+        responder,
+        response_file,
+    ))));
+
+    if let Some(handle) = existing {
+        let slot = std::rc::Rc::clone(&pending);
+        let updated = handle.update(cx, move |win, window, cx| {
+            if let Some((req, resp, file)) = slot.borrow_mut().take() {
+                win.replace_request(req, resp, file, cx);
+            }
+            let focus = win.focus.clone();
+            window.focus(&focus, cx);
+            window.activate_window();
+        });
+        if updated.is_ok() {
+            cx.activate(true);
+            return Some(handle);
+        }
+    }
+
+    let (request, responder, response_file) = pending.borrow_mut().take()?;
+
+    let native_look = cx.try_global::<AppRuntime>().map_or_else(
+        || {
+            let home = std::env::home_dir();
+            appearance::follows_system(home.as_deref())
+        },
+        |rt| rt.launch.native_look,
+    );
+
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(
+                    gpui_kit::Bounds::new(
+                        gpui_kit::point(px(200.), px(150.)),
+                        size(px(760.), px(560.)),
+                    ),
+                )),
+                titlebar: Some(gpui_kit::TitlebarOptions {
+                    title: Some("ruum · Confirm Cleanup".into()),
+                    ..Default::default()
+                }),
+                app_id: Some("ruum".to_owned()),
+                window_min_size: Some(size(px(560.), px(380.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                if native_look {
+                    appearance::follow(window);
+                }
+                let entity = cx.new(|cx| {
+                    CleanupConfirmWindow::new(
+                        request,
+                        responder,
+                        response_file,
+                        confirm_only,
+                        cx,
+                    )
+                });
+                let close_entity = entity.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    let _ = close_entity.update(cx, |win, _| {
+                        win.ensure_cancelled();
+                    });
+                    if confirm_only {
+                        app_menu::request_quit(cx);
+                    }
+                    true
+                });
+                entity
+            },
+        )
+        .ok()?;
+
+    let _ = window.update(cx, |win, window, cx| {
+        let focus = win.focus.clone();
+        window.focus(&focus, cx);
+        window.activate_window();
+    });
+    cx.activate(true);
+
+    with_runtime_mut(cx, |rt| rt.confirm_window = Some(window));
+    Some(window)
+}
+
+fn with_runtime_mut(cx: &mut App, f: impl FnOnce(&mut AppRuntime)) {
+    if cx.has_global::<AppRuntime>() {
+        f(cx.global_mut::<AppRuntime>());
+    }
+}
+
+/// Refresh tray menu status lines if a tray icon is active.
+pub fn refresh_tray_status(cx: &mut App) {
+    let Some(rt) = cx.try_global::<AppRuntime>() else {
+        return;
+    };
+    if rt.tray.is_none() {
+        return;
+    }
+    let home = std::env::home_dir();
+    let free_bytes = home
+        .as_deref()
+        .and_then(|h| ruum_core::space::space_info(h).ok())
+        .map(|s| s.available);
+    let cfg = ruum_core::watchdog_config::watchdog_config_path()
+        .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
+        .unwrap_or_default();
+    let has_proposal = ruum_core::watchdog_config::watchdog_state_path()
+        .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
+        .and_then(|s| s.last_proposal)
+        .is_some_and(|p| !p.items.is_empty());
+
+    if let Some(rt) = cx.try_global::<AppRuntime>()
+        && let Some(tray) = &rt.tray
+    {
+        tray.update_status(free_bytes, cfg.enabled, has_proposal);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LaunchConfig {
+    root: PathBuf,
+    options: ScanOptions,
+    depth: u32,
+    remote: Option<String>,
+    remote_disk: bool,
+    choose_root: bool,
+    power: Option<power::PowerEfficiency>,
+    native_look: bool,
+}
+
+type ConfirmChannelPayload =
+    (CleanupConfirmRequest, Sender<CleanupConfirmDecision>);
+
+#[derive(Debug)]
+struct AppRuntime {
+    launch: LaunchConfig,
+    main_window: Option<WindowHandle<Ruum>>,
+    confirm_window: Option<WindowHandle<CleanupConfirmWindow>>,
+    tray: Option<tray_menu::TrayMenu>,
+    ipc_rx: Option<Receiver<watchdog_runtime::WatchdogIpcEvent>>,
+    #[allow(
+        dead_code,
+        reason = "keeps background IPC listener alive across window closes"
+    )]
+    ipc_server: Option<watchdog_runtime::WatchdogIpcServer>,
+    in_proc_confirm_tx: Sender<ConfirmChannelPayload>,
+    in_proc_confirm_rx: Receiver<ConfirmChannelPayload>,
+    last_watchdog_poll: Option<Instant>,
+    background_analysis_in_flight: bool,
+}
+
+impl Global for AppRuntime {}
+
+#[derive(Debug, Default)]
+struct AsyncSignal {
+    pending: AtomicBool,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl AsyncSignal {
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.waker.lock()
+            && let Some(waker) = guard.take()
+        {
+            waker.wake();
+        }
+    }
+
+    async fn wait(&self) {
+        std::future::poll_fn(|cx| {
+            if self.pending.swap(false, Ordering::AcqRel) {
+                std::task::Poll::Ready(())
+            } else {
+                if let Ok(mut guard) = self.waker.lock() {
+                    *guard = Some(cx.waker().clone());
+                }
+                if self.pending.swap(false, Ordering::AcqRel) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await;
+    }
+}
+
+#[derive(Debug)]
+struct InProcessConfirmAdapter {
+    tx: Sender<ConfirmChannelPayload>,
+}
+
+impl CleanupConfirmAdapter for InProcessConfirmAdapter {
+    fn confirm(
+        &self,
+        request: &CleanupConfirmRequest,
+    ) -> std::io::Result<CleanupConfirmDecision> {
+        let (resp_tx, resp_rx) = channel();
+        self.tx.send((request.clone(), resp_tx)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "UI confirmation channel closed",
+            )
+        })?;
+        Ok(resp_rx.recv().unwrap_or(CleanupConfirmDecision::Cancelled))
+    }
+}
+
+fn open_main_window(
+    cx: &mut App,
+    title_root_override: Option<PathBuf>,
+) -> WindowHandle<Ruum> {
+    let launch = cx
+        .try_global::<AppRuntime>()
+        .expect("AppRuntime installed before opening main window")
+        .launch
+        .clone();
+    let home = std::env::home_dir();
+    let title_root = title_root_override.unwrap_or_else(|| launch.root.clone());
+    let native_look = launch.native_look;
+
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(
+                    gpui_kit::Bounds::new(
+                        gpui_kit::point(px(120.), px(90.)),
+                        size(px(1440.), px(900.)),
+                    ),
+                )),
+                titlebar: Some(gpui_kit::TitlebarOptions {
+                    title: Some(
+                        format!(
+                            "ruum · {}",
+                            marks::display_path(&title_root, home.as_deref())
+                        )
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                // Wayland app id. Hyprland reports it as the window class,
+                // and the desktop entry's StartupWMClass and the documented
+                // window rule both match `ruum`.
+                app_id: Some("ruum".to_owned()),
+                window_min_size: Some(size(px(900.), px(600.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                if native_look {
+                    appearance::follow(window);
+                }
+                cx.new(|cx| {
+                    let mut app = if launch.choose_root {
+                        Ruum::choose(
+                            launch.options,
+                            launch.depth,
+                            launch.remote,
+                            cx,
+                        )
+                    } else {
+                        Ruum::open(
+                            launch.root,
+                            launch.options,
+                            launch.depth,
+                            launch.remote,
+                            launch.remote_disk,
+                            cx,
+                        )
+                    };
+                    app.power_choice = launch.power;
+                    app
+                })
+            },
+        )
+        .expect("open the ruum window");
+
+    // The treemap owns the keyboard from the first frame; there is no
+    // text field to focus first.
+    let _ = window.update(cx, |this, window, cx| {
+        let focus = this.focus.clone();
+        window.focus(&focus, cx);
+        window.activate_window();
+    });
+    window
+}
+
+fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
+    let windows = cx.windows();
+    let existing = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.main_window)
+        .filter(|h| windows.contains(&(*h).into()));
+
+    if let Some(handle) = existing {
+        let _ = handle.update(cx, |app, window, cx| {
+            if let Some(screen) = target {
+                app.navigate_rail(screen, cx);
+            }
+            let focus = app.focus.clone();
+            window.focus(&focus, cx);
+            window.activate_window();
+        });
+        cx.activate(true);
+        return;
+    }
+
+    let window = open_main_window(cx, None);
+    if let Some(screen) = target {
+        let _ = window.update(cx, |app, window, cx| {
+            app.navigate_rail(screen, cx);
+            let focus = app.focus.clone();
+            window.focus(&focus, cx);
+            window.activate_window();
+        });
+    }
+    with_runtime_mut(cx, |rt| rt.main_window = Some(window));
+    cx.activate(true);
+}
+
+fn update_open_main_window<F>(cx: &mut App, f: F)
+where
+    F: FnOnce(&mut Ruum, &mut gpui_kit::Context<'_, Ruum>),
+{
+    let windows = cx.windows();
+    let existing = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.main_window)
+        .filter(|h| windows.contains(&(*h).into()));
+    if let Some(handle) = existing {
+        let _ = handle.update(cx, |app, _, cx| f(app, cx));
+    }
+}
+
+fn drain_tray_actions(cx: &mut App) {
+    let mut actions = Vec::new();
+    if let Some(rt) = cx.try_global::<AppRuntime>()
+        && let Some(tray) = &rt.tray
+    {
+        while let Some(action) = tray.poll_action() {
+            actions.push(action);
+        }
+    }
+    for action in actions {
+        match action {
+            tray_menu::TrayAction::OpenRuum => {
+                open_or_navigate_main_window(None, cx);
+            }
+            tray_menu::TrayAction::OpenSources => {
+                open_or_navigate_main_window(Some(Screen::Sources), cx);
+            }
+            tray_menu::TrayAction::OpenWatchdog => {
+                open_or_navigate_main_window(Some(Screen::Watchdog), cx);
+            }
+            tray_menu::TrayAction::OpenSettings => {
+                open_or_navigate_main_window(Some(Screen::Settings), cx);
+            }
+            tray_menu::TrayAction::CheckDiskSpaceNow => {
+                trigger_tray_space_check(cx);
+            }
+            tray_menu::TrayAction::RunAiAnalysisNow => {
+                trigger_background_ai_analysis(cx);
+            }
+            tray_menu::TrayAction::ReviewLatestProposal => {
+                review_latest_proposal_from_tray(cx);
+            }
+            tray_menu::TrayAction::Quit => {
+                app_menu::request_quit(cx);
+            }
+        }
+    }
+}
+
+fn poll_app_runtime(cx: &mut App) {
+    drain_tray_actions(cx);
+
+    let mut ipc_events = Vec::new();
+    let mut in_proc_requests = Vec::new();
+    if let Some(rt) = cx.try_global::<AppRuntime>() {
+        if let Some(rx) = &rt.ipc_rx {
+            while let Ok(ev) = rx.try_recv() {
+                ipc_events.push(ev);
+            }
+        }
+        while let Ok(req) = rt.in_proc_confirm_rx.try_recv() {
+            in_proc_requests.push(req);
+        }
+    }
+
+    for event in ipc_events {
+        match event {
+            watchdog_runtime::WatchdogIpcEvent::Confirm {
+                request,
+                responder,
+            } => {
+                open_confirm_window(request, Some(responder), None, cx);
+            }
+            watchdog_runtime::WatchdogIpcEvent::WatchdogUpdated => {
+                update_open_main_window(cx, |app, cx| {
+                    app.reload_watchdog_state();
+                    cx.notify();
+                });
+                refresh_tray_status(cx);
+            }
+        }
+    }
+
+    for (request, responder) in in_proc_requests {
+        open_confirm_window(request, Some(responder), None, cx);
+    }
+
+    maybe_run_in_app_watchdog_tick(cx);
+}
+
+fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
+    let Some(rt) = cx.try_global::<AppRuntime>() else {
+        return;
+    };
+    if rt.background_analysis_in_flight {
+        return;
+    }
+    let cfg = ruum_core::watchdog_config::watchdog_config_path()
+        .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
+        .unwrap_or_default()
+        .normalized();
+    if !cfg.enabled {
+        return;
+    }
+    let interval = Duration::from_secs(cfg.poll_interval_secs);
+    if let Some(last) = rt.last_watchdog_poll
+        && last.elapsed() < interval
+    {
+        return;
+    }
+    let confirm_tx = rt.in_proc_confirm_tx.clone();
+    with_runtime_mut(cx, |rt| {
+        rt.last_watchdog_poll = Some(Instant::now());
+        rt.background_analysis_in_flight = true;
+    });
+
+    let task = cx.background_executor().spawn(async move {
+        let runner = ruum_core::ai_cli::DefaultCommandRunner;
+        if matches!(
+            ruum_core::watchdog::service_status(&runner),
+            Ok(ruum_core::watchdog::ServiceStatus::Active)
+        ) {
+            return;
+        }
+        let Some(cfg_path) = ruum_core::watchdog_config::watchdog_config_path()
+        else {
+            return;
+        };
+        let Some(state_path) =
+            ruum_core::watchdog_config::watchdog_state_path()
+        else {
+            return;
+        };
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        let exe =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        let now_secs = now_unix_secs();
+        let adapter = InProcessConfirmAdapter { tx: confirm_tx };
+        let notifier = ruum_core::watchdog::OsNotificationAdapter;
+        let _ = ruum_core::watchdog::run_once(
+            &cfg_path,
+            &state_path,
+            &home,
+            &exe,
+            now_secs,
+            &runner,
+            &adapter,
+            &notifier,
+        );
+    });
+
+    cx.spawn(async move |cx| {
+        task.await;
+        cx.update(|cx| {
+            with_runtime_mut(cx, |rt| {
+                rt.background_analysis_in_flight = false;
+            });
+            update_open_main_window(cx, |app, cx| {
+                app.reload_watchdog_state();
+                cx.notify();
+            });
+            refresh_tray_status(cx);
+        });
+    })
+    .detach();
+}
+
+fn trigger_tray_space_check(cx: &App) {
+    let task = cx.background_executor().spawn(async {
+        let home = std::env::home_dir()?;
+        let info = ruum_core::space::space_info(&home).ok()?;
+        let now_secs = now_unix_secs();
+        if let Some(path) = ruum_core::watchdog_config::watchdog_state_path() {
+            let mut st = ruum_core::watchdog_config::load_state(&path)
+                .unwrap_or_default();
+            st.last_checked_secs = Some(now_secs);
+            let _ = ruum_core::watchdog_config::save_state(&path, &st);
+        }
+        Some((info.available, now_secs))
+    });
+    cx.spawn(async move |cx| {
+        let result = task.await;
+        cx.update(|cx| {
+            if let Some((avail, checked_at)) = result {
+                let msg = format!(
+                    "Disk check: {} available",
+                    ruum_core::size::human_bytes(avail)
+                );
+                update_open_main_window(cx, |app, cx| {
+                    app.reload_watchdog_state();
+                    app.watchdog_space_checked_at = Some(checked_at);
+                    app.push_toast(msg, gpui_omarchy::Status::Success, cx);
+                });
+            }
+            refresh_tray_status(cx);
+        });
+    })
+    .detach();
+}
+
+fn trigger_background_ai_analysis(cx: &mut App) {
+    let windows = cx.windows();
+    let main_open = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.main_window)
+        .filter(|h| windows.contains(&(*h).into()));
+    if let Some(handle) = main_open {
+        let _ = handle.update(cx, |app, _, cx| {
+            app.run_ai_analysis_now(cx);
+        });
+        return;
+    }
+
+    if let Some(rt) = cx.try_global::<AppRuntime>()
+        && rt.background_analysis_in_flight
+    {
+        return;
+    }
+    with_runtime_mut(cx, |rt| rt.background_analysis_in_flight = true);
+
+    let task = cx.background_executor().spawn(async {
+        let home = std::env::home_dir().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot find home directory",
+            )
+        })?;
+        let cfg = ruum_core::watchdog_config::watchdog_config_path()
+            .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
+            .unwrap_or_default();
+        let exe =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        let now_secs = now_unix_secs();
+        let runner = ruum_core::ai_cli::DefaultCommandRunner;
+        let proposal = ruum_core::ai_cli::run_analysis(
+            &cfg, &home, &exe, now_secs, &runner,
+        )
+        .map_err(std::io::Error::other)?;
+        if let Some(state_path) =
+            ruum_core::watchdog_config::watchdog_state_path()
+        {
+            let mut st = ruum_core::watchdog_config::load_state(&state_path)
+                .unwrap_or_default();
+            st.last_proposal = Some(proposal.clone());
+            st.last_triggered_secs = Some(now_secs);
+            let _ = ruum_core::watchdog_config::save_state(&state_path, &st);
+        }
+        Ok::<_, std::io::Error>((home, proposal))
+    });
+
+    cx.spawn(async move |cx| {
+        let res = task.await;
+        cx.update(|cx| {
+            with_runtime_mut(cx, |rt| {
+                rt.background_analysis_in_flight = false;
+            });
+            update_open_main_window(cx, |app, cx| {
+                app.reload_watchdog_state();
+                cx.notify();
+            });
+            refresh_tray_status(cx);
+            match res {
+                Ok((home, proposal)) => {
+                    if proposal.items.is_empty() {
+                        let _ = ruum_core::watchdog::send_os_notification(
+                            "ruum AI Analysis",
+                            "No reclaimable files found.",
+                        );
+                    } else {
+                        let request =
+                            state::proposal_confirm_request(home, &proposal);
+                        open_confirm_window(request, None, None, cx);
+                    }
+                }
+                Err(err) => {
+                    let _ = ruum_core::watchdog::send_os_notification(
+                        "ruum AI Analysis Failed",
+                        &err.to_string(),
+                    );
+                }
+            }
+        });
+    })
+    .detach();
+}
+
+fn review_latest_proposal_from_tray(cx: &mut App) {
+    let proposal = ruum_core::watchdog_config::watchdog_state_path()
+        .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
+        .and_then(|s| s.last_proposal);
+    let Some(prop) = proposal.filter(|p| !p.items.is_empty()) else {
+        open_or_navigate_main_window(Some(Screen::Watchdog), cx);
+        return;
+    };
+    // Fail closed when no user home directory exists rather than widening
+    // cleanup root checks to `/`.
+    let Some(home) = std::env::home_dir() else {
+        open_or_navigate_main_window(Some(Screen::Watchdog), cx);
+        return;
+    };
+    let request = state::proposal_confirm_request(home, &prop);
+    open_confirm_window(request, None, None, cx);
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Extraction works without a display or GPUI initialization.
@@ -453,56 +1308,27 @@ where
 fn run_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
     let req_content = std::fs::read_to_string(&args.req_path)
         .context("read confirm request file")?;
-    let request: ruum_core::confirm::CleanupConfirmRequest =
-        serde_json::from_str(&req_content)
-            .context("parse confirm request JSON")?;
+    let request: CleanupConfirmRequest = serde_json::from_str(&req_content)
+        .context("parse confirm request JSON")?;
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
+            app_menu::install(cx);
+            app_menu::set_confirm_only(cx, true);
             let home = std::env::home_dir();
             let native_look = appearance::follows_system(home.as_deref());
             if native_look {
                 appearance::apply(cx.window_appearance(), cx);
             }
-            let resp_file = args.resp_path.clone();
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(gpui_kit::WindowBounds::Windowed(
-                            gpui_kit::Bounds::new(
-                                gpui_kit::point(px(200.), px(150.)),
-                                size(px(800.), px(600.)),
-                            ),
-                        )),
-                        titlebar: Some(gpui_kit::TitlebarOptions {
-                            title: Some("ruum · Confirm Cleanup".into()),
-                            ..Default::default()
-                        }),
-                        window_min_size: Some(size(px(600.), px(400.))),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        if native_look {
-                            appearance::follow(window);
-                        }
-                        cx.new(|cx| {
-                            Ruum::confirm_only(
-                                request.clone(),
-                                resp_file.clone(),
-                                cx,
-                            )
-                        })
-                    },
-                )
-                .expect("open confirm window");
-
-            let _ = window.update(cx, |this, window, cx| {
-                let focus = this.focus.clone();
-                window.focus(&focus, cx);
-            });
-            cx.activate(true);
+            let _ = open_confirm_window_with_mode(
+                request,
+                None,
+                Some(args.resp_path),
+                true,
+                cx,
+            );
         });
     Ok(())
 }

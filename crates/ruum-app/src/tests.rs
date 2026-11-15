@@ -946,9 +946,11 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
-    // Fixed rows, so this is about where the popup lands and not about which
-    // disks the machine running the test happens to have.
+    // Fixed rows, so this checks the full-page layout and not which disks
+    // the machine running the test happens to have.
     update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Sources, cx);
+        app.volumes_loading = false;
         app.volumes = vec![
             Volume {
                 point: PathBuf::from("/one"),
@@ -965,35 +967,42 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
                 space: None,
             },
         ];
-        app.volumes_open = true;
         cx.notify();
     });
     draw(cx);
 
     let viewport = cx.update(|window, _| window.viewport_size());
+    let page = cx
+        .debug_bounds("sources-page")
+        .expect("sources full page is drawn");
     let rows = cx.debug_bounds("volume-rows").expect("the rows are drawn");
-    let centre = rows.center();
     let rail = crate::ui::size::ICON_RAIL.to_pixels(px(16.));
-    let expected_center_x = rail + (viewport.width - rail) / 2.0;
     assert!(
-        (centre.x - expected_center_x).abs() < px(4.),
-        "the popup is not centred across: {centre:?} in {viewport:?}"
+        (page.origin.x - rail).abs() < px(2.),
+        "sources page starts next to icon rail: {page:?}"
     );
     assert!(
-        (centre.y - viewport.height / 2.0).abs() < px(150.),
-        "the popup is not centred down: {centre:?} in {viewport:?}"
+        (page.size.width - (viewport.width - rail)).abs() < px(2.),
+        "sources page fills remaining width: {page:?} in {viewport:?}"
+    );
+    assert!(rows.size.width > px(200.), "{rows:?}");
+    assert!(
+        cx.debug_bounds("source-cancel").is_none(),
+        "full-page Sources view has no modal Cancel button"
     );
 
-    // Clicking outside the popup on the page backdrop closes it.
+    // Clicking empty space on the full-page Sources view does NOT dismiss it.
     cx.simulate_click(
-        gpui_kit::point(px(100.), px(100.)),
+        gpui_kit::point(page.right() - px(8.), page.origin.y + px(8.)),
         gpui_kit::Modifiers::none(),
     );
     draw(cx);
-    assert!(
-        !read(&view, cx, |app| app.volumes_open),
-        "clicking outside the picker closes it"
+    assert_eq!(
+        read(&view, cx, |app| app.screen),
+        Screen::Sources,
+        "clicking empty space on full-page Sources must not dismiss it"
     );
+    assert!(read(&view, cx, |app| app.volumes_open));
 }
 
 #[gpui_kit::test]
@@ -2277,32 +2286,68 @@ fn icon_rail_switches_pages_and_settings_shortcut(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("rail-watchdog").is_some());
     assert!(cx.debug_bounds("rail-settings").is_some());
 
-    // Click rail-sources
+    // Explore -> Sources
     let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
     cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
     assert!(cx.debug_bounds("sources-page").is_some());
 
-    // Click rail-watchdog
+    // Sources -> Watchdog
     let watchdog_btn = cx.debug_bounds("rail-watchdog").expect("rail-watchdog");
     cx.simulate_click(watchdog_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Watchdog);
     assert!(cx.debug_bounds("watchdog-page").is_some());
 
-    // Click rail-settings
+    // Watchdog -> Sources (bidirectional click)
+    let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
+    cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
+    assert!(cx.debug_bounds("sources-page").is_some());
+
+    // Sources -> Settings
     let settings_btn = cx.debug_bounds("rail-settings").expect("rail-settings");
     cx.simulate_click(settings_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Settings);
     assert!(cx.debug_bounds("settings-page").is_some());
 
-    // Press Escape to return to Explore
+    // Settings -> Sources (bidirectional click)
+    let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
+    cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
+    assert!(cx.debug_bounds("sources-page").is_some());
+
+    // Sources -> Explore
+    let explore_btn = cx.debug_bounds("rail-explore").expect("rail-explore");
+    cx.simulate_click(explore_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+
+    // Settings -> Escape returns to Explore
+    let settings_btn = cx.debug_bounds("rail-settings").expect("rail-settings");
+    cx.simulate_click(settings_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Settings);
     press(cx, "escape");
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
 
-    // Press OpenSettings shortcut action
+    // Menu actions switch pages directly
+    cx.dispatch_action(crate::app_menu::OpenWatchdog);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Watchdog);
+
+    cx.dispatch_action(crate::app_menu::OpenSources);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
+
+    cx.dispatch_action(crate::app_menu::OpenExplore);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+
     cx.dispatch_action(crate::app_menu::OpenSettings);
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Settings);
@@ -2454,7 +2499,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     assert!(cx.debug_bounds("watchdog-check-space").is_some());
     assert!(cx.debug_bounds("watchdog-ai-analyze").is_some());
 
-    // 3. Inject mock proposal into watchdog state and open confirmation modal
+    // 3. Inject mock proposal into watchdog state and open standalone window
     let target_file = temp.path().join("junk/blob.bin");
     update(&view, cx, |app, cx| {
         app.watchdog_state.last_proposal =
@@ -2473,17 +2518,22 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     });
     draw(cx);
 
-    // Modal popup is rendered on top of the window
-    assert!(cx.debug_bounds("cleanup-confirm-backdrop").is_some());
-    assert!(cx.debug_bounds("cleanup-confirm-popup").is_some());
-    assert!(cx.debug_bounds("confirm-cancel").is_some());
-    assert!(cx.debug_bounds("confirm-clean").is_some());
+    // Standalone confirmation window opened as an independent second window.
+    let windows = cx.windows();
+    assert_eq!(windows.len(), 2, "expected standalone confirm window");
+    let mut confirm_cx = VisualTestContext::from_window(windows[1], &cx.cx);
+    draw(&mut confirm_cx);
 
-    // Escape cancels modal dialog
-    press(cx, "escape");
-    assert!(read(&view, cx, |app| app.confirm_modal.is_none()));
-    draw(cx);
-    assert!(cx.debug_bounds("cleanup-confirm-backdrop").is_none());
+    assert!(confirm_cx.debug_bounds("cleanup-confirm-window").is_some());
+    assert!(confirm_cx.debug_bounds("cleanup-confirm-popup").is_some());
+    assert!(confirm_cx.debug_bounds("confirm-cancel").is_some());
+    assert!(confirm_cx.debug_bounds("confirm-clean").is_some());
+
+    // Escape in standalone confirm window cancels and closes it without deleting.
+    confirm_cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1);
+    assert!(target_file.exists());
 
     // In Watchdog screen, Escape returns to Explore
     press(cx, "escape");
@@ -2513,16 +2563,25 @@ fn confirm_only_standalone_mode(cx: &mut TestAppContext) {
         }],
     };
 
-    let (_, cx) = cx.add_window_view(|_, cx| {
-        Ruum::confirm_only(req, resp_file.clone(), cx)
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        crate::CleanupConfirmWindow::new(
+            req,
+            None,
+            Some(resp_file.clone()),
+            true,
+            cx,
+        )
     });
+    let focus = view.read_with(cx, |win, _| win.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
     draw(cx);
 
     assert!(cx.debug_bounds("cleanup-confirm-popup").is_some());
     assert!(!resp_file.exists());
 
     // Press Enter to confirm
-    press(cx, "enter");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
     assert!(resp_file.exists());
     let content = std::fs::read_to_string(&resp_file).expect("read");
     let decision: CleanupConfirmDecision =
@@ -2536,6 +2595,94 @@ fn confirm_only_standalone_mode(cx: &mut TestAppContext) {
         }
         CleanupConfirmDecision::Cancelled => panic!("expected confirmed"),
     }
+}
+
+#[gpui_kit::test]
+fn open_confirm_window_toggles_confirms_and_fails_closed_on_close(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+    };
+    use std::sync::mpsc::channel;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_, cx) = view_over(temp.path(), cx);
+
+    let path_a = temp.path().join("junk/blob.bin");
+    let path_b = temp.path().join("keep/notes.txt");
+    let request = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: "IPC Confirm".into(),
+        summary: Some("Select items".into()),
+        items: vec![
+            CleanupConfirmItem {
+                path: path_a.clone(),
+                bytes: 200_000,
+                mode: RemovalMode::Trash,
+                reason: Some("cache".into()),
+                git_warning: None,
+            },
+            CleanupConfirmItem {
+                path: path_b,
+                bytes: 1_000,
+                mode: RemovalMode::Trash,
+                reason: Some("notes".into()),
+                git_warning: None,
+            },
+        ],
+    };
+
+    // 1. Toggle item checkbox and click Confirm -> returns checked paths only.
+    let (tx1, rx1) = channel();
+    let handle1 = cx.update(|_, cx| {
+        crate::open_confirm_window(request.clone(), Some(tx1), None, cx)
+            .expect("confirm window opened")
+    });
+    assert_eq!(cx.windows().len(), 2);
+    let mut confirm_cx = VisualTestContext::from_window(handle1.into(), &cx.cx);
+    draw(&mut confirm_cx);
+
+    let check_b = confirm_cx
+        .debug_bounds("check-item-1")
+        .expect("second item checkbox");
+    confirm_cx.simulate_click(check_b.center(), gpui_kit::Modifiers::none());
+    draw(&mut confirm_cx);
+
+    let confirm_btn = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    confirm_cx
+        .simulate_click(confirm_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        rx1.recv().expect("confirm decision"),
+        CleanupConfirmDecision::Confirmed {
+            selected_paths: vec![path_a],
+        }
+    );
+    assert_eq!(cx.windows().len(), 1);
+
+    // 2. Closing window without clicking Confirm -> fail-closed Cancelled.
+    let (tx2, rx2) = channel();
+    let handle2 = cx.update(|_, cx| {
+        crate::open_confirm_window(request, Some(tx2), None, cx)
+            .expect("second confirm window opened")
+    });
+    assert_eq!(cx.windows().len(), 2);
+    let mut confirm_cx2 =
+        VisualTestContext::from_window(handle2.into(), &cx.cx);
+    draw(&mut confirm_cx2);
+    confirm_cx2.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    assert_eq!(
+        rx2.recv().expect("fail-closed cancel"),
+        CleanupConfirmDecision::Cancelled
+    );
+    assert_eq!(cx.windows().len(), 1);
 }
 
 #[gpui_kit::test]

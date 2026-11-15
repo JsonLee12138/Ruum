@@ -37,7 +37,7 @@ use ruum_core::treemap::{
 };
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::{
-    MIN_FREE_GB_FLOOR, ProposalItem, WatchdogConfig, WatchdogState,
+    MIN_FREE_GB_FLOOR, WatchdogConfig, WatchdogState,
 };
 use std::collections::BTreeSet;
 
@@ -450,6 +450,30 @@ impl Drop for CleanupConfirmModal {
     }
 }
 
+/// Build a standalone confirmation request from a saved AI cleanup proposal.
+pub fn proposal_confirm_request(
+    root: PathBuf,
+    proposal: &ruum_core::watchdog_config::CleanupProposal,
+) -> CleanupConfirmRequest {
+    let items = proposal
+        .items
+        .iter()
+        .map(|item| CleanupConfirmItem {
+            path: item.path.clone(),
+            bytes: item.bytes,
+            mode: item.mode,
+            reason: item.reason.clone(),
+            git_warning: item.git_warning.clone(),
+        })
+        .collect();
+    CleanupConfirmRequest {
+        root,
+        title: "AI Cleanup Proposal".to_string(),
+        summary: Some(proposal.summary.clone()),
+        items,
+    }
+}
+
 fn write_decision_file(
     path: &Path,
     decision: &CleanupConfirmDecision,
@@ -608,10 +632,6 @@ pub struct Ruum {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
-    /// Whether this window was launched purely to confirm cleanup and exit.
-    pub confirm_only: bool,
-    /// Active interactive cleanup confirmation modal, if open.
-    pub confirm_modal: Option<CleanupConfirmModal>,
     /// Watchdog monitoring configuration.
     pub watchdog_config: WatchdogConfig,
     /// Watchdog persistent runtime state.
@@ -652,16 +672,6 @@ pub struct Ruum {
     pub watchdog_space_checked_at: Option<u64>,
     /// Background daemon OS service status.
     pub watchdog_service_status: Option<ServiceStatus>,
-    /// IPC event receiver for incoming confirmation requests.
-    pub ipc_rx: Option<
-        std::sync::mpsc::Receiver<crate::watchdog_runtime::WatchdogIpcEvent>,
-    >,
-    /// IPC server handle keeping background thread alive.
-    #[allow(
-        dead_code,
-        reason = "keeps background IPC server alive until Ruum drops"
-    )]
-    pub ipc_server: Option<crate::watchdog_runtime::WatchdogIpcServer>,
 }
 
 impl Ruum {
@@ -725,14 +735,6 @@ impl Ruum {
             &ruum_core::ai_cli::DefaultCommandRunner,
         )
         .ok();
-        let (ipc_server, ipc_rx) = if cfg!(test) {
-            (None, None)
-        } else {
-            match crate::watchdog_runtime::WatchdogIpcServer::start() {
-                Ok((srv, rx)) => (Some(srv), Some(rx)),
-                Err(_) => (None, None),
-            }
-        };
 
         let mut tree = Self {
             root_path,
@@ -833,8 +835,6 @@ impl Ruum {
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
-            confirm_only: false,
-            confirm_modal: None,
             watchdog_config,
             watchdog_state,
             watchdog_input_min_free: None,
@@ -855,8 +855,6 @@ impl Ruum {
             watchdog_analysis_epoch: 0,
             watchdog_space_checked_at,
             watchdog_service_status,
-            ipc_rx,
-            ipc_server,
         };
         if local && start {
             tree.device = device_for(&tree.root_path);
@@ -876,9 +874,6 @@ impl Ruum {
             tree.open_volumes(cx);
         }
         Self::start_space_ticker(cx);
-        if tree.ipc_rx.is_some() {
-            Self::start_ipc_poll(cx);
-        }
         tree
     }
 
@@ -971,22 +966,45 @@ impl Ruum {
         cx.notify();
     }
 
+    /// Switch primary screen from the icon rail or app menu shortcuts.
+    pub fn navigate_rail(
+        &mut self,
+        target: Screen,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.run.is_some()
+            || matches!(self.screen, Screen::Review | Screen::Running)
+        {
+            return;
+        }
+        self.crumb_menu = None;
+        self.power_menu = None;
+        self.show_help = false;
+        if target == Screen::Sources {
+            self.screen = Screen::Sources;
+            self.volumes_open = true;
+            self.picker_host = None;
+            self.picker_path = None;
+            self.focus_request = Some(FocusTarget::Dialog);
+            self.load_volume_source(self.remote.clone(), cx);
+            return;
+        }
+        if self.volumes_open || self.screen == Screen::Sources {
+            self.volume_epoch += 1;
+            self.roots_job = None;
+            self.volumes_loading = false;
+            self.volumes_open = false;
+        }
+        self.screen = target;
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
     /// `V`: list every volume and let the scan move to one. The in-flight walk
     /// is left alone until a volume is picked; picking calls [`set_root`],
     /// which cancels it.
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        if self.run.is_some()
-            || (self.screen != Screen::Explore
-                && self.screen != Screen::Sources)
-        {
-            return;
-        }
-        self.screen = Screen::Sources;
-        self.volumes_open = true;
-        self.picker_host = None;
-        self.picker_path = None;
-        self.focus_request = Some(FocusTarget::Dialog);
-        self.load_volume_source(self.remote.clone(), cx);
+        self.navigate_rail(Screen::Sources, cx);
     }
 
     pub fn load_volume_source(
@@ -994,7 +1012,7 @@ impl Ruum {
         host: Option<String>,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.volumes_open {
+        if !self.volumes_open && self.screen != Screen::Sources {
             return;
         }
         self.volume_epoch += 1;
@@ -1037,7 +1055,9 @@ impl Ruum {
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 let _ = this.update(cx, |this, cx| {
-                    if this.volumes_open && this.volume_epoch == epoch {
+                    if (this.volumes_open || this.screen == Screen::Sources)
+                        && this.volume_epoch == epoch
+                    {
                         this.finish_volume_listing(result, cx);
                     }
                 });
@@ -1052,7 +1072,9 @@ impl Ruum {
         epoch: u64,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        if !self.volumes_open || self.volume_epoch != epoch {
+        if (!self.volumes_open && self.screen != Screen::Sources)
+            || self.volume_epoch != epoch
+        {
             return false;
         }
         let Some(result) = self
@@ -1149,78 +1171,6 @@ impl Ruum {
             .into_iter()
             .flatten()
             .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
-    }
-
-    /// Create a Ruum instance purely to display a cleanup confirmation modal.
-    pub fn confirm_only(
-        request: CleanupConfirmRequest,
-        response_file: PathBuf,
-        cx: &mut Context<'_, Self>,
-    ) -> Self {
-        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let mut app = Self::build(
-            home,
-            ScanOptions::default(),
-            3,
-            None,
-            false,
-            false,
-            cx,
-        );
-        app.confirm_only = true;
-        app.volumes_open = false;
-        app.awaiting_root = false;
-        app.confirm_modal =
-            Some(CleanupConfirmModal::new(request, None, Some(response_file)));
-        app
-    }
-
-    /// Background polling loop draining local IPC events.
-    fn start_ipc_poll(cx: &Context<'_, Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let keep_going =
-                    this.update(cx, Self::poll_ipc).unwrap_or(false);
-                if !keep_going {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Poll incoming IPC events once without blocking the UI thread.
-    pub fn poll_ipc(&mut self, cx: &mut Context<'_, Self>) -> bool {
-        let Some(rx) = &self.ipc_rx else {
-            return false;
-        };
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        for event in events {
-            match event {
-                crate::watchdog_runtime::WatchdogIpcEvent::Confirm {
-                    request,
-                    responder,
-                } => {
-                    self.confirm_modal = Some(CleanupConfirmModal::new(
-                        request,
-                        Some(responder),
-                        None,
-                    ));
-                    cx.notify();
-                }
-                crate::watchdog_runtime::WatchdogIpcEvent::WatchdogUpdated => {
-                    self.reload_watchdog_state();
-                    cx.notify();
-                }
-            }
-        }
-        true
     }
 
     /// Re-read watchdog persistent state from disk.
@@ -1871,27 +1821,10 @@ impl Ruum {
                             );
                         } else {
                             let count = proposal.items.len();
-                            let confirm_items: Vec<CleanupConfirmItem> =
-                                proposal
-                                    .items
-                                    .into_iter()
-                                    .map(|item| CleanupConfirmItem {
-                                        path: item.path,
-                                        bytes: item.bytes,
-                                        mode: item.mode,
-                                        reason: item.reason,
-                                        git_warning: item.git_warning,
-                                    })
-                                    .collect();
-                            let request = CleanupConfirmRequest {
-                                root: home,
-                                title: "AI Cleanup Proposal".to_string(),
-                                summary: Some(proposal.summary),
-                                items: confirm_items,
-                            };
-                            this.confirm_modal = Some(
-                                CleanupConfirmModal::new(request, None, None),
-                            );
+                            let request =
+                                proposal_confirm_request(home, &proposal);
+                            crate::open_confirm_window(request, None, None, cx);
+                            crate::refresh_tray_status(cx);
                             this.push_toast(
                                 format!(
                                     "AI proposed {count} candidate items for \
@@ -1915,92 +1848,17 @@ impl Ruum {
         .detach();
     }
 
-    /// Open confirmation dialog for the most recently saved proposal.
-    pub fn open_last_proposal(&mut self, cx: &mut Context<'_, Self>) {
+    /// Open confirmation window for the most recently saved proposal.
+    pub fn open_last_proposal(&self, cx: &mut Context<'_, Self>) {
         let Some(proposal) = &self.watchdog_state.last_proposal else {
             return;
         };
-        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let confirm_items: Vec<CleanupConfirmItem> = proposal
-            .items
-            .iter()
-            .map(|item| CleanupConfirmItem {
-                path: item.path.clone(),
-                bytes: item.bytes,
-                mode: item.mode,
-                reason: item.reason.clone(),
-                git_warning: item.git_warning.clone(),
-            })
-            .collect();
-        let request = CleanupConfirmRequest {
-            root: home,
-            title: "AI Cleanup Proposal".to_string(),
-            summary: Some(proposal.summary.clone()),
-            items: confirm_items,
+        let Some(home) = std::env::home_dir() else {
+            return;
         };
-        self.confirm_modal =
-            Some(CleanupConfirmModal::new(request, None, None));
+        let request = proposal_confirm_request(home, proposal);
+        crate::open_confirm_window(request, None, None, cx);
         cx.notify();
-    }
-
-    /// Confirm the cleanup modal, executing removal or returning IPC decision.
-    pub fn confirm_cleanup_modal(&mut self, cx: &mut Context<'_, Self>) {
-        if let Some(mut modal) = self.confirm_modal.take() {
-            let decision = modal.confirm();
-            if modal.responder.is_none()
-                && modal.response_file.is_none()
-                && let CleanupConfirmDecision::Confirmed { selected_paths } =
-                    decision
-            {
-                let approved_items: Vec<ProposalItem> = modal
-                    .request
-                    .items
-                    .iter()
-                    .filter(|i| selected_paths.contains(&i.path))
-                    .map(|i| {
-                        ProposalItem::new(
-                            i.path.clone(),
-                            i.bytes,
-                            i.mode,
-                            i.reason.clone(),
-                            i.git_warning.clone(),
-                        )
-                    })
-                    .collect();
-                if let Some(home) = std::env::home_dir() {
-                    let (bytes, count) =
-                        ruum_core::watchdog::execute_confirmed_cleanup(
-                            &approved_items,
-                            &home,
-                        );
-                    self.notice = Some((
-                        format!(
-                            "Cleaned {} items, freeing {}",
-                            count,
-                            ruum_core::size::human_bytes(bytes)
-                        ),
-                        Status::Success,
-                    ));
-                }
-            }
-            if self.confirm_only {
-                cx.quit();
-            } else {
-                cx.notify();
-            }
-        }
-    }
-
-    /// Cancel the cleanup modal, returning Cancelled decision.
-    pub fn cancel_cleanup_modal(&mut self, cx: &mut Context<'_, Self>) {
-        if let Some(mut modal) = self.confirm_modal.take() {
-            modal.cancel();
-            if self.confirm_only {
-                cx.quit();
-            } else {
-                cx.notify();
-            }
-        }
     }
 
     pub fn picker_source_matches(&self, cx: &Context<'_, Self>) -> bool {
@@ -2045,7 +1903,7 @@ impl Ruum {
         mut path: PathBuf,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.volumes_open
+        if (!self.volumes_open && self.screen != Screen::Sources)
             || self.volumes_loading
             || self.volumes_error.is_some()
         {
@@ -4159,16 +4017,6 @@ impl Ruum {
         let shift = event.keystroke.modifiers.shift;
         let alt = event.keystroke.modifiers.alt;
 
-        // The cleanup confirmation modal owns keys while open:
-        if self.confirm_modal.is_some() {
-            match key {
-                "escape" => self.cancel_cleanup_modal(cx),
-                "enter" => self.confirm_cleanup_modal(cx),
-                _ => {}
-            }
-            return;
-        }
-
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
         if self.confirm_open {
@@ -4401,7 +4249,7 @@ impl Ruum {
                 self.show_help = true;
                 cx.notify();
             }
-            "q" if !control => cx.quit(),
+            "q" if !control => crate::app_menu::request_quit(cx),
             _ => {}
         }
     }

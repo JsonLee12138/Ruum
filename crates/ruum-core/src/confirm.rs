@@ -435,6 +435,26 @@ impl Drop for IpcListenerGuard {
     }
 }
 
+/// Interactive IPC read timeout for cleanup confirmation prompts (10 minutes).
+///
+/// Users reviewing an AI cleanup proposal in a detached confirmation window may
+/// take several minutes before confirming or cancelling.
+pub const IPC_CONFIRM_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_mins(10);
+
+/// Short IPC read timeout for non-interactive status notifications.
+pub const IPC_NOTIFY_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Select the socket read timeout appropriate for an IPC request kind.
+#[must_use]
+pub const fn ipc_read_timeout(request: &IpcRequest) -> std::time::Duration {
+    match request {
+        IpcRequest::ConfirmCleanup { .. } => IPC_CONFIRM_READ_TIMEOUT,
+        IpcRequest::NotifyWatchdogUpdate { .. } => IPC_NOTIFY_READ_TIMEOUT,
+    }
+}
+
 /// IPC client helper to send a request frame and receive a response frame.
 #[cfg(unix)]
 pub fn send_ipc_message(
@@ -442,7 +462,7 @@ pub fn send_ipc_message(
     request: &IpcRequest,
 ) -> io::Result<IpcResponse> {
     let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(ipc_read_timeout(request)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
 
     let mut line = serde_json::to_string(request)
@@ -479,7 +499,7 @@ pub fn send_ipc_message(
 
     let addr = format!("127.0.0.1:{port}");
     let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(ipc_read_timeout(request)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
 
     let mut line = serde_json::to_string(request)
@@ -1000,5 +1020,29 @@ mod tests {
         );
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn ipc_read_timeout_distinguishes_interactive_confirm_from_notify() {
+        let confirm_req = IpcRequest::ConfirmCleanup {
+            token: "tok".to_string(),
+            request: CleanupConfirmRequest {
+                root: PathBuf::from("/tmp"),
+                title: "Confirm".to_string(),
+                summary: None,
+                items: Vec::new(),
+            },
+        };
+        let notify_req = IpcRequest::NotifyWatchdogUpdate {
+            token: "tok".to_string(),
+        };
+
+        assert_eq!(ipc_read_timeout(&confirm_req), IPC_CONFIRM_READ_TIMEOUT);
+        assert_eq!(
+            IPC_CONFIRM_READ_TIMEOUT,
+            std::time::Duration::from_mins(10)
+        );
+        assert_eq!(ipc_read_timeout(&notify_req), IPC_NOTIFY_READ_TIMEOUT);
+        assert_eq!(IPC_NOTIFY_READ_TIMEOUT, std::time::Duration::from_secs(10));
     }
 }

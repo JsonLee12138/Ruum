@@ -30,7 +30,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>MIT License</string>
+	<string>Copyright (C) 2026 JsonLee12138. Licensed under GPL-3.0-only.</string>
 	<!-- Shown in the prompts macOS raises the first time a scan reaches
 	     each of these. Full Disk Access has no prompt and no string: it is
 	     granted in System Settings, which the app links to. -->

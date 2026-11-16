@@ -19,13 +19,13 @@ Omarchy theme and behaves like the rest of the desktop.
 ## Install
 
 Download `ruum-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the
-[latest release](https://github.com/tobi/ruum/releases/latest), unpack
+[latest release](https://github.com/JsonLee12138/Ruum/releases/latest), unpack
 it, and run `./install.sh` inside (or just copy `ruum` onto your
 `PATH`). Or build it:
 
 ```sh
-git clone https://github.com/tobi/ruum
-cd ruum
+git clone https://github.com/JsonLee12138/Ruum.git
+cd Ruum
 make install
 ```
 
@@ -71,7 +71,7 @@ first build even if `rustup default` points at something older.
 ### macOS
 
 Download `ruum-*-aarch64-macos.zip` (`x86_64-macos` for an Intel Mac)
-from the [latest release](https://github.com/tobi/ruum/releases/latest),
+from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest),
 unzip it, and drag `ruum.app` into Applications. macOS 11 or newer.
 
 A release that was not signed and notarized is stopped by Gatekeeper: macOS
@@ -129,8 +129,8 @@ On Windows 10 or 11, download `ruum-*-x86_64-windows.zip`
 Tools, C++ workload):
 
 ```powershell
-git clone https://github.com/tobi/ruum
-cd ruum
+git clone https://github.com/JsonLee12138/Ruum.git
+cd Ruum
 cargo build --release    # target\release\ruum.exe
 ```
 
@@ -586,4 +586,6 @@ the one it cannot take back.
 
 ## License
 
-MIT
+`GPL-3.0-only` — see [LICENSE](LICENSE). Portions derived from upstream
+`disktree` / `ruum` are attributed under the MIT License in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

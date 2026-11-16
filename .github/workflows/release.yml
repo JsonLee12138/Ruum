@@ -106,7 +106,7 @@ jobs:
           # portable strips before appending; stripping again loses helpers.
           cp target/portable/ruum "dist/$name/"
           cp packaging/install.sh packaging/ruum.desktop.in \
-             assets/ruum.svg README.md LICENSE "dist/$name/"
+             assets/ruum.svg README.md LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
           echo "$VERSION" > "dist/$name/VERSION"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
@@ -245,7 +245,7 @@ jobs:
         run: |
           $name = "ruum-$env:VERSION-$env:ARCH-windows"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/ruum.exe, README.md, LICENSE "dist/$name/"
+          Copy-Item target/release/ruum.exe, README.md, LICENSE, THIRD_PARTY_NOTICES.md "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           # The format `sha256sum -c` reads, with a Unix line ending.

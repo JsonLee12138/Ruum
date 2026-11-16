@@ -335,5 +335,14 @@ mod tests {
         assert!(
             plist.contains(&format!("<string>{DEPLOYMENT_TARGET}</string>"))
         );
+        assert!(plist.contains(
+            "<key>CFBundleIdentifier</key>\n\t\
+             <string>io.github.tobi.ruum</string>"
+        ));
+        assert!(plist.contains(
+            "<key>NSHumanReadableCopyright</key>\n\t\
+             <string>Copyright (C) 2026 JsonLee12138. \
+             Licensed under GPL-3.0-only.</string>"
+        ));
     }
 }

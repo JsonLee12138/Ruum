@@ -59,6 +59,16 @@ and `cargo build --release` directly; CI runs the gate on both systems.
   press keys — so a screen that panics while painting fails a test.
 * **Never delete anything outside a marked path.** See `removal.rs`; the guards
   are load-bearing and are covered by tests.
+* **Tri-platform parity & Factory + Adapter.** Windows, macOS, and Linux are
+  first-class targets; never leave a platform as `Unsupported` or a stub without
+  an explicit decision in `.artifacts/SPEC.md`. Encapsulate OS-specific logic
+  behind `<Domain>Os`, `<Domain>Env::current()`, `pub trait <Domain>Adapter`,
+  stateless `MacOs*`/`Linux*`/`Windows*` adapters, and `<Domain>Factory` (see
+  `auth.rs`, `trash_adapter.rs`, `watchdog_service.rs`, `cli_install.rs`)
+  rather than scattering `cfg!(target_os = ...)` branches, and keep all three
+  adapters compiled unconditionally for cross-OS unit tests. Resolve home via
+  `std::env::home_dir()`, and apply `CREATE_NO_WINDOW` (`0x0800_0000`) to
+  Windows helper subprocesses.
 
 ## Invariants
 
@@ -127,6 +137,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | SSH protocol, discovery and transport | `crates/ruum-core/src/remote.rs` |
 | measurement, filtering, parallelism | `crates/ruum-core/src/scan.rs` |
 | what a node is, or a derived total | `crates/ruum-core/src/tree.rs` |
+| watchdog service lifecycle & OS autostart | `crates/ruum-core/src/watchdog_service.rs` |
+| self-CLI PATH registration across OSes | `crates/ruum-core/src/cli_install.rs` |
 | tile geometry, nesting, the merged tail | `crates/ruum-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/ruum-core/src/removal.rs` |
 | free space and projections | `crates/ruum-core/src/space.rs` |

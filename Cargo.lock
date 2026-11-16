@@ -5969,7 +5969,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-app"
-version = "0.1.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -5992,7 +5992,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-core"
-version = "0.1.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "chrono",
  "rayon",
@@ -6011,7 +6011,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-scan"
-version = "0.1.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "rustix",
  "ruum-core",
@@ -8793,9 +8793,11 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "ruum-core",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

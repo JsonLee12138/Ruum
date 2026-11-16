@@ -121,6 +121,70 @@ fn a_live_supervised_client_receives_a_complete_snapshot() {
     drop(input);
 }
 
+const MAX_ADDRESS_SPACE: u64 = 1 << 30;
+
+fn limit_pair<'a>(
+    limits: &'a str,
+    prefix: &str,
+    soft_index: usize,
+) -> Option<(&'a str, &'a str)> {
+    let line = limits.lines().find(|line| line.starts_with(prefix))?;
+    let mut fields = line.split_whitespace();
+    Some((fields.nth(soft_index)?, fields.next()?))
+}
+
+fn limits_installed(limits: &str) -> bool {
+    let within_cap = |value: &str| {
+        value
+            .parse::<u64>()
+            .is_ok_and(|bytes| bytes <= MAX_ADDRESS_SPACE)
+    };
+    let address_capped = limit_pair(limits, "Max address space", 3)
+        .is_some_and(|(soft, hard)| within_cap(soft) && within_cap(hard));
+    let core_zeroed = limit_pair(limits, "Max core file size", 4)
+        .is_some_and(|(soft, hard)| soft == "0" && hard == "0");
+    address_capped && core_zeroed
+}
+
+fn proc_limits_fixture(
+    core_soft: &str,
+    core_hard: &str,
+    as_soft: &str,
+    as_hard: &str,
+) -> String {
+    format!(
+        "Limit                     Soft Limit           Hard Limit           \
+         Units\n\
+         Max core file size        {core_soft:<20} {core_hard:<20} bytes\n\
+         Max address space         {as_soft:<20} {as_hard:<20} bytes\n"
+    )
+}
+
+#[test]
+fn limits_wait_for_both_address_space_and_core_hard_limit() {
+    let inherited =
+        proc_limits_fixture("0", "unlimited", "unlimited", "unlimited");
+    assert!(!limits_installed(&inherited));
+
+    let mid_syscall =
+        proc_limits_fixture("0", "unlimited", "1073741824", "1073741824");
+    assert!(!limits_installed(&mid_syscall));
+
+    let soft_only = proc_limits_fixture("0", "0", "1073741824", "unlimited");
+    assert!(!limits_installed(&soft_only));
+
+    let core_soft_nonzero =
+        proc_limits_fixture("1", "0", "1073741824", "1073741824");
+    assert!(!limits_installed(&core_soft_nonzero));
+
+    let over_address_cap =
+        proc_limits_fixture("0", "0", "1073741825", "1073741825");
+    assert!(!limits_installed(&over_address_cap));
+
+    let installed = proc_limits_fixture("0", "0", "1073741824", "1073741824");
+    assert!(limits_installed(&installed));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn memory_and_core_limits_are_installed_before_reading_a_request() {
@@ -128,39 +192,18 @@ fn memory_and_core_limits_are_installed_before_reading_a_request() {
     // No startup chatter on stderr: wait for the kernel limit itself
     // while the helper is still blocked waiting for its first request.
     let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let limits = loop {
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
         let limits =
             std::fs::read_to_string(format!("/proc/{}/limits", helper.0.id()))
                 .unwrap();
-        if limits.lines().any(|line| {
-            line.starts_with("Max address space")
-                && line
-                    .split_whitespace()
-                    .nth(3)
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .is_some_and(|value| value <= 1 << 30)
-        }) {
-            break limits;
+        if limits_installed(&limits) {
+            break;
         }
-        assert!(std::time::Instant::now() < deadline);
+        assert!(std::time::Instant::now() < deadline, "{limits}");
         assert!(helper.0.try_wait().unwrap().is_none());
         std::thread::yield_now();
-    };
-    let address = limits
-        .lines()
-        .find(|line| line.starts_with("Max address space"))
-        .unwrap();
-    let values: Vec<_> = address.split_whitespace().collect();
-    assert!(values[3].parse::<u64>().unwrap() <= 1 << 30);
-    assert!(values[4].parse::<u64>().unwrap() <= 1 << 30);
-    let core = limits
-        .lines()
-        .find(|line| line.starts_with("Max core file size"))
-        .unwrap();
-    let values: Vec<_> = core.split_whitespace().collect();
-    assert_eq!(values[4], "0");
-    assert_eq!(values[5], "0");
+    }
 }
 
 #[cfg(target_os = "linux")]

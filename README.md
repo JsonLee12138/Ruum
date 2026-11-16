@@ -18,10 +18,16 @@ Omarchy theme and behaves like the rest of the desktop.
 
 ## Install
 
-Download `ruum-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the
-[latest release](https://github.com/JsonLee12138/Ruum/releases/latest), unpack
-it, and run `./install.sh` inside (or just copy `ruum` onto your
-`PATH`). Or build it:
+Download a package from the
+[latest release](https://github.com/JsonLee12138/Ruum/releases/latest)
+(`x86_64` or `aarch64`):
+
+- **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
+- **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
+- **AppImage:** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
+- **Portable tarball:** unpack `ruum-*-x86_64-linux.tar.gz` and run `./install.sh` inside (or copy `ruum` onto your `PATH`)
+
+Or build it from source:
 
 ```sh
 git clone https://github.com/JsonLee12138/Ruum.git
@@ -70,9 +76,28 @@ first build even if `rustup default` points at something older.
 
 ### macOS
 
-Download `ruum-*-aarch64-macos.zip` (`x86_64-macos` for an Intel Mac)
-from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest),
-unzip it, and drag `ruum.app` into Applications. macOS 11 or newer.
+Install via Homebrew or download an installer from
+the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest)
+(`aarch64-macos` for Apple Silicon, `x86_64-macos` for Intel; macOS 11 or
+newer):
+
+```sh
+brew tap JsonLee12138/tap && brew install --cask ruum
+```
+
+`Casks/ruum.rb` in
+[`JsonLee12138/homebrew-tap`](https://github.com/JsonLee12138/homebrew-tap) is
+automatically synced from the `ruum.rb` asset published with each `Ruum`
+release.
+
+Or install manually:
+
+- **Disk image (`.dmg`):** open `ruum-*-aarch64-macos.dmg` and drag `ruum.app`
+  into `Applications`.
+- **Installer package (`.pkg`):** run `ruum-*-aarch64-macos.pkg` to install
+  `/Applications/ruum.app` and link `/usr/local/bin/ruum`.
+- **Archive (`.zip`):** unzip `ruum-*-aarch64-macos.zip` and drag `ruum.app`
+  into `Applications`.
 
 A release that was not signed and notarized is stopped by Gatekeeper: macOS
 says it "is damaged and can't be opened" or "cannot be verified". The app is
@@ -90,6 +115,7 @@ macOS does not come with Rust; install it with [rustup](https://rustup.rs).
 
 ```sh
 make install     # ~/Applications/ruum.app, and ~/.local/bin/ruum
+make bundle-all  # target/bundle/ruum.app, .zip, .dmg, and .pkg
 make uninstall
 ```
 
@@ -112,21 +138,31 @@ What is different from Linux:
 - **Cloud-only folders** (iCloud Drive, Dropbox and the like, evicted to the
   server) are not opened, so a scan never downloads them.
 
-To sign and notarize a build for others, with a Developer ID certificate in
+To sign and notarize a build for others, with Developer ID certificates in
 the keychain and credentials saved by `xcrun notarytool store-credentials`:
 
 ```sh
-NOTARY_PROFILE=<profile> cargo xtask bundle \
-  --sign "Developer ID Application: Name (TEAMID)" --notarize
+NOTARY_PROFILE=<profile> cargo xtask bundle --all \
+  --sign "Developer ID Application: Name (TEAMID)" \
+  --installer-sign "Developer ID Installer: Name (TEAMID)" \
+  --notarize
 ```
 
 ### Windows
 
-On Windows 10 or 11, download `ruum-*-x86_64-windows.zip`
-(`aarch64-windows` on ARM) from the same release, unpack it anywhere and run
-`ruum.exe`. Or build it with Rust 1.97 or newer, from
-[rustup](https://rustup.rs), and the MSVC toolchain (Visual Studio Build
-Tools, C++ workload):
+On Windows 10 or 11 (`x86_64` or `aarch64`), download an installer or portable
+archive from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest):
+
+- **Installer wizard (`-setup.exe`):** run `ruum-*-x86_64-windows-setup.exe`
+  (supports silent install, Start Menu/Desktop shortcuts, and optional `PATH`
+  registration).
+- **MSI package (`.msi`):** install `ruum-*-x86_64-windows.msi` per-machine
+  with Start Menu shortcut and optional system `PATH` feature.
+- **Portable archive (`.zip`):** unpack `ruum-*-x86_64-windows.zip` anywhere
+  and run `ruum.exe`.
+
+Or build it with Rust 1.97 or newer, from [rustup](https://rustup.rs), and the
+MSVC toolchain (Visual Studio Build Tools, C++ workload):
 
 ```powershell
 git clone https://github.com/JsonLee12138/Ruum.git
@@ -135,6 +171,29 @@ cargo build --release    # target\release\ruum.exe
 ```
 
 See [On Windows](#on-windows) for what differs there.
+
+### Verify downloads & release automation
+
+Every release publishes `SHA256SUMS`, per-artifact `.sha256` files, and Sigstore
+build provenance attestations:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify <downloaded-artifact> --repo JsonLee12138/Ruum
+```
+
+The release workflow works without paid signing certificates or external tokens
+(building ad-hoc on macOS and unsigned on Windows by default). Optional
+repository secrets enable signing and notarization:
+
+- **macOS:** `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`,
+  `MACOS_SIGN_IDENTITY`, optional `MACOS_INSTALLER_SIGN_IDENTITY`,
+  `NOTARY_KEY_P8`, `NOTARY_KEY_ID`, `NOTARY_ISSUER`
+- **Windows:** `WINDOWS_CERT_PFX` (base64 `.pfx`), `WINDOWS_CERT_PASSWORD`
+
+Each release uploads `ruum.rb` as a release asset; `Casks/ruum.rb` is
+automatically synced by `JsonLee12138/homebrew-tap` from that asset without
+configuring a cross-repo `HOMEBREW_TAP_TOKEN` PAT in this repository.
 
 ## Use
 

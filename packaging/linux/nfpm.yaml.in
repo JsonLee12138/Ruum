@@ -1,0 +1,52 @@
+name: "ruum"
+arch: "@NFPM_ARCH@"
+platform: "linux"
+version: "@NFPM_VERSION@"
+section: "utils"
+priority: "optional"
+maintainer: "JsonLee12138 <https://github.com/JsonLee12138/Ruum>"
+description: |
+  GPUI treemap explorer for disk usage.
+  Find what is eating a volume, mark paths for removal, review the list,
+  and remove it with live free-space tracking.
+vendor: "JsonLee12138"
+homepage: "https://github.com/JsonLee12138/Ruum"
+license: "GPL-3.0-only"
+contents:
+  - src: "@BIN_PATH@"
+    dst: "/usr/bin/ruum"
+    file_info:
+      mode: 0755
+  - src: "@DESKTOP_PATH@"
+    dst: "/usr/share/applications/ruum.desktop"
+    file_info:
+      mode: 0644
+  - src: "@ICON_PATH@"
+    dst: "/usr/share/icons/hicolor/scalable/apps/ruum.svg"
+    file_info:
+      mode: 0644
+  - src: "@LICENSE_PATH@"
+    dst: "/usr/share/doc/ruum/LICENSE"
+    file_info:
+      mode: 0644
+  - src: "@README_PATH@"
+    dst: "/usr/share/doc/ruum/README.md"
+    file_info:
+      mode: 0644
+overrides:
+  deb:
+    arch: "@DEB_ARCH@"
+    recommends:
+      - libvulkan1
+      - libxkbcommon0
+      - libwayland-client0
+      - libxcb1
+      - libfontconfig1
+  rpm:
+    arch: "@RPM_ARCH@"
+    recommends:
+      - vulkan-loader
+      - libxkbcommon
+      - libwayland-client
+      - libxcb
+      - fontconfig

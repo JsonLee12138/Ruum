@@ -1,9 +1,10 @@
-//! `cargo xtask bundle`: the macOS app, from a release build.
+//! `cargo xtask bundle`: the macOS app, disk image, and installer package.
 //!
 //! Plain Apple tools and nothing to install: `sips` and `iconutil` draw the
 //! icon from its SVG, `codesign` signs, `ditto` zips the way Finder does
-//! (keeping the signature's extended attributes), and `notarytool` and
-//! `stapler` notarize. Everything lands in `target/bundle/`.
+//! (keeping the signature's extended attributes), `hdiutil` builds `.dmg`,
+//! `pkgbuild` and `productbuild` build `.pkg`, and `notarytool` and `stapler`
+//! notarize. Everything lands in `target/bundle/`.
 //!
 //! Signing is ad hoc unless an identity is given. An ad-hoc app runs on the
 //! Mac that built it; a downloaded one needs a Developer ID signature and
@@ -12,12 +13,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const APP: &str = "ruum.app";
 const EXECUTABLE: &str = "ruum";
+const BUNDLE_ID: &str = "io.github.tobi.ruum";
 /// What the binary is built for at least; `LSMinimumSystemVersion` in
 /// `packaging/macos/Info.plist.in` says the same, and GPUI needs 10.15.7.
 const DEPLOYMENT_TARGET: &str = "11.0";
+
+const DISTRIBUTION_TEMPLATE: &str =
+    include_str!("../../packaging/macos/Distribution.xml.in");
+const POSTINSTALL_SCRIPT: &str =
+    include_str!("../../packaging/macos/scripts/postinstall");
 
 /// The iconset `iconutil` expects: each point size at 1x and 2x.
 const ICON_SIZES: [(&str, u32); 10] = [
@@ -34,23 +42,30 @@ const ICON_SIZES: [(&str, u32); 10] = [
 ];
 
 /// What `bundle` was asked to do.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
     /// A `Developer ID Application: …` identity from the keychain; ad hoc
     /// when absent.
     identity: Option<String>,
+    /// An optional `Developer ID Installer: …` identity for `.pkg`.
+    installer_identity: Option<String>,
     notarize: bool,
+    zip: bool,
+    dmg: bool,
+    pkg: bool,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut options = Options::default();
+    let mut explicit_format = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sign" => {
-                let identity = args
-                    .next()
-                    .ok_or("--sign needs an identity, e.g. \"Developer ID Application: Name (TEAMID)\"")?;
+                let identity = args.next().ok_or(
+                    "--sign needs an identity, e.g. \
+                     \"Developer ID Application: Name (TEAMID)\"",
+                )?;
                 // An empty identity is what CI passes when a secret is
                 // missing; codesign would fail on it without saying why.
                 if identity.trim().is_empty() {
@@ -58,9 +73,39 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 }
                 options.identity = Some(identity.clone());
             }
+            "--installer-sign" => {
+                let identity = args
+                    .next()
+                    .ok_or("--installer-sign needs an identity argument")?;
+                // Empty secret falls back to an unsigned .pkg cleanly.
+                if !identity.trim().is_empty() {
+                    options.installer_identity = Some(identity.clone());
+                }
+            }
             "--notarize" => options.notarize = true,
+            "--zip" => {
+                options.zip = true;
+                explicit_format = true;
+            }
+            "--dmg" => {
+                options.dmg = true;
+                explicit_format = true;
+            }
+            "--pkg" => {
+                options.pkg = true;
+                explicit_format = true;
+            }
+            "--all" => {
+                options.zip = true;
+                options.dmg = true;
+                options.pkg = true;
+                explicit_format = true;
+            }
             other => return Err(format!("unknown bundle option {other}")),
         }
+    }
+    if !explicit_format {
+        options.zip = true;
     }
     if options.notarize && options.identity.is_none() {
         return Err("--notarize needs --sign: Apple notarizes Developer ID \
@@ -77,6 +122,7 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     let options = parse(args)?;
     let root = workspace_root();
     let version = env!("CARGO_PKG_VERSION");
+    let arch = std::env::consts::ARCH;
     let out = root.join("target/bundle");
     let app = out.join(APP);
 
@@ -132,26 +178,61 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
 
     sign(&app, options.identity.as_deref())?;
 
-    let zip = out.join(format!(
-        "ruum-{version}-{}-macos.zip",
-        std::env::consts::ARCH
-    ));
-    archive(&app, &zip)?;
-
-    if options.notarize {
-        notarize(&zip)?;
-        // The ticket is stapled to the app, so zip it again: a zip itself
-        // cannot carry one.
-        tool(Command::new("xcrun").args(["stapler", "staple"]).arg(&app))?;
+    let mut produced = vec![app.clone()];
+    let zip = out.join(format!("ruum-{version}-{arch}-macos.zip"));
+    if options.zip {
         archive(&app, &zip)?;
-        tool(
-            Command::new("spctl")
-                .args(["--assess", "--type", "execute", "-vv"])
-                .arg(&app),
-        )?;
+        if options.notarize {
+            notarize(&zip)?;
+            // The ticket is stapled to the app, so zip it again: a zip itself
+            // cannot carry one.
+            tool(Command::new("xcrun").args(["stapler", "staple"]).arg(&app))?;
+            archive(&app, &zip)?;
+            tool(
+                Command::new("spctl")
+                    .args(["--assess", "--type", "execute", "-vv"])
+                    .arg(&app),
+            )?;
+        }
+        produced.push(zip);
     }
 
-    println!("\n{}\n{}", app.display(), zip.display());
+    if options.dmg {
+        let dmg = out.join(format!("ruum-{version}-{arch}-macos.dmg"));
+        build_dmg(&app, &dmg, &out, options.identity.as_deref())?;
+        if options.notarize {
+            notarize(&dmg)?;
+            tool(Command::new("xcrun").args(["stapler", "staple"]).arg(&dmg))?;
+        }
+        produced.push(dmg);
+    }
+
+    if options.pkg {
+        let pkg = out.join(format!("ruum-{version}-{arch}-macos.pkg"));
+        build_pkg(
+            &app,
+            &pkg,
+            &out,
+            version,
+            arch,
+            options.installer_identity.as_deref(),
+        )?;
+        if should_notarize_pkg(&options) {
+            notarize(&pkg)?;
+            tool(Command::new("xcrun").args(["stapler", "staple"]).arg(&pkg))?;
+        } else if options.notarize {
+            eprintln!(
+                "xtask bundle: skipping notarization for unsigned .pkg \
+                 (pass --installer-sign to sign and notarize .pkg)"
+            );
+        }
+        produced.push(pkg);
+    }
+
+    println!();
+    for path in produced {
+        println!("{}", path.display());
+    }
     Ok(())
 }
 
@@ -227,18 +308,199 @@ fn archive(app: &Path, zip: &Path) -> Result<(), String> {
     )
 }
 
-/// Submit `zip` and wait for Apple's verdict.
+fn build_dmg(
+    app: &Path,
+    dmg: &Path,
+    scratch: &Path,
+    identity: Option<&str>,
+) -> Result<(), String> {
+    let stage = scratch.join("dmg-stage");
+    remove_dir_if_exists(&stage)?;
+    fs::create_dir_all(&stage)
+        .map_err(|err| format!("cannot create {}: {err}", stage.display()))?;
+
+    tool(Command::new("ditto").arg(app).arg(stage.join(APP)))?;
+    create_applications_symlink(&stage.join("Applications"))?;
+
+    if dmg.exists() {
+        fs::remove_file(dmg).map_err(|err| {
+            format!("cannot replace {}: {err}", dmg.display())
+        })?;
+    }
+
+    // Spotlight indexing on fresh staging directories can briefly trigger EBUSY.
+    let backoffs_ms = [500_u64, 1000, 2000];
+    let mut last_err = None;
+    for attempt in 0..=backoffs_ms.len() {
+        let outcome = tool(
+            Command::new("hdiutil")
+                .args(["create", "-volname", "ruum", "-srcfolder"])
+                .arg(&stage)
+                .args(["-ov", "-format", "UDZO"])
+                .arg(dmg),
+        );
+        match outcome {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(err) => {
+                let _ = fs::remove_file(dmg);
+                last_err = Some(err);
+                if let Some(&delay) = backoffs_ms.get(attempt) {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+        }
+    }
+    remove_dir_if_exists(&stage)?;
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+
+    if let Some(id) = identity {
+        tool(
+            Command::new("codesign")
+                .args(["--force", "--timestamp", "--sign"])
+                .arg(id)
+                .arg(dmg),
+        )?;
+    }
+    tool(Command::new("hdiutil").arg("verify").arg(dmg))
+}
+
+fn build_pkg(
+    app: &Path,
+    pkg: &Path,
+    scratch: &Path,
+    version: &str,
+    arch: &str,
+    installer_identity: Option<&str>,
+) -> Result<(), String> {
+    let pkg_root = scratch.join("pkg-root");
+    let pkg_scripts = scratch.join("pkg-scripts");
+    let component_plist = scratch.join("pkg-component.plist");
+    let component_pkg = scratch.join("ruum-component.pkg");
+    let dist_xml = scratch.join("Distribution.xml");
+
+    remove_dir_if_exists(&pkg_root)?;
+    remove_dir_if_exists(&pkg_scripts)?;
+    for file in [&component_plist, &component_pkg, &dist_xml, pkg] {
+        if file.exists() {
+            fs::remove_file(file).map_err(|err| {
+                format!("cannot remove {}: {err}", file.display())
+            })?;
+        }
+    }
+
+    fs::create_dir_all(&pkg_root).map_err(|err| {
+        format!("cannot create {}: {err}", pkg_root.display())
+    })?;
+    fs::create_dir_all(&pkg_scripts).map_err(|err| {
+        format!("cannot create {}: {err}", pkg_scripts.display())
+    })?;
+
+    tool(Command::new("ditto").arg(app).arg(pkg_root.join(APP)))?;
+    let postinstall = pkg_scripts.join("postinstall");
+    write(&postinstall, POSTINSTALL_SCRIPT)?;
+    set_executable(&postinstall)?;
+
+    write(&component_plist, component_plist_xml())?;
+    tool(Command::new("plutil").arg("-lint").arg(&component_plist))?;
+
+    tool(
+        Command::new("pkgbuild")
+            .arg("--root")
+            .arg(&pkg_root)
+            .arg("--component-plist")
+            .arg(&component_plist)
+            .args(["--identifier", &format!("{BUNDLE_ID}.pkg")])
+            .args(["--version", version])
+            .args(["--install-location", "/Applications"])
+            .arg("--scripts")
+            .arg(&pkg_scripts)
+            .arg(&component_pkg),
+    )?;
+
+    write(&dist_xml, &render_distribution_xml(version, arch))?;
+    let mut productbuild = Command::new("productbuild");
+    productbuild
+        .arg("--distribution")
+        .arg(&dist_xml)
+        .arg("--package-path")
+        .arg(scratch);
+    if let Some(id) = installer_identity {
+        productbuild.args(["--sign", id]);
+    }
+    productbuild.arg(pkg);
+    tool(&mut productbuild)?;
+
+    remove_dir_if_exists(&pkg_root)?;
+    remove_dir_if_exists(&pkg_scripts)?;
+    for file in [&component_plist, &component_pkg, &dist_xml] {
+        let _ = fs::remove_file(file);
+    }
+    Ok(())
+}
+
+const fn macos_host_arch(arch: &str) -> &'static str {
+    if arch.eq_ignore_ascii_case("aarch64")
+        || arch.eq_ignore_ascii_case("arm64")
+    {
+        "arm64"
+    } else if arch.eq_ignore_ascii_case("x86_64") {
+        "x86_64"
+    } else {
+        "arm64,x86_64"
+    }
+}
+
+fn render_distribution_xml(version: &str, arch: &str) -> String {
+    DISTRIBUTION_TEMPLATE
+        .replace("@VERSION@", version)
+        .replace("@HOST_ARCH@", macos_host_arch(arch))
+}
+
+const fn component_plist_xml() -> &'static str {
+    concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+        "<plist version=\"1.0\">\n",
+        "<array>\n",
+        "\t<dict>\n",
+        "\t\t<key>BundleHasStrictIdentifier</key>\n",
+        "\t\t<true/>\n",
+        "\t\t<key>BundleIsRelocatable</key>\n",
+        "\t\t<false/>\n",
+        "\t\t<key>BundleIsVersionChecked</key>\n",
+        "\t\t<true/>\n",
+        "\t\t<key>BundleOverwriteAction</key>\n",
+        "\t\t<string>upgrade</string>\n",
+        "\t\t<key>RootRelativeBundlePath</key>\n",
+        "\t\t<string>ruum.app</string>\n",
+        "\t</dict>\n",
+        "</array>\n",
+        "</plist>\n",
+    )
+}
+
+const fn should_notarize_pkg(options: &Options) -> bool {
+    options.notarize && options.pkg && options.installer_identity.is_some()
+}
+
+/// Submit `artifact` and wait for Apple's verdict.
 ///
 /// Credentials come from the environment, never the command line, so they
 /// stay out of shell history and CI logs: `NOTARY_PROFILE`, a keychain
 /// profile saved with `xcrun notarytool store-credentials`, or an App Store
 /// Connect API key as `NOTARY_KEY` (the `.p8` file), `NOTARY_KEY_ID` and
 /// `NOTARY_ISSUER`.
-fn notarize(zip: &Path) -> Result<(), String> {
+fn notarize(artifact: &Path) -> Result<(), String> {
     let mut command = Command::new("xcrun");
     command
         .args(["notarytool", "submit"])
-        .arg(zip)
+        .arg(artifact)
         .arg("--wait");
     if let Ok(profile) = std::env::var("NOTARY_PROFILE") {
         command.arg("--keychain-profile").arg(profile);
@@ -268,6 +530,14 @@ fn workspace_root() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+fn remove_dir_if_exists(dir: &Path) -> Result<(), String> {
+    if dir.exists() {
+        fs::remove_dir_all(dir)
+            .map_err(|err| format!("cannot clear {}: {err}", dir.display()))?;
+    }
+    Ok(())
+}
+
 fn copy(from: &Path, to: &Path) -> Result<(), String> {
     fs::copy(from, to).map(drop).map_err(|err| {
         format!("cannot copy {} to {}: {err}", from.display(), to.display())
@@ -277,6 +547,31 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
 fn write(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents)
         .map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_applications_symlink(link: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink("/Applications", link)
+        .map_err(|err| format!("cannot link {}: {err}", link.display()))
+}
+
+#[cfg(not(unix))]
+fn create_applications_symlink(_link: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let perms = fs::Permissions::from_mode(0o755);
+    fs::set_permissions(path, perms)
+        .map_err(|err| format!("cannot chmod 0755 {}: {err}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Run one tool, inheriting the terminal so its own report is seen.
@@ -305,6 +600,7 @@ mod tests {
     fn signing_is_ad_hoc_unless_an_identity_is_given() {
         let options = parse(&[]).expect("no options");
         assert!(options.identity.is_none() && !options.notarize);
+        assert!(options.zip && !options.dmg && !options.pkg);
         let options = parse(&args(&["--sign", "Developer ID Application: X"]))
             .expect("an identity");
         assert_eq!(
@@ -328,6 +624,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_dmg_pkg_all_and_installer_sign_options() {
+        let dmg_only = parse(&args(&["--dmg"])).expect("--dmg");
+        assert!(!dmg_only.zip && dmg_only.dmg && !dmg_only.pkg);
+
+        let pkg_only = parse(&args(&["--pkg"])).expect("--pkg");
+        assert!(!pkg_only.zip && !pkg_only.dmg && pkg_only.pkg);
+
+        let all = parse(&args(&[
+            "--all",
+            "--sign",
+            "Developer ID Application: X",
+            "--installer-sign",
+            "",
+            "--notarize",
+        ]))
+        .expect("--all with empty installer sign");
+        assert!(all.zip && all.dmg && all.pkg);
+        assert!(all.installer_identity.is_none());
+        assert!(!should_notarize_pkg(&all));
+
+        let signed_pkg = parse(&args(&[
+            "--all",
+            "--sign",
+            "Developer ID Application: X",
+            "--installer-sign",
+            "Developer ID Installer: X",
+            "--notarize",
+        ]))
+        .expect("--all with installer sign");
+        assert_eq!(
+            signed_pkg.installer_identity.as_deref(),
+            Some("Developer ID Installer: X")
+        );
+        assert!(should_notarize_pkg(&signed_pkg));
+
+        assert!(parse(&args(&["--installer-sign"])).is_err());
+    }
+
+    #[test]
     fn the_plist_template_names_the_executable_and_takes_the_version() {
         let plist = include_str!("../../packaging/macos/Info.plist.in");
         assert!(plist.contains(&format!("<string>{EXECUTABLE}</string>")));
@@ -344,5 +679,22 @@ mod tests {
              <string>Copyright (C) 2026 JsonLee12138. \
              Licensed under GPL-3.0-only.</string>"
         ));
+    }
+
+    #[test]
+    fn renders_distribution_xml_and_non_relocatable_component_plist() {
+        let xml = render_distribution_xml("0.1.1", "aarch64");
+        assert!(xml.contains("enable_localSystem=\"true\""));
+        assert!(xml.contains("hostArchitectures=\"arm64\""));
+        assert!(xml.contains("version=\"0.1.1\""));
+        assert!(!xml.contains('@'));
+
+        let xml_intel = render_distribution_xml("0.1.1", "x86_64");
+        assert!(xml_intel.contains("hostArchitectures=\"x86_64\""));
+
+        let comp = component_plist_xml();
+        assert!(comp.contains("<key>BundleIsRelocatable</key>\n\t\t<false/>"));
+        assert!(comp.contains("<string>ruum.app</string>"));
+        assert!(POSTINSTALL_SCRIPT.contains("/usr/local/bin/ruum"));
     }
 }

@@ -70,10 +70,11 @@ jobs:
       - name: Test
         run: cargo xtask test
 
-      # The app bundle, signed ad hoc: catches a broken Info.plist, icon or
-      # signature before a release does.
+      # The app bundle, zip, dmg, and pkg, signed ad hoc: catches a broken
+      # Info.plist, icon, signature, disk image, or installer package before a
+      # release does.
       - name: Bundle
-        run: cargo xtask bundle
+        run: cargo xtask bundle --all
 
   windows:
     name: Lint and test (Windows)

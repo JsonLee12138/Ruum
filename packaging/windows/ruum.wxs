@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="ruum"
+    Manufacturer="JsonLee12138"
+    Version="@MSI_VERSION@"
+    UpgradeCode="E8F4B9A2-6D1C-4B3A-9E7F-2C5A1D8E4B60"
+    Scope="perMachine">
+    <SummaryInformation Description="GPUI treemap explorer for disk usage" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="RuumIcon" SourceFile="@ICON_PATH@" />
+    <Property Id="ARPPRODUCTICON" Value="RuumIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/JsonLee12138/Ruum" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="ruum" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="ruum" />
+    </StandardDirectory>
+
+    <Component Id="MainExecutable" Directory="INSTALLFOLDER" Guid="B7F4E102-1C94-4A6D-9B28-3D71E5A4C001">
+      <File Id="RuumExe" Source="@EXE_PATH@" KeyPath="yes" />
+    </Component>
+
+    <Component Id="ReadmeFile" Directory="INSTALLFOLDER" Guid="B7F4E102-1C94-4A6D-9B28-3D71E5A4C002">
+      <File Id="ReadmeMd" Source="@README_PATH@" KeyPath="yes" />
+    </Component>
+
+    <Component Id="LicenseFile" Directory="INSTALLFOLDER" Guid="B7F4E102-1C94-4A6D-9B28-3D71E5A4C003">
+      <File Id="LicenseTxt" Source="@LICENSE_PATH@" KeyPath="yes" />
+    </Component>
+
+    <Component Id="NoticesFile" Directory="INSTALLFOLDER" Guid="B7F4E102-1C94-4A6D-9B28-3D71E5A4C004">
+      <File Id="NoticesMd" Source="@NOTICES_PATH@" KeyPath="yes" />
+    </Component>
+
+    <Component Id="StartMenuShortcutComponent" Directory="ApplicationProgramsFolder" Guid="7A9E3C21-5B4D-4F82-A1E6-9C3D8B2A5E02">
+      <Shortcut
+        Id="ApplicationStartMenuShortcut"
+        Name="ruum"
+        Description="GPUI treemap explorer for disk usage"
+        Target="[INSTALLFOLDER]ruum.exe"
+        WorkingDirectory="INSTALLFOLDER"
+        Icon="RuumIcon" />
+      <RemoveFolder Id="CleanUpShortcutFolder" On="uninstall" />
+      <RegistryValue
+        Root="HKMU"
+        Key="Software\JsonLee12138\ruum"
+        Name="installed"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+
+    <Component Id="PathEnvComponent" Directory="INSTALLFOLDER" Guid="4D2C7A10-8F3B-4E91-B5C2-1A6D9E3F7C01">
+      <RegistryValue
+        Root="HKMU"
+        Key="Software\JsonLee12138\ruum"
+        Name="path"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+      <Environment
+        Id="PathEntry"
+        Name="PATH"
+        Value="[INSTALLFOLDER]"
+        Permanent="no"
+        Part="last"
+        Action="set"
+        System="yes" />
+    </Component>
+
+    <Feature Id="ProductFeature" Title="ruum" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="ReadmeFile" />
+      <ComponentRef Id="LicenseFile" />
+      <ComponentRef Id="NoticesFile" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+      <Feature Id="AddToPath" Title="Add ruum to system PATH" Level="1">
+        <ComponentRef Id="PathEnvComponent" />
+      </Feature>
+    </Feature>
+  </Package>
+</Wix>

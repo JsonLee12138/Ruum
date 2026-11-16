@@ -1,0 +1,33 @@
+cask "ruum" do
+  arch arm: "aarch64", intel: "x86_64"
+
+  version "@VERSION@"
+
+  on_arm do
+    sha256 "@ARM64_SHA256@"
+  end
+  on_intel do
+    sha256 "@X64_SHA256@"
+  end
+
+  url "https://github.com/@REPO@/releases/download/v#{version}/ruum-#{version}-#{arch}-macos.dmg"
+  name "ruum"
+  desc "GPUI treemap explorer for disk usage"
+  homepage "https://github.com/@REPO@"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on macos: ">= :big_sur"
+
+  app "ruum.app"
+  binary "#{appdir}/ruum.app/Contents/MacOS/ruum"
+
+  zap trash: [
+    "~/Library/Application Support/ruum",
+    "~/Library/Preferences/io.github.tobi.ruum.plist",
+    "~/Library/Saved Application State/io.github.tobi.ruum.savedState",
+  ]
+@CAVEATS@end

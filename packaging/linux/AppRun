@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+APPDIR=${APPDIR:-"$HERE"}
+exec "$APPDIR/usr/bin/ruum" "$@"

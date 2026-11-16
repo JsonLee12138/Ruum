@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+mkdir -p /usr/local/bin
+ln -sf /Applications/ruum.app/Contents/MacOS/ruum /usr/local/bin/ruum

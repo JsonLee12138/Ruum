@@ -9,6 +9,10 @@ description = "Check and packaging entry points for ruum: one command per gate"
 
 [dependencies]
 ruum-core.workspace = true
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

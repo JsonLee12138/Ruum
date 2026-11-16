@@ -47,7 +47,7 @@ define check_install_path
 	fi
 endef
 
-.PHONY: help build run install install-scan uninstall bundle lint test test-ssh ci fmt clean
+.PHONY: help build run install install-scan uninstall bundle bundle-all lint test test-ssh ci fmt clean
 
 help:
 	@echo "ruum"
@@ -58,6 +58,7 @@ help:
 	@echo "  make install     install to $(PREFIX): binary, desktop entry, icon"
 	@echo "                   (macOS: ruum.app into $(APPS))"
 	@echo "  make bundle      macOS: build target/bundle/ruum.app and its zip"
+	@echo "  make bundle-all  macOS: build .app, .zip, .dmg, and .pkg"
 	@echo "  make uninstall   remove what install put there"
 	@echo "  make lint        rustfmt --check and clippy -D warnings"
 	@echo "  make test        core and window-harness tests"
@@ -152,6 +153,9 @@ endif
 
 bundle:
 	$(CARGO) xtask bundle
+
+bundle-all:
+	$(CARGO) xtask bundle --all
 
 clean:
 	$(CARGO) clean

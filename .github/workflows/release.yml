@@ -12,15 +12,17 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Check the tag and draft the release
+  validate:
+    name: Validate tag and version
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
@@ -45,21 +47,13 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # A draft, so nobody downloads from a release still missing half its
-      # builds; `publish` below makes it public once every build is in.
-      - name: Draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --verify-tag \
-              --title "ruum ${TAG#v}" --generate-notes
-          fi
-
   linux:
     name: Build (Linux ${{ matrix.arch }})
-    needs: release
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -73,13 +67,14 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: System libraries
+      - name: System libraries and packaging tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
-            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev \
+            desktop-file-utils rpm cpio
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -95,37 +90,127 @@ jobs:
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           cargo xtask portable
 
-      - name: Package
-        id: package
+      - name: Install nfpm and appimagetool
         env:
-          VERSION: ${{ needs.release.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          nfpm_arch="x86_64"
+          if [ "$ARCH" = "aarch64" ]; then
+            nfpm_arch="arm64"
+          fi
+          mkdir -p "$RUNNER_TEMP/nfpm" "$RUNNER_TEMP/appimage"
+          gh release download --repo goreleaser/nfpm \
+            --pattern "nfpm_*_Linux_${nfpm_arch}.tar.gz" \
+            --pattern "checksums.txt" \
+            --dir "$RUNNER_TEMP/nfpm"
+          (cd "$RUNNER_TEMP/nfpm" && \
+            grep "nfpm_.*_Linux_${nfpm_arch}\.tar\.gz$" checksums.txt \
+              | sha256sum -c -)
+          tar -xzf "$RUNNER_TEMP/nfpm"/nfpm_*_Linux_"${nfpm_arch}".tar.gz \
+            -C "$RUNNER_TEMP/nfpm" nfpm
+          sudo install -m755 "$RUNNER_TEMP/nfpm/nfpm" /usr/local/bin/nfpm
+
+          gh release download continuous --repo AppImage/appimagetool \
+            --pattern "appimagetool-${ARCH}.AppImage" \
+            --dir "$RUNNER_TEMP/appimage"
+          chmod +x "$RUNNER_TEMP/appimage/appimagetool-${ARCH}.AppImage"
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
           name="ruum-$VERSION-$ARCH-linux"
-          mkdir -p "dist/$name"
-          # portable strips before appending; stripping again loses helpers.
-          cp target/portable/ruum "dist/$name/"
-          cp packaging/install.sh packaging/ruum.desktop.in \
-             assets/ruum.svg README.md LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
-          echo "$VERSION" > "dist/$name/VERSION"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          tar_stage="$RUNNER_TEMP/tar-stage/$name"
+          pkg_stage="$RUNNER_TEMP/pkg-stage"
+          verify_dir="$RUNNER_TEMP/verify"
+          rm -rf dist "$tar_stage" "$pkg_stage" "$verify_dir"
+          mkdir -p dist "$tar_stage" "$pkg_stage" "$verify_dir"
 
-      - name: Upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release.outputs.tag }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          # portable strips before appending; stripping again loses helpers.
+          cp target/portable/ruum "$tar_stage/"
+          cp packaging/install.sh packaging/ruum.desktop.in \
+             assets/ruum.svg README.md LICENSE THIRD_PARTY_NOTICES.md \
+             "$tar_stage/"
+          echo "$VERSION" > "$tar_stage/VERSION"
+          tar -C "$RUNNER_TEMP/tar-stage" -czf "dist/$name.tar.gz" "$name"
+
+          cargo xtask package linux-stage \
+            --arch "$ARCH" \
+            --out "$pkg_stage" \
+            --binary target/portable/ruum \
+            --version "$VERSION"
+
+          desktop-file-validate "$pkg_stage/ruum.desktop"
+          desktop-file-validate "$pkg_stage/AppDir/ruum.desktop"
+
+          nfpm package --config "$pkg_stage/nfpm.yaml" \
+            --packager deb --target "dist/$name.deb"
+          nfpm package --config "$pkg_stage/nfpm.yaml" \
+            --packager rpm --target "dist/$name.rpm"
+
+          ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$RUNNER_TEMP/appimage/appimagetool-${ARCH}.AppImage" \
+            "$pkg_stage/AppDir" "dist/$name.AppImage"
+          chmod +x "dist/$name.AppImage"
+
+          # Verify the embedded ruum-scan trailer survived all package formats.
+          deb_member=$(dpkg-deb --fsys-tarfile "dist/$name.deb" | tar -tf - \
+            | grep -E '^(\./)?usr/bin/ruum$' | head -1)
+          dpkg-deb --fsys-tarfile "dist/$name.deb" \
+            | tar -xOf - "$deb_member" > "$verify_dir/ruum-deb"
+          cmp -s target/portable/ruum "$verify_dir/ruum-deb"
+          chmod +x "$verify_dir/ruum-deb"
+          "$verify_dir/ruum-deb" extract-scanner "$ARCH" "$verify_dir/scan-deb"
+
+          rpm_member=$(rpm2cpio "dist/$name.rpm" | cpio -t 2>/dev/null \
+            | grep -E '^(\./)?usr/bin/ruum$' | head -1)
+          rpm2cpio "dist/$name.rpm" \
+            | cpio -i --to-stdout "$rpm_member" > "$verify_dir/ruum-rpm"
+          cmp -s target/portable/ruum "$verify_dir/ruum-rpm"
+          chmod +x "$verify_dir/ruum-rpm"
+          "$verify_dir/ruum-rpm" extract-scanner "$ARCH" "$verify_dir/scan-rpm"
+
+          (cd "$verify_dir" && APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$GITHUB_WORKSPACE/dist/$name.AppImage" \
+            --appimage-extract usr/bin/ruum >/dev/null)
+          cmp -s target/portable/ruum \
+            "$verify_dir/squashfs-root/usr/bin/ruum"
+          "$verify_dir/squashfs-root/usr/bin/ruum" \
+            extract-scanner "$ARCH" "$verify_dir/scan-appimage"
+
+          rm -rf "$verify_dir" "$tar_stage" "$pkg_stage"
+
+      - name: Attest artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.tar.gz
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.deb
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.rpm
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.AppImage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
   macos:
     name: Build (macOS ${{ matrix.arch }})
-    needs: release
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      signed: ${{ steps.signing_state.outputs.signed }}
     strategy:
       matrix:
         include:
-          # `xtask bundle` names the zip after the machine it runs on, so
+          # `xtask bundle` names artifacts after the machine it runs on, so
           # each architecture builds on its own.
           - { runner: macos-15, arch: aarch64 }
           - { runner: macos-15-intel, arch: x86_64 }
@@ -133,15 +218,17 @@ jobs:
     env:
       # Signing and notarizing happen only when the repository has these
       # secrets; without them the app is signed ad hoc, and a downloaded
-      # copy needs "Open Anyway" in System Settings once.
-      #   MACOS_CERTIFICATE           base64 of the Developer ID .p12
-      #   MACOS_CERTIFICATE_PASSWORD  its password
-      #   MACOS_SIGN_IDENTITY         "Developer ID Application: Name (TEAMID)"
-      #   NOTARY_KEY_P8               base64 of an App Store Connect API key
+      # copy needs quarantine removal or "Open Anyway" once.
+      #   MACOS_CERTIFICATE             base64 of the Developer ID .p12
+      #   MACOS_CERTIFICATE_PASSWORD    its password
+      #   MACOS_SIGN_IDENTITY           "Developer ID Application: Name (TEAMID)"
+      #   MACOS_INSTALLER_SIGN_IDENTITY "Developer ID Installer: Name (TEAMID)"
+      #   NOTARY_KEY_P8                 base64 of an App Store Connect API key
       #   NOTARY_KEY_ID, NOTARY_ISSUER  that key's ID and issuer
       MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
       MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      MACOS_INSTALLER_SIGN_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGN_IDENTITY }}
       NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
       NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
       NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
@@ -170,7 +257,10 @@ jobs:
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
           security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/productbuild \
+            -T /usr/bin/productsign
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$password" "$keychain"
           security list-keychains -d user -s "$keychain" \
@@ -178,34 +268,66 @@ jobs:
           rm "$RUNNER_TEMP/cert.p12"
 
       - name: Bundle
+        id: signing_state
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          args=()
-          if [ -n "$MACOS_CERTIFICATE" ]; then
+          trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
+          args=(--all)
+          signed=false
+          if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_SIGN_IDENTITY" ]; then
             args+=(--sign "$MACOS_SIGN_IDENTITY")
+            if [ -n "$MACOS_INSTALLER_SIGN_IDENTITY" ]; then
+              args+=(--installer-sign "$MACOS_INSTALLER_SIGN_IDENTITY")
+            fi
             if [ -n "$NOTARY_KEY_P8" ]; then
               echo "$NOTARY_KEY_P8" | base64 --decode \
                 > "$RUNNER_TEMP/AuthKey.p8"
               export NOTARY_KEY="$RUNNER_TEMP/AuthKey.p8"
               args+=(--notarize)
+              signed=true
             fi
           fi
           cargo xtask bundle "${args[@]}"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
 
-      - name: Upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release.outputs.tag }}
-          VERSION: ${{ needs.release.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          zip="target/bundle/ruum-$VERSION-$ARCH-macos.zip"
-          (cd "$(dirname "$zip")" && shasum -a 256 "$(basename "$zip")" \
-            > "$(basename "$zip").sha256")
-          gh release upload "$TAG" "$zip" "$zip.sha256" --clobber
+          mkdir -p dist
+          for ext in zip dmg pkg; do
+            cp "target/bundle/ruum-$VERSION-$ARCH-macos.$ext" dist/
+          done
+
+          hdiutil verify "dist/ruum-$VERSION-$ARCH-macos.dmg"
+          pkgutil --expand "dist/ruum-$VERSION-$ARCH-macos.pkg" \
+            "$RUNNER_TEMP/pkg-expanded"
+          lsbom "$RUNNER_TEMP/pkg-expanded"/*/Bom \
+            | grep -q "ruum.app/Contents/MacOS/ruum"
+          rm -rf "$RUNNER_TEMP/pkg-expanded"
+
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+
+      - name: Attest artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-macos.zip
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-macos.dmg
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-macos.pkg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
   windows:
     name: Build (Windows ${{ matrix.arch }})
-    needs: release
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -217,6 +339,8 @@ jobs:
       # C++ runtime was never installed. For the tests too, so both steps
       # share one build.
       RUSTFLAGS: -C target-feature=+crt-static
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
     steps:
       - run: git config --global core.autocrlf false
 
@@ -236,37 +360,229 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p ruum-app
 
+      - name: Install WiX and verify Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dotnetTools = Join-Path $env:USERPROFILE ".dotnet\tools"
+          $dotnetTools >> $env:GITHUB_PATH
+          if (-not (Test-Path (Join-Path $dotnetTools "wix.exe")) -and
+              -not (Get-Command wix.exe -ErrorAction SilentlyContinue)) {
+            dotnet tool install --global wix
+            if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed" }
+          }
+
+          $innoCandidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          function Find-InnoCompiler {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            return $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          function Test-InnoVersion([string]$path) {
+            if (-not $path -or -not (Test-Path $path)) { return $false }
+            $rawVer = (Get-Item $path).VersionInfo.ProductVersion
+            if ($rawVer -match '^\d+\.\d+') {
+              $ver = [Version](($rawVer -split '[^0-9.]')[0])
+              return ($ver -ge [Version]"6.3")
+            }
+            return $false
+          }
+
+          $iscc = Find-InnoCompiler
+          if (-not (Test-InnoVersion $iscc)) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install innosetup -y --no-progress
+              if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+            } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+              winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+              if ($LASTEXITCODE -ne 0) { throw "winget install InnoSetup failed with exit code $LASTEXITCODE" }
+            } else {
+              throw "Neither choco nor winget is available to install Inno Setup >= 6.3"
+            }
+            $iscc = Find-InnoCompiler
+          }
+          if (-not (Test-InnoVersion $iscc)) {
+            throw "ISCC.exe (Inno Setup >= 6.3) not found or version is below 6.3"
+          }
+          "ISCC_PATH=$iscc" >> $env:GITHUB_ENV
+
       - name: Package
-        id: package
         shell: pwsh
         env:
-          VERSION: ${{ needs.release.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
-          $name = "ruum-$env:VERSION-$env:ARCH-windows"
-          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/ruum.exe, README.md, LICENSE, THIRD_PARTY_NOTICES.md "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          # The format `sha256sum -c` reads, with a Unix line ending.
-          [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
-          "archive=dist/$name.zip" >> $env:GITHUB_OUTPUT
+          $ErrorActionPreference = "Stop"
 
-      - name: Upload
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release.outputs.tag }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          function Resolve-SignTool {
+            $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            $sdkRoots = @(
+              "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe",
+              "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\arm64\signtool.exe",
+              "${env:ProgramFiles(x86)}\Windows Kits\10\bin\x64\signtool.exe"
+            )
+            foreach ($pattern in $sdkRoots) {
+              $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+              if ($found) { return $found.FullName }
+            }
+            throw "signtool.exe not found"
+          }
+
+          $pfxPath = $null
+          $signtool = $null
+          if (-not [string]::IsNullOrEmpty($env:WINDOWS_CERT_PFX)) {
+            $signtool = Resolve-SignTool
+            $pfxPath = Join-Path $env:RUNNER_TEMP "cert.pfx"
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+            $signArgs = @("sign", "/f", $pfxPath)
+            if (-not [string]::IsNullOrEmpty($env:WINDOWS_CERT_PASSWORD)) {
+              $signArgs += @("/p", $env:WINDOWS_CERT_PASSWORD)
+            }
+            $signArgs += @("/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256")
+            & $signtool @signArgs "target\release\ruum.exe"
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed on ruum.exe" }
+          }
+
+          $stageDir = Join-Path $env:RUNNER_TEMP "win-stage"
+          if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          New-Item -ItemType Directory -Force dist, $stageDir | Out-Null
+
+          $exeAbs = (Resolve-Path "target\release\ruum.exe").Path
+          $stageOutput = cargo xtask package windows-stage `
+            --arch $env:ARCH `
+            --out $stageDir `
+            --exe $exeAbs `
+            --version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "cargo xtask package windows-stage failed" }
+          $wixArchLine = $stageOutput | Where-Object { $_ -like "WIX_ARCH=*" } | Select-Object -First 1
+          $wixArch = ($wixArchLine -split "=", 2)[1].Trim()
+
+          $name = "ruum-$env:VERSION-$env:ARCH-windows"
+          $zipStage = Join-Path $stageDir "zip\$name"
+          New-Item -ItemType Directory -Force $zipStage | Out-Null
+          Copy-Item "target\release\ruum.exe", README.md, LICENSE, THIRD_PARTY_NOTICES.md $zipStage
+          Compress-Archive -Path $zipStage -DestinationPath "dist\$name.zip"
+
+          wix build (Join-Path $stageDir "ruum.wxs") -arch $wixArch -o "dist\$name.msi"
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+
+          & $env:ISCC_PATH (Join-Path $stageDir "ruum.iss")
+          if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed" }
+          Move-Item (Join-Path $stageDir "$name-setup.exe") "dist\$name-setup.exe"
+
+          if ($pfxPath) {
+            $signArgs = @("sign", "/f", $pfxPath)
+            if (-not [string]::IsNullOrEmpty($env:WINDOWS_CERT_PASSWORD)) {
+              $signArgs += @("/p", $env:WINDOWS_CERT_PASSWORD)
+            }
+            $signArgs += @("/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256")
+            foreach ($installer in @("dist\$name.msi", "dist\$name-setup.exe")) {
+              & $signtool @signArgs $installer
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed on $installer" }
+            }
+            Remove-Item -Force $pfxPath
+          }
+
+          Remove-Item -Recurse -Force $stageDir
+
+      - name: Attest artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-windows.zip
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-windows.msi
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-windows-setup.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
   publish:
     name: Publish
-    needs: [release, linux, macos, windows]
+    needs: [validate, linux, macos, windows]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - name: Publish
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and Homebrew cask
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          REPO: ${{ github.repository }}
+          MACOS_SIGNED: ${{ needs.macos.outputs.signed }}
+        run: |
+          cargo xtask package checksums --dir dist
+          arm64_sha=$(awk '{print $1}' "dist/ruum-$VERSION-aarch64-macos.dmg.sha256")
+          x64_sha=$(awk '{print $1}' "dist/ruum-$VERSION-x86_64-macos.dmg.sha256")
+          cask_args=(
+            --version "$VERSION"
+            --arm64-sha256 "$arm64_sha"
+            --x64-sha256 "$x64_sha"
+            --repo "$REPO"
+            --out "dist/ruum.rb"
+          )
+          if [ "$MACOS_SIGNED" = "true" ]; then
+            cask_args+=(--signed)
+          fi
+          cargo xtask package homebrew-cask "${cask_args[@]}"
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release.outputs.tag }}
-        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          create_flags=(--draft --verify-tag --title "ruum $VERSION" --generate-notes)
+          edit_flags=(--draft=false)
+          if [[ "$TAG" == *-* ]]; then
+            create_flags+=(--prerelease)
+            edit_flags+=(--prerelease --latest=false)
+          else
+            edit_flags+=(--latest)
+          fi
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              "${create_flags[@]}"
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            "${edit_flags[@]}"
+          echo "::notice::Homebrew Cask (dist/ruum.rb) is published as a release asset and synced automatically by JsonLee12138/homebrew-tap (.github/workflows/sync.yml). To sync immediately, run: gh workflow run sync.yml --repo JsonLee12138/homebrew-tap"
+          {
+            echo "### Homebrew Cask Sync"
+            echo ""
+            echo "\`dist/ruum.rb\` has been uploaded to release \`$TAG\`."
+            echo "[\`JsonLee12138/homebrew-tap\`](https://github.com/JsonLee12138/homebrew-tap) syncs \`Casks/ruum.rb\` automatically via \`.github/workflows/sync.yml\`."
+            echo ""
+            echo "To trigger sync immediately:"
+            echo ""
+            echo "\`\`\`sh"
+            echo "gh workflow run sync.yml --repo JsonLee12138/homebrew-tap"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

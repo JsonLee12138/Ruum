@@ -25,6 +25,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use crate::i18n::Locale;
+use crate::trash_adapter::{
+    ALREADY_IN_TRASH_REASON, TrashAdapter, TrashAdapterFactory,
+    TrashDisposition, TrashEnv,
+};
 
 /// One path the user asked to remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,15 +154,56 @@ impl Plan {
 /// Paths outside `root` are blocked rather than removed: the tree the user was
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
-    plan_against(targets, root, &mount_points())
+    plan_for_mode(targets, root, RemovalMode::Permanent)
 }
 
-/// [`plan`] against a given read of the mount table, for testing.
+/// Build the plan for `targets` under `root` for a specific [`RemovalMode`].
+pub fn plan_for_mode(
+    targets: &[Target],
+    root: &Path,
+    mode: RemovalMode,
+) -> Plan {
+    let adapter = TrashAdapterFactory::create();
+    let env = TrashEnv::current();
+    plan_against(targets, root, mode, &mount_points(), adapter.as_ref(), &env)
+}
+
+/// Build the plan using an explicit [`TrashAdapter`] and [`TrashEnv`], for
+/// cross-OS testing.
+pub fn plan_with_trash_adapter(
+    targets: &[Target],
+    root: &Path,
+    mode: RemovalMode,
+    adapter: &dyn TrashAdapter,
+    env: &TrashEnv,
+) -> Plan {
+    plan_against(targets, root, mode, &mount_points(), adapter, env)
+}
+
+/// Whether `path` resolves to a trash container or item inside one on the
+/// current OS.
+pub fn is_trash_target(path: &Path) -> bool {
+    let adapter = TrashAdapterFactory::create();
+    let env = TrashEnv::current();
+    let mounts = mount_points();
+    adapter
+        .classify(&normalize(path), &env, &mounts.points)
+        .is_trash()
+}
+
+/// [`plan_for_mode`] against a given read of the mount table, for testing.
 ///
 /// One read answers both what may be removed and which volume each target's
 /// bytes belong to, so the projection cannot be built from a state of the
 /// machine the guards never saw.
-fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
+fn plan_against(
+    targets: &[Target],
+    root: &Path,
+    mode: RemovalMode,
+    mounts: &MountTable,
+    adapter: &dyn TrashAdapter,
+    env: &TrashEnv,
+) -> Plan {
     let root = normalize(root);
     let mut plan = Plan {
         root: root.clone(),
@@ -170,7 +215,7 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
         return plan;
     }
     // Once per plan, not per target: the review screen plans every frame.
-    let home = std::env::home_dir().map(|home| Home::of(&home));
+    let home = env.home.as_deref().map(Home::of);
     let real_root = fs::canonicalize(&root).ok();
 
     for target in targets {
@@ -179,6 +224,18 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
             refuse(&path, &root, home.as_ref(), &mounts.points, &mounts.media)
                 .or_else(|| {
                     linked(&path, &root, real_root.as_deref(), home.as_ref())
+                })
+                .or_else(|| {
+                    match adapter.classify(&path, env, &mounts.points) {
+                        TrashDisposition::NotTrash => None,
+                        TrashDisposition::BlockedAlways(reason) => {
+                            Some(reason.to_owned())
+                        }
+                        TrashDisposition::Container(_)
+                        | TrashDisposition::Entry { .. } => (mode
+                            == RemovalMode::Trash)
+                            .then(|| ALREADY_IN_TRASH_REASON.to_owned()),
+                    }
                 });
         if let Some(reason) = reason {
             plan.blocked.push(Blocked {
@@ -284,7 +341,7 @@ fn guard_key(path: &Path) -> PathBuf {
     guard_key_for(path, cfg!(target_os = "macos"))
 }
 
-fn guard_key_for(path: &Path, macos: bool) -> PathBuf {
+pub(crate) fn guard_key_for(path: &Path, macos: bool) -> PathBuf {
     let path = normalize(path);
     if !macos {
         return path;
@@ -362,7 +419,6 @@ fn system_trees() -> Vec<PathBuf> {
             "Program Files (x86)",
             "ProgramData",
             "System Volume Information",
-            "$Recycle.Bin",
             "Recovery",
             "Boot",
             "bootmgr",
@@ -1106,7 +1162,24 @@ impl RemovalHandle {
 }
 
 /// Start removing the plan's targets on a worker thread.
+/// Run the removal worker for `plan` in `mode` on a background thread.
 pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
+    spawn_with_trash_adapter(
+        plan,
+        mode,
+        TrashAdapterFactory::create(),
+        TrashEnv::current(),
+    )
+}
+
+/// Run the removal worker using an explicit [`TrashAdapter`] and [`TrashEnv`],
+/// for deterministic cross-OS testing.
+pub fn spawn_with_trash_adapter(
+    plan: Plan,
+    mode: RemovalMode,
+    trash_adapter: Box<dyn TrashAdapter>,
+    trash_env: TrashEnv,
+) -> RemovalHandle {
     let (sender, events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
@@ -1118,7 +1191,17 @@ pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
 
     let worker = thread::Builder::new().name("ruum-remove".into()).spawn({
         let sender = sender.clone();
-        move || run(&plan, mode, backend, &worker_cancel, &sender)
+        move || {
+            run(
+                &plan,
+                mode,
+                backend,
+                trash_adapter.as_ref(),
+                &trash_env,
+                &worker_cancel,
+                &sender,
+            );
+        }
     });
     if let Err(error) = worker {
         let _ = sender.send(RemovalEvent::Item {
@@ -1133,10 +1216,16 @@ pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
     RemovalHandle { events, cancel }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "worker entrypoint accepts injected trash adapter and env for tests"
+)]
 fn run(
     plan: &Plan,
     mode: RemovalMode,
     backend: TrashBackend,
+    trash_adapter: &dyn TrashAdapter,
+    trash_env: &TrashEnv,
     cancel: &AtomicBool,
     sender: &mpsc::Sender<RemovalEvent>,
 ) {
@@ -1153,7 +1242,7 @@ fn run(
     // Links too: one put on the way down since the plan was made would lead
     // the trash out of the root. Permanent removal on Unix refuses that by
     // itself; see [`open_parent`].
-    let home = std::env::home_dir().map(|home| Home::of(&home));
+    let home = trash_env.home.as_deref().map(Home::of);
     let real_root = fs::canonicalize(&plan.root).ok();
 
     for target in &plan.targets {
@@ -1187,11 +1276,26 @@ fn run(
         let outcome = if let Some(reason) = reason {
             Err(io::Error::other(reason))
         } else {
-            match mode {
-                RemovalMode::Permanent => {
-                    remove_permanently(&target.path, &plan.root)
+            let disposition =
+                trash_adapter.classify(&target.path, trash_env, &mounts.points);
+            match disposition {
+                TrashDisposition::BlockedAlways(reason) => {
+                    Err(io::Error::other(reason))
                 }
-                RemovalMode::Trash => move_to_trash(&target.path, backend),
+                TrashDisposition::Container(_)
+                | TrashDisposition::Entry { .. }
+                    if mode == RemovalMode::Trash =>
+                {
+                    Err(io::Error::other(ALREADY_IN_TRASH_REASON))
+                }
+                _ => match mode {
+                    RemovalMode::Permanent => trash_adapter.remove_permanent(
+                        &target.path,
+                        &plan.root,
+                        &disposition,
+                    ),
+                    RemovalMode::Trash => move_to_trash(&target.path, backend),
+                },
             }
         };
         if outcome.is_ok() {
@@ -1281,7 +1385,7 @@ pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
 /// the root are followed: they are how the user named it, and on macOS
 /// `/tmp` and `/var` are links themselves.
 #[cfg(unix)]
-fn open_parent<'a>(
+pub(crate) fn open_parent<'a>(
     path: &'a Path,
     root: &Path,
 ) -> io::Result<(std::os::fd::OwnedFd, &'a std::ffi::OsStr)> {
@@ -1377,7 +1481,7 @@ pub fn remove_permanently(path: &Path, _root: &Path) -> io::Result<()> {
 
 /// Where a directory lives, as far as crossing into another filesystem goes.
 #[cfg(unix)]
-struct Volume {
+pub(crate) struct Volume {
     device: rustix::fs::Stat,
     /// The mount the directory belongs to, where the kernel reports it (Linux,
     /// `statx`). See [`Self::contains`].
@@ -1386,7 +1490,7 @@ struct Volume {
 
 #[cfg(unix)]
 impl Volume {
-    fn of(dir: &std::os::fd::OwnedFd) -> io::Result<Self> {
+    pub(crate) fn of(dir: &std::os::fd::OwnedFd) -> io::Result<Self> {
         Ok(Self {
             device: rustix::fs::fstat(dir)?,
             mount: mount_id(dir),
@@ -1399,7 +1503,7 @@ impl Volume {
     /// volume, so it goes with the directory it is in; a bind mount keeps
     /// `st_dev` but is a mount of its own, and stops the removal. Without
     /// mount IDs (macOS) the device decides.
-    const fn contains(&self, other: &Self) -> bool {
+    pub(crate) const fn contains(&self, other: &Self) -> bool {
         match (self.mount, other.mount) {
             (Some(one), Some(two)) => one == two,
             _ => self.device.st_dev == other.device.st_dev,
@@ -1422,7 +1526,7 @@ const fn mount_id(_dir: &std::os::fd::OwnedFd) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn open_dir<P: rustix::path::Arg>(
+pub(crate) fn open_dir<P: rustix::path::Arg>(
     parent: impl std::os::fd::AsFd,
     name: P,
 ) -> rustix::io::Result<std::os::fd::OwnedFd> {
@@ -1435,17 +1539,11 @@ fn open_dir<P: rustix::path::Arg>(
     )
 }
 
-/// Empty the directory open at `dir`, staying on the volume of `top`.
 #[cfg(unix)]
-fn remove_contents(
+fn read_dir_entries(
     dir: &std::os::fd::OwnedFd,
-    top: &Volume,
-    path: &Path,
-) -> io::Result<()> {
-    use rustix::fs::{AtFlags, Dir, FileType, unlinkat};
-    use rustix::io::Errno;
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt as _;
+) -> io::Result<Vec<(std::ffi::CString, rustix::fs::FileType)>> {
+    use rustix::fs::Dir;
 
     // Names first, then removal: unlinking while a directory stream is open
     // on the same directory may skip entries.
@@ -1457,8 +1555,22 @@ fn remove_contents(
             entries.push((name.to_owned(), entry.file_type()));
         }
     }
+    Ok(entries)
+}
 
-    for (name, kind) in entries {
+/// Empty the directory open at `dir`, staying on the volume of `top`.
+#[cfg(unix)]
+fn remove_contents(
+    dir: &std::os::fd::OwnedFd,
+    top: &Volume,
+    path: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, unlinkat};
+    use rustix::io::Errno;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    for (name, kind) in read_dir_entries(dir)? {
         if !matches!(kind, FileType::Directory | FileType::Unknown) {
             unlinkat(dir, &name, AtFlags::empty())?;
             continue;
@@ -1489,14 +1601,223 @@ fn remove_contents(
     Ok(())
 }
 
+/// Remove one entry inside `parent` best-effort, never following symlinks or
+/// crossing mount boundaries.
+#[cfg(unix)]
+fn remove_entry_at_best_effort(
+    parent: &std::os::fd::OwnedFd,
+    top: &Volume,
+    parent_path: &Path,
+    name: &std::ffi::CStr,
+    kind: rustix::fs::FileType,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, unlinkat};
+    use rustix::io::Errno;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if !matches!(kind, FileType::Directory | FileType::Unknown) {
+        unlinkat(parent, name, AtFlags::empty())?;
+        return Ok(());
+    }
+    let child = match open_dir(parent, name) {
+        Ok(child) => child,
+        Err(Errno::NOTDIR | Errno::LOOP) => {
+            unlinkat(parent, name, AtFlags::empty())?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let child_path = parent_path.join(OsStr::from_bytes(name.to_bytes()));
+    if !top.contains(&Volume::of(&child)?) {
+        return Err(io::Error::other(format!(
+            "stopped at {}: another filesystem is mounted there, and nothing \
+             on it was touched",
+            child_path.display()
+        )));
+    }
+    drain_dir_best_effort(&child, top, &child_path)?;
+    drop(child);
+    unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    Ok(())
+}
+
+/// Best-effort drain of a container directory, continuing past per-entry
+/// failures and summarizing any errors at the end.
+#[cfg(unix)]
+pub(crate) fn drain_dir_best_effort(
+    dir: &std::os::fd::OwnedFd,
+    top: &Volume,
+    dir_path: &Path,
+) -> io::Result<()> {
+    let entries = read_dir_entries(dir)?;
+    let mut failures = 0_usize;
+    let mut first_error: Option<io::Error> = None;
+    for (name, kind) in entries {
+        if let Err(err) =
+            remove_entry_at_best_effort(dir, top, dir_path, &name, kind)
+        {
+            failures += 1;
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(summarize_drain_errors(failures, first_error))
+    }
+}
+
+/// Best-effort drain of an XDG `files/` directory, unlinking each entry's
+/// `info/<name>.trashinfo` only after the entry itself is removed.
+#[cfg(unix)]
+pub(crate) fn drain_xdg_files_best_effort(
+    files_dir: &std::os::fd::OwnedFd,
+    files_vol: &Volume,
+    files_path: &Path,
+    info_dir: Option<&std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, unlinkat};
+    use rustix::io::Errno;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let entries = read_dir_entries(files_dir)?;
+    let mut failures = 0_usize;
+    let mut first_error: Option<io::Error> = None;
+    for (name, kind) in entries {
+        match remove_entry_at_best_effort(
+            files_dir, files_vol, files_path, &name, kind,
+        ) {
+            Ok(()) => {
+                if let Some(info_fd) = info_dir {
+                    let mut info_name =
+                        OsString::from(OsStr::from_bytes(name.to_bytes()));
+                    info_name.push(".trashinfo");
+                    match unlinkat(info_fd, &info_name, AtFlags::empty()) {
+                        Ok(()) | Err(Errno::NOENT) => {}
+                        Err(err) => {
+                            failures += 1;
+                            if first_error.is_none() {
+                                first_error = Some(err.into());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                failures += 1;
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(summarize_drain_errors(failures, first_error))
+    }
+}
+
+/// Remove a paired `<xdg_root>/info/<name>.trashinfo` safely via `O_NOFOLLOW`
+/// and a [`Volume::contains`] check from `<xdg_root>`, tolerating `NotFound`.
+#[cfg(unix)]
+pub(crate) fn remove_paired_trashinfo(info_path: &Path) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+    use rustix::io::Errno;
+
+    let Some(info_dir) = info_path.parent() else {
+        return Ok(());
+    };
+    let Some(info_name) = info_path.file_name() else {
+        return Ok(());
+    };
+    let Some(xdg_root) = info_dir.parent() else {
+        return Ok(());
+    };
+    let xdg_fd = match open_dir(rustix::fs::CWD, xdg_root) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(io::Error::other(format!(
+                "refused to follow symlink or non-directory at {}",
+                xdg_root.display()
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let xdg_vol = Volume::of(&xdg_fd)?;
+    match statat(&xdg_fd, "info", AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let kind = FileType::from_raw_mode(stat.st_mode);
+            if kind == FileType::Symlink {
+                return Err(io::Error::other(format!(
+                    "refused to follow symlink at {}",
+                    info_dir.display()
+                )));
+            }
+            if kind != FileType::Directory {
+                return Err(io::Error::other(format!(
+                    "{} is not a directory",
+                    info_dir.display()
+                )));
+            }
+        }
+        Err(Errno::NOENT) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    }
+    let info_fd = match open_dir(&xdg_fd, "info") {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(io::Error::other(format!(
+                "refused to follow symlink at {}",
+                info_dir.display()
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if !xdg_vol.contains(&Volume::of(&info_fd)?) {
+        return Err(io::Error::other(format!(
+            "stopped at {}: another filesystem is mounted there, and nothing \
+             on it was touched",
+            info_dir.display()
+        )));
+    }
+    match unlinkat(&info_fd, info_name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Summarize one or more best-effort drain failures into a single `io::Error`.
+pub(crate) fn summarize_drain_errors(
+    failures: usize,
+    first_error: Option<io::Error>,
+) -> io::Error {
+    let noun = if failures == 1 { "item" } else { "items" };
+    match first_error {
+        Some(first) => io::Error::new(
+            first.kind(),
+            format!(
+                "failed to remove {failures} {noun} (first error: {first})"
+            ),
+        ),
+        None => io::Error::other(format!("failed to remove {failures} {noun}")),
+    }
+}
+
 #[cfg(windows)]
-fn is_dir_link(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_dir_link(meta: &fs::Metadata) -> bool {
     use std::os::windows::fs::FileTypeExt as _;
     meta.file_type().is_symlink_dir()
 }
 
-#[cfg(not(any(unix, windows)))]
-const fn is_dir_link(_meta: &fs::Metadata) -> bool {
+#[cfg(not(windows))]
+pub(crate) const fn is_dir_link(_meta: &fs::Metadata) -> bool {
     false
 }
 
@@ -1881,7 +2202,16 @@ mod tests {
             target(Path::new("/data/junk"), 200),
             target(Path::new("/.snapshots/7/junk"), 400),
         ];
-        let plan = plan_against(&marked, Path::new("/"), &mounts);
+        let adapter = TrashAdapterFactory::create();
+        let env = TrashEnv::default();
+        let plan = plan_against(
+            &marked,
+            Path::new("/"),
+            RemovalMode::Permanent,
+            &mounts,
+            adapter.as_ref(),
+            &env,
+        );
         assert!(
             plan.blocked.is_empty(),
             "a mark inside another volume is legal: {:?}",
@@ -1898,7 +2228,14 @@ mod tests {
             target(Path::new("/home/tobi/junk"), 100),
             target(Path::new("/home/tobi/junk/deeper"), 60),
         ];
-        let plan = plan_against(&nested, Path::new("/"), &mounts);
+        let plan = plan_against(
+            &nested,
+            Path::new("/"),
+            RemovalMode::Permanent,
+            &mounts,
+            adapter.as_ref(),
+            &env,
+        );
         assert_eq!(plan.covered.len(), 1);
         assert_eq!(plan.bytes(), 100);
         assert_eq!(plan.reclaim(), 100);
@@ -1912,8 +2249,14 @@ mod tests {
             ..MountTable::default()
         };
         let root = Path::new("/ruum-untabled");
-        let plan =
-            plan_against(&[target(&root.join("junk"), 50)], root, &partial);
+        let plan = plan_against(
+            &[target(&root.join("junk"), 50)],
+            root,
+            RemovalMode::Permanent,
+            &partial,
+            adapter.as_ref(),
+            &env,
+        );
         assert_eq!(plan.bytes(), 50);
         assert_eq!(plan.reclaim(), 0);
         assert_eq!(plan.foreign(), 0);
@@ -2775,5 +3118,175 @@ mod tests {
         for path in ["/Applications/Xcode.app", "/Users/tobi/Library/Caches"] {
             assert_eq!(tree_of(Path::new(path), home), None, "{path}");
         }
+    }
+
+    #[test]
+    fn plan_for_mode_blocks_trash_targets_in_trash_mode() {
+        let temp = tree();
+        let root = temp.path();
+        let trash = root.join(".Trash");
+        fs::create_dir_all(&trash).expect("mkdir");
+        fs::write(trash.join("item.bin"), b"123").expect("write");
+
+        let mac = TrashAdapterFactory::create_for(
+            crate::trash_adapter::TrashOs::MacOs,
+        );
+        let env = TrashEnv {
+            home: Some(root.to_path_buf()),
+            xdg_data_home: None,
+            uid: Some(501),
+        };
+        let targets = [target(&trash, 3)];
+
+        let trash_plan = plan_with_trash_adapter(
+            &targets,
+            root,
+            RemovalMode::Trash,
+            mac.as_ref(),
+            &env,
+        );
+        assert!(trash_plan.is_empty());
+        assert_eq!(trash_plan.blocked.len(), 1);
+        assert_eq!(trash_plan.blocked[0].reason, ALREADY_IN_TRASH_REASON);
+
+        let perm_plan = plan_with_trash_adapter(
+            &targets,
+            root,
+            RemovalMode::Permanent,
+            mac.as_ref(),
+            &env,
+        );
+        assert_eq!(perm_plan.targets.len(), 1);
+        assert!(perm_plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_with_trash_adapter_blocks_other_user_and_desktop_ini_always() {
+        let temp = tree();
+        let root = temp.path();
+        let mounts = MountTable {
+            points: vec![guard_key(root)],
+            media: Vec::new(),
+            mounts: None,
+        };
+        let mac = TrashAdapterFactory::create_for(
+            crate::trash_adapter::TrashOs::MacOs,
+        );
+        let env = TrashEnv {
+            home: None,
+            xdg_data_home: None,
+            uid: Some(501),
+        };
+        let other_trashes = root.join(".Trashes/502");
+        fs::create_dir_all(&other_trashes).expect("mkdir");
+        for mode in [RemovalMode::Trash, RemovalMode::Permanent] {
+            let p = plan_against(
+                &[target(&other_trashes, 10)],
+                root,
+                mode,
+                &mounts,
+                mac.as_ref(),
+                &env,
+            );
+            assert!(p.is_empty(), "other user's .Trashes blocked in {mode:?}");
+            assert_eq!(
+                p.blocked[0].reason,
+                crate::trash_adapter::OTHER_USER_TRASH_REASON
+            );
+        }
+
+        let win = TrashAdapterFactory::create_for(
+            crate::trash_adapter::TrashOs::Windows,
+        );
+        let ini = root.join("$Recycle.Bin/S-1-5-21-100/desktop.ini");
+        fs::create_dir_all(ini.parent().expect("parent")).expect("mkdir");
+        fs::write(&ini, b"[.ShellClassInfo]").expect("write");
+        for mode in [RemovalMode::Trash, RemovalMode::Permanent] {
+            let p = plan_against(
+                &[target(&ini, 10)],
+                root,
+                mode,
+                &mounts,
+                win.as_ref(),
+                &env,
+            );
+            assert!(p.is_empty(), "desktop.ini blocked in {mode:?}");
+            assert_eq!(
+                p.blocked[0].reason,
+                crate::trash_adapter::RECYCLE_BIN_METADATA_REASON
+            );
+        }
+    }
+
+    #[test]
+    fn is_trash_target_identifies_host_trash() {
+        let env = TrashEnv::current();
+        if cfg!(target_os = "macos")
+            && let Some(home) = env.home
+        {
+            assert!(is_trash_target(&home.join(".Trash")));
+            assert!(is_trash_target(&home.join(".Trash/some-file")));
+            assert!(!is_trash_target(&home.join("Documents")));
+        } else if cfg!(windows) {
+            assert!(is_trash_target(Path::new(r"C:\$Recycle.Bin")));
+            assert!(is_trash_target(Path::new(r"D:\$Recycle.Bin")));
+            assert!(!is_trash_target(Path::new(r"C:\Temp")));
+        } else if let Some(home) = env.home {
+            let xdg = env
+                .xdg_data_home
+                .unwrap_or_else(|| home.join(".local/share"));
+            assert!(is_trash_target(&xdg.join("Trash")));
+            assert!(!is_trash_target(&home.join("Documents")));
+        }
+    }
+
+    #[test]
+    fn worker_fails_closed_when_trash_target_reaches_spawn_in_trash_mode() {
+        let env = TrashEnv::current();
+        let target_path = if cfg!(target_os = "macos") {
+            env.home
+                .as_ref()
+                .map(|h| h.join(".Trash/ruum-never-touched"))
+        } else if cfg!(windows) {
+            Some(PathBuf::from(r"D:\$Recycle.Bin\S-1-5-21\$RNOPE"))
+        } else {
+            env.home.as_ref().map(|h| {
+                env.xdg_data_home
+                    .as_ref()
+                    .map_or_else(|| h.join(".local/share"), Clone::clone)
+                    .join("Trash/files/ruum-never-touched")
+            })
+        };
+        let Some(target_path) = target_path else {
+            return;
+        };
+        let root = if cfg!(windows) {
+            PathBuf::from(r"D:\")
+        } else {
+            PathBuf::from("/")
+        };
+        let manual_plan = Plan {
+            targets: vec![target(&target_path, 1)],
+            covered: Vec::new(),
+            blocked: Vec::new(),
+            root,
+            reclaim: 0,
+            foreign: 0,
+        };
+        let handle = spawn(manual_plan, RemovalMode::Trash);
+        let mut item_outcome = None;
+        for _ in 0..2000 {
+            while let Some(event) = handle.poll() {
+                if let RemovalEvent::Item { outcome, .. } = event {
+                    item_outcome = Some(outcome);
+                }
+            }
+            if item_outcome.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let err = item_outcome.expect("item event").expect_err("must block");
+        assert_eq!(err, ALREADY_IN_TRASH_REASON);
     }
 }

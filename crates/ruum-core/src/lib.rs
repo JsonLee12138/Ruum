@@ -34,6 +34,7 @@ pub mod scan_preview;
 pub mod scan_threads;
 pub mod size;
 pub mod space;
+pub mod trash_adapter;
 pub mod tree;
 pub mod treemap;
 pub mod watchdog;

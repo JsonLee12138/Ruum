@@ -27,7 +27,7 @@ use ruum_core::filter::{Keep, Matches, filter};
 use ruum_core::insights::{Candidate, worth_a_look};
 use ruum_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
-    detect_trash_backend, plan,
+    detect_trash_backend, plan_for_mode,
 };
 use ruum_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use ruum_core::space::{SpaceInfo, device_for, space_info, volume_root_for};
@@ -543,6 +543,10 @@ pub struct Ruum {
     pub marks: Marks,
     pub removal_mode: RemovalMode,
     pub trash_backend: TrashBackend,
+    #[cfg(test)]
+    pub trash_env: Option<ruum_core::trash_adapter::TrashEnv>,
+    #[cfg(test)]
+    pub trash_os: Option<ruum_core::trash_adapter::TrashOs>,
     /// The permanent-deletion alert dialog is open. Trash needs no dialog: it
     /// is reversible, so it commits directly.
     pub confirm_open: bool,
@@ -791,6 +795,10 @@ impl Ruum {
                 RemovalMode::Permanent
             },
             trash_backend,
+            #[cfg(test)]
+            trash_env: None,
+            #[cfg(test)]
+            trash_os: None,
             confirm_open: false,
             confirm_focus: cx.focus_handle(),
             focus_request: None,
@@ -3286,6 +3294,38 @@ impl Ruum {
         cx.notify();
     }
 
+    fn plan_in_mode(&self, mode: RemovalMode) -> Plan {
+        #[cfg(test)]
+        if let Some(env) = &self.trash_env {
+            let os = self.trash_os.unwrap_or_else(
+                ruum_core::trash_adapter::TrashAdapterFactory::current_os,
+            );
+            let adapter =
+                ruum_core::trash_adapter::TrashAdapterFactory::create_for(os);
+            return ruum_core::removal::plan_with_trash_adapter(
+                self.marks.items(),
+                &self.root_path,
+                mode,
+                adapter.as_ref(),
+                env,
+            );
+        }
+        plan_for_mode(self.marks.items(), &self.root_path, mode)
+    }
+
+    /// Enter the Review screen, automatically choosing Permanent mode when
+    /// every marked local path is blocked in Trash mode (such as items already
+    /// in the trash) yet valid for Permanent cleanup.
+    pub fn open_review(&mut self) {
+        if self.remote.is_none()
+            && self.plan_in_mode(RemovalMode::Trash).is_empty()
+            && !self.plan_in_mode(RemovalMode::Permanent).is_empty()
+        {
+            self.removal_mode = RemovalMode::Permanent;
+        }
+        self.screen = Screen::Review;
+    }
+
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
         if self.remote.is_some() {
@@ -3307,7 +3347,7 @@ impl Ruum {
             // this computer's mounts or project an unmeasured saving.
             return selection;
         }
-        plan(self.marks.items(), &self.root_path)
+        self.plan_in_mode(self.removal_mode)
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────
@@ -3721,6 +3761,24 @@ impl Ruum {
         true
     }
 
+    fn spawn_removal(&self, plan: Plan) -> RemovalHandle {
+        #[cfg(test)]
+        if let Some(env) = &self.trash_env {
+            let os = self.trash_os.unwrap_or_else(
+                ruum_core::trash_adapter::TrashAdapterFactory::current_os,
+            );
+            let adapter =
+                ruum_core::trash_adapter::TrashAdapterFactory::create_for(os);
+            return ruum_core::removal::spawn_with_trash_adapter(
+                plan,
+                self.removal_mode,
+                adapter,
+                env.clone(),
+            );
+        }
+        ruum_core::removal::spawn(plan, self.removal_mode)
+    }
+
     pub fn begin_removal(&mut self, cx: &mut Context<'_, Self>) {
         if self.remote.is_some() {
             return;
@@ -3753,7 +3811,7 @@ impl Ruum {
         };
         self.run_log.clear();
         self.screen = Screen::Running;
-        self.run = Some(ruum_core::removal::spawn(plan, self.removal_mode));
+        self.run = Some(self.spawn_removal(plan));
         Self::poll_removal(epoch, cx);
         cx.notify();
     }
@@ -4353,7 +4411,7 @@ impl Ruum {
                         Status::Warning,
                     ));
                 } else {
-                    self.screen = Screen::Review;
+                    self.open_review();
                 }
                 cx.notify();
             }

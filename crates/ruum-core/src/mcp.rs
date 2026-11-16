@@ -26,7 +26,7 @@ use crate::remote::{Header, RemoteRoots, RemoteScan, Request};
 use crate::remote_trash::{execute_remote_trash, plan_remote};
 use crate::removal::{
     Blocked, Plan, RemovalEvent, RemovalMode, Target, TrashBackend,
-    detect_trash_backend, normalize, plan, spawn,
+    detect_trash_backend, normalize, plan_for_mode, spawn,
 };
 use crate::scan::{ScanOptions, scan};
 use crate::size::human_bytes;
@@ -615,10 +615,20 @@ impl McpServer {
             self.cache.get(&(None, root_path.clone())).map(|c| &c.tree);
         let targets =
             build_targets(&raw_targets, &root_path, cached_tree, false);
-        let local_plan = plan(&targets, &root_path);
+        let local_plan =
+            plan_for_mode(&targets, &root_path, RemovalMode::Permanent);
         let backend = detect_trash_backend();
         let trash_available = !matches!(backend, TrashBackend::Unavailable);
-        let allowed_modes = if trash_available {
+        let has_trash_target = trash_available
+            && !local_plan.targets.is_empty()
+            && !plan_for_mode(
+                &local_plan.targets,
+                &root_path,
+                RemovalMode::Trash,
+            )
+            .blocked
+            .is_empty();
+        let allowed_modes = if trash_available && !has_trash_target {
             vec!["trash", "permanent"]
         } else {
             vec!["permanent"]
@@ -737,7 +747,8 @@ impl McpServer {
             self.cache.get(&(None, root_path.clone())).map(|c| &c.tree);
         let targets =
             build_targets(&raw_targets, &root_path, cached_tree, false);
-        let local_plan = plan(&targets, &root_path);
+        let local_plan =
+            plan_for_mode(&targets, &root_path, RemovalMode::Trash);
         if local_plan.targets.is_empty() || !local_plan.blocked.is_empty() {
             return Err(format_plan_rejection(
                 "trash_paths",
@@ -808,7 +819,8 @@ impl McpServer {
                 "trash backend is unavailable on this system".to_owned()
             );
         }
-        let approved_plan = plan(&approved_targets, &root_path);
+        let approved_plan =
+            plan_for_mode(&approved_targets, &root_path, RemovalMode::Trash);
         let space_before = space_info(&root_path).ok();
         let summary = run_local_removal(approved_plan, RemovalMode::Trash);
         self.invalidate_overlapping(None, &root_path);
@@ -856,7 +868,8 @@ impl McpServer {
             self.cache.get(&(None, root_path.clone())).map(|c| &c.tree);
         let targets =
             build_targets(&raw_targets, &root_path, cached_tree, false);
-        let local_plan = plan(&targets, &root_path);
+        let local_plan =
+            plan_for_mode(&targets, &root_path, RemovalMode::Permanent);
         if local_plan.targets.is_empty() || !local_plan.blocked.is_empty() {
             return Err(format_plan_rejection(
                 "delete_permanently",
@@ -921,7 +934,11 @@ impl McpServer {
             .map(|t| t.path.display().to_string())
             .collect();
 
-        let approved_plan = plan(&approved_targets, &root_path);
+        let approved_plan = plan_for_mode(
+            &approved_targets,
+            &root_path,
+            RemovalMode::Permanent,
+        );
         let request = AuthRequest::for_permanent_delete_with_reason(
             &approved_plan,
             caller_reason,
@@ -2768,5 +2785,109 @@ mod tests {
             "OS auth must not be invoked when user cancels at the confirm popup"
         );
         assert!(target.exists());
+    }
+
+    #[test]
+    fn plan_removal_excludes_trash_mode_and_trash_paths_rejects_trash_targets()
+    {
+        use crate::trash_adapter::{ALREADY_IN_TRASH_REASON, TrashEnv};
+
+        #[derive(Debug)]
+        struct CountingConfirm(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl CleanupConfirmAdapter for CountingConfirm {
+            fn confirm(
+                &self,
+                _request: &CleanupConfirmRequest,
+            ) -> io::Result<CleanupConfirmDecision> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(CleanupConfirmDecision::Cancelled)
+            }
+        }
+
+        let env = TrashEnv::current();
+        let (root_path, trash_path) = if cfg!(target_os = "macos") {
+            let Some(home) = env.home else {
+                return;
+            };
+            (home.clone(), home.join(".Trash"))
+        } else if cfg!(windows) {
+            (
+                PathBuf::from(r"C:\"),
+                PathBuf::from(r"C:\$Recycle.Bin\S-1-5-21-0\$RTEST"),
+            )
+        } else {
+            let Some(home) = env.home else {
+                return;
+            };
+            let xdg = env
+                .xdg_data_home
+                .unwrap_or_else(|| home.join(".local/share"));
+            let root = xdg.parent().map_or(home, Path::to_path_buf);
+            (root, xdg.join("Trash"))
+        };
+
+        let confirm_calls =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut server = McpServer::with_confirm(
+            Box::new(CountingAuth {
+                calls: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+                last_reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                decision: Ok(false),
+            }),
+            Box::new(CountingConfirm(std::sync::Arc::clone(&confirm_calls))),
+        );
+
+        let root_str = root_path.to_str().expect("utf8");
+        let trash_str = trash_path.to_str().expect("utf8");
+        let responses = run_session(
+            &mut server,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "plan_removal",
+                        "arguments": {
+                            "root": root_str,
+                            "targets": [trash_str]
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "trash_paths",
+                        "arguments": {
+                            "root": root_str,
+                            "targets": [trash_str]
+                        }
+                    }
+                }),
+            ],
+        )
+        .expect("serve succeeds");
+
+        let (err1, payload1) = parse_tool_payload(&responses[0]);
+        assert!(!err1, "plan_removal must succeed: {payload1}");
+        assert_eq!(payload1["allowed_modes"], json!(["permanent"]));
+
+        let (err2, payload2) = parse_tool_payload(&responses[1]);
+        assert!(err2, "trash_paths must reject trash targets upfront");
+        assert_eq!(
+            payload2["blocked"][0]["reason"],
+            json!(ALREADY_IN_TRASH_REASON),
+            "{payload2}"
+        );
+        assert_eq!(
+            confirm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "confirm UI must not open for rejected trash targets"
+        );
     }
 }

@@ -12,9 +12,12 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::identity::HostIdentity;
-use crate::removal::Target;
+use crate::removal::{Target, normalize};
 use crate::size::human_bytes;
 use crate::space::SpaceInfo;
+use crate::trash_adapter::{
+    TrashAdapter, TrashAdapterFactory, TrashDisposition, TrashEnv,
+};
 
 /// One path per line, outermost targets only, for `xargs -d '\n'`, a
 /// script, or a later look. A path that cannot be written safely on one
@@ -188,7 +191,22 @@ pub fn delete_script_for(
         "command -v realpath >/dev/null\ncommand -v findmnt >/dev/null\n",
     );
     let _ = writeln!(body, "root={}", shell_quote(&root.to_string_lossy()));
-    body.push_str(r#"remove() {
+    let adapter = TrashAdapterFactory::create();
+    let env = TrashEnv::current();
+    let classified: Vec<(String, bool)> = targets
+        .iter()
+        .filter_map(|target| match line(&target.path) {
+            Line::Plain(path) => {
+                let container =
+                    is_trash_container(&target.path, adapter.as_ref(), &env);
+                Some((path, container))
+            }
+            Line::Escaped(_) => None,
+        })
+        .collect();
+    let has_containers = classified.iter().any(|(_, container)| *container);
+
+    body.push_str(r#"guard_target() {
   p=$1
   case "$root" in /) prefix=/;; *) prefix=$root/;; esac
   case "$p" in "$prefix"*) ;; *) echo "Outside scan: $p" >&2; return 1;; esac
@@ -207,13 +225,31 @@ pub fn delete_script_for(
     mount=$(env printf '%b' "$mount") || exit 1
     case "$mount/" in "$p/"*) echo "Contains mount: $p" >&2; exit 1;; esac
   done
+}
+remove() {
+  guard_target "$1"
+  p=$1
   rm -rf --one-file-system --preserve-root=all -- "$p"
 }
 "#);
-    for target in targets {
-        if let Line::Plain(path) = line(&target.path) {
-            let _ = writeln!(body, "remove {}", shell_quote(&path));
-        }
+    if has_containers {
+        body.push_str(
+            r#"empty_container() {
+  guard_target "$1"
+  p=$1
+  [ -d "$p" ] || return 1
+  find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+}
+"#,
+        );
+    }
+    for (path, container) in classified {
+        let cmd = if container {
+            "empty_container"
+        } else {
+            "remove"
+        };
+        let _ = writeln!(body, "{cmd} {}", shell_quote(&path));
     }
     let mut script = String::from(
         r#"#!/bin/sh
@@ -247,6 +283,59 @@ if [ "${1-}" != --delete ]; then
     }
     script.push_str("\n)\n");
     script
+}
+
+fn is_trash_container(
+    path: &Path,
+    adapter: &dyn TrashAdapter,
+    env: &TrashEnv,
+) -> bool {
+    let norm = normalize(path);
+    if matches!(
+        adapter.classify(&norm, env, &[]),
+        TrashDisposition::Container(_)
+    ) {
+        return true;
+    }
+    has_trash_container_suffix(&norm)
+}
+
+fn is_ascii_uid_str(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_xdg_trash_root_parts(parts: &[&str]) -> bool {
+    matches!(parts, [.., ".local", "share", "Trash"])
+        || matches!(parts, [.., ".Trash", uid] if is_ascii_uid_str(uid))
+        || parts.last().is_some_and(|last| {
+            last.strip_prefix(".Trash-").is_some_and(is_ascii_uid_str)
+        })
+}
+
+fn has_trash_container_suffix(path: &Path) -> bool {
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|comp| match comp {
+            std::path::Component::Normal(seg) => seg.to_str(),
+            _ => None,
+        })
+        .collect();
+    let is_trashes_uid = matches!(
+        parts.as_slice(),
+        [.., ".Trashes", uid] if is_ascii_uid_str(uid)
+    );
+    if matches!(parts.as_slice(), [.., ".Trash" | ".Trashes"])
+        || is_trashes_uid
+        || is_xdg_trash_root_parts(&parts)
+    {
+        return true;
+    }
+    if let Some((last, parent)) = parts.split_last()
+        && matches!(*last, "files" | "info" | "expunged")
+    {
+        return is_xdg_trash_root_parts(parent);
+    }
+    false
 }
 
 fn host_guard(identity: Option<&HostIdentity>) -> String {
@@ -551,5 +640,73 @@ mod tests {
         );
         assert!(prompt.contains("git status"));
         assert!(prompt.contains("Do not delete anything else"));
+    }
+
+    #[test]
+    fn delete_script_empties_trash_containers_without_removing_container() {
+        let identity = HostIdentity {
+            hostname: "workstation".into(),
+            machine_id: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+        let targets = [
+            target("/home/me/.local/share/Trash", 4096, true),
+            target("/Users/me/.Trash", 2048, true),
+            target("/home/me/.cache/pip", 1024, true),
+        ];
+        let script =
+            delete_script_for(&targets, Path::new("/"), None, Some(&identity));
+        assert!(
+            script.contains(
+                "find \"$p\" -mindepth 1 -maxdepth 1 -exec rm -rf \
+                 --one-file-system -- {} +"
+            ),
+            "expected container empty command in script:\n{script}"
+        );
+        assert!(
+            script.contains("empty_container '/home/me/.local/share/Trash'"),
+            "{script}"
+        );
+        assert!(
+            script.contains("empty_container '/Users/me/.Trash'"),
+            "{script}"
+        );
+        assert!(script.contains("remove '/home/me/.cache/pip'"), "{script}");
+        assert!(
+            !script.contains("remove '/home/me/.local/share/Trash'"),
+            "{script}"
+        );
+        assert!(!script.contains("remove '/Users/me/.Trash'"), "{script}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_script_empties_xdg_trash_contents_and_preserves_dir() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let xdg_trash = dir.path().join(".local/share/Trash");
+        let files = xdg_trash.join("files");
+        let info = xdg_trash.join("info");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(files.join("old.bin"), b"stale").unwrap();
+        std::fs::write(info.join("old.bin.trashinfo"), b"[Trash Info]\n")
+            .unwrap();
+
+        let targets = [target(xdg_trash.to_str().unwrap(), 100, true)];
+        let script = delete_script(&targets, dir.path(), None);
+        let script_path = dir.path().join("empty_trash.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        assert!(
+            Command::new("sh")
+                .arg(&script_path)
+                .arg("--delete")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(xdg_trash.exists(), "Trash container directory must remain");
+        assert!(!files.join("old.bin").exists());
+        assert!(!info.join("old.bin.trashinfo").exists());
     }
 }

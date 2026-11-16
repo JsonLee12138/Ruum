@@ -3334,3 +3334,162 @@ fn clicking_notification_reopens_closed_main_window(cx: &TestAppContext) {
         Screen::Explore
     );
 }
+
+#[gpui_kit::test]
+fn review_auto_switches_to_permanent_for_trash_and_localizes_trash_block(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::trash_adapter::{
+        ALREADY_IN_TRASH_REASON, TrashEnv, TrashOs,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let trash_file = temp.path().join(".Trash/old.bin");
+    let keep_file = temp.path().join("keep/notes.txt");
+    std::fs::create_dir_all(trash_file.parent().expect("parent"))
+        .expect("mkdir trash");
+    std::fs::create_dir_all(keep_file.parent().expect("parent"))
+        .expect("mkdir keep");
+    std::fs::write(&trash_file, vec![b't'; 8192]).expect("write trash");
+    std::fs::write(&keep_file, b"keep").expect("write keep");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.trash_env = Some(TrashEnv {
+            home: Some(temp.path().to_path_buf()),
+            xdg_data_home: None,
+            uid: Some(501),
+        });
+        app.trash_os = Some(TrashOs::MacOs);
+        app.removal_mode = RemovalMode::Trash;
+        app.marks.toggle(ruum_core::removal::Target {
+            path: temp.path().join(".Trash"),
+            bytes: 8192,
+            is_dir: true,
+            hidden: true,
+        });
+        cx.notify();
+    });
+    draw(cx);
+
+    // Entering Review when only trash targets are marked auto-switches to Permanent.
+    press(cx, "c");
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.removal_mode, RemovalMode::Permanent);
+        let plan = app.plan();
+        assert_eq!(plan.targets.len(), 1);
+        assert!(plan.blocked.is_empty());
+    });
+
+    // Switching back to Trash mode blocks .Trash with ALREADY_IN_TRASH_REASON,
+    // disables commit, and renders localized reason cleanly.
+    press(cx, "m");
+    update(&view, cx, |app, cx| {
+        app.locale = crate::i18n::Locale::Zh;
+        cx.notify();
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.removal_mode, RemovalMode::Trash);
+        let plan = app.plan();
+        assert!(plan.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].reason, ALREADY_IN_TRASH_REASON);
+        assert_ne!(
+            crate::i18n::review::blocked_reason(
+                &plan.blocked[0].reason,
+                app.locale
+            ),
+            ALREADY_IN_TRASH_REASON
+        );
+    });
+
+    // Enter in Trash mode must not open confirm dialog or start running.
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Review);
+        assert!(!app.confirm_open);
+    });
+
+    // Switching back to Permanent still requires the mandatory confirm dialog.
+    press(cx, "p");
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Review);
+        assert!(app.confirm_open);
+    });
+    press(cx, "escape");
+    read(&view, cx, |app| {
+        assert!(!app.confirm_open);
+    });
+
+    // If a non-trash target is also marked, open_review preserves Trash mode.
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Explore;
+        app.removal_mode = RemovalMode::Trash;
+        app.marks.toggle(ruum_core::removal::Target {
+            path: temp.path().join("keep"),
+            bytes: 4,
+            is_dir: true,
+            hidden: false,
+        });
+        app.open_review();
+        cx.notify();
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.removal_mode, RemovalMode::Trash);
+    });
+
+    // Unmark "keep" so only .Trash remains, then confirm permanent deletion
+    // end-to-end and verify .Trash contents are emptied while .Trash stays.
+    #[cfg(unix)]
+    {
+        update(&view, cx, |app, cx| {
+            app.unmark(&temp.path().join("keep"), cx);
+            app.screen = Screen::Explore;
+            app.removal_mode = RemovalMode::Trash;
+            app.open_review();
+            cx.notify();
+        });
+        draw(cx);
+        read(&view, cx, |app| {
+            assert_eq!(app.removal_mode, RemovalMode::Permanent);
+        });
+
+        press(cx, "enter");
+        assert!(read(&view, cx, |app| app.confirm_open));
+
+        press(cx, "enter");
+        assert!(!read(&view, cx, |app| app.confirm_open));
+        assert_eq!(read(&view, cx, |app| app.screen), Screen::Running);
+
+        let epoch = read(&view, cx, |app| app.run_epoch);
+        let mut finished = false;
+        for _ in 0..400 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            finished = update(&view, cx, |app, cx| {
+                app.poll_removal_once(epoch, cx);
+                app.screen == Screen::Done
+            });
+            if finished {
+                break;
+            }
+        }
+        assert!(finished, "permanent trash empty finished");
+        draw(cx);
+
+        let summary = read(&view, cx, |app| app.run_summary.clone());
+        assert_eq!(summary.removed, 1, "{summary:?}");
+        assert_eq!(summary.failed, 0, "{summary:?}");
+        assert!(!trash_file.exists(), "item inside .Trash must be removed");
+        assert!(
+            temp.path().join(".Trash").is_dir(),
+            ".Trash container directory must remain intact"
+        );
+        assert!(keep_file.exists(), "unmarked files must stay untouched");
+    }
+}

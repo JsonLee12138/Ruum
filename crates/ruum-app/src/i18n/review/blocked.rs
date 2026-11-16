@@ -1,5 +1,10 @@
 //! Guard-reason translation and review export/action footer strings.
 
+use ruum_core::trash_adapter::{
+    ALREADY_IN_TRASH_REASON, OTHER_USER_TRASH_REASON,
+    RECYCLE_BIN_METADATA_REASON,
+};
+
 use crate::i18n::{Locale, item_count, pick};
 
 fn pick_reason(
@@ -76,6 +81,27 @@ pub fn blocked_reason(reason: &str, locale: Locale) -> String {
                 "마운트 지점: 삭제하면 다른 파일 시스템에 영향을 줍니다",
             )
         }
+        ALREADY_IN_TRASH_REASON => pick_reason(
+            reason,
+            locale,
+            "已在废纸篓中；请切换为永久删除以清空",
+            "すでにゴミ箱の中にあります。空にするには完全削除に切り替えてください",
+            "이미 휴지통에 있습니다. 비우려면 영구 삭제로 전환하세요",
+        ),
+        OTHER_USER_TRASH_REASON => pick_reason(
+            reason,
+            locale,
+            "其他用户的废纸篓目录不可删除",
+            "他のユーザーのゴミ箱ディレクトリは削除できません",
+            "다른 사용자의 휴지통 디렉터리는 삭제할 수 없습니다",
+        ),
+        RECYCLE_BIN_METADATA_REASON => pick_reason(
+            reason,
+            locale,
+            "属于回收站结构文件；请改用清空回收站",
+            "ごみ箱の構成ファイルです。ごみ箱を空にしてください",
+            "휴지통 구조의 일부입니다. 대신 휴지통 비우기를 사용하세요",
+        ),
         _ => translate_dynamic_blocked_reason(reason, locale),
     }
 }
@@ -300,5 +326,26 @@ pub fn available_footer(avail: &str, locale: Locale) -> String {
         Locale::Zh => format!("可用 {avail}"),
         Locale::Ja => format!("空き {avail}"),
         Locale::Ko => format!("{avail} 사용 가능"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trash_guard_reasons_are_localized_across_all_locales() {
+        for reason in [
+            ALREADY_IN_TRASH_REASON,
+            OTHER_USER_TRASH_REASON,
+            RECYCLE_BIN_METADATA_REASON,
+        ] {
+            assert_eq!(blocked_reason(reason, Locale::En), reason);
+            for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+                let translated = blocked_reason(reason, locale);
+                assert!(!translated.is_empty());
+                assert_ne!(translated, reason);
+            }
+        }
     }
 }

@@ -16,6 +16,10 @@ use crate::export::shell_quote;
 use crate::identity::HostIdentity;
 use crate::remote::{Header, validate_host};
 use crate::removal::{Blocked, Target, percent_encode};
+use crate::trash_adapter::{
+    ALREADY_IN_TRASH_REASON, TrashAdapter, TrashAdapterFactory,
+    TrashDisposition, TrashEnv, TrashOs,
+};
 
 const REMOTE_SYSTEM_TREES: [&str; 24] = [
     "/bin",
@@ -125,6 +129,18 @@ pub fn plan_remote(targets: &[Target], header: &Header) -> RemotePlan {
         .as_deref()
         .and_then(|home| normalize_unix(home).ok())
         .map(|home| remote_key(&home, macos));
+    let trash_adapter = TrashAdapterFactory::create_for(if macos {
+        TrashOs::MacOs
+    } else {
+        TrashOs::Linux
+    });
+    let trash_env = TrashEnv {
+        home: header.home.clone(),
+        xdg_data_home: None,
+        uid: None,
+    };
+    let remote_mounts =
+        remote_mount_roots(&root_norm, header.disk_root.as_deref());
 
     let mut accepted: Vec<(String, Target)> = Vec::new();
     for target in targets {
@@ -146,6 +162,9 @@ pub fn plan_remote(targets: &[Target], header: &Header) -> RemotePlan {
             &root_key,
             home_key.as_deref(),
             macos,
+            trash_adapter.as_ref(),
+            &trash_env,
+            &remote_mounts,
         ) {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
@@ -367,6 +386,29 @@ fn within_unix(path: &str, base: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+fn remote_mount_roots(
+    root_norm: &str,
+    disk_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut mounts = vec![PathBuf::from(root_norm)];
+    if let Some(disk_root) = disk_root
+        .and_then(|dir| normalize_unix(dir).ok())
+        .map(PathBuf::from)
+        && !mounts.contains(&disk_root)
+    {
+        mounts.push(disk_root);
+    }
+    let fs_root = PathBuf::from("/");
+    if !mounts.contains(&fs_root) {
+        mounts.push(fs_root);
+    }
+    mounts
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "remote guard checks pass pre-normalized keys and reused trash adapter state"
+)]
 fn refuse_remote(
     norm: &str,
     key: &str,
@@ -374,6 +416,9 @@ fn refuse_remote(
     root_key: &str,
     home_key: Option<&str>,
     macos: bool,
+    trash_adapter: &dyn TrashAdapter,
+    trash_env: &TrashEnv,
+    remote_mounts: &[PathBuf],
 ) -> Option<String> {
     if norm == "/" || key == "/" {
         return Some("the filesystem root cannot be removed".into());
@@ -412,7 +457,13 @@ fn refuse_remote(
             ));
         }
     }
-    None
+    match trash_adapter.classify(Path::new(norm), trash_env, remote_mounts) {
+        TrashDisposition::NotTrash => None,
+        TrashDisposition::BlockedAlways(reason) => Some(reason.to_owned()),
+        TrashDisposition::Container(_) | TrashDisposition::Entry { .. } => {
+            Some(ALREADY_IN_TRASH_REASON.to_owned())
+        }
+    }
 }
 
 fn append_host_guard(
@@ -801,5 +852,92 @@ mod tests {
             );
             assert!(keep.exists(), "file must remain untouched on wrong host");
         }
+    }
+
+    #[test]
+    fn plan_remote_blocks_macos_and_linux_trash_containers_and_other_users() {
+        use crate::trash_adapter::{
+            ALREADY_IN_TRASH_REASON, OTHER_USER_TRASH_REASON,
+        };
+
+        let mac = macos_header("/Users/me", Some("/Users/me"));
+        let mac_plan = plan_remote(
+            &[
+                target("/Users/me/.Trash", 100, true),
+                target("/Users/me/.Trash/old.zip", 50, false),
+                target(
+                    "/System/Volumes/Data/Users/me/.Trash/alias.bin",
+                    25,
+                    false,
+                ),
+                target("/Users/me/Library/Caches/pip", 4096, true),
+            ],
+            &mac,
+        );
+        assert_eq!(mac_plan.targets.len(), 1);
+        assert_eq!(
+            mac_plan.targets[0].path,
+            PathBuf::from("/Users/me/Library/Caches/pip")
+        );
+        assert_eq!(mac_plan.blocked.len(), 3);
+        for blocked in &mac_plan.blocked {
+            assert_eq!(blocked.reason, ALREADY_IN_TRASH_REASON);
+        }
+
+        let mut mac_vol = macos_header("/Volumes/USB", Some("/Users/me"));
+        mac_vol.disk_root = Some(PathBuf::from("/Volumes/USB"));
+        let mac_vol_plan = plan_remote(
+            &[
+                target("/Volumes/USB/.Trashes", 100, true),
+                target("/Volumes/USB/.Trashes/502", 100, true),
+            ],
+            &mac_vol,
+        );
+        assert!(mac_vol_plan.targets.is_empty());
+        assert_eq!(mac_vol_plan.blocked.len(), 2);
+        assert_eq!(mac_vol_plan.blocked[0].reason, ALREADY_IN_TRASH_REASON);
+        assert_eq!(mac_vol_plan.blocked[1].reason, OTHER_USER_TRASH_REASON);
+
+        let linux = linux_header("/home/me", Some("/home/me"));
+        let linux_plan = plan_remote(
+            &[
+                target("/home/me/.local/share/Trash", 100, true),
+                target("/home/me/.local/share/Trash/files/old.iso", 50, false),
+                target("/home/me/.cache/pip", 2048, true),
+            ],
+            &linux,
+        );
+        assert_eq!(linux_plan.targets.len(), 1);
+        assert_eq!(
+            linux_plan.targets[0].path,
+            PathBuf::from("/home/me/.cache/pip")
+        );
+        assert_eq!(linux_plan.blocked.len(), 2);
+        for blocked in &linux_plan.blocked {
+            assert_eq!(blocked.reason, ALREADY_IN_TRASH_REASON);
+        }
+
+        let mut linux_vol = linux_header("/mnt/disk", Some("/home/me"));
+        linux_vol.disk_root = Some(PathBuf::from("/mnt/disk"));
+        let linux_vol_plan = plan_remote(
+            &[
+                target("/mnt/disk/.Trash", 100, true),
+                target("/mnt/disk/.Trash/1000", 100, true),
+                target("/mnt/disk/.Trash-1000", 100, true),
+            ],
+            &linux_vol,
+        );
+        assert!(linux_vol_plan.targets.is_empty());
+        assert_eq!(linux_vol_plan.blocked.len(), 3);
+        assert_eq!(linux_vol_plan.blocked[0].reason, ALREADY_IN_TRASH_REASON);
+        assert_eq!(linux_vol_plan.blocked[1].reason, OTHER_USER_TRASH_REASON);
+        assert_eq!(linux_vol_plan.blocked[2].reason, OTHER_USER_TRASH_REASON);
+
+        let err = trash_script_for(
+            &[target("/home/me/.local/share/Trash", 100, true)],
+            &linux,
+        )
+        .expect_err("trash_script_for must refuse remote trash container");
+        assert!(err.to_string().contains(ALREADY_IN_TRASH_REASON), "{err}");
     }
 }

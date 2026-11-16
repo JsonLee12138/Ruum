@@ -1403,6 +1403,20 @@ pub fn parse_and_validate_proposal(
     home_dir: &Path,
     now_secs: u64,
 ) -> Result<CleanupProposal, String> {
+    parse_and_validate_proposal_with(
+        raw_output,
+        home_dir,
+        now_secs,
+        crate::removal::is_trash_target,
+    )
+}
+
+fn parse_and_validate_proposal_with(
+    raw_output: &str,
+    home_dir: &Path,
+    now_secs: u64,
+    is_trash: impl Fn(&Path) -> bool,
+) -> Result<CleanupProposal, String> {
     let parsed = extract_proposal_from_output(raw_output)?;
 
     let mut candidate_targets = Vec::new();
@@ -1454,7 +1468,13 @@ pub fn parse_and_validate_proposal(
     let mut proposal_items = Vec::new();
     for target in safe_plan.targets {
         let meta_opt = item_meta.iter().find(|(p, ..)| p == &target.path);
-        let mode = meta_opt.map_or(RemovalMode::Trash, |(_, m, _)| *m);
+        let requested_mode =
+            meta_opt.map_or(RemovalMode::Trash, |(_, m, _)| *m);
+        let mode = if is_trash(&target.path) {
+            RemovalMode::Permanent
+        } else {
+            requested_mode
+        };
         let reason = meta_opt.and_then(|(.., r)| r.clone());
 
         let git_warning = crate::git::state(&target.path).and_then(|st| {
@@ -2024,5 +2044,66 @@ mod tests {
         );
         assert!(prompt.contains("PRE-SCANNED RECLAIMABLE CANDIDATES"));
         assert!(prompt.contains(&target_dir.display().to_string()));
+    }
+
+    #[test]
+    fn parse_and_validate_proposal_forces_permanent_for_trash_targets() {
+        use crate::trash_adapter::{TrashAdapterFactory, TrashEnv, TrashOs};
+
+        let temp_home = tempfile::tempdir().unwrap();
+        let trash_item = temp_home.path().join(".Trash/old.zip");
+        let cache_dir = temp_home.path().join("project/target");
+        fs::create_dir_all(trash_item.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&trash_item, b"stale").unwrap();
+        fs::write(cache_dir.join("out.bin"), b"build").unwrap();
+
+        let raw = format!(
+            r#"{{
+              "summary": "Clean trash and build cache",
+              "items": [
+                {{
+                  "path": "{}",
+                  "mode": "trash",
+                  "reason": "Old item inside Trash"
+                }},
+                {{
+                  "path": "{}",
+                  "mode": "trash",
+                  "reason": "Build artifact"
+                }}
+              ]
+            }}"#,
+            trash_item.display(),
+            cache_dir.display()
+        );
+
+        let mac = TrashAdapterFactory::create_for(TrashOs::MacOs);
+        let env = TrashEnv {
+            home: Some(temp_home.path().to_path_buf()),
+            xdg_data_home: None,
+            uid: Some(501),
+        };
+        let prop = parse_and_validate_proposal_with(
+            &raw,
+            temp_home.path(),
+            1_700_000_000,
+            |path| mac.classify(path, &env, &[]).is_trash(),
+        )
+        .unwrap();
+
+        let trash_prop = prop
+            .items
+            .iter()
+            .find(|item| item.path == trash_item)
+            .expect("trash item kept");
+        assert_eq!(trash_prop.mode, RemovalMode::Permanent);
+
+        let cache_prop = prop
+            .items
+            .iter()
+            .find(|item| item.path == cache_dir)
+            .expect("cache item kept");
+        assert_eq!(cache_prop.mode, RemovalMode::Trash);
     }
 }

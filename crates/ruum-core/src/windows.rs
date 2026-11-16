@@ -745,6 +745,54 @@ pub fn user_profiles_dir() -> Option<PathBuf> {
     path
 }
 
+/// Empty the Windows Recycle Bin on `volume_root` without confirmation UI or
+/// sound.
+///
+/// `volume_root` must identify a single drive or volume mount (for example
+/// `C:\`); empty strings are rejected because Win32 treats a null or empty
+/// root as "empty all drives".
+pub fn empty_recycle_bin(volume_root: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{S_FALSE, S_OK};
+    use windows_sys::Win32::UI::Shell::{
+        SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
+        SHEmptyRecycleBinW,
+    };
+
+    const E_UNEXPECTED: i32 = 0x8000_FFFF_u32.cast_signed();
+    const HR_FILE_NOT_FOUND: i32 = 0x8007_0002_u32.cast_signed();
+    const HR_PATH_NOT_FOUND: i32 = 0x8007_0003_u32.cast_signed();
+
+    let clean =
+        crate::trash_adapter::sanitize_windows_volume_root(volume_root)?;
+    if clean.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a volume root cannot contain NUL",
+        ));
+    }
+    let mut wide: Vec<u16> = clean.encode_utf16().collect();
+    wide.push(0);
+
+    // SAFETY: `hwnd` is null (no owner window), `wide` is a non-empty
+    // NUL-terminated UTF-16 volume root outliving the call, and the flags are
+    // documented `SHERB_*` constants.
+    let hr = unsafe {
+        SHEmptyRecycleBinW(
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND,
+        )
+    };
+    if matches!(
+        hr,
+        S_OK | S_FALSE | E_UNEXPECTED | HR_FILE_NOT_FOUND | HR_PATH_NOT_FOUND
+    ) {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(hr))
+    }
+}
+
 /// `arg` quoted so a program's C runtime splits it back out whole: inside
 /// quotes, backslashes are literal except before a quote, where they must
 /// be doubled, so `C:\` becomes `"C:\\"` and not `"C:\"`.

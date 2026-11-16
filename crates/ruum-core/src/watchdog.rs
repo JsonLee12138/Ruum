@@ -497,6 +497,16 @@ pub fn execute_confirmed_cleanup(
     items: &[ProposalItem],
     home_dir: &Path,
 ) -> (u64, usize) {
+    execute_confirmed_cleanup_with(items, home_dir, &mut |path, err| {
+        eprintln!("ruum watchdog: failed to remove {}: {err}", path.display());
+    })
+}
+
+fn execute_confirmed_cleanup_with(
+    items: &[ProposalItem],
+    home_dir: &Path,
+    log_error: &mut dyn FnMut(&Path, &str),
+) -> (u64, usize) {
     let mut total_bytes = 0_u64;
     let mut total_count = 0_usize;
 
@@ -525,7 +535,7 @@ pub fn execute_confirmed_cleanup(
             })
             .collect();
 
-        let plan = crate::removal::plan(&targets, home_dir);
+        let plan = crate::removal::plan_for_mode(&targets, home_dir, mode);
         if plan.targets.is_empty() {
             continue;
         }
@@ -543,7 +553,15 @@ pub fn execute_confirmed_cleanup(
                         done = true;
                         break;
                     }
-                    RemovalEvent::Item { .. } | RemovalEvent::Start { .. } => {}
+                    RemovalEvent::Item {
+                        path,
+                        outcome: Err(err),
+                        ..
+                    } => log_error(&path, &err),
+                    RemovalEvent::Item {
+                        outcome: Ok(()), ..
+                    }
+                    | RemovalEvent::Start { .. } => {}
                 }
             }
             if !progressed && !done {
@@ -1380,5 +1398,72 @@ mod tests {
                 tag: NOTIF_TAG_AI_ANALYSIS.to_string(),
             }
         );
+    }
+
+    #[test]
+    fn execute_confirmed_cleanup_respects_mode_and_reports_item_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+
+        // Outside home -> blocked by plan_for_mode in Trash mode
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("keep.bin");
+        fs::write(&outside_file, b"keep").unwrap();
+
+        let blocked_items = vec![ProposalItem::new(
+            outside_file.clone(),
+            4,
+            RemovalMode::Trash,
+            None,
+            None,
+        )];
+        let mut logged = Vec::new();
+        let (bytes, count) = execute_confirmed_cleanup_with(
+            &blocked_items,
+            home,
+            &mut |path, err| {
+                logged.push((path.to_path_buf(), err.to_owned()));
+            },
+        );
+        assert_eq!((bytes, count), (0, 0));
+        assert!(outside_file.exists());
+        assert!(logged.is_empty());
+
+        // Trigger a worker-level RemovalEvent::Item { outcome: Err(..) }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let locked_dir = home.join("locked");
+            let locked_file = locked_dir.join("stuck.bin");
+            fs::create_dir_all(&locked_dir).unwrap();
+            fs::write(&locked_file, b"stuck").unwrap();
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555))
+                .unwrap();
+
+            let perm_items = vec![ProposalItem::new(
+                locked_file.clone(),
+                5,
+                RemovalMode::Permanent,
+                None,
+                None,
+            )];
+            let (perm_bytes, perm_count) = execute_confirmed_cleanup_with(
+                &perm_items,
+                home,
+                &mut |path, err| {
+                    logged.push((path.to_path_buf(), err.to_owned()));
+                },
+            );
+
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755))
+                .unwrap();
+
+            assert_eq!((perm_bytes, perm_count), (0, 0));
+            assert!(locked_file.exists());
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0].0, locked_file);
+            assert!(!logged[0].1.is_empty());
+        }
     }
 }

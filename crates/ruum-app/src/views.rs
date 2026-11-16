@@ -2278,7 +2278,7 @@ fn review_button(
         .hover(move |style| style.bg(highlight.opacity(0.18)))
         .active(move |style| style.bg(highlight.opacity(0.26)))
         .on_click(cx.listener(|this, _, window, cx| {
-            this.screen = Screen::Review;
+            this.open_review();
             cx.notify();
             window.focus(&this.focus, cx);
         }))

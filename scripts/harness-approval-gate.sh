@@ -53,9 +53,13 @@ const isGatedSwarm =
   toolName === "swarm" && String(args.action || "").trim() === "add";
 const isGated = isGatedSubagent || isGatedSwarm;
 
-const workspaceRoot =
+const rawWorkspaceRoot =
   (Array.isArray(input.workspacePaths) && input.workspacePaths[0]) ||
   process.env.AGY_HARNESS_SCRIPT_REPO_ROOT;
+let workspaceRoot = rawWorkspaceRoot;
+try {
+  workspaceRoot = fs.realpathSync(rawWorkspaceRoot);
+} catch {}
 
 const specPath = path.join(workspaceRoot, ".artifacts", "SPEC.md");
 const planPath = path.join(workspaceRoot, ".artifacts", "PLAN.md");
@@ -269,7 +273,11 @@ is_swm = tool_name == "swarm" and str(args.get("action") or "").strip() == "add"
 is_gated = is_sub or is_swm
 
 ws_list = data.get("workspacePaths") or []
-ws_root = pathlib.Path(ws_list[0] if ws_list else os.environ["AGY_HARNESS_SCRIPT_REPO_ROOT"])
+raw_ws_root = ws_list[0] if ws_list else os.environ["AGY_HARNESS_SCRIPT_REPO_ROOT"]
+try:
+    ws_root = pathlib.Path(os.path.realpath(str(raw_ws_root)))
+except Exception:
+    ws_root = pathlib.Path(raw_ws_root)
 spec_path = ws_root / ".artifacts" / "SPEC.md"
 plan_path = ws_root / ".artifacts" / "PLAN.md"
 

@@ -6,12 +6,13 @@
 use std::time::Duration;
 
 use gpui_kit::base::CheckboxState;
+use gpui_kit::base::input::InputState;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Animation, AnimationExt as _, Context, Div, ElementId, FocusHandle, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
-    Rems, Stateful, StatefulInteractiveElement as _, Styled, Svg,
-    Transformation, Window, div, radians, svg,
+    Animation, AnimationExt as _, Context, Div, ElementId, Entity, FocusHandle,
+    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, Rems, Stateful, StatefulInteractiveElement as _,
+    Styled, Svg, Transformation, Window, div, radians, svg,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, IconName, button, checkbox, dialog_button,
@@ -738,6 +739,25 @@ pub fn watchdog_page(
         .child(proposal_card)
 }
 
+fn setting_input_field(
+    id: &'static str,
+    label: &'static str,
+    state: &Entity<InputState>,
+    label_color: Hsla,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .child(div().text_color(label_color).child(label))
+        .child(
+            gpui_omarchy::input(id, state, window, cx)
+                .debug_selector(move || id.into()),
+        )
+}
+
 /// Settings configuration page.
 pub fn settings_page(
     app: &Ruum,
@@ -749,6 +769,14 @@ pub fn settings_page(
 
     let input_min_free = app
         .watchdog_input_min_free
+        .as_ref()
+        .expect("inputs initialized");
+    let input_poll_interval = app
+        .watchdog_input_poll_interval
+        .as_ref()
+        .expect("inputs initialized");
+    let input_cooldown = app
+        .watchdog_input_cooldown
         .as_ref()
         .expect("inputs initialized");
     let input_custom_cmd = app
@@ -842,24 +870,30 @@ pub fn settings_page(
                             ),
                         ),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(space::XS)
-                        .child(div().text_color(theme.secondary).child(
-                            crate::i18n::pages::min_free_threshold(locale),
-                        ))
-                        .child(
-                            gpui_omarchy::input(
-                                "setting-min-free-input",
-                                input_min_free,
-                                window,
-                                cx,
-                            )
-                            .debug_selector(|| "setting-min-free-input".into()),
-                        ),
-                ),
+                .child(setting_input_field(
+                    "setting-min-free-input",
+                    crate::i18n::pages::min_free_threshold(locale),
+                    input_min_free,
+                    theme.secondary,
+                    window,
+                    cx,
+                ))
+                .child(setting_input_field(
+                    "setting-poll-interval-input",
+                    crate::i18n::pages::poll_interval_minutes(locale),
+                    input_poll_interval,
+                    theme.secondary,
+                    window,
+                    cx,
+                ))
+                .child(setting_input_field(
+                    "setting-cooldown-input",
+                    crate::i18n::pages::cooldown_minutes(locale),
+                    input_cooldown,
+                    theme.secondary,
+                    window,
+                    cx,
+                )),
         );
 
     let mut provider_buttons = div().flex().flex_row().gap(space::SM);

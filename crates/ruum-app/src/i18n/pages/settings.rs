@@ -63,6 +63,26 @@ pub const fn min_free_threshold(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn poll_interval_minutes(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Check Interval (minutes):",
+        "\u{68c0}\u{6d4b}\u{95f4}\u{9694}\u{ff08}\u{5206}\u{949f}\u{ff09}\u{ff1a}",
+        "\u{30c1}\u{30a7}\u{30c3}\u{30af}\u{9593}\u{9694}\u{ff08}\u{5206}\u{ff09}:",
+        "\u{d655}\u{c778} \u{ac04}\u{aca9}(\u{bd84}):",
+    )
+}
+
+pub const fn cooldown_minutes(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Re-Alert Cooldown (min 5 minutes):",
+        "\u{91cd}\u{590d}\u{63d0}\u{793a}\u{51b7}\u{5374}\u{65f6}\u{95f4}\u{ff08}\u{6700}\u{4f4e} 5 \u{5206}\u{949f}\u{ff09}\u{ff1a}",
+        "\u{518d}\u{901a}\u{77e5}\u{30af}\u{30fc}\u{30eb}\u{30c0}\u{30a6}\u{30f3}\u{ff08}\u{6700}\u{5c0f} 5 \u{5206}\u{ff09}:",
+        "\u{c7ac}\u{c54c}\u{b9bc} \u{cfe8}\u{b2e4}\u{c6b4}(\u{cd5c}\u{c18c} 5\u{bd84}):",
+    )
+}
+
 pub const fn ai_assistant_cli_title(locale: Locale) -> &'static str {
     pick(
         locale,

@@ -45,8 +45,8 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use gpui_kit::{
-    App, AppContext as _, FocusHandle, Global, IntoElement, Render, Window,
-    WindowHandle, WindowOptions, px, size,
+    App, AppContext as _, FocusHandle, Global, IntoElement, Pixels, Render,
+    Size, Window, WindowHandle, WindowOptions, px, size,
 };
 use ruum_core::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmRequest,
@@ -687,6 +687,18 @@ impl CleanupConfirmAdapter for InProcessConfirmAdapter {
     }
 }
 
+/// Compute initial main window dimensions (60% of primary display, minimum
+/// 800x600), falling back to a 1440x900 screen when no display is reported.
+#[must_use]
+pub(crate) fn initial_main_window_size(
+    screen_size: Option<Size<Pixels>>,
+) -> Size<Pixels> {
+    let screen = screen_size.unwrap_or_else(|| size(px(1440.), px(900.)));
+    let width = (screen.width.as_f32() * 0.6).round().max(800.0);
+    let height = (screen.height.as_f32() * 0.6).round().max(600.0);
+    size(px(width), px(height))
+}
+
 fn open_main_window(
     cx: &mut App,
     title_root_override: Option<PathBuf>,
@@ -699,15 +711,14 @@ fn open_main_window(
     let home = std::env::home_dir();
     let title_root = title_root_override.unwrap_or_else(|| launch.root.clone());
     let native_look = launch.native_look;
+    let win_size =
+        initial_main_window_size(cx.primary_display().map(|d| d.bounds().size));
 
     let window = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(gpui_kit::WindowBounds::Windowed(
-                    gpui_kit::Bounds::new(
-                        gpui_kit::point(px(120.), px(90.)),
-                        size(px(1440.), px(900.)),
-                    ),
+                window_bounds: Some(gpui_kit::WindowBounds::centered(
+                    win_size, cx,
                 )),
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some(
@@ -733,7 +744,7 @@ fn open_main_window(
                 // and the desktop entry's StartupWMClass and the documented
                 // window rule both match `ruum`.
                 app_id: Some("ruum".to_owned()),
-                window_min_size: Some(size(px(900.), px(600.))),
+                window_min_size: Some(size(px(800.), px(600.))),
                 ..Default::default()
             },
             move |window, cx| {

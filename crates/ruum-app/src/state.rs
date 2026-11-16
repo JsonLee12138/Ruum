@@ -37,7 +37,7 @@ use ruum_core::treemap::{
 };
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::{
-    MIN_FREE_GB_FLOOR, WatchdogConfig, WatchdogState,
+    MIN_COOLDOWN_SECS, MIN_FREE_GB_FLOOR, WatchdogConfig, WatchdogState,
 };
 use std::collections::BTreeSet;
 
@@ -641,6 +641,10 @@ pub struct Ruum {
     pub watchdog_state: WatchdogState,
     /// Settings input: threshold minimum free gigabytes.
     pub watchdog_input_min_free: Option<Entity<InputState>>,
+    /// Settings input: watchdog check interval in minutes.
+    pub watchdog_input_poll_interval: Option<Entity<InputState>>,
+    /// Settings input: watchdog re-alert cooldown in minutes.
+    pub watchdog_input_cooldown: Option<Entity<InputState>>,
     /// Settings input: custom AI CLI command.
     pub watchdog_input_custom_cmd: Option<Entity<InputState>>,
     /// Settings input: custom AI CLI extra arguments.
@@ -841,6 +845,8 @@ impl Ruum {
             watchdog_config,
             watchdog_state,
             watchdog_input_min_free: None,
+            watchdog_input_poll_interval: None,
+            watchdog_input_cooldown: None,
             watchdog_input_custom_cmd: None,
             watchdog_input_extra_args: None,
             watchdog_input_model: None,
@@ -1176,6 +1182,8 @@ impl Ruum {
             &self.picker_host,
             &self.picker_path,
             &self.watchdog_input_min_free,
+            &self.watchdog_input_poll_interval,
+            &self.watchdog_input_cooldown,
             &self.watchdog_input_custom_cmd,
             &self.watchdog_input_extra_args,
             &self.watchdog_input_model,
@@ -1210,6 +1218,35 @@ impl Ruum {
                     .default_value(val)
             });
             self.watchdog_input_min_free = Some(input);
+        }
+        if self.watchdog_input_poll_interval.is_none() {
+            let val = self
+                .watchdog_config
+                .poll_interval_secs
+                .div_ceil(60)
+                .max(1)
+                .to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("5")
+                    .default_value(val)
+            });
+            self.watchdog_input_poll_interval = Some(input);
+        }
+        if self.watchdog_input_cooldown.is_none() {
+            let min_cooldown_mins = MIN_COOLDOWN_SECS / 60;
+            let val = self
+                .watchdog_config
+                .cooldown_secs
+                .div_ceil(60)
+                .max(min_cooldown_mins)
+                .to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("360")
+                    .default_value(val)
+            });
+            self.watchdog_input_cooldown = Some(input);
         }
         if self.watchdog_input_custom_cmd.is_none() {
             let val = self.watchdog_config.custom_command.clone();
@@ -1257,6 +1294,19 @@ impl Ruum {
                 cfg.min_free_gb = val.max(MIN_FREE_GB_FLOOR);
             }
         }
+        if let Some(ref input) = self.watchdog_input_poll_interval {
+            let text = input.read(cx).value();
+            if let Ok(val) = text.trim().parse::<u64>() {
+                cfg.poll_interval_secs = val.max(1).saturating_mul(60);
+            }
+        }
+        if let Some(ref input) = self.watchdog_input_cooldown {
+            let text = input.read(cx).value();
+            if let Ok(val) = text.trim().parse::<u64>() {
+                let min_mins = MIN_COOLDOWN_SECS / 60;
+                cfg.cooldown_secs = val.max(min_mins).saturating_mul(60);
+            }
+        }
         if let Some(ref input) = self.watchdog_input_custom_cmd {
             cfg.custom_command = input.read(cx).value().trim().to_string();
         }
@@ -1267,7 +1317,7 @@ impl Ruum {
             let text = input.read(cx).value().trim().to_string();
             cfg.model = (!text.is_empty()).then_some(text);
         }
-        cfg
+        cfg.normalized()
     }
 
     /// Switch the active UI locale in tests.

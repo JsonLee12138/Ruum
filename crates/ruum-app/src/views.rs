@@ -1912,7 +1912,7 @@ fn toast_overlay(app: &Ruum, cx: &Context<'_, Ruum>) -> Option<Stateful<Div>> {
             .occlude()
             .absolute()
             .bottom(space::MD)
-            .left(Rems(size::ICON_RAIL.0 + space::MD.0))
+            .right(space::MD)
             .max_w(size::TOAST)
             .flex()
             .flex_row()

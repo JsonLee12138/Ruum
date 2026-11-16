@@ -2511,20 +2511,105 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     draw(cx);
     assert!(cx.debug_bounds("settings-page").is_some());
     assert!(cx.debug_bounds("setting-enable-watchdog").is_some());
+    assert!(cx.debug_bounds("setting-min-free-input").is_some());
+    assert!(cx.debug_bounds("setting-poll-interval-input").is_some());
+    assert!(cx.debug_bounds("setting-cooldown-input").is_some());
     assert!(cx.debug_bounds("setting-save-btn").is_some());
 
-    // Toggle watchdog setting and save
+    // Focusing poll-interval or cooldown input marks the UI as editing.
+    cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        view.update(cx, |app, cx| {
+            let poll_input = app
+                .watchdog_input_poll_interval
+                .clone()
+                .expect("poll interval input");
+            window.focus(&poll_input.read(cx).focus_handle(cx), cx);
+            assert!(app.is_editing(window, cx));
+
+            let cooldown_input =
+                app.watchdog_input_cooldown.clone().expect("cooldown input");
+            window.focus(&cooldown_input.read(cx).focus_handle(cx), cx);
+            assert!(app.is_editing(window, cx));
+
+            window.focus(&app.focus, cx);
+            assert!(!app.is_editing(window, cx));
+        });
+    });
+
+    // Toggle watchdog setting, update poll interval & cooldown (minutes), save
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
             app.watchdog_config.enabled = true;
             if let Some(ref input) = app.watchdog_input_min_free {
                 input.update(cx, |inp, cx| inp.set_value("35", window, cx));
             }
+            if let Some(ref input) = app.watchdog_input_poll_interval {
+                input.update(cx, |inp, cx| inp.set_value("10", window, cx));
+            }
+            if let Some(ref input) = app.watchdog_input_cooldown {
+                input.update(cx, |inp, cx| inp.set_value("45", window, cx));
+            }
             app.save_watchdog_settings(cx);
         });
     });
     assert!(read(&view, cx, |app| app.watchdog_config.enabled));
     assert_eq!(read(&view, cx, |app| app.watchdog_config.min_free_gb), 35);
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.poll_interval_secs),
+        600
+    );
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.cooldown_secs),
+        2700
+    );
+
+    // Cooldown below 5 minutes clamps to MIN_COOLDOWN_SECS (300s).
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            if let Some(ref input) = app.watchdog_input_poll_interval {
+                input.update(cx, |inp, cx| inp.set_value("5", window, cx));
+            }
+            if let Some(ref input) = app.watchdog_input_cooldown {
+                input.update(cx, |inp, cx| inp.set_value("2", window, cx));
+            }
+            app.save_watchdog_settings(cx);
+        });
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.poll_interval_secs),
+        300
+    );
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.cooldown_secs),
+        ruum_core::watchdog_config::MIN_COOLDOWN_SECS
+    );
+
+    // Zero minutes clamps to 300s, and invalid text preserves existing value.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            if let Some(ref input) = app.watchdog_input_cooldown {
+                input.update(cx, |inp, cx| inp.set_value("0", window, cx));
+            }
+            app.save_watchdog_settings(cx);
+        });
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.cooldown_secs),
+        300
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            if let Some(ref input) = app.watchdog_input_cooldown {
+                input.update(cx, |inp, cx| inp.set_value("bad", window, cx));
+            }
+            app.save_watchdog_settings(cx);
+        });
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.cooldown_secs),
+        300
+    );
 
     // 2. Navigate to Watchdog page
     update(&view, cx, |app, _| app.screen = Screen::Watchdog);
@@ -2744,7 +2829,18 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
 
     update(&view, cx, Ruum::save_watchdog_settings);
     draw(cx);
-    assert!(cx.debug_bounds("toast-notification").is_some());
+    let toast_bounds = cx
+        .debug_bounds("toast-notification")
+        .expect("toast notification bounds");
+    let viewport = cx.update(|window, _| window.viewport_size());
+    assert!(
+        toast_bounds.right() > viewport.width / 2.0,
+        "expected toast on right half: {toast_bounds:?} vs {viewport:?}"
+    );
+    assert!(
+        toast_bounds.bottom() > viewport.height / 2.0,
+        "expected toast on bottom half: {toast_bounds:?} vs {viewport:?}"
+    );
     assert!(cx.debug_bounds("setting-save-status").is_none());
     assert!(cx.debug_bounds("settings-notice-line").is_none());
 
@@ -3089,4 +3185,26 @@ fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
             !crate::i18n::messages::title_confirm_cleanup(locale).is_empty()
         );
     }
+}
+
+#[test]
+fn initial_main_window_size_scales_and_clamps_to_minimum() {
+    use gpui_kit::size;
+
+    assert_eq!(
+        crate::initial_main_window_size(Some(size(px(3840.), px(2160.)))),
+        size(px(2304.), px(1296.))
+    );
+    assert_eq!(
+        crate::initial_main_window_size(Some(size(px(1920.), px(1080.)))),
+        size(px(1152.), px(648.))
+    );
+    assert_eq!(
+        crate::initial_main_window_size(Some(size(px(1280.), px(720.)))),
+        size(px(800.), px(600.))
+    );
+    assert_eq!(
+        crate::initial_main_window_size(None),
+        size(px(864.), px(600.))
+    );
 }

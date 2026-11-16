@@ -21,6 +21,9 @@ pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 /// Default watchdog polling interval in seconds (5 minutes).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
 
+/// Minimum allowable notification / AI analysis cooldown in seconds (5 minutes).
+pub const MIN_COOLDOWN_SECS: u64 = 300;
+
 /// Default notification / AI analysis cooldown in seconds (6 hours).
 pub const DEFAULT_COOLDOWN_SECS: u64 = 21_600;
 
@@ -115,6 +118,9 @@ impl WatchdogConfig {
         }
         if cfg.poll_interval_secs < MIN_POLL_INTERVAL_SECS {
             cfg.poll_interval_secs = MIN_POLL_INTERVAL_SECS;
+        }
+        if cfg.cooldown_secs < MIN_COOLDOWN_SECS {
+            cfg.cooldown_secs = MIN_COOLDOWN_SECS;
         }
         cfg
     }
@@ -287,11 +293,19 @@ mod tests {
         let zeroed = WatchdogConfig {
             min_free_gb: 0,
             poll_interval_secs: 5,
+            cooldown_secs: 0,
             ..def
         };
         let norm = zeroed.normalized();
         assert_eq!(norm.min_free_gb, MIN_FREE_GB_FLOOR);
         assert_eq!(norm.poll_interval_secs, MIN_POLL_INTERVAL_SECS);
+        assert_eq!(norm.cooldown_secs, MIN_COOLDOWN_SECS);
+
+        let low_cooldown = WatchdogConfig {
+            cooldown_secs: 60,
+            ..WatchdogConfig::default()
+        };
+        assert_eq!(low_cooldown.normalized().cooldown_secs, MIN_COOLDOWN_SECS);
     }
 
     #[test]

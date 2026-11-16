@@ -2520,7 +2520,12 @@ impl Ruum {
             cx.notify();
             return;
         }
-        if !path.is_absolute() {
+        let valid_abs = if self.volumes_source.is_some() {
+            ruum_core::remote::is_remote_absolute(&path)
+        } else {
+            path.is_absolute()
+        };
+        if !valid_abs {
             self.picker_error = Some(
                 crate::i18n::messages::picker_abs_path(self.locale).into(),
             );

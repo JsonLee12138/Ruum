@@ -556,7 +556,8 @@ fn create_applications_symlink(link: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn create_applications_symlink(_link: &Path) -> Result<(), String> {
+#[allow(clippy::unnecessary_wraps, reason = "matches unix signature")]
+const fn create_applications_symlink(_link: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -570,7 +571,8 @@ fn set_executable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), String> {
+#[allow(clippy::unnecessary_wraps, reason = "matches unix signature")]
+const fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 

@@ -5,7 +5,7 @@
 //! and stream without making a second serialized copy of the whole tree.
 
 use std::io::{self, BufRead, BufReader, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -78,14 +78,34 @@ pub struct Roots {
     pub volumes: Vec<crate::space::Volume>,
 }
 
+/// Reports whether `path` is absolute on the local host or on a remote POSIX
+/// or Windows target.
+pub fn is_remote_absolute(path: &Path) -> bool {
+    if path.is_absolute() {
+        return true;
+    }
+    let raw = path.to_string_lossy();
+    let bytes = raw.as_bytes();
+    if bytes.starts_with(b"/") {
+        return true;
+    }
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
 pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
     let roots: Roots = receive(input)?;
     if roots.version != VERSION
         || roots
             .volumes
             .iter()
-            .any(|volume| !volume.point.is_absolute())
-        || roots.home.as_ref().is_some_and(|home| !home.is_absolute())
+            .any(|volume| !is_remote_absolute(&volume.point))
+        || roots
+            .home
+            .as_ref()
+            .is_some_and(|home| !is_remote_absolute(home))
     {
         return Err(io::Error::other("incompatible remote root discovery"));
     }
@@ -332,7 +352,7 @@ fn read_snapshot_with_progress(
     shared: &Shared,
 ) -> io::Result<Snapshot> {
     let header: Header = receive(input)?;
-    if header.version != VERSION || !header.root.is_absolute() {
+    if header.version != VERSION || !is_remote_absolute(&header.root) {
         return Err(io::Error::other("incompatible remote helper protocol"));
     }
     let mut progress = Progress {
@@ -1335,5 +1355,55 @@ mod tests {
         data.truncate(data.len() - 7);
         assert!(read_snapshot(&mut data.as_slice()).is_err());
         assert!(dir.path().join("a ' file").exists());
+    }
+
+    #[test]
+    fn recognizes_remote_absolute_paths_across_posix_and_windows() {
+        for valid in ["/only-on-the-remote-host", "/", "C:\\Users", "D:/data"] {
+            assert!(is_remote_absolute(Path::new(valid)), "{valid}");
+        }
+        for invalid in ["relative", "C:foo", ""] {
+            assert!(!is_remote_absolute(Path::new(invalid)), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn read_roots_and_snapshot_accept_cross_platform_absolute_paths() {
+        let roots = Roots {
+            version: VERSION,
+            home: Some(PathBuf::from("/home/remote")),
+            platform: "linux".into(),
+            identity: None,
+            volumes: vec![
+                crate::space::Volume {
+                    point: PathBuf::from("/"),
+                    device: Some("/dev/sda1".into()),
+                    space: None,
+                },
+                crate::space::Volume {
+                    point: PathBuf::from("C:\\"),
+                    device: Some("NTFS".into()),
+                    space: None,
+                },
+            ],
+        };
+        let mut roots_wire = Vec::new();
+        send(&mut roots_wire, &roots).unwrap();
+        let decoded_roots = read_roots(&mut roots_wire.as_slice()).unwrap();
+        assert_eq!(decoded_roots.volumes.len(), 2);
+
+        for remote_root in ["/only-on-the-remote-host", "D:/data"] {
+            let mut snap_wire = Vec::new();
+            send(
+                &mut snap_wire,
+                &Header::new(PathBuf::from(remote_root), None, "linux", None),
+            )
+            .unwrap();
+            send(&mut snap_wire, &Record("root".into(), 0, 0, 0, 0, false, 0))
+                .unwrap();
+            send(&mut snap_wire, &"done").unwrap();
+            let snapshot = read_snapshot(&mut snap_wire.as_slice()).unwrap();
+            assert_eq!(snapshot.header.root, PathBuf::from(remote_root));
+        }
     }
 }

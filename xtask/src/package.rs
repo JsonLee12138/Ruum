@@ -58,14 +58,6 @@ impl Arch {
         }
     }
 
-    pub const fn deb_arch(self) -> &'static str {
-        self.nfpm_arch()
-    }
-
-    pub const fn rpm_arch(self) -> &'static str {
-        self.as_str()
-    }
-
     pub const fn wix_arch(self) -> &'static str {
         match self {
             Self::X86_64 => "x64",
@@ -399,8 +391,6 @@ pub fn stage_linux(opts: &LinuxStageOptions) -> Result<(), String> {
 
     let nfpm = NFPM_TEMPLATE
         .replace("@NFPM_ARCH@", opts.arch.nfpm_arch())
-        .replace("@DEB_ARCH@", opts.arch.deb_arch())
-        .replace("@RPM_ARCH@", opts.arch.rpm_arch())
         .replace("@NFPM_VERSION@", &nfpm_version)
         .replace("@BIN_PATH@", &slash_path(&staged_bin))
         .replace("@DESKTOP_PATH@", &slash_path(&desktop_path))
@@ -625,7 +615,8 @@ fn set_executable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), String> {
+#[allow(clippy::unnecessary_wraps, reason = "matches unix signature")]
+const fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -744,7 +735,7 @@ mod tests {
 
         let nfpm = fs::read_to_string(out.join("nfpm.yaml")).unwrap();
         assert!(nfpm.contains("arch: \"arm64\""));
-        assert!(nfpm.contains("arch: \"aarch64\""));
+        assert!(nfpm.contains("overrides:"));
         assert!(!nfpm.contains('@'));
 
         assert!(out.join("AppDir/usr/bin/ruum").is_file());

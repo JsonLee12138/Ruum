@@ -35,7 +35,6 @@ contents:
       mode: 0644
 overrides:
   deb:
-    arch: "@DEB_ARCH@"
     recommends:
       - libvulkan1
       - libxkbcommon0
@@ -43,7 +42,6 @@ overrides:
       - libxcb1
       - libfontconfig1
   rpm:
-    arch: "@RPM_ARCH@"
     recommends:
       - vulkan-loader
       - libxkbcommon

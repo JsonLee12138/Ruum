@@ -1844,7 +1844,7 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     // Marking something inside it is refused, and says why.
     update(&view, cx, |app, cx| app.toggle_mark(&deeper, cx));
     let (count, notice, expected) = read(&view, cx, |app| {
-        let deeper_path = temp.path().join("junk/deeper");
+        let deeper_path = temp.path().join("junk").join("deeper");
         let junk_path = temp.path().join("junk");
         let target_disp =
             crate::marks::display_path(&deeper_path, app.home.as_deref());

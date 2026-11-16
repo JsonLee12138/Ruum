@@ -10,7 +10,7 @@ use gpui_kit::{
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
     MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
-    pattern_slash, px, relative,
+    pattern_slash, px, relative, svg,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, ChoiceItem, IconName, Status, Theme,
@@ -758,20 +758,47 @@ fn sibling_menu(
     panel
 }
 
-/// Four tiles in category colours, and the name.
+const LOGO_FRAME_AND_SLAB_SVG: &[u8] = br#"<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="12 12 40 40"
+  fill="currentColor"
+>
+  <path
+    fill-rule="evenodd"
+    d="M12 12H52V52H12V12ZM14 14V50H50V14H14Z"
+  />
+  <rect x="31" y="17" width="16" height="11" />
+</svg>"#;
+
+const LOGO_MONOLITH_SVG: &[u8] = br#"<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="12 12 40 40"
+  fill="currentColor"
+>
+  <rect x="17" y="17" width="11" height="30" />
+</svg>"#;
+
+const LOGO_WATCHDOG_SVG: &[u8] = br#"<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="12 12 40 40"
+  fill="currentColor"
+>
+  <path
+    fill-rule="evenodd"
+    d="M31 31H47V47H31V31ZM33 33V45H45V33H33Z"
+  />
+  <rect x="35" y="35" width="8" height="8" />
+</svg>"#;
+
+/// The C1 Machined Monolith mark and the name.
 fn logo(theme: &Theme) -> Div {
-    let tile = |category| {
-        div()
-            .size(space::SM)
-            .bg(palette::category_accent(theme, category))
-    };
-    let column = |top, bottom| {
-        div()
-            .flex()
-            .flex_col()
-            .gap(space::XXS)
-            .child(tile(top))
-            .child(tile(bottom))
+    let layer = |data, color| {
+        svg()
+            .data(data)
+            .absolute()
+            .inset_0()
+            .size_full()
+            .text_color(color)
     };
     div()
         .flex()
@@ -781,11 +808,12 @@ fn logo(theme: &Theme) -> Div {
         .flex_shrink_0()
         .child(
             div()
-                .flex()
-                .flex_row()
-                .gap(space::XXS)
-                .child(column(Category::Code, Category::Synced))
-                .child(column(Category::AgentScratch, Category::Toolchain)),
+                .relative()
+                .size(icon::LG)
+                .flex_shrink_0()
+                .child(layer(LOGO_FRAME_AND_SLAB_SVG, theme.secondary))
+                .child(layer(LOGO_MONOLITH_SVG, theme.bright))
+                .child(layer(LOGO_WATCHDOG_SVG, palette::highlight(theme))),
         )
         .child(
             div()

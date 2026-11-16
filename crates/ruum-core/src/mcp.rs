@@ -152,12 +152,20 @@ impl McpServer {
         ssh_host: Option<&str>,
         path: &Path,
     ) {
-        let norm = normalize(path);
+        let norm = if ssh_host.is_some() {
+            normalize_remote_path(path)
+        } else {
+            normalize(path)
+        };
         self.cache.retain(|(host, root), _| {
             if host.as_deref() != ssh_host {
                 return true;
             }
-            let root_norm = normalize(root);
+            let root_norm = if ssh_host.is_some() {
+                normalize_remote_path(root)
+            } else {
+                normalize(root)
+            };
             !(root_norm.starts_with(&norm) || norm.starts_with(&root_norm))
         });
     }
@@ -579,7 +587,7 @@ impl McpServer {
         let root_str = required_str(args, "root")?;
         let raw_targets = required_string_array(args, "targets")?;
         if let Some(host) = ssh_host {
-            let root_path = normalize(Path::new(root_str));
+            let root_path = normalize_remote_path(Path::new(root_str));
             let key = (Some(host.clone()), root_path.clone());
             let cached = self.cache.get(&key).ok_or_else(|| {
                 format!(
@@ -653,7 +661,7 @@ impl McpServer {
         let root_str = required_str(args, "root")?;
         let raw_targets = required_string_array(args, "targets")?;
         if let Some(host) = ssh_host {
-            let root_path = normalize(Path::new(root_str));
+            let root_path = normalize_remote_path(Path::new(root_str));
             let key = (Some(host.clone()), root_path.clone());
             let cached = self.cache.get(&key).ok_or_else(|| {
                 format!(
@@ -985,7 +993,7 @@ impl McpServer {
         root_str: &str,
     ) -> Result<(PathBuf, bool), String> {
         let candidate_root = if ssh_host.is_some() {
-            normalize(Path::new(root_str))
+            normalize_remote_path(Path::new(root_str))
         } else {
             resolve_local_path(root_str)?
         };
@@ -1013,7 +1021,7 @@ impl McpServer {
     ) -> Result<(PathBuf, bool), String> {
         if let Some(host) = ssh_host {
             if !rescan && let Some(raw) = path_arg {
-                let norm = normalize(Path::new(raw));
+                let norm = normalize_remote_path(Path::new(raw));
                 let key = (Some(host.to_owned()), norm.clone());
                 if let Some(existing) = self.cache.get(&key)
                     && same_scan_options(&existing.options, options)
@@ -1029,7 +1037,7 @@ impl McpServer {
             let snapshot = RemoteScan::spawn(host, &request)
                 .and_then(RemoteScan::wait)
                 .map_err(|err| err.to_string())?;
-            let root_path = normalize(&snapshot.header.root);
+            let root_path = normalize_remote_path(&snapshot.header.root);
             let key = (Some(host.to_owned()), root_path.clone());
             let prev_count = self.cache.get(&key).map_or(0, |c| c.scan_count);
             self.cache.insert(
@@ -1304,6 +1312,30 @@ fn path_for_crumbs(
     path
 }
 
+fn normalize_remote_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return normalize(path);
+    };
+    if !text.starts_with('/') {
+        return normalize(path);
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(format!("/{}", parts.join("/")))
+    }
+}
+
 fn build_targets(
     raw_targets: &[String],
     root_path: &Path,
@@ -1314,8 +1346,13 @@ fn build_targets(
         .iter()
         .map(|raw| {
             let path = PathBuf::from(raw);
+            let norm = if remote {
+                normalize_remote_path(&path)
+            } else {
+                normalize(&path)
+            };
             if let Some(tree) = cached_tree
-                && let Ok(rel) = normalize(&path).strip_prefix(root_path)
+                && let Ok(rel) = norm.strip_prefix(root_path)
                 && let Some(node) = find_relative_node(tree, rel)
             {
                 return Target {
@@ -2029,10 +2066,12 @@ mod tests {
         classify(&mut root);
 
         let mut server = McpServer::new(Box::new(DenyAuth));
-        let root_path = PathBuf::from("/tmp/synth-work");
+        let root_path = normalize(&std::env::temp_dir().join("synth-work"));
+        let root_str = root_path.to_str().expect("utf8").to_owned();
+        let cache_str = root_path.join(".cache").display().to_string();
         server.insert_cached(
             None,
-            root_path,
+            root_path.clone(),
             CachedScan {
                 tree: root,
                 space: None,
@@ -2052,7 +2091,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "find_reclaimable",
-                    "arguments": { "root": "/tmp/synth-work" }
+                    "arguments": { "root": root_str }
                 }
             })],
         )
@@ -2062,11 +2101,10 @@ mod tests {
         assert!(!is_err);
         let candidates = payload["candidates"].as_array().expect("candidates");
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0]["path"], "/tmp/synth-work/.cache");
+        assert_eq!(candidates[0]["path"], cache_str);
         assert_eq!(candidates[0]["finding"]["kind"], "reclaimable");
 
-        server
-            .invalidate_overlapping(None, Path::new("/tmp/synth-work/.cache"));
+        server.invalidate_overlapping(None, &root_path.join(".cache"));
         assert!(server.cache().is_empty());
     }
 
@@ -2205,9 +2243,88 @@ mod tests {
 
         let (err2, rem_plan) = parse_tool_payload(&responses[1]);
         assert!(!err2);
+        assert_eq!(rem_plan["root"], "/home/me");
         assert_eq!(rem_plan["targets"].as_array().expect("targets").len(), 1);
+        assert_eq!(rem_plan["targets"][0]["path"], "/home/me/cache");
         assert_eq!(rem_plan["blocked"].as_array().expect("blocked").len(), 2);
         assert_eq!(rem_plan["allowed_modes"], json!(["trash"]));
+    }
+
+    #[test]
+    fn normalize_remote_path_keeps_posix_separators_and_invalidates() {
+        assert_eq!(
+            normalize_remote_path(Path::new("/home/me/./sub/../cache/"))
+                .to_str(),
+            Some("/home/me/cache")
+        );
+        assert_eq!(normalize_remote_path(Path::new("/..")).to_str(), Some("/"));
+        assert_eq!(normalize_remote_path(Path::new("/")).to_str(), Some("/"));
+
+        let mut remote_tree = Node::directory("me");
+        let mut cache = Node::directory("cache");
+        cache
+            .children
+            .push(Node::entry("item.bin", NodeKind::File, 2048));
+        remote_tree.children.push(cache);
+        aggregate(&mut remote_tree, Metric::Bytes);
+
+        let mut server = McpServer::new(Box::new(DenyAuth));
+        let cached = CachedScan {
+            tree: remote_tree,
+            space: None,
+            home: Some(PathBuf::from("/home/me")),
+            platform: "linux".to_owned(),
+            identity: Some(HostIdentity {
+                hostname: "box".to_owned(),
+                machine_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            }),
+            options: ScanOptions::default(),
+            scan_count: 1,
+        };
+        server.insert_cached(
+            Some("box".to_owned()),
+            PathBuf::from("/home/me"),
+            cached.clone(),
+        );
+        server.insert_cached(
+            Some("box".to_owned()),
+            PathBuf::from("/var/log"),
+            cached,
+        );
+
+        let responses = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "plan_removal",
+                    "arguments": {
+                        "root": "/home/me/./",
+                        "ssh_host": "box",
+                        "targets": ["/home/me/./cache"]
+                    }
+                }
+            })],
+        )
+        .expect("serve succeeds");
+        let (is_err, payload) = parse_tool_payload(&responses[0]);
+        assert!(!is_err, "unexpected error: {payload}");
+        assert_eq!(payload["root"], "/home/me");
+        assert_eq!(payload["targets"][0]["path"], "/home/me/cache");
+        assert_eq!(payload["targets"][0]["bytes"], 2048);
+
+        server
+            .invalidate_overlapping(Some("box"), Path::new("/home/me/./cache"));
+        assert!(!server.cache().contains_key(&(
+            Some("box".to_owned()),
+            PathBuf::from("/home/me")
+        )));
+        assert!(server.cache().contains_key(&(
+            Some("box".to_owned()),
+            PathBuf::from("/var/log")
+        )));
     }
 
     struct CountingAuth {

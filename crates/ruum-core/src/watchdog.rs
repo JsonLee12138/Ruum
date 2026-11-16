@@ -875,23 +875,19 @@ mod tests {
         let state_path = home.join("watchdog-state.json");
 
         // Target to clean
-        let target_dir = home.join("cache/artifacts");
+        let target_dir = home.join("cache").join("artifacts");
         fs::create_dir_all(&target_dir).unwrap();
         fs::write(target_dir.join("temp.dat"), b"12345678").unwrap();
 
-        let fake_ai_json = format!(
-            r#"{{
-              "summary": "Reclaim temp artifacts",
-              "items": [
-                {{
-                  "path": "{}",
-                  "mode": "trash",
-                  "reason": "Test artifact"
-                }}
-              ]
-            }}"#,
-            target_dir.display()
-        );
+        let fake_ai_json = serde_json::json!({
+            "summary": "Reclaim temp artifacts",
+            "items": [{
+                "path": target_dir.to_string_lossy(),
+                "mode": "trash",
+                "reason": "Test artifact",
+            }],
+        })
+        .to_string();
 
         let runner = MockRunner::default();
         // Return fake AI proposal JSON on command
@@ -965,19 +961,15 @@ mod tests {
         let target_file = home.join("keep_me.txt");
         fs::write(&target_file, b"important").unwrap();
 
-        let fake_ai_json = format!(
-            r#"{{
-              "summary": "Should be cancelled",
-              "items": [
-                {{
-                  "path": "{}",
-                  "mode": "trash",
-                  "reason": "Test item"
-                }}
-              ]
-            }}"#,
-            target_file.display()
-        );
+        let fake_ai_json = serde_json::json!({
+            "summary": "Should be cancelled",
+            "items": [{
+                "path": target_file.to_string_lossy(),
+                "mode": "trash",
+                "reason": "Test item",
+            }],
+        })
+        .to_string();
 
         let fake_exe = home.join("ruum");
         fs::write(&fake_exe, b"").unwrap();
@@ -1045,19 +1037,15 @@ mod tests {
             let target_file = home.join("cache.bin");
             fs::write(&target_file, b"abcd").unwrap();
 
-            let fake_ai_json = format!(
-                r#"{{
-                  "summary": "Test summary",
-                  "items": [
-                    {{
-                      "path": "{}",
-                      "mode": "trash",
-                      "reason": "Test item"
-                    }}
-                  ]
-                }}"#,
-                target_file.display()
-            );
+            let fake_ai_json = serde_json::json!({
+                "summary": "Test summary",
+                "items": [{
+                    "path": target_file.to_string_lossy(),
+                    "mode": "trash",
+                    "reason": "Test item",
+                }],
+            })
+            .to_string();
 
             let fake_exe = home.join("ruum");
             fs::write(&fake_exe, b"").unwrap();

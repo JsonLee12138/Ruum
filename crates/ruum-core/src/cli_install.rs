@@ -1205,7 +1205,8 @@ mod tests {
             usr_local_bin: PathBuf::from("/usr/local/bin"),
         };
         let adapter = CliInstallFactory::create_for(CliInstallOs::Windows);
-        let expected_bin_dir = local_appdata.join("Programs/ruum/bin");
+        let expected_bin_dir =
+            local_appdata.join("Programs").join("ruum").join("bin");
         let expected_exe = expected_bin_dir.join("ruum.exe");
 
         // 1. NotInstalled before install.

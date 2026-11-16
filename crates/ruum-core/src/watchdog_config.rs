@@ -191,7 +191,10 @@ fn config_dir_for(
             .map(|base| base.join("ruum"))
     } else {
         xdg_config_home
-            .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
+            .filter(|p| {
+                !p.as_os_str().is_empty()
+                    && (p.is_absolute() || p.to_string_lossy().starts_with('/'))
+            })
             .or_else(|| home.map(|h| h.join(".config")))
             .map(|base| base.join("ruum"))
     }

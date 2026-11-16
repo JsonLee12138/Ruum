@@ -1862,7 +1862,7 @@ mod tests {
         let home_path = temp_home.path();
 
         // Create a safe target inside home
-        let safe_dir = home_path.join("project/target");
+        let safe_dir = home_path.join("project").join("target");
         fs::create_dir_all(&safe_dir).unwrap();
         fs::write(safe_dir.join("build.o"), b"object code").unwrap();
 
@@ -1871,30 +1871,27 @@ mod tests {
         fs::create_dir_all(git_dir.join(".git")).unwrap();
         fs::write(git_dir.join("file.txt"), b"dirty content").unwrap();
 
-        let json_input = format!(
-            r#"{{
-              "summary": "Clean build cache and system",
-              "items": [
-                {{
-                  "path": "{}",
-                  "mode": "trash",
-                  "reason": "Cargo target directory"
-                }},
-                {{
-                  "path": "/etc/shadow",
-                  "mode": "permanent",
-                  "reason": "Forbidden system file"
-                }},
-                {{
-                  "path": "{}",
-                  "mode": "trash",
-                  "reason": "Git checkout candidate"
-                }}
-              ]
-            }}"#,
-            safe_dir.display(),
-            git_dir.display()
-        );
+        let json_input = serde_json::json!({
+            "summary": "Clean build cache and system",
+            "items": [
+                {
+                    "path": safe_dir.to_string_lossy(),
+                    "mode": "trash",
+                    "reason": "Cargo target directory",
+                },
+                {
+                    "path": "/etc/shadow",
+                    "mode": "permanent",
+                    "reason": "Forbidden system file",
+                },
+                {
+                    "path": git_dir.to_string_lossy(),
+                    "mode": "trash",
+                    "reason": "Git checkout candidate",
+                },
+            ],
+        })
+        .to_string();
 
         let proposal =
             parse_and_validate_proposal(&json_input, home_path, 1_700_000_000)
@@ -2101,18 +2098,24 @@ mod tests {
     #[test]
     fn parse_and_validate_proposal_unwraps_response_envelope_and_reports_raw() {
         let temp_home = tempfile::tempdir().unwrap();
-        let cache_dir = temp_home.path().join("project/target");
+        let cache_dir = temp_home.path().join("project").join("target");
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(cache_dir.join("out.bin"), b"12345").unwrap();
 
-        let wrapped = format!(
-            r#"{{"status":"SUCCESS","response":{}}}"#,
-            serde_json::to_string(&format!(
-                "```json\n{{\"summary\":\"ok\",\"items\":[{{\"path\":\"{}\",\"mode\":\"trash\",\"reason\":\"build artifact\"}}]}}\n```",
-                cache_dir.display()
-            ))
-            .unwrap()
-        );
+        let inner = serde_json::json!({
+            "summary": "ok",
+            "items": [{
+                "path": cache_dir.to_string_lossy(),
+                "mode": "trash",
+                "reason": "build artifact",
+            }],
+        })
+        .to_string();
+        let wrapped = serde_json::json!({
+            "status": "SUCCESS",
+            "response": format!("```json\n{inner}\n```"),
+        })
+        .to_string();
         let prop = parse_and_validate_proposal(&wrapped, temp_home.path(), 42)
             .unwrap();
         assert_eq!(prop.items.len(), 1);
@@ -2137,7 +2140,7 @@ mod tests {
     #[test]
     fn collect_reclaimable_candidates_and_prompt_include_discovered_dirs() {
         let temp_home = tempfile::tempdir().unwrap();
-        let target_dir = temp_home.path().join("myproj/target");
+        let target_dir = temp_home.path().join("myproj").join("target");
         fs::create_dir_all(&target_dir).unwrap();
         fs::write(target_dir.join("big.o"), vec![b'a'; 4096]).unwrap();
 
@@ -2162,32 +2165,29 @@ mod tests {
         use crate::trash_adapter::{TrashAdapterFactory, TrashEnv, TrashOs};
 
         let temp_home = tempfile::tempdir().unwrap();
-        let trash_item = temp_home.path().join(".Trash/old.zip");
-        let cache_dir = temp_home.path().join("project/target");
+        let trash_item = temp_home.path().join(".Trash").join("old.zip");
+        let cache_dir = temp_home.path().join("project").join("target");
         fs::create_dir_all(trash_item.parent().unwrap()).unwrap();
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(&trash_item, b"stale").unwrap();
         fs::write(cache_dir.join("out.bin"), b"build").unwrap();
 
-        let raw = format!(
-            r#"{{
-              "summary": "Clean trash and build cache",
-              "items": [
-                {{
-                  "path": "{}",
-                  "mode": "trash",
-                  "reason": "Old item inside Trash"
-                }},
-                {{
-                  "path": "{}",
-                  "mode": "trash",
-                  "reason": "Build artifact"
-                }}
-              ]
-            }}"#,
-            trash_item.display(),
-            cache_dir.display()
-        );
+        let raw = serde_json::json!({
+            "summary": "Clean trash and build cache",
+            "items": [
+                {
+                    "path": trash_item.to_string_lossy(),
+                    "mode": "trash",
+                    "reason": "Old item inside Trash",
+                },
+                {
+                    "path": cache_dir.to_string_lossy(),
+                    "mode": "trash",
+                    "reason": "Build artifact",
+                },
+            ],
+        })
+        .to_string();
 
         let mac = TrashAdapterFactory::create_for(TrashOs::MacOs);
         let env = TrashEnv {

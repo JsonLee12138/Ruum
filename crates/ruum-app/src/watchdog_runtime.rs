@@ -163,12 +163,11 @@ impl Drop for WatchdogIpcServer {
         }
         #[cfg(windows)]
         {
-            if let Ok(content) = std::fs::read_to_string(&self.port_path) {
-                if let Ok(port) = content.trim().parse::<u16>() {
-                    let _ = std::net::TcpStream::connect(format!(
-                        "127.0.0.1:{port}"
-                    ));
-                }
+            if let Ok(content) = std::fs::read_to_string(&self.port_path)
+                && let Ok(port) = content.trim().parse::<u16>()
+            {
+                let _ =
+                    std::net::TcpStream::connect(format!("127.0.0.1:{port}"));
             }
         }
         if let Some(handle) = self.thread.take() {

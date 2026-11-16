@@ -328,9 +328,12 @@ mod tests {
         assert!(request.reason.contains("/tmp/work"));
         assert!(request.reason.contains("7 items"));
         assert!(request.reason.contains("7.0 MiB"));
-        assert!(request.reason.contains("/tmp/work/dir-1"));
-        assert!(request.reason.contains("/tmp/work/dir-5"));
-        assert!(!request.reason.contains("/tmp/work/dir-6"));
+        let dir1 = plan.root.join("dir-1").display().to_string();
+        let dir5 = plan.root.join("dir-5").display().to_string();
+        let dir6 = plan.root.join("dir-6").display().to_string();
+        assert!(request.reason.contains(&dir1));
+        assert!(request.reason.contains(&dir5));
+        assert!(!request.reason.contains(&dir6));
         assert!(request.reason.contains("2 more"));
 
         let custom = AuthRequest::for_permanent_delete_with_reason(

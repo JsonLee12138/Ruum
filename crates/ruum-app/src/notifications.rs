@@ -375,7 +375,6 @@ mod win_toast {
     use std::io;
     use std::sync::mpsc;
     use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
 
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::Foundation::TypedEventHandler;
@@ -525,22 +524,10 @@ mod win_toast {
 
         notifier.Show(&toast)?;
 
-        let deadline = Instant::now() + NOTIFY_WAIT_TTL;
-        loop {
-            let Some(remaining) =
-                deadline.checked_duration_since(Instant::now())
-            else {
-                break;
-            };
-            match rx.recv_timeout(remaining) {
-                Ok(ToastWaitEvent::Activated) => {
-                    if let Ok(exe) = std::env::current_exe() {
-                        activate_or_launch_ruum(&args.tag, &exe);
-                    }
-                    break;
-                }
-                Ok(ToastWaitEvent::Closed) | Err(_) => break,
-            }
+        if let Ok(ToastWaitEvent::Activated) = rx.recv_timeout(NOTIFY_WAIT_TTL)
+            && let Ok(exe) = std::env::current_exe()
+        {
+            activate_or_launch_ruum(&args.tag, &exe);
         }
         drop(toast);
         Ok(())

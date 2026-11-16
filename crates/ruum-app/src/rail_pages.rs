@@ -18,6 +18,7 @@ use gpui_omarchy::{
     ActiveTheme, ButtonVariant, IconName, button, checkbox, dialog_button,
     dialog_description, dialog_popup, dialog_title, with_tooltip,
 };
+use ruum_core::cli_install::CliInstallStatus;
 use ruum_core::removal::RemovalMode;
 use ruum_core::size::human_bytes;
 use ruum_core::watchdog::ServiceStatus;
@@ -454,19 +455,36 @@ pub fn watchdog_page(
         .as_ref()
         .map_or_else(|| "/".to_string(), |h| h.display().to_string());
 
-    let (free_str, total_str, free_bytes) = if let Some(space) = &app.space {
+    let space_opt = app.watchdog_home_space.as_ref().or(if cfg!(test) {
+        app.space.as_ref()
+    } else {
+        None
+    });
+    let thresh_bytes = app
+        .watchdog_config
+        .min_free_gb
+        .saturating_mul(1024 * 1024 * 1024);
+    let (free_display, is_breached) = if let Some(space) = space_opt {
         (
-            human_bytes(space.available),
-            human_bytes(space.total),
-            space.available,
+            crate::i18n::pages::free_of_total(
+                &human_bytes(space.available),
+                &human_bytes(space.total),
+                locale,
+            ),
+            Some(space.available < thresh_bytes),
         )
     } else {
-        let unknown = crate::i18n::pages::unknown(locale).to_string();
-        (unknown.clone(), unknown, 0)
+        (crate::i18n::pages::unknown(locale).to_string(), None)
     };
-
-    let thresh_bytes = app.watchdog_config.min_free_gb * 1024 * 1024 * 1024;
-    let is_breached = free_bytes < thresh_bytes;
+    let (status_text, status_color) = match is_breached {
+        Some(true) => {
+            (crate::i18n::pages::status_low_disk(locale), theme.danger)
+        }
+        Some(false) => {
+            (crate::i18n::pages::status_healthy(locale), theme.accent)
+        }
+        None => (crate::i18n::pages::unknown(locale), theme.secondary),
+    };
 
     let service_label =
         crate::i18n::pages::service_status(app.watchdog_service_status, locale);
@@ -515,14 +533,12 @@ pub fn watchdog_page(
                         ))
                         .child(
                             div()
-                                .text_color(if is_breached {
+                                .text_color(if is_breached == Some(true) {
                                     theme.danger
                                 } else {
                                     theme.bright
                                 })
-                                .child(crate::i18n::pages::free_of_total(
-                                    &free_str, &total_str, locale,
-                                )),
+                                .child(free_display),
                         ),
                 )
                 .child(
@@ -550,16 +566,11 @@ pub fn watchdog_page(
                         )
                         .child(
                             div()
-                                .text_color(if is_breached {
-                                    theme.danger
-                                } else {
-                                    theme.accent
+                                .debug_selector(|| {
+                                    "watchdog-status-value".into()
                                 })
-                                .child(if is_breached {
-                                    crate::i18n::pages::status_low_disk(locale)
-                                } else {
-                                    crate::i18n::pages::status_healthy(locale)
-                                }),
+                                .text_color(status_color)
+                                .child(status_text),
                         ),
                 )
                 .child(
@@ -792,12 +803,14 @@ pub fn settings_page(
         .as_ref()
         .expect("inputs initialized");
 
-    let is_enabled = app.watchdog_config.enabled;
-    let is_service = app.watchdog_config.background_service;
-    let current_provider = app.watchdog_config.ai_provider;
+    let is_enabled = app.watchdog_draft.enabled;
+    let is_service = app.watchdog_draft.background_service;
+    let is_auto_analyze = app.watchdog_draft.ai_auto_analyze;
+    let current_provider = app.watchdog_draft.ai_provider;
 
     let entity_watchdog = cx.entity().downgrade();
     let entity_service = entity_watchdog.clone();
+    let entity_auto_analyze = entity_watchdog.clone();
 
     let watchdog_section = dialog_popup(cx)
         .w_full()
@@ -830,8 +843,8 @@ pub fn settings_page(
                                     let _ = entity_watchdog.update(
                                         cx,
                                         |this, cx| {
-                                            this.watchdog_config.enabled =
-                                                !this.watchdog_config.enabled;
+                                            this.watchdog_draft.enabled =
+                                                !this.watchdog_draft.enabled;
                                             cx.notify();
                                         },
                                     );
@@ -859,9 +872,9 @@ pub fn settings_page(
                                     let _ = entity_service.update(
                                         cx,
                                         |this, cx| {
-                                            this.watchdog_config
+                                            this.watchdog_draft
                                                 .background_service = !this
-                                                .watchdog_config
+                                                .watchdog_draft
                                                 .background_service;
                                             cx.notify();
                                         },
@@ -932,73 +945,63 @@ pub fn settings_page(
             crate::i18n::pages::ai_assistant_cli_desc(locale),
             cx,
         ))
+        .child(
+            div()
+                .debug_selector(|| "setting-ai-auto-analyze".into())
+                .child(
+                    checkbox(
+                        "setting-ai-auto-analyze",
+                        crate::i18n::pages::ai_auto_analyze(locale),
+                        if is_auto_analyze {
+                            CheckboxState::Checked
+                        } else {
+                            CheckboxState::Unchecked
+                        },
+                        cx,
+                    )
+                    .tab_stop(false)
+                    .on_change(move |_, _, _, cx| {
+                        let _ = entity_auto_analyze.update(cx, |this, cx| {
+                            this.watchdog_draft.ai_auto_analyze =
+                                !this.watchdog_draft.ai_auto_analyze;
+                            cx.notify();
+                        });
+                    }),
+                ),
+        )
         .child(provider_buttons);
 
-    if current_provider == AiCliProvider::Custom {
-        ai_section = ai_section
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(space::XS)
-                    .child(
-                        div().text_color(theme.secondary).child(
-                            crate::i18n::pages::custom_executable(locale),
-                        ),
-                    )
-                    .child(
-                        gpui_omarchy::input(
-                            "setting-custom-cmd-input",
-                            input_custom_cmd,
-                            window,
-                            cx,
-                        )
-                        .debug_selector(|| "setting-custom-cmd-input".into()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(space::XS)
-                    .child(
-                        div().text_color(theme.secondary).child(
-                            crate::i18n::pages::custom_extra_args(locale),
-                        ),
-                    )
-                    .child(
-                        gpui_omarchy::input(
-                            "setting-extra-args-input",
-                            input_extra_args,
-                            window,
-                            cx,
-                        )
-                        .debug_selector(|| "setting-extra-args-input".into()),
-                    ),
-            );
+    let show_custom_cmd = current_provider == AiCliProvider::Custom
+        || !app.watchdog_config.custom_command.is_empty()
+        || !input_custom_cmd.read(cx).value().trim().is_empty();
+    if show_custom_cmd {
+        ai_section = ai_section.child(setting_input_field(
+            "setting-custom-cmd-input",
+            crate::i18n::pages::custom_executable(locale),
+            input_custom_cmd,
+            theme.secondary,
+            window,
+            cx,
+        ));
     }
 
     ai_section = ai_section
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(space::XS)
-                .child(
-                    div()
-                        .text_color(theme.secondary)
-                        .child(crate::i18n::pages::model_override(locale)),
-                )
-                .child(
-                    gpui_omarchy::input(
-                        "setting-model-input",
-                        input_model,
-                        window,
-                        cx,
-                    )
-                    .debug_selector(|| "setting-model-input".into()),
-                ),
-        )
+        .child(setting_input_field(
+            "setting-extra-args-input",
+            crate::i18n::pages::custom_extra_args(locale),
+            input_extra_args,
+            theme.secondary,
+            window,
+            cx,
+        ))
+        .child(setting_input_field(
+            "setting-model-input",
+            crate::i18n::pages::model_override(locale),
+            input_model,
+            theme.secondary,
+            window,
+            cx,
+        ))
         .child(
             div()
                 .flex()
@@ -1058,7 +1061,7 @@ pub fn settings_page(
             .max_h(Rems(14.0))
             .overflow_y_scroll();
 
-        let selected_model = app.watchdog_config.model.as_deref();
+        let selected_model = app.watchdog_draft.model.as_deref();
         for (index, model) in app.watchdog_models.iter().enumerate() {
             let is_selected = selected_model == Some(model.id.as_str());
             let is_benchmarking =
@@ -1308,6 +1311,92 @@ pub fn settings_page(
         ai_section = ai_section.child(models_header).child(model_rows);
     }
 
+    let (cli_status_text, cli_in_path_hint, cli_installed) =
+        match &app.cli_install_status {
+            Some(CliInstallStatus::Installed { path, in_path }) => {
+                let path_str = path.display().to_string();
+                let hint = (!in_path).then(|| {
+                    let dir = path
+                        .parent()
+                        .map_or_else(String::new, |d| d.display().to_string());
+                    crate::i18n::pages::cli_not_in_path_hint(&dir, locale)
+                });
+                (
+                    crate::i18n::pages::cli_status_installed(&path_str, locale),
+                    hint,
+                    true,
+                )
+            }
+            Some(CliInstallStatus::NotInstalled) | None => (
+                crate::i18n::pages::cli_status_not_installed(locale).to_owned(),
+                None,
+                false,
+            ),
+        };
+    let cli_btn_label = if app.cli_updating {
+        crate::i18n::pages::cli_updating_btn(locale)
+    } else if cli_installed {
+        crate::i18n::pages::cli_uninstall_btn(locale)
+    } else {
+        crate::i18n::pages::cli_install_btn(locale)
+    };
+    let cli_section = dialog_popup(cx)
+        .w_full()
+        .child(dialog_title(crate::i18n::pages::cli_tool_title(locale), cx))
+        .child(dialog_description(
+            crate::i18n::pages::cli_tool_desc(locale),
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::MD)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XXS)
+                        .child(
+                            div()
+                                .text_color(theme.bright)
+                                .child(cli_status_text),
+                        )
+                        .children(cli_in_path_hint.map(|hint| {
+                            div()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.danger)
+                                .child(hint)
+                        })),
+                )
+                .child(
+                    div().debug_selector(|| "setting-cli-btn".into()).child(
+                        button(
+                            "setting-cli-btn",
+                            cli_btn_label,
+                            if cli_installed || app.cli_updating {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Primary
+                            },
+                            cx,
+                        )
+                        .disabled(app.cli_updating)
+                        .on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                if cli_installed {
+                                    this.uninstall_ruum_cli(cx);
+                                } else {
+                                    this.install_or_update_cli(cx);
+                                }
+                            },
+                        )),
+                    ),
+                ),
+        );
+
     let save_bar = div()
         .flex()
         .flex_row()
@@ -1326,9 +1415,11 @@ pub fn settings_page(
                     ButtonVariant::Primary,
                     cx,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.save_watchdog_settings(cx);
-                })),
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.save_watchdog_settings(window, cx);
+                    },
+                )),
             ),
         );
 
@@ -1354,6 +1445,7 @@ pub fn settings_page(
         )
         .child(watchdog_section)
         .child(ai_section)
+        .child(cli_section)
         .child(save_bar)
 }
 

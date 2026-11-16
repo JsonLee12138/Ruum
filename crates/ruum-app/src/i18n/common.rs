@@ -22,6 +22,16 @@ pub const fn menu_settings(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn menu_install_cli(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Install CLI Command\u{2026}",
+        "安装命令行工具\u{2026}",
+        "CLI コマンドをインストール\u{2026}",
+        "CLI 명령 설치\u{2026}",
+    )
+}
+
 pub const fn menu_hide_app(locale: Locale) -> &'static str {
     pick(
         locale,

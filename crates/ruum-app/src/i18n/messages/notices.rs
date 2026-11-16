@@ -13,6 +13,57 @@ pub fn failed_save_settings(err: &str, locale: Locale) -> String {
     }
 }
 
+pub const fn invalid_watchdog_number(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Enter valid whole numbers for threshold, interval, and cooldown",
+        "请为阈值、检查间隔和冷却时间输入有效的整数",
+        "しきい値、確認間隔、クールダウンには有効な整数を入力してください",
+        "임계값, 확인 간격 및 쿨다운에 올바른 정수를 입력하세요",
+    )
+}
+
+pub fn cli_installed(path: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("CLI command installed at {path}"),
+        Locale::Zh => format!("CLI 命令已安装到 {path}"),
+        Locale::Ja => format!("CLI コマンドを {path} にインストールしました"),
+        Locale::Ko => format!("CLI 명령을 {path}에 설치했습니다"),
+    }
+}
+
+pub const fn cli_uninstalled(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "CLI command uninstalled",
+        "CLI 命令已卸载",
+        "CLI コマンドをアンインストールしました",
+        "CLI 명령을 제거했습니다",
+    )
+}
+
+pub fn cli_install_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to install CLI command: {err}"),
+        Locale::Zh => format!("安装 CLI 命令失败：{err}"),
+        Locale::Ja => {
+            format!("CLI コマンドのインストールに失敗しました: {err}")
+        }
+        Locale::Ko => format!("CLI 명령 설치 실패: {err}"),
+    }
+}
+
+pub fn cli_uninstall_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to uninstall CLI command: {err}"),
+        Locale::Zh => format!("卸载 CLI 命令失败：{err}"),
+        Locale::Ja => {
+            format!("CLI コマンドのアンインストールに失敗しました: {err}")
+        }
+        Locale::Ko => format!("CLI 명령 제거 실패: {err}"),
+    }
+}
+
 pub const fn settings_saved(locale: Locale) -> &'static str {
     pick(
         locale,

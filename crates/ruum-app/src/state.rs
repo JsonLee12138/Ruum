@@ -20,6 +20,9 @@ use gpui_kit::{
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 use ruum_core::access::file_table_readable;
+use ruum_core::cli_install::{
+    CliInstallEnv, CliInstallFactory, CliInstallStatus,
+};
 use ruum_core::confirm::{
     CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
 };
@@ -484,6 +487,29 @@ fn write_decision_file(
     std::fs::write(path, json)
 }
 
+/// Draft form state for the Settings page, isolated from committed config
+/// until the user explicitly saves.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchdogSettingsDraft {
+    pub enabled: bool,
+    pub background_service: bool,
+    pub ai_auto_analyze: bool,
+    pub ai_provider: ruum_core::watchdog_config::AiCliProvider,
+    pub model: Option<String>,
+}
+
+impl From<&WatchdogConfig> for WatchdogSettingsDraft {
+    fn from(cfg: &WatchdogConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            background_service: cfg.background_service,
+            ai_auto_analyze: cfg.ai_auto_analyze,
+            ai_provider: cfg.ai_provider,
+            model: cfg.model.clone(),
+        }
+    }
+}
+
 /// Everything the app knows and everything it can do.
 pub struct Ruum {
     /// Active UI locale (`En`, `Zh`, `Ja`, `Ko`).
@@ -641,8 +667,16 @@ pub struct Ruum {
     pub scanned_at: i64,
     /// Watchdog monitoring configuration.
     pub watchdog_config: WatchdogConfig,
+    /// Injectable path to `watchdog.json` (`None` under `cfg!(test)`).
+    pub watchdog_config_path: Option<PathBuf>,
     /// Watchdog persistent runtime state.
     pub watchdog_state: WatchdogState,
+    /// Injectable path to `watchdog-state.json` (`None` under `cfg!(test)`).
+    pub watchdog_state_path: Option<PathBuf>,
+    /// Unsaved toggle/provider/model selections on the Settings page.
+    pub watchdog_draft: WatchdogSettingsDraft,
+    /// When true, `views::root` syncs Settings text inputs from `watchdog_config`.
+    pub watchdog_inputs_need_sync: bool,
     /// Settings input: threshold minimum free gigabytes.
     pub watchdog_input_min_free: Option<Entity<InputState>>,
     /// Settings input: watchdog check interval in minutes.
@@ -681,8 +715,20 @@ pub struct Ruum {
     pub watchdog_analysis_epoch: u64,
     /// Unix seconds when disk space was last checked on Watchdog page.
     pub watchdog_space_checked_at: Option<u64>,
+    /// Free space on the home directory's volume for the Watchdog dashboard.
+    pub watchdog_home_space: Option<SpaceInfo>,
     /// Background daemon OS service status.
     pub watchdog_service_status: Option<ServiceStatus>,
+    /// Self-CLI PATH registration status.
+    pub cli_install_status: Option<CliInstallStatus>,
+    /// True while installing or uninstalling the `ruum` CLI command.
+    pub cli_updating: bool,
+    #[cfg(test)]
+    pub cli_install_env: Option<CliInstallEnv>,
+    #[cfg(test)]
+    pub cli_install_os: Option<ruum_core::cli_install::CliInstallOs>,
+    #[cfg(test)]
+    pub cli_install_exe: Option<PathBuf>,
 }
 
 impl Ruum {
@@ -734,18 +780,36 @@ impl Ruum {
             None
         };
         let trash_backend = detect_trash_backend();
-        let watchdog_config =
-            ruum_core::watchdog_config::watchdog_config_path()
-                .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
+        let (
+            watchdog_config_path,
+            watchdog_state_path,
+            watchdog_config,
+            watchdog_state,
+            watchdog_home_space,
+        ) = if cfg!(test) {
+            (
+                None,
+                None,
+                WatchdogConfig::default(),
+                WatchdogState::default(),
+                None,
+            )
+        } else {
+            let cfg_path = ruum_core::watchdog_config::watchdog_config_path();
+            let state_path = ruum_core::watchdog_config::watchdog_state_path();
+            let cfg = cfg_path
+                .as_deref()
+                .and_then(|p| ruum_core::watchdog_config::load_config(p).ok())
                 .unwrap_or_default();
-        let watchdog_state = ruum_core::watchdog_config::watchdog_state_path()
-            .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
-            .unwrap_or_default();
+            let state = state_path
+                .as_deref()
+                .and_then(|p| ruum_core::watchdog_config::load_state(p).ok())
+                .unwrap_or_default();
+            let home_space = home.as_deref().and_then(|h| space_info(h).ok());
+            (cfg_path, state_path, cfg, state, home_space)
+        };
         let watchdog_space_checked_at = watchdog_state.last_checked_secs;
-        let watchdog_service_status = ruum_core::watchdog::service_status(
-            &ruum_core::ai_cli::DefaultCommandRunner,
-        )
-        .ok();
+        let watchdog_draft = WatchdogSettingsDraft::from(&watchdog_config);
 
         let mut tree = Self {
             root_path,
@@ -851,7 +915,11 @@ impl Ruum {
             scan_elapsed: None,
             scanned_at: now_seconds(),
             watchdog_config,
+            watchdog_config_path,
             watchdog_state,
+            watchdog_state_path,
+            watchdog_draft,
+            watchdog_inputs_need_sync: false,
             watchdog_input_min_free: None,
             watchdog_input_poll_interval: None,
             watchdog_input_cooldown: None,
@@ -871,9 +939,21 @@ impl Ruum {
             watchdog_analyzing: false,
             watchdog_analysis_epoch: 0,
             watchdog_space_checked_at,
-            watchdog_service_status,
+            watchdog_home_space,
+            watchdog_service_status: None,
+            cli_install_status: None,
+            cli_updating: false,
+            #[cfg(test)]
+            cli_install_env: None,
+            #[cfg(test)]
+            cli_install_os: None,
+            #[cfg(test)]
+            cli_install_exe: None,
             locale: crate::i18n::Locale::current(),
         };
+        if !cfg!(test) {
+            Self::probe_system_statuses(cx);
+        }
         if local && start {
             tree.device = device_for(&tree.root_path);
             tree.full_disk_access = tree
@@ -1014,6 +1094,20 @@ impl Ruum {
             self.volumes_open = false;
         }
         self.screen = target;
+        if target == Screen::Settings {
+            self.reload_watchdog_config_and_prepare_settings();
+            if !cfg!(test) {
+                Self::probe_system_statuses(cx);
+            }
+        } else if target == Screen::Watchdog {
+            self.reload_watchdog_state();
+            if !cfg!(test) {
+                self.watchdog_home_space = std::env::home_dir()
+                    .as_deref()
+                    .and_then(|h| space_info(h).ok());
+                Self::probe_system_statuses(cx);
+            }
+        }
         self.focus_request = Some(FocusTarget::Root);
         cx.notify();
     }
@@ -1202,12 +1296,97 @@ impl Ruum {
             .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
     }
 
+    /// Probe OS background service and CLI registration statuses off the UI
+    /// thread.
+    pub fn probe_system_statuses(cx: &Context<'_, Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let task = cx.background_executor().spawn(async {
+            let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                Duration::from_secs(5),
+            );
+            let service_status =
+                ruum_core::watchdog::service_status(&runner).ok();
+            let cli_status = std::env::current_exe().ok().and_then(|exe| {
+                ruum_core::cli_install::cli_status(&runner, &exe).ok()
+            });
+            (service_status, cli_status)
+        });
+        cx.spawn(async move |this, cx| {
+            let (service_status, cli_status) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.watchdog_service_status = service_status;
+                this.cli_install_status = cli_status;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Re-read watchdog persistent state from disk.
     pub fn reload_watchdog_state(&mut self) {
-        if let Some(path) = ruum_core::watchdog_config::watchdog_state_path()
-            && let Ok(st) = ruum_core::watchdog_config::load_state(&path)
+        if let Some(path) = self.watchdog_state_path.as_deref()
+            && let Ok(st) = ruum_core::watchdog_config::load_state(path)
         {
+            self.watchdog_space_checked_at = st.last_checked_secs;
             self.watchdog_state = st;
+        }
+    }
+
+    /// Reload `watchdog.json` (when configured), reset Settings draft, and
+    /// schedule text input synchronization.
+    pub fn reload_watchdog_config_and_prepare_settings(&mut self) {
+        if let Some(path) = self.watchdog_config_path.as_deref()
+            && let Ok(cfg) = ruum_core::watchdog_config::load_config(path)
+        {
+            self.watchdog_config = cfg;
+        }
+        self.watchdog_draft =
+            WatchdogSettingsDraft::from(&self.watchdog_config);
+        self.watchdog_inputs_need_sync = true;
+    }
+
+    /// Write all 6 Settings text inputs from `self.watchdog_config`.
+    pub fn sync_watchdog_inputs_from_config(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let min_free = self.watchdog_config.min_free_gb.to_string();
+        let poll_interval = self
+            .watchdog_config
+            .poll_interval_secs
+            .div_ceil(60)
+            .max(1)
+            .to_string();
+        let min_cooldown_mins = MIN_COOLDOWN_SECS / 60;
+        let cooldown = self
+            .watchdog_config
+            .cooldown_secs
+            .div_ceil(60)
+            .max(min_cooldown_mins)
+            .to_string();
+        let custom_cmd = self.watchdog_config.custom_command.clone();
+        let extra_args = self.watchdog_config.extra_args.clone();
+        let model = self.watchdog_config.model.clone().unwrap_or_default();
+
+        let pairs = [
+            (&self.watchdog_input_min_free, min_free),
+            (&self.watchdog_input_poll_interval, poll_interval),
+            (&self.watchdog_input_cooldown, cooldown),
+            (&self.watchdog_input_custom_cmd, custom_cmd),
+            (&self.watchdog_input_extra_args, extra_args),
+            (&self.watchdog_input_model, model),
+        ];
+        for (slot, val) in pairs {
+            if let Some(input) = slot
+                && input.read(cx).value().as_str() != val
+            {
+                input.update(cx, |inp, cx| {
+                    inp.set_value(val, window, cx);
+                });
+            }
         }
     }
 
@@ -1293,9 +1472,15 @@ impl Ruum {
         }
     }
 
-    /// Read current Watchdog settings including any unsaved text input values.
+    /// Read current Watchdog settings including any unsaved draft/input values.
     fn snapshot_watchdog_config(&self, cx: &App) -> WatchdogConfig {
         let mut cfg = self.watchdog_config.clone();
+        cfg.enabled = self.watchdog_draft.enabled;
+        cfg.background_service = self.watchdog_draft.background_service;
+        cfg.ai_auto_analyze = self.watchdog_draft.ai_auto_analyze;
+        cfg.ai_provider = self.watchdog_draft.ai_provider;
+        cfg.model.clone_from(&self.watchdog_draft.model);
+
         if let Some(ref input) = self.watchdog_input_min_free {
             let text = input.read(cx).value();
             if let Ok(val) = text.trim().parse::<u64>() {
@@ -1382,8 +1567,8 @@ impl Ruum {
         provider: ruum_core::watchdog_config::AiCliProvider,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.watchdog_config.ai_provider != provider {
-            self.watchdog_config.ai_provider = provider;
+        if self.watchdog_draft.ai_provider != provider {
+            self.watchdog_draft.ai_provider = provider;
             self.watchdog_test_epoch += 1;
             self.watchdog_fetch_epoch += 1;
             self.watchdog_benchmark_epoch += 1;
@@ -1404,7 +1589,7 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         let trimmed = model_id.trim();
-        self.watchdog_config.model =
+        self.watchdog_draft.model =
             (!trimmed.is_empty()).then(|| trimmed.to_string());
         if let Some(ref input) = self.watchdog_input_model {
             input.update(cx, |inp, cx| {
@@ -1414,15 +1599,108 @@ impl Ruum {
         cx.notify();
     }
 
-    /// Save watchdog settings from inputs to `watchdog.json` and sync OS service.
-    pub fn save_watchdog_settings(&mut self, cx: &mut Context<'_, Self>) {
-        self.watchdog_config = self.snapshot_watchdog_config(cx);
+    fn parse_strict_u64_input(
+        slot: Option<&Entity<InputState>>,
+        fallback: u64,
+        cx: &App,
+    ) -> Result<u64, ()> {
+        match slot {
+            Some(input) => {
+                input.read(cx).value().trim().parse::<u64>().map_err(|_| ())
+            }
+            None => Ok(fallback),
+        }
+    }
 
-        if let Some(path) = ruum_core::watchdog_config::watchdog_config_path()
-            && let Err(err) = ruum_core::watchdog_config::save_config(
-                &path,
-                &self.watchdog_config,
-            )
+    /// Save watchdog settings from inputs to `watchdog.json`, echo normalized
+    /// values, update runtime cache, and conditionally sync OS service.
+    pub fn save_watchdog_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let fallback_poll_mins =
+            self.watchdog_config.poll_interval_secs.div_ceil(60).max(1);
+        let fallback_cool_mins = self
+            .watchdog_config
+            .cooldown_secs
+            .div_ceil(60)
+            .max(MIN_COOLDOWN_SECS / 60);
+
+        let Ok(min_free_gb) = Self::parse_strict_u64_input(
+            self.watchdog_input_min_free.as_ref(),
+            self.watchdog_config.min_free_gb,
+            cx,
+        ) else {
+            self.push_toast(
+                crate::i18n::messages::invalid_watchdog_number(self.locale),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+        let Ok(poll_mins) = Self::parse_strict_u64_input(
+            self.watchdog_input_poll_interval.as_ref(),
+            fallback_poll_mins,
+            cx,
+        ) else {
+            self.push_toast(
+                crate::i18n::messages::invalid_watchdog_number(self.locale),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+        let Ok(cooldown_mins) = Self::parse_strict_u64_input(
+            self.watchdog_input_cooldown.as_ref(),
+            fallback_cool_mins,
+            cx,
+        ) else {
+            self.push_toast(
+                crate::i18n::messages::invalid_watchdog_number(self.locale),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+
+        let custom_command =
+            self.watchdog_input_custom_cmd.as_ref().map_or_else(
+                || self.watchdog_config.custom_command.clone(),
+                |input| input.read(cx).value().trim().to_string(),
+            );
+        let extra_args = self.watchdog_input_extra_args.as_ref().map_or_else(
+            || self.watchdog_config.extra_args.clone(),
+            |input| input.read(cx).value().trim().to_string(),
+        );
+        let model = self.watchdog_input_model.as_ref().map_or_else(
+            || self.watchdog_draft.model.clone(),
+            |input| {
+                let text = input.read(cx).value().trim().to_string();
+                (!text.is_empty()).then_some(text)
+            },
+        );
+
+        let min_cooldown_mins = MIN_COOLDOWN_SECS / 60;
+        let next_cfg = WatchdogConfig {
+            enabled: self.watchdog_draft.enabled,
+            background_service: self.watchdog_draft.background_service,
+            min_free_gb,
+            poll_interval_secs: poll_mins.max(1).saturating_mul(60),
+            cooldown_secs: cooldown_mins
+                .max(min_cooldown_mins)
+                .saturating_mul(60),
+            ai_auto_analyze: self.watchdog_draft.ai_auto_analyze,
+            ai_provider: self.watchdog_draft.ai_provider,
+            custom_command,
+            extra_args,
+            model,
+        }
+        .normalized();
+
+        if let Some(path) = self.watchdog_config_path.as_deref()
+            && let Err(err) =
+                ruum_core::watchdog_config::save_config(path, &next_cfg)
         {
             self.push_toast(
                 crate::i18n::messages::failed_save_settings(
@@ -1435,6 +1713,30 @@ impl Ruum {
             return;
         }
 
+        let prev_cfg =
+            std::mem::replace(&mut self.watchdog_config, next_cfg.clone());
+        self.watchdog_draft = WatchdogSettingsDraft::from(&next_cfg);
+        self.watchdog_inputs_need_sync = false;
+        self.sync_watchdog_inputs_from_config(window, cx);
+
+        let threshold_changed = prev_cfg.min_free_gb != next_cfg.min_free_gb;
+        let re_enabled = !prev_cfg.enabled && next_cfg.enabled;
+        if threshold_changed || re_enabled {
+            self.watchdog_state.last_triggered_secs = None;
+            self.watchdog_state.last_triggered_threshold_gb = None;
+            if let Some(state_path) = self.watchdog_state_path.as_deref() {
+                let _ = ruum_core::watchdog_config::save_state(
+                    state_path,
+                    &self.watchdog_state,
+                );
+            }
+        }
+
+        let reset_poll = threshold_changed
+            || re_enabled
+            || prev_cfg.poll_interval_secs != next_cfg.poll_interval_secs;
+        crate::notify_watchdog_config_saved(&next_cfg, reset_poll, cx);
+
         if cfg!(test) {
             self.push_toast(
                 crate::i18n::messages::settings_saved(self.locale),
@@ -1444,10 +1746,30 @@ impl Ruum {
             return;
         }
 
-        let enable_service = self.watchdog_config.background_service;
+        let enable_service = next_cfg.background_service;
+        let needs_service_sync = if enable_service {
+            !matches!(self.watchdog_service_status, Some(ServiceStatus::Active))
+        } else {
+            matches!(
+                self.watchdog_service_status,
+                Some(ServiceStatus::Active | ServiceStatus::Inactive)
+            ) || (self.watchdog_service_status.is_none()
+                && prev_cfg.background_service)
+        };
+
+        if !needs_service_sync || self.watchdog_saving {
+            self.push_toast(
+                crate::i18n::messages::settings_saved(self.locale),
+                Status::Success,
+                cx,
+            );
+            return;
+        }
+
         let current_exe =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
         self.watchdog_saving = true;
+        crate::with_runtime_mut(cx, |rt| rt.service_sync_in_flight = true);
         self.push_toast(
             crate::i18n::messages::settings_saved_updating_service(self.locale),
             Status::Success,
@@ -1469,6 +1791,11 @@ impl Ruum {
 
         cx.spawn(async move |this, cx| {
             let (sync_res, status) = task.await;
+            cx.update(|cx| {
+                crate::with_runtime_mut(cx, |rt| {
+                    rt.service_sync_in_flight = false;
+                });
+            });
             let _ = this.update(cx, |this, cx| {
                 this.watchdog_saving = false;
                 this.watchdog_service_status = status;
@@ -1493,6 +1820,156 @@ impl Ruum {
                                 locale,
                             ),
                             Status::Warning,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    fn resolve_cli_target(
+        &self,
+    ) -> std::io::Result<(
+        ruum_core::cli_install::CliInstallOs,
+        CliInstallEnv,
+        PathBuf,
+    )> {
+        let env = self.cli_install_env.clone().ok_or_else(|| {
+            std::io::Error::other(
+                "CLI registration disabled in tests without injected env",
+            )
+        })?;
+        let os = self
+            .cli_install_os
+            .unwrap_or_else(CliInstallFactory::current_os);
+        let exe = self
+            .cli_install_exe
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/ruum-test"));
+        Ok((os, env, exe))
+    }
+
+    #[cfg(not(test))]
+    fn resolve_cli_target() -> std::io::Result<(
+        ruum_core::cli_install::CliInstallOs,
+        CliInstallEnv,
+        PathBuf,
+    )> {
+        let exe = std::env::current_exe()?;
+        Ok((
+            CliInstallFactory::current_os(),
+            CliInstallEnv::current(),
+            exe,
+        ))
+    }
+
+    /// Install or update the `ruum` CLI command in `PATH` off the UI thread.
+    pub fn install_or_update_cli(&mut self, cx: &mut Context<'_, Self>) {
+        if self.cli_updating {
+            return;
+        }
+        #[cfg(test)]
+        let target = self.resolve_cli_target();
+        #[cfg(not(test))]
+        let target = Self::resolve_cli_target();
+        self.cli_updating = true;
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let (os, env, exe) = target?;
+            let adapter = CliInstallFactory::create_for(os);
+            let runner = ruum_core::ai_cli::DefaultCommandRunner;
+            let installed_path = adapter.install(&runner, &env, &exe)?;
+            let status =
+                adapter.status(&runner, &env, &exe).unwrap_or_else(|_| {
+                    CliInstallStatus::Installed {
+                        path: installed_path.clone(),
+                        in_path: true,
+                    }
+                });
+            Ok::<_, std::io::Error>((installed_path, status))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.cli_updating = false;
+                let locale = this.locale;
+                match res {
+                    Ok((path, status)) => {
+                        this.cli_install_status = Some(status);
+                        this.push_toast(
+                            crate::i18n::messages::cli_installed(
+                                &path.display().to_string(),
+                                locale,
+                            ),
+                            Status::Success,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            crate::i18n::messages::cli_install_failed(
+                                &err.to_string(),
+                                locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Uninstall the `ruum` CLI command from `PATH` off the UI thread.
+    pub fn uninstall_ruum_cli(&mut self, cx: &mut Context<'_, Self>) {
+        if self.cli_updating {
+            return;
+        }
+        #[cfg(test)]
+        let target = self.resolve_cli_target();
+        #[cfg(not(test))]
+        let target = Self::resolve_cli_target();
+        self.cli_updating = true;
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let (os, env, exe) = target?;
+            let adapter = CliInstallFactory::create_for(os);
+            let runner = ruum_core::ai_cli::DefaultCommandRunner;
+            adapter.uninstall(&runner, &env, &exe)?;
+            let status = adapter
+                .status(&runner, &env, &exe)
+                .unwrap_or(CliInstallStatus::NotInstalled);
+            Ok::<_, std::io::Error>(status)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.cli_updating = false;
+                let locale = this.locale;
+                match res {
+                    Ok(status) => {
+                        this.cli_install_status = Some(status);
+                        this.push_toast(
+                            crate::i18n::messages::cli_uninstalled(locale),
+                            Status::Success,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            crate::i18n::messages::cli_uninstall_failed(
+                                &err.to_string(),
+                                locale,
+                            ),
+                            Status::Error,
                             cx,
                         );
                     }
@@ -1806,7 +2283,10 @@ impl Ruum {
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
         match space_info(&target) {
             Ok(info) => {
-                self.space = Some(info);
+                self.watchdog_home_space = Some(info);
+                if self.remote.is_none() && self.root_path == target {
+                    self.space = Some(info);
+                }
                 self.watchdog_space_checked_at = Some(now_secs);
                 let thresh_bytes = self
                     .watchdog_config
@@ -1911,11 +2391,11 @@ impl Ruum {
                 existing_tree.as_deref(),
                 &runner,
             );
-            (home, now_secs, res)
+            (home, res)
         });
 
         cx.spawn(async move |this, cx| {
-            let (home, completed_secs, res) = task.await;
+            let (home, res) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if epoch != this.watchdog_analysis_epoch {
                     return;
@@ -1926,13 +2406,10 @@ impl Ruum {
                     Ok(proposal) => {
                         this.watchdog_state.last_proposal =
                             Some(proposal.clone());
-                        this.watchdog_state.last_triggered_secs =
-                            Some(completed_secs);
-                        if let Some(path) =
-                            ruum_core::watchdog_config::watchdog_state_path()
+                        if let Some(path) = this.watchdog_state_path.as_deref()
                         {
                             let _ = ruum_core::watchdog_config::save_state(
-                                &path,
+                                path,
                                 &this.watchdog_state,
                             );
                         }

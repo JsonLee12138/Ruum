@@ -205,6 +205,10 @@ fn run() -> Result<()> {
             };
         let (in_proc_tx, in_proc_rx) = channel();
         let (in_proc_notif_tx, in_proc_notif_rx) = channel();
+        let initial_watchdog_config =
+            ruum_core::watchdog_config::watchdog_config_path()
+                .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
+                .unwrap_or_default();
         cx.set_global(AppRuntime {
             launch,
             main_window: None,
@@ -218,6 +222,8 @@ fn run() -> Result<()> {
             in_proc_notif_rx,
             last_watchdog_poll: None,
             background_analysis_in_flight: false,
+            service_sync_in_flight: false,
+            watchdog_config: initial_watchdog_config,
         });
 
         cx.on_action(|_: &app_menu::OpenExplore, cx| {
@@ -231,6 +237,12 @@ fn run() -> Result<()> {
         });
         cx.on_action(|_: &app_menu::OpenSettings, cx| {
             open_or_navigate_main_window(Some(Screen::Settings), cx);
+        });
+        cx.on_action(|_: &app_menu::InstallCliCommand, cx| {
+            open_or_navigate_main_window(Some(Screen::Settings), cx);
+            update_open_main_window(cx, |app, cx| {
+                app.install_or_update_cli(cx);
+            });
         });
         cx.on_action(|_: &app_menu::ShowMainWindow, cx| {
             open_or_navigate_main_window(None, cx);
@@ -591,14 +603,12 @@ pub fn refresh_tray_status(cx: &mut App) {
     if rt.tray.is_none() {
         return;
     }
+    let watchdog_enabled = rt.watchdog_config.enabled;
     let home = std::env::home_dir();
     let free_bytes = home
         .as_deref()
         .and_then(|h| ruum_core::space::space_info(h).ok())
         .map(|s| s.available);
-    let cfg = ruum_core::watchdog_config::watchdog_config_path()
-        .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
-        .unwrap_or_default();
     let has_proposal = ruum_core::watchdog_config::watchdog_state_path()
         .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
         .and_then(|s| s.last_proposal)
@@ -607,8 +617,23 @@ pub fn refresh_tray_status(cx: &mut App) {
     if let Some(rt) = cx.try_global::<AppRuntime>()
         && let Some(tray) = &rt.tray
     {
-        tray.update_status(free_bytes, cfg.enabled, has_proposal);
+        tray.update_status(free_bytes, watchdog_enabled, has_proposal);
     }
+}
+
+/// Update cached runtime Watchdog config and optionally reset poll timer.
+pub(crate) fn notify_watchdog_config_saved(
+    new_cfg: &ruum_core::watchdog_config::WatchdogConfig,
+    reset_poll: bool,
+    cx: &mut App,
+) {
+    with_runtime_mut(cx, |rt| {
+        rt.watchdog_config = new_cfg.normalized();
+        if reset_poll {
+            rt.last_watchdog_poll = None;
+        }
+    });
+    refresh_tray_status(cx);
 }
 
 #[derive(Clone, Debug)]
@@ -646,6 +671,8 @@ pub(crate) struct AppRuntime {
     in_proc_notif_rx: Receiver<NotificationChannelPayload>,
     last_watchdog_poll: Option<Instant>,
     background_analysis_in_flight: bool,
+    pub(crate) service_sync_in_flight: bool,
+    watchdog_config: ruum_core::watchdog_config::WatchdogConfig,
 }
 
 impl Global for AppRuntime {}
@@ -682,6 +709,8 @@ pub(crate) fn install_test_runtime(
         in_proc_notif_rx,
         last_watchdog_poll: None,
         background_analysis_in_flight: false,
+        service_sync_in_flight: false,
+        watchdog_config: ruum_core::watchdog_config::WatchdogConfig::default(),
     });
 }
 
@@ -1086,17 +1115,14 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
     let Some(rt) = cx.try_global::<AppRuntime>() else {
         return;
     };
-    if rt.background_analysis_in_flight {
+    if rt.background_analysis_in_flight || rt.service_sync_in_flight {
         return;
     }
-    let cfg = ruum_core::watchdog_config::watchdog_config_path()
-        .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
-        .unwrap_or_default()
-        .normalized();
+    let cfg = &rt.watchdog_config;
     if !cfg.enabled {
         return;
     }
-    let interval = Duration::from_secs(cfg.poll_interval_secs);
+    let interval = Duration::from_secs(cfg.poll_interval_secs.max(1));
     if let Some(last) = rt.last_watchdog_poll
         && last.elapsed() < interval
     {
@@ -1173,17 +1199,20 @@ fn trigger_tray_space_check(cx: &App) {
             st.last_checked_secs = Some(now_secs);
             let _ = ruum_core::watchdog_config::save_state(&path, &st);
         }
-        Some((info.available, now_secs))
+        Some((info, now_secs))
     });
     cx.spawn(async move |cx| {
         let result = task.await;
         cx.update(|cx| {
-            if let Some((avail, checked_at)) = result {
+            if let Some((info, checked_at)) = result {
                 update_open_main_window(cx, |app, cx| {
+                    app.watchdog_home_space = Some(info);
                     app.reload_watchdog_state();
                     app.watchdog_space_checked_at = Some(checked_at);
-                    let msg =
-                        i18n::messages::disk_check_available(avail, app.locale);
+                    let msg = i18n::messages::disk_check_available(
+                        info.available,
+                        app.locale,
+                    );
                     app.push_toast(msg, gpui_omarchy::Status::Success, cx);
                 });
             }
@@ -1237,7 +1266,6 @@ fn trigger_background_ai_analysis(cx: &mut App) {
             let mut st = ruum_core::watchdog_config::load_state(&state_path)
                 .unwrap_or_default();
             st.last_proposal = Some(proposal.clone());
-            st.last_triggered_secs = Some(now_secs);
             let _ = ruum_core::watchdog_config::save_state(&state_path, &st);
         }
         Ok::<_, std::io::Error>((home, proposal))

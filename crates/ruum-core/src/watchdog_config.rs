@@ -78,6 +78,7 @@ impl AiCliProvider {
 
 /// Watchdog background monitoring configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WatchdogConfig {
     pub enabled: bool,
     pub background_service: bool,
@@ -166,35 +167,47 @@ pub struct CleanupProposal {
 
 /// Persistent runtime state of the watchdog.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WatchdogState {
     pub last_checked_secs: Option<u64>,
     pub last_triggered_secs: Option<u64>,
+    pub last_triggered_threshold_gb: Option<u64>,
     pub last_proposal: Option<CleanupProposal>,
+}
+
+fn config_dir_for(
+    is_macos: bool,
+    is_windows: bool,
+    home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if is_macos {
+        home.map(|h| h.join("Library/Application Support/ruum"))
+    } else if is_windows {
+        appdata
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| home.map(|h| h.join("AppData").join("Roaming")))
+            .map(|base| base.join("ruum"))
+    } else {
+        xdg_config_home
+            .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
+            .or_else(|| home.map(|h| h.join(".config")))
+            .map(|base| base.join("ruum"))
+    }
 }
 
 /// Cross-platform base configuration directory for ruum:
 /// `<config_dir>/ruum`
 #[must_use]
 pub fn config_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|h| h.join("Library/Application Support/ruum"))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|base| base.join("ruum"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|h| h.join(".config"))
-            })
-            .map(|base| base.join("ruum"))
-    }
+    config_dir_for(
+        cfg!(target_os = "macos"),
+        cfg!(windows),
+        std::env::home_dir(),
+        std::env::var_os("APPDATA").map(PathBuf::from),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+    )
 }
 
 /// Path to `watchdog.json`.
@@ -207,6 +220,12 @@ pub fn watchdog_config_path() -> Option<PathBuf> {
 #[must_use]
 pub fn watchdog_state_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("watchdog-state.json"))
+}
+
+/// Path to `watchdog.pid`.
+#[must_use]
+pub fn watchdog_pid_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("watchdog.pid"))
 }
 
 /// Path to `ipc.token`.
@@ -371,12 +390,32 @@ mod tests {
         let state = WatchdogState {
             last_checked_secs: Some(1_700_000_100),
             last_triggered_secs: Some(1_700_000_100),
+            last_triggered_threshold_gb: Some(20),
             last_proposal: Some(proposal),
         };
         save_state(&path, &state).unwrap();
 
         let reloaded = load_state(&path).unwrap();
         assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn partial_legacy_json_preserves_fields_and_defaults_missing() {
+        let cfg: WatchdogConfig =
+            serde_json::from_str(r#"{"enabled":true,"min_free_gb":15}"#)
+                .unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.min_free_gb, 15);
+        assert_eq!(cfg.cooldown_secs, DEFAULT_COOLDOWN_SECS);
+        assert_eq!(cfg.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
+        assert!(cfg.ai_auto_analyze);
+
+        let state: WatchdogState =
+            serde_json::from_str(r#"{"last_checked_secs":123}"#).unwrap();
+        assert_eq!(state.last_checked_secs, Some(123));
+        assert_eq!(state.last_triggered_secs, None);
+        assert_eq!(state.last_triggered_threshold_gb, None);
+        assert_eq!(state.last_proposal, None);
     }
 
     #[test]
@@ -391,7 +430,53 @@ mod tests {
                 watchdog_state_path().unwrap(),
                 dir.join("watchdog-state.json")
             );
+            assert_eq!(watchdog_pid_path().unwrap(), dir.join("watchdog.pid"));
             assert_eq!(ipc_token_path().unwrap(), dir.join("ipc.token"));
         }
+    }
+
+    #[test]
+    fn config_dir_for_covers_all_platforms_and_fallbacks() {
+        let home = Some(PathBuf::from("/users/tester"));
+        assert_eq!(
+            config_dir_for(true, false, home.clone(), None, None),
+            Some(PathBuf::from(
+                "/users/tester/Library/Application Support/ruum"
+            ))
+        );
+        assert_eq!(
+            config_dir_for(
+                false,
+                true,
+                home.clone(),
+                Some(PathBuf::from("C:/AppData/Roaming")),
+                None
+            ),
+            Some(PathBuf::from("C:/AppData/Roaming/ruum"))
+        );
+        assert_eq!(
+            config_dir_for(
+                false,
+                true,
+                home.clone(),
+                Some(PathBuf::new()),
+                None
+            ),
+            Some(PathBuf::from("/users/tester/AppData/Roaming/ruum"))
+        );
+        assert_eq!(
+            config_dir_for(
+                false,
+                false,
+                home.clone(),
+                None,
+                Some(PathBuf::from("/custom/xdg"))
+            ),
+            Some(PathBuf::from("/custom/xdg/ruum"))
+        );
+        assert_eq!(
+            config_dir_for(false, false, home, None, None),
+            Some(PathBuf::from("/users/tester/.config/ruum"))
+        );
     }
 }

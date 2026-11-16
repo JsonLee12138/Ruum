@@ -221,8 +221,48 @@ mod tests {
             assert!(!messages::plus_more(3, locale).is_empty());
             assert!(!messages::usage(locale).is_empty());
             assert!(!messages::nothing_to_copy(locale).is_empty());
+            assert!(!common::menu_install_cli(locale).is_empty());
+            assert!(!pages::cli_tool_title(locale).is_empty());
+            assert!(!pages::cli_tool_desc(locale).is_empty());
+            assert!(
+                !pages::cli_status_installed("/usr/local/bin/ruum", locale)
+                    .is_empty()
+            );
+            assert!(!pages::cli_status_not_installed(locale).is_empty());
+            assert!(
+                !pages::cli_not_in_path_hint("/opt/bin", locale).is_empty()
+            );
+            assert!(!pages::cli_install_btn(locale).is_empty());
+            assert!(!pages::cli_uninstall_btn(locale).is_empty());
+            assert!(!pages::cli_updating_btn(locale).is_empty());
+            assert!(!pages::ai_auto_analyze(locale).is_empty());
+            assert!(pages::enable_service(locale).contains("Windows"));
+            assert!(!messages::invalid_watchdog_number(locale).is_empty());
+            assert!(
+                !messages::cli_installed("/usr/local/bin/ruum", locale)
+                    .is_empty()
+            );
+            assert!(!messages::cli_uninstalled(locale).is_empty());
+            assert!(!messages::cli_install_failed("err", locale).is_empty());
+            assert!(!messages::cli_uninstall_failed("err", locale).is_empty());
         }
         for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert_ne!(
+                common::menu_install_cli(locale),
+                common::menu_install_cli(Locale::En)
+            );
+            assert_ne!(
+                pages::cli_tool_title(locale),
+                pages::cli_tool_title(Locale::En)
+            );
+            assert_ne!(
+                pages::ai_auto_analyze(locale),
+                pages::ai_auto_analyze(Locale::En)
+            );
+            assert_ne!(
+                messages::invalid_watchdog_number(locale),
+                messages::invalid_watchdog_number(Locale::En)
+            );
             assert_ne!(
                 explore::panel::selection_eyebrow(locale),
                 explore::panel::selection_eyebrow(Locale::En)

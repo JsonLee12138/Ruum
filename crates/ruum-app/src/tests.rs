@@ -2540,7 +2540,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     // Toggle watchdog setting, update poll interval & cooldown (minutes), save
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
-            app.watchdog_config.enabled = true;
+            app.watchdog_draft.enabled = true;
             if let Some(ref input) = app.watchdog_input_min_free {
                 input.update(cx, |inp, cx| inp.set_value("35", window, cx));
             }
@@ -2550,7 +2550,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
             if let Some(ref input) = app.watchdog_input_cooldown {
                 input.update(cx, |inp, cx| inp.set_value("45", window, cx));
             }
-            app.save_watchdog_settings(cx);
+            app.save_watchdog_settings(window, cx);
         });
     });
     assert!(read(&view, cx, |app| app.watchdog_config.enabled));
@@ -2564,7 +2564,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
         2700
     );
 
-    // Cooldown below 5 minutes clamps to MIN_COOLDOWN_SECS (300s).
+    // Cooldown below 5 minutes clamps to MIN_COOLDOWN_SECS (300s) and echoes.
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
             if let Some(ref input) = app.watchdog_input_poll_interval {
@@ -2573,7 +2573,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
             if let Some(ref input) = app.watchdog_input_cooldown {
                 input.update(cx, |inp, cx| inp.set_value("2", window, cx));
             }
-            app.save_watchdog_settings(cx);
+            app.save_watchdog_settings(window, cx);
         });
     });
     assert_eq!(
@@ -2584,14 +2584,21 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
         read(&view, cx, |app| app.watchdog_config.cooldown_secs),
         ruum_core::watchdog_config::MIN_COOLDOWN_SECS
     );
+    let cooldown_val =
+        read(&view, cx, |app| app.watchdog_input_cooldown.clone())
+            .expect("cooldown input");
+    assert_eq!(
+        cx.update(|_, cx| cooldown_val.read(cx).value().to_string()),
+        "5"
+    );
 
-    // Zero minutes clamps to 300s, and invalid text preserves existing value.
+    // Zero minutes clamps to 300s, and invalid text aborts with Error toast.
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
             if let Some(ref input) = app.watchdog_input_cooldown {
                 input.update(cx, |inp, cx| inp.set_value("0", window, cx));
             }
-            app.save_watchdog_settings(cx);
+            app.save_watchdog_settings(window, cx);
         });
     });
     assert_eq!(
@@ -2603,12 +2610,16 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
             if let Some(ref input) = app.watchdog_input_cooldown {
                 input.update(cx, |inp, cx| inp.set_value("bad", window, cx));
             }
-            app.save_watchdog_settings(cx);
+            app.save_watchdog_settings(window, cx);
         });
     });
     assert_eq!(
         read(&view, cx, |app| app.watchdog_config.cooldown_secs),
         300
+    );
+    assert_eq!(
+        read(&view, cx, |app| app.notice.as_ref().map(|(_, s)| *s)),
+        Some(gpui_omarchy::Status::Error)
     );
 
     // 2. Navigate to Watchdog page
@@ -2824,10 +2835,17 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
     assert!(cx.debug_bounds("toast-notification").is_none());
     assert!(cx.debug_bounds("setting-test-cli").is_some());
     assert!(cx.debug_bounds("setting-fetch-models").is_some());
+    assert!(cx.debug_bounds("setting-cli-btn").is_some());
+    assert!(cx.debug_bounds("setting-ai-auto-analyze").is_some());
+    assert!(cx.debug_bounds("setting-extra-args-input").is_some());
     assert!(cx.debug_bounds("setting-save-status").is_none());
     assert!(cx.debug_bounds("settings-notice-line").is_none());
 
-    update(&view, cx, Ruum::save_watchdog_settings);
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.save_watchdog_settings(window, cx);
+        });
+    });
     draw(cx);
     let toast_bounds = cx
         .debug_bounds("toast-notification")
@@ -2886,7 +2904,7 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
     assert!(cx.debug_bounds("setting-model-select-1").is_some());
     assert!(cx.debug_bounds("setting-speed-results").is_none());
     assert_eq!(
-        read(&view, cx, |app| app.watchdog_config.model.clone()),
+        read(&view, cx, |app| app.watchdog_draft.model.clone()),
         Some("gemini-4-hydrogen-high".to_string())
     );
     let input_model = read(&view, cx, |app| app.watchdog_input_model.clone())
@@ -2896,12 +2914,26 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
         "gemini-4-hydrogen-high"
     );
 
-    // Clicking the trailing Select button switches the selected model.
+    // Clicking the trailing Select button switches the selected model in draft.
     let select_second = cx
         .debug_bounds("setting-model-select-1")
         .expect("select second model");
     cx.simulate_click(select_second.center(), gpui_kit::Modifiers::none());
     draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_draft.model.clone()),
+        Some("claude-sonnet-4-6".to_string())
+    );
+    // Committed config only updates after Save Settings.
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_config.model.clone()),
+        None
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.save_watchdog_settings(window, cx);
+        });
+    });
     assert_eq!(
         read(&view, cx, |app| app.watchdog_config.model.clone()),
         Some("claude-sonnet-4-6".to_string())
@@ -2970,10 +3002,11 @@ esac
         .expect("chmod fake cli");
 
     let (view, cx) = view_over(temp.path(), cx);
-    cx.simulate_resize(gpui_kit::size(px(1000.), px(900.)));
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
     update(&view, cx, |app, _| {
         app.screen = Screen::Settings;
         app.watchdog_config.ai_provider = AiCliProvider::Agy;
+        app.watchdog_draft.ai_provider = AiCliProvider::Agy;
         app.watchdog_config.custom_command =
             fake_cli.to_string_lossy().to_string();
     });
@@ -3063,6 +3096,16 @@ esac
         )
     });
     assert_eq!(msg.as_deref(), Some(expected));
+    assert_eq!(
+        read(&view, cx, |app| app.watchdog_state.last_triggered_secs),
+        None
+    );
+    assert_eq!(
+        read(&view, cx, |app| {
+            app.watchdog_state.last_triggered_threshold_gb
+        }),
+        None
+    );
 }
 
 #[gpui_kit::test]
@@ -3492,4 +3535,391 @@ fn review_auto_switches_to_permanent_for_trash_and_localizes_trash_block(
         );
         assert!(keep_file.exists(), "unmarked files must stay untouched");
     }
+}
+
+#[gpui_kit::test]
+fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::{
+        AiCliProvider, DEFAULT_COOLDOWN_SECS, WatchdogConfig, WatchdogState,
+        load_config, load_state,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_path = temp.path().join("watchdog.json");
+    let state_path = temp.path().join("watchdog-state.json");
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // Under cfg!(test), paths are None so host config is never touched.
+    read(&view, cx, |app| {
+        assert!(app.watchdog_config_path.is_none());
+        assert!(app.watchdog_state_path.is_none());
+        assert_eq!(app.watchdog_config.cooldown_secs, DEFAULT_COOLDOWN_SECS);
+    });
+
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    // Defaults echo "20", "5", "360", and extra_args/auto-analyze are visible.
+    assert!(cx.debug_bounds("setting-ai-auto-analyze").is_some());
+    assert!(cx.debug_bounds("setting-extra-args-input").is_some());
+    assert!(cx.debug_bounds("setting-cli-btn").is_some());
+    assert!(cx.debug_bounds("setting-custom-cmd-input").is_none());
+
+    let val_of = |cx: &mut Window,
+                  sel: fn(
+        &Ruum,
+    ) -> &Option<
+        Entity<gpui_kit::base::input::InputState>,
+    >| {
+        let inp = read(&view, cx, |app| sel(app).clone()).expect("input");
+        cx.update(|_, cx| inp.read(cx).value().to_string())
+    };
+    assert_eq!(val_of(cx, |a| &a.watchdog_input_min_free), "20");
+    assert_eq!(val_of(cx, |a| &a.watchdog_input_poll_interval), "5");
+    assert_eq!(val_of(cx, |a| &a.watchdog_input_cooldown), "360");
+
+    // Inject temp config/state paths and pre-seed cooldown state to verify reset.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.watchdog_config_path = Some(cfg_path.clone());
+            app.watchdog_state_path = Some(state_path.clone());
+            app.watchdog_state = WatchdogState {
+                last_checked_secs: Some(500),
+                last_triggered_secs: Some(400),
+                last_triggered_threshold_gb: Some(20),
+                last_proposal: None,
+            };
+            app.watchdog_draft.enabled = true;
+            app.watchdog_draft.background_service = true;
+            app.watchdog_draft.ai_auto_analyze = false;
+            app.set_watchdog_provider(AiCliProvider::Custom, cx);
+            app.watchdog_input_min_free.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("42", window, cx);
+                },
+            );
+            app.watchdog_input_poll_interval
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("15", window, cx));
+            app.watchdog_input_cooldown.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("120", window, cx);
+                },
+            );
+            app.watchdog_input_custom_cmd.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("/opt/bin/custom-ai", window, cx);
+                },
+            );
+            app.watchdog_input_extra_args
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("--fast --json", window, cx));
+            app.watchdog_input_model
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| {
+                    i.set_value("gpt-5-codex", window, cx);
+                });
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+
+    let expected = WatchdogConfig {
+        enabled: true,
+        background_service: true,
+        min_free_gb: 42,
+        poll_interval_secs: 900,
+        cooldown_secs: 7200,
+        ai_auto_analyze: false,
+        ai_provider: AiCliProvider::Custom,
+        custom_command: "/opt/bin/custom-ai".into(),
+        extra_args: "--fast --json".into(),
+        model: Some("gpt-5-codex".into()),
+    };
+    assert_eq!(load_config(&cfg_path).expect("saved cfg"), expected);
+    let saved_state = load_state(&state_path).expect("saved state");
+    assert_eq!(saved_state.last_triggered_secs, None);
+    assert_eq!(saved_state.last_triggered_threshold_gb, None);
+
+    // Reload into a fresh Ruum instance and confirm all 10 fields echo back.
+    let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
+    update(&fresh_view, fresh_cx, |app, cx| {
+        app.watchdog_config_path = Some(cfg_path.clone());
+        app.watchdog_state_path = Some(state_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(fresh_cx);
+    assert!(fresh_cx.debug_bounds("setting-custom-cmd-input").is_some());
+    read(&fresh_view, fresh_cx, |app| {
+        assert_eq!(app.watchdog_config, expected);
+        assert!(app.watchdog_draft.enabled);
+        assert!(app.watchdog_draft.background_service);
+        assert!(!app.watchdog_draft.ai_auto_analyze);
+        assert_eq!(app.watchdog_draft.ai_provider, AiCliProvider::Custom);
+        assert_eq!(app.watchdog_draft.model.as_deref(), Some("gpt-5-codex"));
+    });
+    let fresh_val = |cx: &mut Window,
+                     sel: fn(
+        &Ruum,
+    ) -> &Option<
+        Entity<gpui_kit::base::input::InputState>,
+    >| {
+        let inp = read(&fresh_view, cx, |app| sel(app).clone()).expect("input");
+        cx.update(|_, cx| inp.read(cx).value().to_string())
+    };
+    assert_eq!(fresh_val(fresh_cx, |a| &a.watchdog_input_min_free), "42");
+    assert_eq!(
+        fresh_val(fresh_cx, |a| &a.watchdog_input_poll_interval),
+        "15"
+    );
+    assert_eq!(fresh_val(fresh_cx, |a| &a.watchdog_input_cooldown), "120");
+    assert_eq!(
+        fresh_val(fresh_cx, |a| &a.watchdog_input_custom_cmd),
+        "/opt/bin/custom-ai"
+    );
+    assert_eq!(
+        fresh_val(fresh_cx, |a| &a.watchdog_input_extra_args),
+        "--fast --json"
+    );
+    assert_eq!(
+        fresh_val(fresh_cx, |a| &a.watchdog_input_model),
+        "gpt-5-codex"
+    );
+}
+
+#[gpui_kit::test]
+fn settings_draft_isolation_validation_and_clamped_echo(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::{AiCliProvider, load_config};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_path = temp.path().join("watchdog.json");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.watchdog_config_path = Some(cfg_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    // Mutate draft + inputs without saving -> committed config unchanged.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.watchdog_draft.enabled = true;
+            app.watchdog_draft.ai_auto_analyze = false;
+            app.set_watchdog_provider(AiCliProvider::Codex, cx);
+            app.watchdog_input_min_free
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("99", window, cx));
+        });
+    });
+    read(&view, cx, |app| {
+        assert!(!app.watchdog_config.enabled);
+        assert!(app.watchdog_config.ai_auto_analyze);
+        assert_eq!(app.watchdog_config.ai_provider, AiCliProvider::Agy);
+    });
+
+    // Re-entering Settings resets unsaved draft and input edits from config.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Explore, cx);
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert!(!app.watchdog_draft.enabled);
+        assert!(app.watchdog_draft.ai_auto_analyze);
+        assert_eq!(app.watchdog_draft.ai_provider, AiCliProvider::Agy);
+    });
+    let min_free_inp = read(&view, cx, |a| a.watchdog_input_min_free.clone())
+        .expect("min free input");
+    assert_eq!(
+        cx.update(|_, cx| min_free_inp.read(cx).value().to_string()),
+        "20"
+    );
+
+    // Invalid numeric inputs abort Save with Status::Error and write nothing.
+    for bad in ["", "abc", "-3"] {
+        cx.update(|window, cx| {
+            view.update(cx, |app, cx| {
+                app.watchdog_draft.enabled = true;
+                app.watchdog_input_min_free
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |i, cx| i.set_value(bad, window, cx));
+                app.save_watchdog_settings(window, cx);
+            });
+        });
+        assert!(!read(&view, cx, |a| a.watchdog_config.enabled));
+        assert!(!cfg_path.exists());
+        assert_eq!(
+            read(&view, cx, |a| a.notice.as_ref().map(|(_, s)| *s)),
+            Some(gpui_omarchy::Status::Error)
+        );
+    }
+
+    // Clamped inputs ("0", "0", "2") normalize to 1 GB, 1 min, 5 min and echo.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.watchdog_input_min_free
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("0", window, cx));
+            app.watchdog_input_poll_interval
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("0", window, cx));
+            app.watchdog_input_cooldown
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("2", window, cx));
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+    let saved = load_config(&cfg_path).expect("saved clamped");
+    assert_eq!(saved.min_free_gb, 1);
+    assert_eq!(saved.poll_interval_secs, 60);
+    assert_eq!(saved.cooldown_secs, 300);
+
+    let poll_inp = read(&view, cx, |a| a.watchdog_input_poll_interval.clone())
+        .expect("poll input");
+    let cool_inp = read(&view, cx, |a| a.watchdog_input_cooldown.clone())
+        .expect("cooldown input");
+    assert_eq!(
+        cx.update(|_, cx| min_free_inp.read(cx).value().to_string()),
+        "1"
+    );
+    assert_eq!(
+        cx.update(|_, cx| poll_inp.read(cx).value().to_string()),
+        "1"
+    );
+    assert_eq!(
+        cx.update(|_, cx| cool_inp.read(cx).value().to_string()),
+        "5"
+    );
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn settings_cli_install_card_and_menu_action_work_without_host_mutation(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::cli_install::{
+        CliInstallEnv, CliInstallOs, CliInstallStatus,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let fake_exe = temp.path().join("bin/ruum");
+    std::fs::create_dir_all(fake_exe.parent().unwrap()).expect("mkdir bin");
+    std::fs::write(&fake_exe, b"#!/bin/sh\n").expect("write fake exe");
+    let fake_home = temp.path().join("home");
+    let local_bin = fake_home.join(".local/bin");
+    std::fs::create_dir_all(&fake_home).expect("mkdir home");
+    let env = CliInstallEnv {
+        home: Some(fake_home),
+        local_appdata: None,
+        path_var: Some(local_bin.to_string_lossy().into_owned()),
+        usr_local_bin: temp.path().join("usr_local_bin"),
+    };
+
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.cli_install_env = Some(env);
+        app.cli_install_os = Some(CliInstallOs::Linux);
+        app.cli_install_exe = Some(fake_exe.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    // Click Install CLI Command button -> installs symlink into temp home.
+    let btn = cx.debug_bounds("setting-cli-btn").expect("cli button");
+    cx.simulate_click(btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+
+    let link = local_bin.join("ruum");
+    assert!(link.is_symlink(), "expected symlink at {}", link.display());
+    assert_eq!(
+        read(&view, cx, |a| a.cli_install_status.clone()),
+        Some(CliInstallStatus::Installed {
+            path: link.clone(),
+            in_path: true,
+        })
+    );
+    assert_eq!(
+        read(&view, cx, |a| a.notice.as_ref().map(|(_, s)| *s)),
+        Some(gpui_omarchy::Status::Success)
+    );
+
+    // Click again -> uninstalls symlink cleanly.
+    let btn = cx.debug_bounds("setting-cli-btn").expect("cli button");
+    cx.simulate_click(btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(!link.exists() && std::fs::symlink_metadata(&link).is_err());
+    assert_eq!(
+        read(&view, cx, |a| a.cli_install_status.clone()),
+        Some(CliInstallStatus::NotInstalled)
+    );
+
+    // Dispatching InstallCliCommand action navigates to Settings and installs.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Explore, cx);
+    });
+    draw(cx);
+    cx.dispatch_action(crate::app_menu::InstallCliCommand);
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Settings);
+    assert!(link.is_symlink());
+}
+
+#[gpui_kit::test]
+fn watchdog_page_handles_none_space_saturating_mul_and_syncs_checked_at(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::{WatchdogState, save_state};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let state_path = temp.path().join("watchdog-state.json");
+    save_state(
+        &state_path,
+        &WatchdogState {
+            last_checked_secs: Some(1_234_567),
+            last_triggered_secs: None,
+            last_triggered_threshold_gb: None,
+            last_proposal: None,
+        },
+    )
+    .expect("save state");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.watchdog_state_path = Some(state_path);
+        app.watchdog_home_space = None;
+        app.space = None;
+        app.watchdog_config.min_free_gb = u64::MAX;
+        app.reload_watchdog_state();
+        app.navigate_rail(Screen::Watchdog, cx);
+    });
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert_eq!(app.watchdog_space_checked_at, Some(1_234_567));
+    });
+    assert!(cx.debug_bounds("watchdog-page").is_some());
+    assert!(cx.debug_bounds("watchdog-status-value").is_some());
 }

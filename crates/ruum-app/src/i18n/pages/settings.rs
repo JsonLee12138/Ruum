@@ -46,10 +46,109 @@ pub const fn enable_watchdog(locale: Locale) -> &'static str {
 pub const fn enable_service(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Run as OS Background Service at Login (launchd / systemd)",
-        "\u{767b}\u{5f55}\u{65f6}\u{4f5c}\u{4e3a}\u{7cfb}\u{7edf}\u{540e}\u{53f0}\u{670d}\u{52a1}\u{8fd0}\u{884c} (launchd / systemd)",
-        "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{6642}\u{306b} OS \u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{30b5}\u{30fc}\u{30d3}\u{30b9}\u{3068}\u{3057}\u{3066}\u{5b9f}\u{884c} (launchd / systemd)",
-        "\u{b85c}\u{adf8}\u{c778} \u{c2dc} OS \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c11c}\u{be44}\u{c2a4}\u{b85c} \u{c2e4}\u{d589} (launchd / systemd)",
+        "Run as OS Background Service at Login (launchd / systemd / Windows)",
+        "\u{767b}\u{5f55}\u{65f6}\u{4f5c}\u{4e3a}\u{7cfb}\u{7edf}\u{540e}\u{53f0}\u{670d}\u{52a1}\u{8fd0}\u{884c} (launchd / systemd / Windows)",
+        "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{6642}\u{306b} OS \u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{30b5}\u{30fc}\u{30d3}\u{30b9}\u{3068}\u{3057}\u{3066}\u{5b9f}\u{884c} (launchd / systemd / Windows)",
+        "\u{b85c}\u{adf8}\u{c778} \u{c2dc} OS \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c11c}\u{be44}\u{c2a4}\u{b85c} \u{c2e4}\u{d589} (launchd / systemd / Windows)",
+    )
+}
+
+pub const fn ai_auto_analyze(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Automatically Run AI Analysis on Low Disk Space",
+        "\u{78c1}\u{76d8}\u{7a7a}\u{95f4}\u{4e0d}\u{8db3}\u{65f6}\u{81ea}\u{52a8}\u{8fd0}\u{884c} AI \u{5206}\u{6790}",
+        "\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{4e0d}\u{8db3}\u{6642}\u{306b} AI \u{5206}\u{6790}\u{3092}\u{81ea}\u{52d5}\u{5b9f}\u{884c}\u{3059}\u{308b}",
+        "\u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04} \u{bd80}\u{c871} \u{c2dc} AI \u{bd84}\u{c11d} \u{c790}\u{b3d9} \u{c2e4}\u{d589}",
+    )
+}
+
+pub const fn cli_tool_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Command-Line Tool",
+        "\u{547d}\u{4ee4}\u{884c}\u{5de5}\u{5177}",
+        "\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{30e9}\u{30a4}\u{30f3}\u{30c4}\u{30fc}\u{30eb}",
+        "\u{ba85}\u{b839}\u{c904} \u{b3c4}\u{ad6c}",
+    )
+}
+
+pub const fn cli_tool_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Register the ruum command in your PATH for terminal usage, MCP, and \
+         Watchdog.",
+        "\u{5c06} ruum \u{547d}\u{4ee4}\u{6ce8}\u{518c}\u{5230} PATH\u{ff0c}\u{4ee5}\u{4fbf}\u{5728}\u{7ec8}\u{7aef}\u{3001}MCP \u{548c}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{4e2d}\u{4f7f}\u{7528}\u{3002}",
+        "\u{30bf}\u{30fc}\u{30df}\u{30ca}\u{30eb}\u{3001}MCP\u{3001}\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}\u{3067}\u{5229}\u{7528}\u{3067}\u{304d}\u{308b}\u{3088}\u{3046} ruum \u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092} PATH \u{306b}\u{767b}\u{9332}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{d130}\u{bbf8}\u{b110}, MCP \u{bc0f} \u{c6cc}\u{ce58}\u{b3c5}\u{c5d0}\u{c11c} \u{c0ac}\u{c6a9}\u{d560} \u{c218} \u{c788}\u{b3c4}\u{b85d} ruum \u{ba85}\u{b839}\u{c744} PATH\u{c5d0} \u{b4f1}\u{b85d}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub fn cli_status_installed(path: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Installed at {path}"),
+        Locale::Zh => format!("\u{5df2}\u{5b89}\u{88c5}\u{4e8e} {path}"),
+        Locale::Ja => {
+            format!(
+                "{path} \u{306b}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}\u{6e08}\u{307f}"
+            )
+        }
+        Locale::Ko => format!("{path}\u{c5d0} \u{c124}\u{ce58}\u{b428}"),
+    }
+}
+
+pub const fn cli_status_not_installed(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Not installed",
+        "\u{672a}\u{5b89}\u{88c5}",
+        "\u{672a}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}",
+        "\u{c124}\u{ce58}\u{b418}\u{c9c0} \u{c54a}\u{c74c}",
+    )
+}
+
+pub fn cli_not_in_path_hint(dir: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Directory {dir} is not currently in your PATH."),
+        Locale::Zh => format!(
+            "\u{76ee}\u{5f55} {dir} \u{5f53}\u{524d}\u{672a}\u{5305}\u{542b}\u{5728}\u{60a8}\u{7684} PATH \u{4e2d}\u{3002}"
+        ),
+        Locale::Ja => format!(
+            "\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea} {dir} \u{306f}\u{73fe}\u{5728} PATH \u{306b}\u{542b}\u{307e}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093}\u{3002}"
+        ),
+        Locale::Ko => format!(
+            "\u{b514}\u{b809}\u{d130}\u{b9ac} {dir}\u{c774}(\u{ac00}) \u{d604}\u{c7ac} PATH\u{c5d0} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}."
+        ),
+    }
+}
+
+pub const fn cli_install_btn(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Install CLI Command",
+        "\u{5b89}\u{88c5} CLI \u{547d}\u{4ee4}",
+        "CLI \u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}",
+        "CLI \u{ba85}\u{b839} \u{c124}\u{ce58}",
+    )
+}
+
+pub const fn cli_uninstall_btn(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Uninstall CLI Command",
+        "\u{5378}\u{8f7d} CLI \u{547d}\u{4ee4}",
+        "CLI \u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{30a2}\u{30f3}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}",
+        "CLI \u{ba85}\u{b839} \u{c81c}\u{ac70}",
+    )
+}
+
+pub const fn cli_updating_btn(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Updating\u{2026}",
+        "\u{66f4}\u{65b0}\u{4e2d}\u{2026}",
+        "\u{66f4}\u{65b0}\u{4e2d}\u{2026}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{c911}\u{2026}",
     )
 }
 

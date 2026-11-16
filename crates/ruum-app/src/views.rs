@@ -49,6 +49,10 @@ pub fn root(
     }
     if app.screen == Screen::Settings {
         app.ensure_watchdog_inputs(window, cx);
+        if app.watchdog_inputs_need_sync {
+            app.watchdog_inputs_need_sync = false;
+            app.sync_watchdog_inputs_from_config(window, cx);
+        }
     }
     app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
@@ -103,6 +107,12 @@ pub fn root(
         .on_action(cx.listener(
             |this, _: &crate::app_menu::OpenSettings, _, cx| {
                 this.navigate_rail(Screen::Settings, cx);
+            },
+        ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::InstallCliCommand, _, cx| {
+                this.navigate_rail(Screen::Settings, cx);
+                this.install_or_update_cli(cx);
             },
         ))
         .on_action(cx.listener(|this, _: &crate::app_menu::Rescan, _, cx| {

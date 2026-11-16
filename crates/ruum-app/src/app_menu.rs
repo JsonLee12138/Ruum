@@ -48,6 +48,8 @@ mod menu_actions {
             OpenWatchdog,
             /// Open the Settings page.
             OpenSettings,
+            /// Install or update the `ruum` CLI command in PATH.
+            InstallCliCommand,
             /// Show or focus the main window.
             ShowMainWindow,
         ]
@@ -174,6 +176,10 @@ fn build_menus(locale: Locale) -> [Menu; 4] {
     [
         Menu::new("ruum").items([
             MenuItem::action(common::menu_settings(locale), OpenSettings),
+            MenuItem::action(
+                common::menu_install_cli(locale),
+                InstallCliCommand,
+            ),
             MenuItem::separator(),
             MenuItem::os_submenu(
                 common::menu_services(locale),

@@ -62,6 +62,12 @@ fn run_command_with_timeout(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     // Discourage interactive TUI prompts or ANSI progress spinners.
     cmd.env("TERM", "dumb");
     cmd.env("NO_COLOR", "1");
@@ -166,27 +172,48 @@ impl CommandRunner for TimedCommandRunner {
     }
 }
 
-/// Candidate directories checked when probing CLI assistants.
-#[must_use]
-pub fn candidate_bin_dirs() -> Vec<PathBuf> {
+fn candidate_bin_dirs_for(
+    is_macos: bool,
+    is_linux: bool,
+    is_windows: bool,
+    home: Option<PathBuf>,
+    local_app: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::home_dir() {
+    if let Some(home) = home {
         dirs.push(home.join(".local/bin"));
         dirs.push(home.join(".cargo/bin"));
     }
-    if cfg!(target_os = "macos") {
+    if is_macos {
         dirs.push(PathBuf::from("/opt/homebrew/bin"));
         dirs.push(PathBuf::from("/usr/local/bin"));
-    } else if cfg!(target_os = "linux") {
+    } else if is_linux {
         dirs.push(PathBuf::from("/usr/local/bin"));
         dirs.push(PathBuf::from("/usr/bin"));
         dirs.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
-    } else if cfg!(windows)
-        && let Some(local_app) = std::env::var_os("LOCALAPPDATA")
-    {
-        dirs.push(PathBuf::from(local_app).join("Programs"));
+    } else if is_windows {
+        if let Some(local) = local_app.filter(|p| !p.as_os_str().is_empty()) {
+            dirs.push(local.join("Programs"));
+        }
+        if let Some(roaming) = app_data.filter(|p| !p.as_os_str().is_empty()) {
+            dirs.push(roaming.join("npm"));
+        }
     }
     dirs
+}
+
+/// Candidate directories checked when probing CLI assistants.
+#[must_use]
+pub fn candidate_bin_dirs() -> Vec<PathBuf> {
+    candidate_bin_dirs_for(
+        cfg!(target_os = "macos"),
+        cfg!(target_os = "linux"),
+        cfg!(windows),
+        std::env::home_dir(),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("APPDATA").map(PathBuf::from),
+    )
 }
 
 /// Build an enriched `PATH` environment variable string.
@@ -211,45 +238,70 @@ pub fn enriched_path_var() -> String {
     entries.join(&sep.to_string())
 }
 
-/// Locate a command binary in the enriched `PATH` or as a direct path.
-#[must_use]
-pub fn resolve_cli_executable(command_or_name: &str) -> Option<PathBuf> {
+fn resolve_with_windows_exts(
+    base_dir: Option<&Path>,
+    name: &str,
+    check_win_exts: bool,
+) -> Option<PathBuf> {
+    let exact = match base_dir {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    };
+    if exact.is_file() {
+        return Some(exact);
+    }
+    if check_win_exts {
+        for ext in ["exe", "cmd", "bat"] {
+            let suffixed = format!("{name}.{ext}");
+            let cand = match base_dir {
+                Some(dir) => dir.join(&suffixed),
+                None => PathBuf::from(&suffixed),
+            };
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_cli_executable_with(
+    command_or_name: &str,
+    is_windows: bool,
+    enriched_path: &str,
+) -> Option<PathBuf> {
     let trimmed = command_or_name.trim();
     if trimmed.is_empty() {
         return None;
     }
     let path = Path::new(trimmed);
     if path.is_absolute() || path.components().count() > 1 {
-        if path.is_file() {
-            return Some(path.to_path_buf());
-        }
-        #[cfg(windows)]
-        {
-            let exe = path.with_extension("exe");
-            if exe.is_file() {
-                return Some(exe);
-            }
-        }
-        return None;
+        return resolve_with_windows_exts(None, trimmed, is_windows);
     }
 
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let enriched = enriched_path_var();
-    for dir_str in enriched.split(sep) {
-        let dir = Path::new(dir_str);
-        let candidate = dir.join(trimmed);
-        if candidate.is_file() {
-            return Some(candidate);
+    let sep = if is_windows { ';' } else { ':' };
+    for dir_str in enriched_path.split(sep) {
+        if dir_str.trim().is_empty() {
+            continue;
         }
-        #[cfg(windows)]
+        let dir = Path::new(dir_str);
+        if let Some(found) =
+            resolve_with_windows_exts(Some(dir), trimmed, is_windows)
         {
-            let candidate_exe = dir.join(format!("{trimmed}.exe"));
-            if candidate_exe.is_file() {
-                return Some(candidate_exe);
-            }
+            return Some(found);
         }
     }
     None
+}
+
+/// Locate a command binary in the enriched `PATH` or as a direct path.
+#[must_use]
+pub fn resolve_cli_executable(command_or_name: &str) -> Option<PathBuf> {
+    resolve_cli_executable_with(
+        command_or_name,
+        cfg!(windows),
+        &enriched_path_var(),
+    )
 }
 
 /// Concrete invocation arguments for an AI CLI assistant.
@@ -1628,6 +1680,63 @@ mod tests {
         if cfg!(unix) {
             assert!(resolved.is_some());
         }
+    }
+
+    #[test]
+    fn windows_candidate_bin_dirs_and_extension_resolution() {
+        let dirs = candidate_bin_dirs_for(
+            false,
+            false,
+            true,
+            Some(PathBuf::from(r"C:\Users\tester")),
+            Some(PathBuf::from(r"C:\Users\tester\AppData\Local")),
+            Some(PathBuf::from(r"C:\Users\tester\AppData\Roaming")),
+        );
+        assert!(dirs.contains(
+            &PathBuf::from(r"C:\Users\tester\AppData\Local").join("Programs")
+        ));
+        assert!(dirs.contains(
+            &PathBuf::from(r"C:\Users\tester\AppData\Roaming").join("npm")
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let npm_dir = temp.path().join("npm");
+        fs::create_dir_all(&npm_dir).unwrap();
+        let cmd_path = npm_dir.join("codex.cmd");
+        let bat_path = npm_dir.join("pi.bat");
+        let exe_path = npm_dir.join("agy.exe");
+        fs::write(&cmd_path, b"@echo off\n").unwrap();
+        fs::write(&bat_path, b"@echo off\n").unwrap();
+        fs::write(&exe_path, b"").unwrap();
+
+        let path_str = npm_dir.to_string_lossy().to_string();
+        assert_eq!(
+            resolve_cli_executable_with("agy", true, &path_str),
+            Some(exe_path)
+        );
+        assert_eq!(
+            resolve_cli_executable_with("codex", true, &path_str),
+            Some(cmd_path.clone())
+        );
+        assert_eq!(
+            resolve_cli_executable_with("pi", true, &path_str),
+            Some(bat_path)
+        );
+        // Non-Windows ignores .cmd/.bat/.exe fallback
+        assert_eq!(
+            resolve_cli_executable_with("codex", false, &path_str),
+            None
+        );
+        // Direct path with extension fallback
+        let direct_codex = npm_dir.join("codex");
+        assert_eq!(
+            resolve_cli_executable_with(
+                &direct_codex.to_string_lossy(),
+                true,
+                ""
+            ),
+            Some(cmd_path)
+        );
     }
 
     #[test]

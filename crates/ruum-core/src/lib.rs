@@ -9,6 +9,7 @@ pub mod access;
 pub mod ai_cli;
 pub mod auth;
 pub mod classify;
+pub mod cli_install;
 pub mod confirm;
 pub mod deployment;
 pub mod export;
@@ -39,5 +40,6 @@ pub mod tree;
 pub mod treemap;
 pub mod watchdog;
 pub mod watchdog_config;
+pub mod watchdog_service;
 #[cfg(windows)]
 mod windows;

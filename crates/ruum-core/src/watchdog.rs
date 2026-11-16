@@ -228,7 +228,10 @@ pub fn evaluate_tick(
         });
     }
 
-    if let Some(last_trig) = state.last_triggered_secs {
+    let same_threshold = state
+        .last_triggered_threshold_gb
+        .is_none_or(|prev| prev == norm.min_free_gb);
+    if same_threshold && let Some(last_trig) = state.last_triggered_secs {
         let elapsed = now_secs.saturating_sub(last_trig);
         if elapsed < norm.cooldown_secs {
             let remaining = norm.cooldown_secs.saturating_sub(elapsed);
@@ -246,230 +249,11 @@ pub fn evaluate_tick(
     })
 }
 
-/// Path to the macOS `launchd` plist for the user watchdog service.
-#[must_use]
-pub fn macos_launchd_plist_path() -> Option<PathBuf> {
-    std::env::home_dir()
-        .map(|h| h.join("Library/LaunchAgents/com.ruum.watchdog.plist"))
-}
-
-/// Content template for macOS `launchd` plist.
-#[must_use]
-pub fn macos_launchd_plist_content(exe_path: &Path) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-        <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
-        \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-        <plist version=\"1.0\">\n\
-        <dict>\n\
-            <key>Label</key>\n\
-            <string>com.ruum.watchdog</string>\n\
-            <key>ProgramArguments</key>\n\
-            <array>\n\
-                <string>{exe}</string>\n\
-                <string>watchdog</string>\n\
-            </array>\n\
-            <key>KeepAlive</key>\n\
-            <true/>\n\
-            <key>RunAtLoad</key>\n\
-            <true/>\n\
-        </dict>\n\
-        </plist>\n",
-        exe = exe_path.display(),
-    )
-}
-
-/// Path to the Linux `systemd --user` service unit.
-#[must_use]
-pub fn linux_systemd_service_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        let p = PathBuf::from(xdg);
-        if p.is_absolute() {
-            return Some(p.join("systemd/user/ruum-watchdog.service"));
-        }
-    }
-    std::env::home_dir()
-        .map(|h| h.join(".config/systemd/user/ruum-watchdog.service"))
-}
-
-/// Content template for Linux `systemd --user` unit.
-#[must_use]
-pub fn linux_systemd_unit_content(exe_path: &Path) -> String {
-    format!(
-        "[Unit]\n\
-        Description=Ruum Disk Space Watchdog\n\
-        After=default.target\n\n\
-        [Service]\n\
-        Type=simple\n\
-        ExecStart={exe} watchdog\n\
-        Restart=on-failure\n\
-        RestartSec=30\n\n\
-        [Install]\n\
-        WantedBy=default.target\n",
-        exe = exe_path.display(),
-    )
-}
-
-/// Operational status of the OS background service.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServiceStatus {
-    Active,
-    Inactive,
-    NotInstalled,
-    Unsupported,
-}
-
-/// Install the watchdog as an OS background service.
-pub fn install_service(
-    runner: &dyn CommandRunner,
-    exe_path: &Path,
-) -> io::Result<()> {
-    if cfg!(target_os = "macos") {
-        let plist_path = macos_launchd_plist_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no LaunchAgents dir")
-        })?;
-        if let Some(parent) = plist_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&plist_path, macos_launchd_plist_content(exe_path))?;
-        let path_str = plist_path.to_string_lossy();
-        let _ = runner.run(
-            Path::new("launchctl"),
-            &["unload", "-w", &path_str],
-            &[],
-        );
-        let out = runner.run(
-            Path::new("launchctl"),
-            &["load", "-w", &path_str],
-            &[],
-        )?;
-        if out.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "launchctl load failed: {}",
-                out.stderr
-            )))
-        }
-    } else if cfg!(target_os = "linux") {
-        let unit_path = linux_systemd_service_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no systemd user dir")
-        })?;
-        if let Some(parent) = unit_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&unit_path, linux_systemd_unit_content(exe_path))?;
-        let _ = runner.run(
-            Path::new("systemctl"),
-            &["--user", "daemon-reload"],
-            &[],
-        );
-        let out = runner.run(
-            Path::new("systemctl"),
-            &["--user", "enable", "--now", "ruum-watchdog.service"],
-            &[],
-        )?;
-        if out.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "systemctl enable failed: {}",
-                out.stderr
-            )))
-        }
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "background service registration is not supported on Windows",
-        ))
-    }
-}
-
-/// Uninstall the watchdog OS background service.
-pub fn uninstall_service(runner: &dyn CommandRunner) -> io::Result<()> {
-    if cfg!(target_os = "macos") {
-        let plist_path = macos_launchd_plist_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no LaunchAgents dir")
-        })?;
-        let path_str = plist_path.to_string_lossy();
-        let _ = runner.run(
-            Path::new("launchctl"),
-            &["unload", "-w", &path_str],
-            &[],
-        );
-        if plist_path.exists() {
-            fs::remove_file(&plist_path)?;
-        }
-        Ok(())
-    } else if cfg!(target_os = "linux") {
-        let unit_path = linux_systemd_service_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no systemd user dir")
-        })?;
-        let _ = runner.run(
-            Path::new("systemctl"),
-            &["--user", "stop", "ruum-watchdog.service"],
-            &[],
-        );
-        let _ = runner.run(
-            Path::new("systemctl"),
-            &["--user", "disable", "ruum-watchdog.service"],
-            &[],
-        );
-        if unit_path.exists() {
-            fs::remove_file(&unit_path)?;
-        }
-        let _ = runner.run(
-            Path::new("systemctl"),
-            &["--user", "daemon-reload"],
-            &[],
-        );
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "background service registration is not supported on Windows",
-        ))
-    }
-}
-
-/// Query the current status of the OS background service.
-pub fn service_status(runner: &dyn CommandRunner) -> io::Result<ServiceStatus> {
-    if cfg!(target_os = "macos") {
-        let Some(plist_path) = macos_launchd_plist_path() else {
-            return Ok(ServiceStatus::NotInstalled);
-        };
-        let out = runner.run(
-            Path::new("launchctl"),
-            &["list", "com.ruum.watchdog"],
-            &[],
-        )?;
-        if out.success() {
-            Ok(ServiceStatus::Active)
-        } else if plist_path.exists() {
-            Ok(ServiceStatus::Inactive)
-        } else {
-            Ok(ServiceStatus::NotInstalled)
-        }
-    } else if cfg!(target_os = "linux") {
-        let Some(unit_path) = linux_systemd_service_path() else {
-            return Ok(ServiceStatus::NotInstalled);
-        };
-        let out = runner.run(
-            Path::new("systemctl"),
-            &["--user", "is-active", "ruum-watchdog.service"],
-            &[],
-        )?;
-        if out.success() && out.stdout.trim() == "active" {
-            Ok(ServiceStatus::Active)
-        } else if unit_path.exists() {
-            Ok(ServiceStatus::Inactive)
-        } else {
-            Ok(ServiceStatus::NotInstalled)
-        }
-    } else {
-        Ok(ServiceStatus::Unsupported)
-    }
-}
+pub use crate::watchdog_service::{
+    ServiceStatus, install_service, linux_systemd_service_path,
+    linux_systemd_unit_content, macos_launchd_plist_content,
+    macos_launchd_plist_path, service_status, uninstall_service,
+};
 
 /// Notify an active GUI instance over IPC of a watchdog state change.
 pub fn notify_gui_watchdog_update() {
@@ -638,12 +422,18 @@ fn run_once_in(
     };
 
     // 1. Notify user of low disk space
+    let norm = config.normalized();
     let min_gb = threshold_bytes / (1024 * 1024 * 1024);
     let _ = notifier.notify_tagged(
         NOTIF_TAG_LOW_SPACE,
         i18n::low_disk_space_title(locale),
         &i18n::low_disk_space_body(available_bytes, min_gb, locale),
     );
+    // Persist cooldown and threshold immediately so disabled or failing AI CLI
+    // runs cannot cause notification or CLI storms on subsequent ticks.
+    state.last_triggered_secs = Some(now_secs);
+    state.last_triggered_threshold_gb = Some(norm.min_free_gb);
+    save_state(state_path, &state)?;
 
     // 2. Invoke AI CLI for analysis if enabled
     let mut proposal = None;
@@ -657,7 +447,6 @@ fn run_once_in(
         ) {
             Ok(prop) => {
                 state.last_proposal = Some(prop.clone());
-                state.last_triggered_secs = Some(now_secs);
                 proposal = Some(prop);
                 save_state(state_path, &state)?;
                 notify_gui_watchdog_update();
@@ -738,6 +527,41 @@ fn run_once_in(
     })
 }
 
+struct PidFileGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl PidFileGuard {
+    fn acquire(state_path: &Path) -> Self {
+        let path = state_path.with_file_name("watchdog.pid");
+        let pid = std::process::id();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&path, format!("{pid}\n"));
+        Self { path, pid }
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if let Ok(content) = fs::read_to_string(&self.path)
+            && content.trim().parse::<u32>().ok() == Some(self.pid)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    Some((meta.len(), modified))
+}
+
 /// Run the background polling loop until interrupted.
 #[allow(
     clippy::too_many_arguments,
@@ -753,7 +577,9 @@ pub fn run_loop(
     confirm_adapter: &dyn CleanupConfirmAdapter,
     notifier: &dyn NotificationAdapter,
 ) -> io::Result<()> {
+    let _pid_guard = PidFileGuard::acquire(state_path);
     while !cancel.load(Ordering::Relaxed) {
+        let config_stamp = file_stamp(config_path);
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -770,10 +596,14 @@ pub fn run_loop(
             notifier,
         );
 
-        let config = load_config(config_path)?;
-        let sleep_secs = config.normalized().poll_interval_secs;
+        let sleep_secs = load_config(config_path)
+            .unwrap_or_default()
+            .normalized()
+            .poll_interval_secs;
         for _ in 0..sleep_secs {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed)
+                || file_stamp(config_path) != config_stamp
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -987,6 +817,37 @@ mod tests {
         let res_after =
             evaluate_tick(&cfg_enabled, &state_triggered, home, 5000).unwrap();
         assert!(matches!(res_after, TickResult::Breached { .. }));
+    }
+
+    #[test]
+    fn evaluate_tick_bypasses_cooldown_when_threshold_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+
+        let state = WatchdogState {
+            last_triggered_secs: Some(1000),
+            last_triggered_threshold_gb: Some(20),
+            ..WatchdogState::default()
+        };
+
+        // Same threshold (1_000_000 vs 20 -> let's test matching 1_000_000)
+        let state_same = WatchdogState {
+            last_triggered_secs: Some(1000),
+            last_triggered_threshold_gb: Some(1_000_000),
+            ..WatchdogState::default()
+        };
+        let cfg = WatchdogConfig {
+            enabled: true,
+            min_free_gb: 1_000_000,
+            cooldown_secs: 3600,
+            ..WatchdogConfig::default()
+        };
+        let res_same = evaluate_tick(&cfg, &state_same, home, 1500).unwrap();
+        assert!(matches!(res_same, TickResult::InCooldown { .. }));
+
+        // Different prior threshold (20 GB != 1_000_000 GB) bypasses cooldown
+        let res_changed = evaluate_tick(&cfg, &state, home, 1500).unwrap();
+        assert!(matches!(res_changed, TickResult::Breached { .. }));
     }
 
     #[test]
@@ -1255,6 +1116,7 @@ mod tests {
         let prev_state = WatchdogState {
             last_checked_secs: Some(1_700_000_000),
             last_triggered_secs: Some(1_700_000_000),
+            last_triggered_threshold_gb: None,
             last_proposal: None,
         };
         save_state(&state_path, &prev_state).unwrap();
@@ -1283,15 +1145,224 @@ mod tests {
     }
 
     #[test]
+    fn run_once_records_cooldown_without_ai_or_on_ai_error() {
+        struct FailingRunner;
+        impl CommandRunner for FailingRunner {
+            fn run(
+                &self,
+                _program: &Path,
+                _args: &[&str],
+                _envs: &[(&str, &str)],
+            ) -> io::Result<ai_cli::CommandOutput> {
+                Ok(ai_cli::CommandOutput {
+                    status_code: 1,
+                    stdout: String::new(),
+                    stderr: "cli crashed".to_string(),
+                })
+            }
+        }
+
+        // Case 1: ai_auto_analyze = false still records cooldown & threshold
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let cfg_path = home.join("watchdog.json");
+        let state_path = home.join("watchdog-state.json");
+        let cfg_no_ai = WatchdogConfig {
+            enabled: true,
+            min_free_gb: 1_000_000,
+            cooldown_secs: 3600,
+            ai_auto_analyze: false,
+            ..WatchdogConfig::default()
+        };
+        crate::watchdog_config::save_config(&cfg_path, &cfg_no_ai).unwrap();
+
+        let notifier = MockNotification::default();
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let runner = MockRunner::default();
+
+        let first = run_once(
+            &cfg_path,
+            &state_path,
+            home,
+            Path::new("/bin/ruum"),
+            1_700_000_000,
+            &runner,
+            &confirm,
+            &notifier,
+        )
+        .unwrap();
+        assert!(matches!(first.tick, TickResult::Breached { .. }));
+        assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
+
+        let saved = load_state(&state_path).unwrap();
+        assert_eq!(saved.last_triggered_secs, Some(1_700_000_000));
+        assert_eq!(saved.last_triggered_threshold_gb, Some(1_000_000));
+
+        // Second tick 60s later must be InCooldown (no notification storm)
+        let second = run_once(
+            &cfg_path,
+            &state_path,
+            home,
+            Path::new("/bin/ruum"),
+            1_700_000_060,
+            &runner,
+            &confirm,
+            &notifier,
+        )
+        .unwrap();
+        assert!(matches!(second.tick, TickResult::InCooldown { .. }));
+        assert_eq!(notifier.notifications.lock().unwrap().len(), 1);
+
+        // Case 2: ai_auto_analyze = true with failing AI CLI still records cooldown
+        let temp2 = tempfile::tempdir().unwrap();
+        let home2 = temp2.path();
+        let cfg_path2 = home2.join("watchdog.json");
+        let state_path2 = home2.join("watchdog-state.json");
+        let fake_exe = home2.join("ruum");
+        fs::write(&fake_exe, b"").unwrap();
+        let cfg_ai_fail = WatchdogConfig {
+            enabled: true,
+            min_free_gb: 1_000_000,
+            cooldown_secs: 3600,
+            ai_auto_analyze: true,
+            ai_provider: crate::watchdog_config::AiCliProvider::Custom,
+            custom_command: fake_exe.to_string_lossy().to_string(),
+            ..WatchdogConfig::default()
+        };
+        crate::watchdog_config::save_config(&cfg_path2, &cfg_ai_fail).unwrap();
+        let notifier2 = MockNotification::default();
+        let _ = run_once(
+            &cfg_path2,
+            &state_path2,
+            home2,
+            &fake_exe,
+            1_700_000_000,
+            &FailingRunner,
+            &confirm,
+            &notifier2,
+        )
+        .unwrap();
+        let saved2 = load_state(&state_path2).unwrap();
+        assert_eq!(saved2.last_triggered_secs, Some(1_700_000_000));
+        assert_eq!(saved2.last_triggered_threshold_gb, Some(1_000_000));
+    }
+
+    #[test]
+    fn run_loop_writes_and_cleans_pid_file_and_wakes_on_config_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let cfg_path = home.join("watchdog.json");
+        let state_path = home.join("watchdog-state.json");
+        let pid_path = home.join("watchdog.pid");
+
+        let cfg_initial = WatchdogConfig {
+            enabled: false,
+            poll_interval_secs: 60,
+            ..WatchdogConfig::default()
+        };
+        crate::watchdog_config::save_config(&cfg_path, &cfg_initial).unwrap();
+
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel_bg = std::sync::Arc::clone(&cancel);
+
+        let cfg_bg = cfg_path.clone();
+        let state_bg = state_path.clone();
+        let home_bg = home.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let runner = MockRunner::default();
+            let confirm = MockConfirm {
+                decision: CleanupConfirmDecision::Cancelled,
+            };
+            let notifier = MockNotification::default();
+            run_loop(
+                &cfg_bg,
+                &state_bg,
+                &home_bg,
+                Path::new("/bin/ruum"),
+                &cancel_bg,
+                &runner,
+                &confirm,
+                &notifier,
+            )
+        });
+
+        // Wait for initial tick and PID file creation
+        let start = std::time::Instant::now();
+        while !pid_path.exists() || !state_path.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "run_loop did not create pid/state files in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let pid_str = fs::read_to_string(&pid_path).unwrap();
+        assert_eq!(
+            pid_str.trim().parse::<u32>().ok(),
+            Some(std::process::id())
+        );
+        let first_checked = load_state(&state_path).unwrap().last_checked_secs;
+        assert!(first_checked.is_some());
+
+        // Sleep 1.1s so `now_secs` advances, then modify config to wake loop
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let cfg_updated = WatchdogConfig {
+            enabled: false,
+            min_free_gb: 99,
+            poll_interval_secs: 60,
+            ..WatchdogConfig::default()
+        };
+        crate::watchdog_config::save_config(&cfg_path, &cfg_updated).unwrap();
+
+        // Loop must wake up within <= 2s (well below the 60s poll interval)
+        let wake_start = std::time::Instant::now();
+        loop {
+            let checked = load_state(&state_path).unwrap().last_checked_secs;
+            if checked > first_checked {
+                break;
+            }
+            assert!(
+                wake_start.elapsed() < std::time::Duration::from_secs(3),
+                "run_loop did not wake within <= 2s on watchdog.json change"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        cancel.store(true, Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+        assert!(
+            !pid_path.exists(),
+            "watchdog.pid should be removed on clean exit"
+        );
+    }
+
+    #[test]
     fn service_status_and_lifecycle_mock() {
         let runner = MockRunner::default();
         let status = service_status(&runner).unwrap();
         if cfg!(windows) {
-            assert_eq!(status, ServiceStatus::Unsupported);
+            // Mock runner returns status 0 for `reg query`, so without a live
+            // PID file Windows reports Inactive (never Unsupported).
+            assert_eq!(status, ServiceStatus::Inactive);
         } else {
             // Mock runner returns "active", so service_status reports Active
             assert_eq!(status, ServiceStatus::Active);
         }
+    }
+
+    #[test]
+    fn pid_file_guard_preserves_newer_pid_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("watchdog-state.json");
+        let pid_path = temp.path().join("watchdog.pid");
+        {
+            let _guard = PidFileGuard::acquire(&state_path);
+            assert!(pid_path.exists());
+            fs::write(&pid_path, "999999\n").unwrap();
+        }
+        assert_eq!(fs::read_to_string(&pid_path).unwrap().trim(), "999999");
     }
 
     #[test]

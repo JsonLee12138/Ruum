@@ -55,6 +55,7 @@ jobs:
       id-token: write
       attestations: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           # The oldest supported runners: their glibc is what the binary
@@ -208,6 +209,7 @@ jobs:
     outputs:
       signed: ${{ steps.signing_state.outputs.signed }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           # `xtask bundle` names artifacts after the machine it runs on, so
@@ -329,6 +331,7 @@ jobs:
       id-token: write
       attestations: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { runner: windows-2025, arch: x86_64 }
@@ -372,33 +375,157 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed" }
           }
 
-          $innoCandidates = @(
-            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-          )
-          function Find-InnoCompiler {
+          function Get-InnoCandidates {
+            $candidates = [System.Collections.Generic.List[string]]::new()
+            $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $addCandidate = {
+              param([string]$candidatePath)
+              if (-not [string]::IsNullOrWhiteSpace($candidatePath)) {
+                $trimmed = $candidatePath.Trim().Trim('"')
+                if ((Test-Path -LiteralPath $trimmed -PathType Leaf) -and $seen.Add($trimmed)) {
+                  $candidates.Add($trimmed)
+                }
+              }
+            }
+
             $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-            if ($cmd) { return $cmd.Source }
-            return $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($cmd) { & $addCandidate $cmd.Source }
+
+            foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, ${env:ProgramFiles(Arm)})) {
+              if (-not [string]::IsNullOrWhiteSpace($base)) {
+                & $addCandidate (Join-Path $base "Inno Setup 6\ISCC.exe")
+              }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+              & $addCandidate (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+            }
+
+            $regPaths = @(
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            )
+            foreach ($regPath in $regPaths) {
+              $parentKey = Split-Path $regPath
+              if (-not (Test-Path -LiteralPath $parentKey)) { continue }
+              $items = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like "Inno Setup*" }
+              foreach ($item in $items) {
+                if (-not [string]::IsNullOrWhiteSpace($item.InstallLocation)) {
+                  & $addCandidate (Join-Path $item.InstallLocation.Trim().Trim('"') "ISCC.exe")
+                }
+              }
+            }
+
+            $chocoRoots = @("C:\ProgramData\chocolatey\lib\innosetup")
+            if (-not [string]::IsNullOrWhiteSpace($env:ChocolateyInstall)) {
+              $chocoRoots += Join-Path $env:ChocolateyInstall "lib\innosetup"
+            }
+            foreach ($chocoRoot in ($chocoRoots | Select-Object -Unique)) {
+              if (Test-Path -LiteralPath $chocoRoot) {
+                Get-ChildItem -Path $chocoRoot -Filter "ISCC.exe" -Recurse -File -ErrorAction SilentlyContinue |
+                  ForEach-Object { & $addCandidate $_.FullName }
+              }
+            }
+
+            return $candidates.ToArray()
           }
-          function Test-InnoVersion([string]$path) {
-            if (-not $path -or -not (Test-Path $path)) { return $false }
-            $rawVer = (Get-Item $path).VersionInfo.ProductVersion
-            if ($rawVer -match '^\d+\.\d+') {
-              $ver = [Version](($rawVer -split '[^0-9.]')[0])
-              return ($ver -ge [Version]"6.3")
+
+          function Test-InnoVersion([string]$path, [switch]$Quiet) {
+            if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              return $false
+            }
+            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+            if (-not $item) { return $false }
+
+            $firstVer = $null
+            $matchedVer = $null
+            $sources = @(
+              [string]$item.VersionInfo.ProductVersion,
+              [string]$item.VersionInfo.FileVersion
+            )
+            foreach ($raw in $sources) {
+              if (-not [string]::IsNullOrWhiteSpace($raw) -and ($raw -match '\b(\d+\.\d+(?:\.\d+)?)\b')) {
+                $candidateVer = $null
+                if ([Version]::TryParse($Matches[1], [ref]$candidateVer) -and $candidateVer -gt [Version]"0.0") {
+                  if (-not $firstVer) { $firstVer = $candidateVer }
+                  if ($candidateVer -ge [Version]"6.3") {
+                    $matchedVer = $candidateVer
+                    break
+                  }
+                }
+              }
+            }
+
+            if (-not $matchedVer) {
+              $prevPref = $ErrorActionPreference
+              try {
+                $ErrorActionPreference = "Continue"
+                $helpText = (& $path /? 2>&1 | Out-String)
+              } catch {
+                $helpText = ""
+              } finally {
+                $ErrorActionPreference = $prevPref
+                $global:LASTEXITCODE = 0
+              }
+              if (-not [string]::IsNullOrWhiteSpace($helpText) -and ($helpText -match '\b(\d+\.\d+(?:\.\d+)?)\b')) {
+                $candidateVer = $null
+                if ([Version]::TryParse($Matches[1], [ref]$candidateVer) -and $candidateVer -gt [Version]"0.0") {
+                  if (-not $firstVer) { $firstVer = $candidateVer }
+                  if ($candidateVer -ge [Version]"6.3") {
+                    $matchedVer = $candidateVer
+                  }
+                }
+              }
+            }
+
+            $reportedVer = if ($matchedVer) { $matchedVer } else { $firstVer }
+            if ($reportedVer) {
+              if (-not $Quiet) {
+                Write-Host "Found ISCC.exe at '$path' (version $reportedVer)"
+              }
+              return ($reportedVer -ge [Version]"6.3")
+            }
+
+            if (-not $Quiet) {
+              Write-Host "Found ISCC.exe at '$path' (version unknown)"
             }
             return $false
+          }
+
+          function Find-InnoCompiler {
+            $firstExisting = $null
+            foreach ($candidate in @(Get-InnoCandidates)) {
+              if (-not $firstExisting) { $firstExisting = $candidate }
+              if (Test-InnoVersion $candidate -Quiet) {
+                return $candidate
+              }
+              Write-Host "Skipping ISCC.exe candidate at '$candidate' (version below 6.3 or unparseable)"
+            }
+            return $firstExisting
           }
 
           $iscc = Find-InnoCompiler
           if (-not (Test-InnoVersion $iscc)) {
             if (Get-Command choco -ErrorAction SilentlyContinue) {
-              choco install innosetup -y --no-progress
-              if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+              if ($iscc) {
+                choco upgrade innosetup -y --no-progress
+                if ($LASTEXITCODE -ne 0) { throw "choco upgrade innosetup failed with exit code $LASTEXITCODE" }
+              } else {
+                choco install innosetup -y --no-progress
+                if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+              }
             } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-              winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
-              if ($LASTEXITCODE -ne 0) { throw "winget install InnoSetup failed with exit code $LASTEXITCODE" }
+              if ($iscc) {
+                winget upgrade --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+                if ($LASTEXITCODE -ne 0) {
+                  winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+                  if ($LASTEXITCODE -ne 0) { throw "winget install InnoSetup failed with exit code $LASTEXITCODE" }
+                }
+              } else {
+                winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+                if ($LASTEXITCODE -ne 0) { throw "winget install InnoSetup failed with exit code $LASTEXITCODE" }
+              }
             } else {
               throw "Neither choco nor winget is available to install Inno Setup >= 6.3"
             }

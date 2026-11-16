@@ -524,8 +524,10 @@ mod win_toast {
 
         notifier.Show(&toast)?;
 
-        if let Ok(ToastWaitEvent::Activated) = rx.recv_timeout(NOTIFY_WAIT_TTL)
-            && let Ok(exe) = std::env::current_exe()
+        if matches!(
+            rx.recv_timeout(NOTIFY_WAIT_TTL),
+            Ok(ToastWaitEvent::Activated)
+        ) && let Ok(exe) = std::env::current_exe()
         {
             activate_or_launch_ruum(&args.tag, &exe);
         }

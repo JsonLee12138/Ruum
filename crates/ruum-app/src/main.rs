@@ -16,6 +16,7 @@ mod appearance;
 pub use ruum_core::git;
 mod i18n;
 mod marks;
+mod notifications;
 mod palette;
 mod power;
 mod rail_pages;
@@ -65,6 +66,7 @@ struct Args {
     options: ScanOptions,
     depth: u32,
     power: Option<power::PowerEfficiency>,
+    initial_screen: Option<Screen>,
 }
 
 fn main() -> Result<()> {
@@ -78,6 +80,12 @@ fn main() -> Result<()> {
 
 fn run() -> Result<()> {
     if extract_scanner()? || run_mcp()? || run_watchdog()? {
+        return Ok(());
+    }
+    if let Some(notify_args) =
+        notifications::parse_notify_wait_args(std::env::args_os().skip(1))
+    {
+        notifications::run_notify_wait_command(&notify_args)?;
         return Ok(());
     }
     if let Some(dialog_args) =
@@ -172,6 +180,7 @@ fn run() -> Result<()> {
         choose_root: args.choose_root,
         power: args.power,
         native_look,
+        initial_screen: args.initial_screen,
     };
 
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
@@ -180,6 +189,7 @@ fn run() -> Result<()> {
     });
     app.run(move |cx| {
         gpui_omarchy::init(cx);
+        install_notification_handler(cx);
         app_menu::install_for(i18n::Locale::current(), cx);
         if native_look {
             appearance::apply(cx.window_appearance(), cx);
@@ -194,6 +204,7 @@ fn run() -> Result<()> {
                 }
             };
         let (in_proc_tx, in_proc_rx) = channel();
+        let (in_proc_notif_tx, in_proc_notif_rx) = channel();
         cx.set_global(AppRuntime {
             launch,
             main_window: None,
@@ -203,6 +214,8 @@ fn run() -> Result<()> {
             ipc_server,
             in_proc_confirm_tx: in_proc_tx,
             in_proc_confirm_rx: in_proc_rx,
+            in_proc_notif_tx,
+            in_proc_notif_rx,
             last_watchdog_poll: None,
             background_analysis_in_flight: false,
         });
@@ -399,15 +412,17 @@ impl CleanupConfirmWindow {
                     let summary = i18n::messages::cleaned_items_summary(
                         count, bytes, locale,
                     );
-                    if !cfg!(test) && count > 0 {
-                        let _ = ruum_core::watchdog::send_os_notification(
-                            i18n::messages::cleanup_complete_notif_title(
-                                locale,
-                            ),
-                            &summary,
-                        );
-                    }
                     cx.update(|cx| {
+                        if !cfg!(test) && count > 0 {
+                            post_app_notification(
+                                ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
+                                i18n::messages::cleanup_complete_notif_title(
+                                    locale,
+                                ),
+                                &summary,
+                                cx,
+                            );
+                        }
                         refresh_tray_status(cx);
                         update_open_main_window(cx, |app, cx| {
                             app.reload_watchdog_state();
@@ -562,7 +577,7 @@ fn open_confirm_window_with_mode(
     Some(window)
 }
 
-fn with_runtime_mut(cx: &mut App, f: impl FnOnce(&mut AppRuntime)) {
+pub(crate) fn with_runtime_mut(cx: &mut App, f: impl FnOnce(&mut AppRuntime)) {
     if cx.has_global::<AppRuntime>() {
         f(cx.global_mut::<AppRuntime>());
     }
@@ -597,7 +612,7 @@ pub fn refresh_tray_status(cx: &mut App) {
 }
 
 #[derive(Clone, Debug)]
-struct LaunchConfig {
+pub(crate) struct LaunchConfig {
     root: PathBuf,
     options: ScanOptions,
     depth: u32,
@@ -606,15 +621,17 @@ struct LaunchConfig {
     choose_root: bool,
     power: Option<power::PowerEfficiency>,
     native_look: bool,
+    initial_screen: Option<Screen>,
 }
 
 type ConfirmChannelPayload =
     (CleanupConfirmRequest, Sender<CleanupConfirmDecision>);
+type NotificationChannelPayload = (String, String, String);
 
 #[derive(Debug)]
-struct AppRuntime {
+pub(crate) struct AppRuntime {
     launch: LaunchConfig,
-    main_window: Option<WindowHandle<Ruum>>,
+    pub(crate) main_window: Option<WindowHandle<Ruum>>,
     confirm_window: Option<WindowHandle<CleanupConfirmWindow>>,
     tray: Option<tray_menu::TrayMenu>,
     ipc_rx: Option<Receiver<watchdog_runtime::WatchdogIpcEvent>>,
@@ -625,11 +642,48 @@ struct AppRuntime {
     ipc_server: Option<watchdog_runtime::WatchdogIpcServer>,
     in_proc_confirm_tx: Sender<ConfirmChannelPayload>,
     in_proc_confirm_rx: Receiver<ConfirmChannelPayload>,
+    in_proc_notif_tx: Sender<NotificationChannelPayload>,
+    in_proc_notif_rx: Receiver<NotificationChannelPayload>,
     last_watchdog_poll: Option<Instant>,
     background_analysis_in_flight: bool,
 }
 
 impl Global for AppRuntime {}
+
+#[cfg(test)]
+pub(crate) fn install_test_runtime(
+    root: PathBuf,
+    choose_root: bool,
+    main_window: Option<WindowHandle<Ruum>>,
+    cx: &mut App,
+) {
+    let (in_proc_confirm_tx, in_proc_confirm_rx) = channel();
+    let (in_proc_notif_tx, in_proc_notif_rx) = channel();
+    cx.set_global(AppRuntime {
+        launch: LaunchConfig {
+            root,
+            options: ScanOptions::default(),
+            depth: 3,
+            remote: None,
+            remote_disk: false,
+            choose_root,
+            power: None,
+            native_look: false,
+            initial_screen: None,
+        },
+        main_window,
+        confirm_window: None,
+        tray: None,
+        ipc_rx: None,
+        ipc_server: None,
+        in_proc_confirm_tx,
+        in_proc_confirm_rx,
+        in_proc_notif_tx,
+        in_proc_notif_rx,
+        last_watchdog_poll: None,
+        background_analysis_in_flight: false,
+    });
+}
 
 #[derive(Debug, Default)]
 struct AsyncSignal {
@@ -684,6 +738,29 @@ impl CleanupConfirmAdapter for InProcessConfirmAdapter {
             )
         })?;
         Ok(resp_rx.recv().unwrap_or(CleanupConfirmDecision::Cancelled))
+    }
+}
+
+#[derive(Debug)]
+struct InProcessNotificationAdapter {
+    tx: Sender<NotificationChannelPayload>,
+}
+
+impl ruum_core::watchdog::NotificationAdapter for InProcessNotificationAdapter {
+    fn notify_tagged(
+        &self,
+        tag: &str,
+        title: &str,
+        body: &str,
+    ) -> std::io::Result<()> {
+        self.tx
+            .send((tag.to_owned(), title.to_owned(), body.to_owned()))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "UI notification channel closed",
+                )
+            })
     }
 }
 
@@ -770,6 +847,12 @@ fn open_main_window(
                         )
                     };
                     app.power_choice = launch.power;
+                    if let Some(screen) = launch.initial_screen {
+                        app.navigate_rail(screen, cx);
+                        if screen == Screen::Watchdog {
+                            app.reload_watchdog_state();
+                        }
+                    }
                     app
                 })
             },
@@ -786,6 +869,68 @@ fn open_main_window(
     window
 }
 
+pub(crate) fn install_notification_handler(cx: &App) {
+    cx.set_app_identity(
+        notifications::RUUM_APP_ID,
+        notifications::RUUM_APP_NAME,
+    );
+    cx.on_system_notification_response(|response, cx| {
+        handle_notification_response(&response, cx);
+    });
+}
+
+#[must_use]
+pub(crate) fn target_screen_for_notification_tag(tag: &str) -> Option<Screen> {
+    match tag {
+        ruum_core::watchdog::NOTIF_TAG_LOW_SPACE
+        | ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS => Some(Screen::Watchdog),
+        _ => None,
+    }
+}
+
+pub(crate) fn handle_notification_response(
+    response: &gpui_kit::SystemNotificationResponse,
+    cx: &mut App,
+) {
+    activate_window_for_notification_tag(&response.tag, cx);
+}
+
+fn activate_window_for_notification_tag(tag: &str, cx: &mut App) {
+    open_or_navigate_main_window(target_screen_for_notification_tag(tag), cx);
+    update_open_main_window(cx, |app, cx| {
+        app.reload_watchdog_state();
+        cx.notify();
+    });
+    refresh_tray_status(cx);
+}
+
+pub(crate) fn post_app_notification(
+    tag: &str,
+    title: &str,
+    body: &str,
+    cx: &App,
+) {
+    if cfg!(test) || notifications::has_native_notification_identity() {
+        cx.show_system_notification(gpui_kit::SystemNotification {
+            tag: tag.to_owned().into(),
+            title: title.to_owned().into(),
+            body: body.to_owned().into(),
+            actions: Vec::new(),
+        });
+        return;
+    }
+    let title_owned = title.to_owned();
+    let body_owned = body.to_owned();
+    cx.background_executor()
+        .spawn(async move {
+            let _ = ruum_core::watchdog::send_fallback_os_notification(
+                &title_owned,
+                &body_owned,
+            );
+        })
+        .detach();
+}
+
 fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
     let windows = cx.windows();
     let existing = cx
@@ -797,6 +942,9 @@ fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
         let _ = handle.update(cx, |app, window, cx| {
             if let Some(screen) = target {
                 app.navigate_rail(screen, cx);
+                if screen == Screen::Watchdog {
+                    app.reload_watchdog_state();
+                }
             }
             let focus = app.focus.clone();
             window.focus(&focus, cx);
@@ -810,6 +958,9 @@ fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
     if let Some(screen) = target {
         let _ = window.update(cx, |app, window, cx| {
             app.navigate_rail(screen, cx);
+            if screen == Screen::Watchdog {
+                app.reload_watchdog_state();
+            }
             let focus = app.focus.clone();
             window.focus(&focus, cx);
             window.activate_window();
@@ -877,6 +1028,7 @@ fn poll_app_runtime(cx: &mut App) {
 
     let mut ipc_events = Vec::new();
     let mut in_proc_requests = Vec::new();
+    let mut in_proc_notifs = Vec::new();
     if let Some(rt) = cx.try_global::<AppRuntime>() {
         if let Some(rx) = &rt.ipc_rx {
             while let Ok(ev) = rx.try_recv() {
@@ -885,6 +1037,9 @@ fn poll_app_runtime(cx: &mut App) {
         }
         while let Ok(req) = rt.in_proc_confirm_rx.try_recv() {
             in_proc_requests.push(req);
+        }
+        while let Ok(notif) = rt.in_proc_notif_rx.try_recv() {
+            in_proc_notifs.push(notif);
         }
     }
 
@@ -903,11 +1058,25 @@ fn poll_app_runtime(cx: &mut App) {
                 });
                 refresh_tray_status(cx);
             }
+            watchdog_runtime::WatchdogIpcEvent::ShowNotification {
+                tag,
+                title,
+                body,
+            } => {
+                post_app_notification(&tag, &title, &body, cx);
+            }
+            watchdog_runtime::WatchdogIpcEvent::OpenWindow { tag } => {
+                activate_window_for_notification_tag(&tag, cx);
+            }
         }
     }
 
     for (request, responder) in in_proc_requests {
         open_confirm_window(request, Some(responder), None, cx);
+    }
+
+    for (tag, title, body) in in_proc_notifs {
+        post_app_notification(&tag, &title, &body, cx);
     }
 
     maybe_run_in_app_watchdog_tick(cx);
@@ -934,6 +1103,7 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         return;
     }
     let confirm_tx = rt.in_proc_confirm_tx.clone();
+    let notif_tx = rt.in_proc_notif_tx.clone();
     with_runtime_mut(cx, |rt| {
         rt.last_watchdog_poll = Some(Instant::now());
         rt.background_analysis_in_flight = true;
@@ -963,7 +1133,7 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
         let now_secs = now_unix_secs();
         let adapter = InProcessConfirmAdapter { tx: confirm_tx };
-        let notifier = ruum_core::watchdog::OsNotificationAdapter;
+        let notifier = InProcessNotificationAdapter { tx: notif_tx };
         let _ = ruum_core::watchdog::run_once(
             &cfg_path,
             &state_path,
@@ -1088,9 +1258,11 @@ fn trigger_background_ai_analysis(cx: &mut App) {
             match res {
                 Ok((home, proposal)) => {
                     if proposal.items.is_empty() {
-                        let _ = ruum_core::watchdog::send_os_notification(
+                        post_app_notification(
+                            ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
                             i18n::messages::ai_analysis_notif_title(locale),
                             i18n::messages::ai_analysis_no_reclaimable(locale),
+                            cx,
                         );
                     } else {
                         let request = state::proposal_confirm_request(
@@ -1100,9 +1272,11 @@ fn trigger_background_ai_analysis(cx: &mut App) {
                     }
                 }
                 Err(err) => {
-                    let _ = ruum_core::watchdog::send_os_notification(
+                    post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
                         i18n::messages::ai_analysis_failed_notif_title(locale),
                         &err.to_string(),
+                        cx,
                     );
                 }
             }
@@ -1272,12 +1446,21 @@ fn run_watchdog() -> Result<bool> {
             Ok(true)
         }
         WatchdogCommand::RunOnce => {
-            let _ = ruum_core::watchdog::run_default_once()?;
+            let _ = ruum_core::watchdog::run_default_once_with_notifier(
+                &notifications::DesktopNotificationAdapter {
+                    detached_once: true,
+                },
+            )?;
             Ok(true)
         }
         WatchdogCommand::RunLoop => {
             let cancel = std::sync::atomic::AtomicBool::new(false);
-            ruum_core::watchdog::run_default_loop(&cancel)?;
+            ruum_core::watchdog::run_default_loop_with_notifier(
+                &cancel,
+                &notifications::DesktopNotificationAdapter {
+                    detached_once: false,
+                },
+            )?;
             Ok(true)
         }
     }
@@ -1347,6 +1530,18 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
     parse_args_with_power(args, power::PowerEfficiency::default())
 }
 
+fn parse_open_screen(value: &str) -> Result<Screen> {
+    match value {
+        "explore" => Ok(Screen::Explore),
+        "sources" => Ok(Screen::Sources),
+        "watchdog" => Ok(Screen::Watchdog),
+        "settings" => Ok(Screen::Settings),
+        other => anyhow::bail!(
+            "unknown screen {other}; try explore, sources, watchdog, or settings"
+        ),
+    }
+}
+
 fn parse_args_with_power(
     args: impl Iterator<Item = std::ffi::OsString>,
     preset: power::PowerEfficiency,
@@ -1359,6 +1554,7 @@ fn parse_args_with_power(
     let mut power = Some(preset);
     let mut depth = 3_u32;
     let mut disk = false;
+    let mut initial_screen = None;
     // `std::env::args` panics on a name that is not Unicode, and a path is
     // any name: a restart as administrator hands the root back exactly as
     // it was, so the caller passes `args_os`.
@@ -1395,6 +1591,13 @@ fn parse_args_with_power(
             "-D" | "--disk" => disk = true,
             "--check" => check = true,
             "--choose" => choose_root = true,
+            "--open-screen" => {
+                let value = text(
+                    args.next(),
+                    "--open-screen needs a screen (explore, sources, watchdog, settings)",
+                )?;
+                initial_screen = Some(parse_open_screen(&value)?);
+            }
             "-d" | "--depth" => {
                 let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
@@ -1500,6 +1703,7 @@ fn parse_args_with_power(
             power,
             options,
             depth,
+            initial_screen,
         });
     }
     let home = std::env::home_dir();
@@ -1539,6 +1743,7 @@ fn parse_args_with_power(
         options,
         depth: depth.clamp(1, 6),
         power,
+        initial_screen,
     })
 }
 
@@ -1820,5 +2025,57 @@ mod argument_tests {
                 i18n::messages::usage(locale).contains("--confirm-cleanup")
             );
         }
+    }
+
+    #[test]
+    fn open_screen_parses_valid_screens_and_rejects_invalid() {
+        assert_eq!(parse_args(arguments(&[])).unwrap().initial_screen, None);
+        assert_eq!(
+            parse_args(arguments(&["--open-screen", "explore"]))
+                .unwrap()
+                .initial_screen,
+            Some(Screen::Explore)
+        );
+        assert_eq!(
+            parse_args(arguments(&["--open-screen", "sources"]))
+                .unwrap()
+                .initial_screen,
+            Some(Screen::Sources)
+        );
+        assert_eq!(
+            parse_args(arguments(&["--open-screen", "watchdog"]))
+                .unwrap()
+                .initial_screen,
+            Some(Screen::Watchdog)
+        );
+        assert_eq!(
+            parse_args(arguments(&["--open-screen", "settings"]))
+                .unwrap()
+                .initial_screen,
+            Some(Screen::Settings)
+        );
+        assert!(parse_args(arguments(&["--open-screen", "unknown"])).is_err());
+        assert!(parse_args(arguments(&["--open-screen"])).is_err());
+    }
+
+    #[test]
+    fn notification_tag_maps_to_expected_target_screen() {
+        use ruum_core::watchdog::{
+            NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_LOW_SPACE,
+        };
+
+        assert_eq!(
+            target_screen_for_notification_tag(NOTIF_TAG_LOW_SPACE),
+            Some(Screen::Watchdog)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(NOTIF_TAG_AI_ANALYSIS),
+            Some(Screen::Watchdog)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(NOTIF_TAG_CLEANUP_DONE),
+            None
+        );
+        assert_eq!(target_screen_for_notification_tag("ruum.other"), None);
     }
 }

@@ -25,6 +25,14 @@ pub enum WatchdogIpcEvent {
     },
     /// External background poller notified that watchdog state was updated.
     WatchdogUpdated,
+    /// External headless process requests showing a desktop notification.
+    ShowNotification {
+        tag: String,
+        title: String,
+        body: String,
+    },
+    /// External notification click handler requests opening/focusing Ruum.
+    OpenWindow { tag: String },
 }
 
 /// Handle to the background IPC server thread.
@@ -124,6 +132,20 @@ fn run_listener_loop(
                 let _ = event_tx.send(WatchdogIpcEvent::WatchdogUpdated);
                 Ok(IpcResponse::Ok)
             }
+            IpcRequest::ShowNotification {
+                tag, title, body, ..
+            } => {
+                let _ = event_tx.send(WatchdogIpcEvent::ShowNotification {
+                    tag,
+                    title,
+                    body,
+                });
+                Ok(IpcResponse::Ok)
+            }
+            IpcRequest::OpenWindow { tag, .. } => {
+                let _ = event_tx.send(WatchdogIpcEvent::OpenWindow { tag });
+                Ok(IpcResponse::Ok)
+            }
         });
         if res.is_err() && cancelled.load(Ordering::Relaxed) {
             break;
@@ -210,8 +232,10 @@ mod tests {
                     })
                     .expect("send response");
             }
-            WatchdogIpcEvent::WatchdogUpdated => {
-                panic!("unexpected watchdog update event");
+            WatchdogIpcEvent::WatchdogUpdated
+            | WatchdogIpcEvent::ShowNotification { .. }
+            | WatchdogIpcEvent::OpenWindow { .. } => {
+                panic!("unexpected watchdog notification event");
             }
         }
 
@@ -224,6 +248,59 @@ mod tests {
                 ));
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+
+        drop(server);
+    }
+
+    #[test]
+    fn ipc_server_forwards_show_notification_and_open_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("notif_server.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("notif_server.port");
+
+        let listener =
+            IpcListenerGuard::bind(&socket_or_port).expect("bind listener");
+        let token = "test_token_ipc_notif_server_1234567890".to_string();
+
+        let (server, rx) =
+            WatchdogIpcServer::start_with_listener(listener, token.clone())
+                .expect("start server");
+
+        let show_req = IpcRequest::ShowNotification {
+            token: token.clone(),
+            tag: "ruum.low_disk_space".to_string(),
+            title: "Low Space".to_string(),
+            body: "Only 2 GB left".to_string(),
+        };
+        let resp = send_ipc_message(&socket_or_port, &show_req)
+            .expect("send show notification");
+        assert_eq!(resp, IpcResponse::Ok);
+
+        match rx.recv().expect("recv show notification") {
+            WatchdogIpcEvent::ShowNotification { tag, title, body } => {
+                assert_eq!(tag, "ruum.low_disk_space");
+                assert_eq!(title, "Low Space");
+                assert_eq!(body, "Only 2 GB left");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let open_req = IpcRequest::OpenWindow {
+            token,
+            tag: "ruum.ai_analysis".to_string(),
+        };
+        let resp = send_ipc_message(&socket_or_port, &open_req)
+            .expect("send open window");
+        assert_eq!(resp, IpcResponse::Ok);
+
+        match rx.recv().expect("recv open window") {
+            WatchdogIpcEvent::OpenWindow { tag } => {
+                assert_eq!(tag, "ruum.ai_analysis");
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
 
         drop(server);

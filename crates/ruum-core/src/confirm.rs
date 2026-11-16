@@ -114,6 +114,16 @@ pub enum IpcRequest {
     NotifyWatchdogUpdate {
         token: String,
     },
+    ShowNotification {
+        token: String,
+        tag: String,
+        title: String,
+        body: String,
+    },
+    OpenWindow {
+        token: String,
+        tag: String,
+    },
 }
 
 /// Protocol response frame returned by the IPC listener.
@@ -308,7 +318,9 @@ where
 
     let token = match &request {
         IpcRequest::ConfirmCleanup { token, .. }
-        | IpcRequest::NotifyWatchdogUpdate { token } => token.as_str(),
+        | IpcRequest::NotifyWatchdogUpdate { token }
+        | IpcRequest::ShowNotification { token, .. }
+        | IpcRequest::OpenWindow { token, .. } => token.as_str(),
     };
 
     let response = if token == expected_token {
@@ -451,7 +463,9 @@ pub const IPC_NOTIFY_READ_TIMEOUT: std::time::Duration =
 pub const fn ipc_read_timeout(request: &IpcRequest) -> std::time::Duration {
     match request {
         IpcRequest::ConfirmCleanup { .. } => IPC_CONFIRM_READ_TIMEOUT,
-        IpcRequest::NotifyWatchdogUpdate { .. } => IPC_NOTIFY_READ_TIMEOUT,
+        IpcRequest::NotifyWatchdogUpdate { .. }
+        | IpcRequest::ShowNotification { .. }
+        | IpcRequest::OpenWindow { .. } => IPC_NOTIFY_READ_TIMEOUT,
     }
 }
 
@@ -917,9 +931,9 @@ mod tests {
                             },
                         })
                     }
-                    IpcRequest::NotifyWatchdogUpdate { .. } => {
-                        Ok(IpcResponse::Ok)
-                    }
+                    IpcRequest::NotifyWatchdogUpdate { .. }
+                    | IpcRequest::ShowNotification { .. }
+                    | IpcRequest::OpenWindow { .. } => Ok(IpcResponse::Ok),
                 })
                 .unwrap();
 
@@ -1044,5 +1058,93 @@ mod tests {
         );
         assert_eq!(ipc_read_timeout(&notify_req), IPC_NOTIFY_READ_TIMEOUT);
         assert_eq!(IPC_NOTIFY_READ_TIMEOUT, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn ipc_show_notification_and_open_window_serde_and_timeout() {
+        let show_req = IpcRequest::ShowNotification {
+            token: "tok".to_string(),
+            tag: "ruum.low_disk_space".to_string(),
+            title: "Low Disk Space".to_string(),
+            body: "Free space is low".to_string(),
+        };
+        let show_json = serde_json::to_string(&show_req).unwrap();
+        let show_parsed: IpcRequest = serde_json::from_str(&show_json).unwrap();
+        assert_eq!(show_parsed, show_req);
+        assert_eq!(ipc_read_timeout(&show_req), IPC_NOTIFY_READ_TIMEOUT);
+
+        let open_req = IpcRequest::OpenWindow {
+            token: "tok".to_string(),
+            tag: "ruum.ai_analysis".to_string(),
+        };
+        let open_json = serde_json::to_string(&open_req).unwrap();
+        let open_parsed: IpcRequest = serde_json::from_str(&open_json).unwrap();
+        assert_eq!(open_parsed, open_req);
+        assert_eq!(ipc_read_timeout(&open_req), IPC_NOTIFY_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn ipc_show_notification_and_open_window_auth_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = "valid_token_1234567890123456789012345678".to_string();
+
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("notif-auth.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("notif-auth.port");
+
+        let listener = IpcListenerGuard::bind(&socket_or_port).unwrap();
+        let server_token = token.clone();
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..3 {
+                listener
+                    .accept_and_handle(&server_token, |req| match req {
+                        IpcRequest::ShowNotification { tag, .. } => {
+                            assert_eq!(tag, "ruum.low_disk_space");
+                            Ok(IpcResponse::Ok)
+                        }
+                        IpcRequest::OpenWindow { tag, .. } => {
+                            assert_eq!(tag, "ruum.ai_analysis");
+                            Ok(IpcResponse::Ok)
+                        }
+                        other => panic!("unexpected IPC request: {other:?}"),
+                    })
+                    .unwrap();
+            }
+        });
+
+        let show_ok = send_ipc_message(
+            &socket_or_port,
+            &IpcRequest::ShowNotification {
+                token: token.clone(),
+                tag: "ruum.low_disk_space".to_string(),
+                title: "Title".to_string(),
+                body: "Body".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(show_ok, IpcResponse::Ok);
+
+        let open_ok = send_ipc_message(
+            &socket_or_port,
+            &IpcRequest::OpenWindow {
+                token,
+                tag: "ruum.ai_analysis".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(open_ok, IpcResponse::Ok);
+
+        let bad_auth = send_ipc_message(
+            &socket_or_port,
+            &IpcRequest::OpenWindow {
+                token: "wrong_token_1234567890123456789012345678".to_string(),
+                tag: "ruum.ai_analysis".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(bad_auth, IpcResponse::Error { .. }));
+
+        server_thread.join().unwrap();
     }
 }

@@ -46,9 +46,25 @@ pub enum TickResult {
     },
 }
 
+/// Notification tag for low disk space alerts.
+pub const NOTIF_TAG_LOW_SPACE: &str = "ruum.low_disk_space";
+/// Notification tag for completed cleanup summaries.
+pub const NOTIF_TAG_CLEANUP_DONE: &str = "ruum.cleanup_complete";
+/// Notification tag for AI analysis completion / proposals.
+pub const NOTIF_TAG_AI_ANALYSIS: &str = "ruum.ai_analysis";
+
 /// Abstract adapter for sending temporary OS notifications.
 pub trait NotificationAdapter: Send + Sync {
-    fn notify(&self, title: &str, body: &str) -> io::Result<()>;
+    fn notify_tagged(
+        &self,
+        tag: &str,
+        title: &str,
+        body: &str,
+    ) -> io::Result<()>;
+
+    fn notify(&self, title: &str, body: &str) -> io::Result<()> {
+        self.notify_tagged(NOTIF_TAG_LOW_SPACE, title, body)
+    }
 }
 
 /// Default system notification adapter sending non-persistent alerts.
@@ -56,13 +72,97 @@ pub trait NotificationAdapter: Send + Sync {
 pub struct OsNotificationAdapter;
 
 impl NotificationAdapter for OsNotificationAdapter {
-    fn notify(&self, title: &str, body: &str) -> io::Result<()> {
-        send_os_notification(title, body)
+    fn notify_tagged(
+        &self,
+        tag: &str,
+        title: &str,
+        body: &str,
+    ) -> io::Result<()> {
+        if try_ipc_notification(tag, title, body) {
+            return Ok(());
+        }
+        send_fallback_os_notification(title, body)
     }
 }
 
-/// Send a temporary OS desktop notification using native platform utilities.
-pub fn send_os_notification(title: &str, body: &str) -> io::Result<()> {
+fn resolve_ipc_target_and_token() -> Option<(PathBuf, String)> {
+    let token_path = crate::watchdog_config::ipc_token_path()?;
+    let token = crate::confirm::load_or_create_ipc_token(&token_path).ok()?;
+    #[cfg(unix)]
+    let target = crate::confirm::resolve_socket_path();
+    #[cfg(windows)]
+    let target = crate::confirm::ipc_port_path()?;
+    Some((target, token))
+}
+
+fn send_ipc_ok(
+    socket_or_port: &Path,
+    request: &crate::confirm::IpcRequest,
+) -> bool {
+    matches!(
+        crate::confirm::send_ipc_message(socket_or_port, request),
+        Ok(crate::confirm::IpcResponse::Ok)
+    )
+}
+
+/// Try delivering a tagged notification through an active GUI instance.
+pub fn try_ipc_notification_with(
+    socket_or_port: &Path,
+    token: &str,
+    tag: &str,
+    title: &str,
+    body: &str,
+) -> bool {
+    send_ipc_ok(
+        socket_or_port,
+        &crate::confirm::IpcRequest::ShowNotification {
+            token: token.to_string(),
+            tag: tag.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+        },
+    )
+}
+
+/// Try delivering a tagged notification through the default local IPC channel.
+#[must_use]
+pub fn try_ipc_notification(tag: &str, title: &str, body: &str) -> bool {
+    let Some((target, token)) = resolve_ipc_target_and_token() else {
+        return false;
+    };
+    try_ipc_notification_with(&target, &token, tag, title, body)
+}
+
+/// Try opening/focusing an active GUI window via an explicit IPC socket/port.
+pub fn try_ipc_open_window_with(
+    socket_or_port: &Path,
+    token: &str,
+    tag: &str,
+) -> bool {
+    send_ipc_ok(
+        socket_or_port,
+        &crate::confirm::IpcRequest::OpenWindow {
+            token: token.to_string(),
+            tag: tag.to_string(),
+        },
+    )
+}
+
+/// Try opening/focusing an active GUI window through the default local IPC.
+#[must_use]
+pub fn try_ipc_open_window(tag: &str) -> bool {
+    let Some((target, token)) = resolve_ipc_target_and_token() else {
+        return false;
+    };
+    try_ipc_open_window_with(&target, &token, tag)
+}
+
+/// Send a fallback OS desktop notification directly via CLI utilities
+/// (`osascript` on macOS, `notify-send` on Linux) without touching IPC.
+pub fn send_fallback_os_notification(
+    title: &str,
+    body: &str,
+) -> io::Result<()> {
     if cfg!(target_os = "macos") {
         let script = format!(
             "display notification \"{}\" with title \"{}\"",
@@ -88,6 +188,15 @@ pub fn send_os_notification(title: &str, body: &str) -> io::Result<()> {
             .status();
     }
     Ok(())
+}
+
+/// Send a temporary OS desktop notification, preferring an active GUI via IPC
+/// and falling back to platform CLI utilities.
+pub fn send_os_notification(title: &str, body: &str) -> io::Result<()> {
+    if try_ipc_notification(NOTIF_TAG_LOW_SPACE, title, body) {
+        return Ok(());
+    }
+    send_fallback_os_notification(title, body)
 }
 
 /// Evaluate volume free space against threshold and cooldown in $O(1)$.
@@ -364,32 +473,13 @@ pub fn service_status(runner: &dyn CommandRunner) -> io::Result<ServiceStatus> {
 
 /// Notify an active GUI instance over IPC of a watchdog state change.
 pub fn notify_gui_watchdog_update() {
-    let Some(token_path) = crate::watchdog_config::ipc_token_path() else {
+    let Some((target, token)) = resolve_ipc_target_and_token() else {
         return;
     };
-    let Ok(token) = crate::confirm::load_or_create_ipc_token(&token_path)
-    else {
-        return;
-    };
-
-    #[cfg(unix)]
-    {
-        let socket = crate::confirm::resolve_socket_path();
-        let _ = crate::confirm::send_ipc_message(
-            &socket,
-            &crate::confirm::IpcRequest::NotifyWatchdogUpdate { token },
-        );
-    }
-
-    #[cfg(windows)]
-    {
-        if let Some(port_path) = crate::confirm::ipc_port_path() {
-            let _ = crate::confirm::send_ipc_message(
-                &port_path,
-                &crate::confirm::IpcRequest::NotifyWatchdogUpdate { token },
-            );
-        }
-    }
+    let _ = send_ipc_ok(
+        &target,
+        &crate::confirm::IpcRequest::NotifyWatchdogUpdate { token },
+    );
 }
 
 /// Summary outcome of a single watchdog check execution.
@@ -531,7 +621,8 @@ fn run_once_in(
 
     // 1. Notify user of low disk space
     let min_gb = threshold_bytes / (1024 * 1024 * 1024);
-    let _ = notifier.notify(
+    let _ = notifier.notify_tagged(
+        NOTIF_TAG_LOW_SPACE,
         i18n::low_disk_space_title(locale),
         &i18n::low_disk_space_body(available_bytes, min_gb, locale),
     );
@@ -603,7 +694,8 @@ fn run_once_in(
                 removed_items = count;
 
                 if removed_items > 0 {
-                    let _ = notifier.notify(
+                    let _ = notifier.notify_tagged(
+                        NOTIF_TAG_CLEANUP_DONE,
                         i18n::cleanup_complete_title(locale),
                         &i18n::cleanup_complete_body(
                             removed_items,
@@ -672,9 +764,8 @@ pub fn run_loop(
     Ok(())
 }
 
-/// Convenience entrypoint for running a single watchdog evaluation with default
-/// configuration paths and system adapters.
-pub fn run_default_once() -> io::Result<WatchdogRunOutcome> {
+fn default_watchdog_paths() -> io::Result<(PathBuf, PathBuf, PathBuf, PathBuf)>
+{
     let config_path = crate::watchdog_config::watchdog_config_path()
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no config path")
@@ -687,13 +778,21 @@ pub fn run_default_once() -> io::Result<WatchdogRunOutcome> {
         io::Error::new(io::ErrorKind::NotFound, "no home directory")
     })?;
     let current_exe = std::env::current_exe()?;
+    Ok((config_path, state_path, home_dir, current_exe))
+}
+
+/// Run a single watchdog evaluation with default paths and a custom notifier.
+pub fn run_default_once_with_notifier(
+    notifier: &dyn NotificationAdapter,
+) -> io::Result<WatchdogRunOutcome> {
+    let (config_path, state_path, home_dir, current_exe) =
+        default_watchdog_paths()?;
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let runner = crate::ai_cli::DefaultCommandRunner;
     let confirm = crate::confirm::GuiCleanupConfirm::new();
-    let notifier = OsNotificationAdapter;
     run_once(
         &config_path,
         &state_path,
@@ -702,28 +801,19 @@ pub fn run_default_once() -> io::Result<WatchdogRunOutcome> {
         now_secs,
         &runner,
         &confirm,
-        &notifier,
+        notifier,
     )
 }
 
-/// Convenience entrypoint for running the watchdog polling loop with default
-/// configuration paths and system adapters.
-pub fn run_default_loop(cancel: &AtomicBool) -> io::Result<()> {
-    let config_path = crate::watchdog_config::watchdog_config_path()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no config path")
-        })?;
-    let state_path =
-        crate::watchdog_config::watchdog_state_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no state path")
-        })?;
-    let home_dir = std::env::home_dir().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no home directory")
-    })?;
-    let current_exe = std::env::current_exe()?;
+/// Run the watchdog polling loop with default paths and a custom notifier.
+pub fn run_default_loop_with_notifier(
+    cancel: &AtomicBool,
+    notifier: &dyn NotificationAdapter,
+) -> io::Result<()> {
+    let (config_path, state_path, home_dir, current_exe) =
+        default_watchdog_paths()?;
     let runner = crate::ai_cli::DefaultCommandRunner;
     let confirm = crate::confirm::GuiCleanupConfirm::new();
-    let notifier = OsNotificationAdapter;
     run_loop(
         &config_path,
         &state_path,
@@ -732,8 +822,20 @@ pub fn run_default_loop(cancel: &AtomicBool) -> io::Result<()> {
         cancel,
         &runner,
         &confirm,
-        &notifier,
+        notifier,
     )
+}
+
+/// Convenience entrypoint for running a single watchdog evaluation with default
+/// configuration paths and system adapters.
+pub fn run_default_once() -> io::Result<WatchdogRunOutcome> {
+    run_default_once_with_notifier(&OsNotificationAdapter)
+}
+
+/// Convenience entrypoint for running the watchdog polling loop with default
+/// configuration paths and system adapters.
+pub fn run_default_loop(cancel: &AtomicBool) -> io::Result<()> {
+    run_default_loop_with_notifier(cancel, &OsNotificationAdapter)
 }
 
 #[cfg(test)]
@@ -744,14 +846,25 @@ mod tests {
     #[derive(Default)]
     struct MockNotification {
         notifications: Mutex<Vec<(String, String)>>,
+        tagged: Mutex<Vec<(String, String, String)>>,
     }
 
     impl NotificationAdapter for MockNotification {
-        fn notify(&self, title: &str, body: &str) -> io::Result<()> {
+        fn notify_tagged(
+            &self,
+            tag: &str,
+            title: &str,
+            body: &str,
+        ) -> io::Result<()> {
             self.notifications
                 .lock()
                 .unwrap()
                 .push((title.to_string(), body.to_string()));
+            self.tagged.lock().unwrap().push((
+                tag.to_string(),
+                title.to_string(),
+                body.to_string(),
+            ));
             Ok(())
         }
     }
@@ -950,6 +1063,11 @@ mod tests {
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].0, i18n::low_disk_space_title(locale));
         assert_eq!(notes[1].0, i18n::cleanup_complete_title(locale));
+
+        let tagged = notifier.tagged.lock().unwrap().clone();
+        assert_eq!(tagged.len(), 2);
+        assert_eq!(tagged[0].0, NOTIF_TAG_LOW_SPACE);
+        assert_eq!(tagged[1].0, NOTIF_TAG_CLEANUP_DONE);
 
         // State updated
         let reloaded_state = load_state(&state_path).unwrap();
@@ -1156,5 +1274,111 @@ mod tests {
             // Mock runner returns "active", so service_status reports Active
             assert_eq!(status, ServiceStatus::Active);
         }
+    }
+
+    #[test]
+    fn notification_adapter_notify_defaults_to_low_space_tag() {
+        let notifier = MockNotification::default();
+        notifier.notify("Title", "Body").unwrap();
+        let tagged = notifier.tagged.lock().unwrap().clone();
+        assert_eq!(
+            tagged,
+            vec![(
+                NOTIF_TAG_LOW_SPACE.to_string(),
+                "Title".to_string(),
+                "Body".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn try_ipc_notification_and_open_window_roundtrip_and_token_check() {
+        use crate::confirm::{IpcListenerGuard, IpcRequest, IpcResponse};
+
+        let temp = tempfile::tempdir().unwrap();
+        let token = "watchdog_ipc_token_12345678901234567890123".to_string();
+
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("watchdog-ipc.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("watchdog-ipc.port");
+
+        // Missing socket returns false without error.
+        assert!(!try_ipc_notification_with(
+            &socket_or_port,
+            &token,
+            NOTIF_TAG_LOW_SPACE,
+            "Title",
+            "Body",
+        ));
+        assert!(!try_ipc_open_window_with(
+            &socket_or_port,
+            &token,
+            NOTIF_TAG_AI_ANALYSIS,
+        ));
+
+        let listener = IpcListenerGuard::bind(&socket_or_port).unwrap();
+        let server_token = token.clone();
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let received_srv = std::sync::Arc::clone(&received);
+
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let rec = std::sync::Arc::clone(&received_srv);
+                listener
+                    .accept_and_handle(&server_token, move |req| {
+                        rec.lock().unwrap().push(req);
+                        Ok(IpcResponse::Ok)
+                    })
+                    .unwrap();
+            }
+        });
+
+        assert!(try_ipc_notification_with(
+            &socket_or_port,
+            &token,
+            NOTIF_TAG_LOW_SPACE,
+            "Low Space",
+            "Only 1 GB free",
+        ));
+        assert!(try_ipc_open_window_with(
+            &socket_or_port,
+            &token,
+            NOTIF_TAG_AI_ANALYSIS,
+        ));
+
+        // Invalid token must return false and not invoke handler.
+        assert!(!try_ipc_notification_with(
+            &socket_or_port,
+            "wrong_token_12345678901234567890123456",
+            NOTIF_TAG_LOW_SPACE,
+            "Low Space",
+            "Body",
+        ));
+        assert!(!try_ipc_open_window_with(
+            &socket_or_port,
+            "wrong_token_12345678901234567890123456",
+            NOTIF_TAG_AI_ANALYSIS,
+        ));
+
+        server_thread.join().unwrap();
+        let reqs = received.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0],
+            IpcRequest::ShowNotification {
+                token: token.clone(),
+                tag: NOTIF_TAG_LOW_SPACE.to_string(),
+                title: "Low Space".to_string(),
+                body: "Only 1 GB free".to_string(),
+            }
+        );
+        assert_eq!(
+            reqs[1],
+            IpcRequest::OpenWindow {
+                token,
+                tag: NOTIF_TAG_AI_ANALYSIS.to_string(),
+            }
+        );
     }
 }

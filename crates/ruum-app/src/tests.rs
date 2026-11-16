@@ -3208,3 +3208,129 @@ fn initial_main_window_size_scales_and_clamps_to_minimum() {
         size(px(864.), px(600.))
     );
 }
+
+#[gpui_kit::test]
+fn system_notification_posts_with_app_identity(cx: &TestAppContext) {
+    use ruum_core::watchdog::NOTIF_TAG_LOW_SPACE;
+
+    cx.update(|cx| {
+        gpui_omarchy::init(cx);
+        crate::install_notification_handler(cx);
+        crate::post_app_notification(
+            NOTIF_TAG_LOW_SPACE,
+            "Low Disk Space",
+            "Only 2 GB remaining",
+            cx,
+        );
+    });
+
+    assert_eq!(
+        cx.app_identity(),
+        Some(("io.github.tobi.ruum".into(), "ruum".into()))
+    );
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tag.as_ref(), NOTIF_TAG_LOW_SPACE);
+    assert_eq!(shown[0].title.as_ref(), "Low Disk Space");
+    assert_eq!(shown[0].body.as_ref(), "Only 2 GB remaining");
+}
+
+#[gpui_kit::test]
+fn clicking_low_space_notification_navigates_open_window_to_watchdog(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::SystemNotificationResponse;
+    use ruum_core::watchdog::NOTIF_TAG_LOW_SPACE;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let tree = scan(temp.path(), options()).expect("scan the fixture");
+    let root_path = temp.path().to_path_buf();
+    let window = cx.add_window(move |_, cx| {
+        Ruum::with_tree(root_path.clone(), tree, options(), 3, cx)
+    });
+
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(window),
+            cx,
+        );
+    });
+
+    assert_eq!(
+        window
+            .read_with(cx, |app, _| app.screen)
+            .expect("read explore screen"),
+        Screen::Explore
+    );
+
+    cx.simulate_system_notification_response(SystemNotificationResponse {
+        tag: NOTIF_TAG_LOW_SPACE.into(),
+        action_id: None,
+    });
+
+    assert_eq!(
+        window
+            .read_with(cx, |app, _| app.screen)
+            .expect("read watchdog screen"),
+        Screen::Watchdog
+    );
+}
+
+#[gpui_kit::test]
+fn clicking_notification_reopens_closed_main_window(cx: &TestAppContext) {
+    use gpui_kit::SystemNotificationResponse;
+    use ruum_core::watchdog::{NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_LOW_SPACE};
+
+    let temp = fixture();
+    cx.update(|cx| {
+        gpui_omarchy::init(cx);
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+    });
+    assert!(
+        cx.read(|cx| {
+            cx.global::<crate::AppRuntime>().main_window.is_none()
+        })
+    );
+
+    cx.simulate_system_notification_response(SystemNotificationResponse {
+        tag: NOTIF_TAG_LOW_SPACE.into(),
+        action_id: None,
+    });
+    cx.run_until_parked();
+
+    let reopened = cx.read(|cx| cx.global::<crate::AppRuntime>().main_window);
+    let handle = reopened.expect("main window reopened for low-space alert");
+    assert_eq!(
+        handle
+            .read_with(cx, |app, _| app.screen)
+            .expect("read reopened watchdog screen"),
+        Screen::Watchdog
+    );
+
+    // Simulate tray-resident mode again (window closed) and click cleanup-done
+    // notification: should open window and preserve default Explore screen.
+    cx.update(|cx| {
+        crate::with_runtime_mut(cx, |rt| rt.main_window = None);
+    });
+    cx.simulate_system_notification_response(SystemNotificationResponse {
+        tag: NOTIF_TAG_CLEANUP_DONE.into(),
+        action_id: None,
+    });
+    cx.run_until_parked();
+
+    let reopened_default =
+        cx.read(|cx| cx.global::<crate::AppRuntime>().main_window);
+    let default_handle = reopened_default
+        .expect("main window reopened for cleanup notification");
+    assert_eq!(
+        default_handle
+            .read_with(cx, |app, _| app.screen)
+            .expect("read reopened default screen"),
+        Screen::Explore
+    );
+}

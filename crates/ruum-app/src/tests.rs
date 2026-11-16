@@ -791,17 +791,16 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
     );
     draw(cx);
 
-    let (selected, notice) = read(&view, cx, |app| {
+    let (selected, notice, expected) = read(&view, cx, |app| {
+        let disp = crate::marks::display_path(&path, app.home.as_deref());
         (
             app.selected.clone(),
             app.notice.as_ref().map(|(text, _)| text.clone()),
+            crate::i18n::messages::no_longer_on_disk(&disp, app.locale),
         )
     });
     assert_eq!(selected, Some(target), "the clicked tile is selected");
-    assert!(
-        notice.is_some_and(|text| text.contains("no longer on disk")),
-        "the reveal ran for it"
-    );
+    assert_eq!(notice, Some(expected), "the reveal ran for it");
 }
 
 #[gpui_kit::test]
@@ -1013,11 +1012,18 @@ fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
     draw(cx);
 
     // The selection is .cache, the largest; take it away behind the tree.
-    std::fs::remove_dir_all(temp.path().join(".cache")).expect("remove");
+    let cache = temp.path().join(".cache");
+    std::fs::remove_dir_all(&cache).expect("remove");
     press(cx, "o");
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let (notice, expected) = read(&view, cx, |app| {
+        let disp = crate::marks::display_path(&cache, app.home.as_deref());
+        (
+            app.notice.clone(),
+            crate::i18n::messages::no_longer_on_disk(&disp, app.locale),
+        )
+    });
     let (message, _) = notice.expect("a notice");
-    assert!(message.contains("no longer on disk"), "{message}");
+    assert_eq!(message, expected);
 }
 
 #[gpui_kit::test]
@@ -1166,9 +1172,19 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
         "{copied}"
     );
     assert!(junk.exists(), "nothing was removed");
-    let notice = read(&view, cx, |app| app.notice.clone());
-    assert!(
-        notice.is_some_and(|(message, _)| message.contains("copied")),
+    let (notice, expected) = read(&view, cx, |app| {
+        (
+            app.notice.clone(),
+            crate::i18n::messages::copied_agent_prompt(
+                1,
+                &ruum_core::size::human_bytes(300_000),
+                app.locale,
+            ),
+        )
+    });
+    assert_eq!(
+        notice.map(|(message, _)| message),
+        Some(expected),
         "the copy is confirmed"
     );
 }
@@ -1827,14 +1843,25 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
 
     // Marking something inside it is refused, and says why.
     update(&view, cx, |app, cx| app.toggle_mark(&deeper, cx));
-    let (count, notice) = read(&view, cx, |app| {
+    let (count, notice, expected) = read(&view, cx, |app| {
+        let deeper_path = temp.path().join("junk/deeper");
+        let junk_path = temp.path().join("junk");
+        let target_disp =
+            crate::marks::display_path(&deeper_path, app.home.as_deref());
+        let ancestor_disp =
+            crate::marks::display_path(&junk_path, app.home.as_deref());
         (
             app.marks.len(),
             app.notice.as_ref().map(|(text, _)| text.clone()),
+            crate::i18n::messages::goes_with_marked(
+                &target_disp,
+                &ancestor_disp,
+                app.locale,
+            ),
         )
     });
     assert_eq!(count, 1);
-    assert!(notice.is_some_and(|text| text.contains("goes with the marked")));
+    assert_eq!(notice, Some(expected));
 
     // Unmarking the directory unmarks everything.
     update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
@@ -2192,9 +2219,16 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
         app.power_settings_path = Some(config.path().to_owned());
         app.set_power_efficiency(Power::Miser, cx);
     });
-    assert!(read(&view, cx, |app| app.notice.as_ref().is_some_and(
-        |(message, _)| message.contains("could not be saved")
-    )));
+    assert!(read(&view, cx, |app| {
+        let label = Power::Miser.label_in(app.cpu_threads, app.locale);
+        let prefix =
+            crate::i18n::messages::power_save_failed(&label, "", app.locale);
+        // Compare without the OS-specific trailing error text.
+        let head = prefix.trim_end();
+        app.notice
+            .as_ref()
+            .is_some_and(|(message, _)| message.starts_with(head))
+    }));
     update(&view, cx, Ruum::start_scan);
     assert_eq!(read(&view, cx, |app| app.scan_epoch), epoch + 1);
 }
@@ -2926,10 +2960,133 @@ esac
 
     cx.run_until_parked();
     assert!(!read(&view, cx, |app| app.watchdog_analyzing));
-    let msg =
-        read(&view, cx, |app| app.notice.as_ref().map(|(m, _)| m.clone()));
-    assert_eq!(
-        msg.as_deref(),
-        Some("AI analysis found no reclaimable files")
-    );
+    let (msg, expected) = read(&view, cx, |app| {
+        (
+            app.notice.as_ref().map(|(m, _)| m.clone()),
+            crate::i18n::messages::ai_found_no_files(app.locale),
+        )
+    });
+    assert_eq!(msg.as_deref(), Some(expected));
+}
+
+#[gpui_kit::test]
+fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
+    use crate::i18n::Locale;
+    use ruum_core::confirm::{CleanupConfirmItem, CleanupConfirmRequest};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+
+    let target = temp.path().join("junk");
+    update(&view, cx, |app, cx| {
+        app.marks.toggle(ruum_core::removal::Target {
+            path: target.clone(),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        cx.notify();
+    });
+
+    for locale in crate::i18n::ALL_LOCALES {
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            app.navigate_rail(Screen::Explore, cx);
+            app.show_help = false;
+            app.confirm_open = false;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("ruum-root").is_some());
+        assert!(cx.debug_bounds("icon-rail").is_some());
+
+        // Help overlay on Explore.
+        update(&view, cx, |app, cx| {
+            app.show_help = true;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("ruum-root").is_some());
+
+        // Review screen + permanent delete confirmation dialog.
+        update(&view, cx, |app, cx| {
+            app.show_help = false;
+            app.screen = Screen::Review;
+            app.removal_mode = RemovalMode::Permanent;
+            app.confirm_open = true;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("ruum-root").is_some());
+
+        // Sources page (awaiting root -> localized window title).
+        update(&view, cx, |app, cx| {
+            app.confirm_open = false;
+            app.screen = Screen::Explore;
+            app.navigate_rail(Screen::Sources, cx);
+            app.awaiting_root = true;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("sources-page").is_some());
+        assert!(cx.debug_bounds("choose-root-idle").is_some());
+        let expected_choose_title =
+            crate::i18n::messages::title_choose_source(locale);
+        assert_eq!(
+            read(&view, cx, |app| app.window_title().to_owned()),
+            expected_choose_title
+        );
+
+        // Watchdog page.
+        update(&view, cx, |app, cx| {
+            app.awaiting_root = false;
+            app.navigate_rail(Screen::Watchdog, cx);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("watchdog-page").is_some());
+        assert!(cx.debug_bounds("watchdog-check-space").is_some());
+        assert!(cx.debug_bounds("watchdog-ai-analyze").is_some());
+
+        // Settings page.
+        update(&view, cx, |app, cx| {
+            app.navigate_rail(Screen::Settings, cx);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("settings-page").is_some());
+        assert!(cx.debug_bounds("setting-save-btn").is_some());
+    }
+
+    // Standalone cleanup confirmation window across all locales.
+    let req = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: crate::i18n::messages::ai_proposal_title(Locale::Ja).into(),
+        summary: None,
+        items: vec![CleanupConfirmItem {
+            path: target,
+            bytes: 300_000,
+            mode: RemovalMode::Trash,
+            reason: Some("cache".into()),
+            git_warning: Some("untracked files".into()),
+        }],
+    };
+    let (confirm_view, confirm_cx) = cx.add_window_view(|_, cx| {
+        crate::CleanupConfirmWindow::new(req, None, None, false, cx)
+    });
+    for locale in crate::i18n::ALL_LOCALES {
+        confirm_view.update(confirm_cx, |win, cx| {
+            win.set_locale(locale);
+            cx.notify();
+        });
+        draw(confirm_cx);
+        assert!(confirm_cx.debug_bounds("cleanup-confirm-popup").is_some());
+        assert!(confirm_cx.debug_bounds("confirm-cancel").is_some());
+        assert!(confirm_cx.debug_bounds("confirm-clean").is_some());
+        assert!(
+            !crate::i18n::messages::title_confirm_cleanup(locale).is_empty()
+        );
+    }
 }

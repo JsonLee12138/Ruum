@@ -214,18 +214,19 @@ fn centred_popup(
 /// it is an alert dialog that names what goes and what comes back. The trash is
 /// reversible and needs no dialog.
 fn delete_dialog(app: &Ruum, cx: &mut Context<'_, Ruum>) -> impl IntoElement {
+    let locale = app.locale;
     let plan = app.plan();
     let title = match plan.targets.as_slice() {
-        [only] => format!(
-            "Delete \u{201c}{}\u{201d} permanently?",
-            short_name(&only.path)
+        [only] => crate::i18n::review::delete_title_single(
+            &short_name(&only.path),
+            locale,
         ),
-        targets => format!("Delete {} items permanently?", targets.len()),
+        targets => {
+            crate::i18n::review::delete_title_many(targets.len(), locale)
+        }
     };
-    let body = format!(
-        "This frees {}. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
-        human_bytes(plan.bytes())
-    );
+    let body =
+        crate::i18n::review::delete_body(&human_bytes(plan.bytes()), locale);
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
     let actions = div()
@@ -236,7 +237,7 @@ fn delete_dialog(app: &Ruum, cx: &mut Context<'_, Ruum>) -> impl IntoElement {
         .child(
             dialog_button(
                 "delete-cancel",
-                "Cancel",
+                crate::i18n::review::cancel(locale),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -248,7 +249,7 @@ fn delete_dialog(app: &Ruum, cx: &mut Context<'_, Ruum>) -> impl IntoElement {
         .child(
             dialog_button(
                 "delete-confirm",
-                "Delete",
+                crate::i18n::review::delete_confirm(locale),
                 ButtonVariant::Danger,
                 cx,
             )
@@ -299,6 +300,7 @@ fn explore(
     cx: &mut Context<'_, Ruum>,
 ) -> Div {
     let theme = cx.omarchy().clone();
+    let locale = app.locale;
     if app.awaiting_root {
         return div()
             .debug_selector(|| "choose-root-idle".into())
@@ -312,15 +314,17 @@ fn explore(
             .child(
                 div()
                     .text_size(text::HEADING)
-                    .child("Choose a source. Then choose a root."),
+                    .child(crate::i18n::explore::idle_title(locale)),
             )
-            .child(div().text_color(theme.secondary).child(
-                "Local or SSH · one mount at a time · no background scan",
-            ))
+            .child(
+                div()
+                    .text_color(theme.secondary)
+                    .child(crate::i18n::explore::idle_subtitle(locale)),
+            )
             .child(
                 button(
                     "choose-source",
-                    "Choose source…",
+                    crate::i18n::explore::choose_source_button(locale),
                     ButtonVariant::Primary,
                     cx,
                 )
@@ -456,7 +460,7 @@ fn top_bar(
                     this.open_volumes(cx);
                     this.apply_focus(window, cx);
                 })),
-            "Choose local or SSH source · v",
+            crate::i18n::explore::logo_tooltip(app.locale),
         ))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
@@ -516,7 +520,7 @@ fn trail(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.widen_to(path.clone(), cx);
                         })),
-                    "Scan from here · what is below is reused",
+                    crate::i18n::explore::crumb_widen_tooltip(app.locale),
                 )
                 .into_any_element()
             }
@@ -666,7 +670,10 @@ fn sibling_menu(
                 .py(space::XS)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.8))
-                .child(format!("Siblings in {parent_name}")),
+                .child(crate::i18n::explore::siblings_in(
+                    &parent_name,
+                    app.locale,
+                )),
         );
     for (row_index, row) in rows.into_iter().enumerate() {
         let current =
@@ -735,7 +742,7 @@ fn sibling_menu(
                 .py(space::XS)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.7))
-                .child(format!("+{more} smaller")),
+                .child(crate::i18n::explore::more_smaller(more, app.locale)),
         );
     }
     panel
@@ -789,6 +796,7 @@ fn view_settings(
     window: &mut Window,
     cx: &mut Context<'_, Ruum>,
 ) -> Div {
+    let locale = app.locale;
     let focus = app.focus.clone();
     let entity = cx.entity().downgrade();
 
@@ -798,9 +806,12 @@ fn view_settings(
         button_group(
             "mode",
             vec![
-                ChoiceItem::new("size", "Size"),
-                ChoiceItem::new("files", "Files"),
-                ChoiceItem::new("age", "Age"),
+                ChoiceItem::new("size", crate::i18n::explore::mode_size(locale)),
+                ChoiceItem::new(
+                    "files",
+                    crate::i18n::explore::mode_files(locale),
+                ),
+                ChoiceItem::new("age", crate::i18n::explore::mode_age(locale)),
             ],
             Some(app.mode_index()),
             move |index, window, cx| {
@@ -828,7 +839,7 @@ fn view_settings(
         let focus = focus.clone();
         checkbox(
             "hidden",
-            "Hidden files",
+            crate::i18n::explore::hidden_files(locale),
             check(app.options.include_hidden),
             cx,
         )
@@ -844,7 +855,7 @@ fn view_settings(
     let apparent = {
         checkbox(
             "apparent",
-            "Apparent size",
+            crate::i18n::explore::apparent_size(locale),
             check(app.options.apparent_size),
             cx,
         )
@@ -963,11 +974,11 @@ fn view_settings(
                     .px(space::SM)
                     .text_size(text::BODY)
                     .text_color(theme.foreground)
-                    .child(format!("Depth {depth}")),
+                    .child(crate::i18n::explore::depth_label(depth, locale)),
             )
             .child(stepper("depth-less", "\u{2212}", -1, cx))
             .child(stepper("depth-more", "+", 1, cx)),
-        "Levels drawn at once \u{00b7} [ and ]",
+        crate::i18n::explore::depth_tooltip(locale),
     );
 
     div()
@@ -984,20 +995,6 @@ fn view_settings(
         .child(power_efficiency(app, cx))
 }
 
-/// What the tooltip says the choice will do, where the gauge alone cannot.
-/// Measured on an 18-core Apple silicon Mac scanning its whole Data volume
-/// (medians of three): 4 workers 209 s and 433 CPU-seconds, 8 workers 133 s
-/// and 580, 18 workers 137 s and 1,314. Elsewhere the shape is expected, not
-/// measured, so it gives no numbers.
-const POWER_TRADEOFF: &str = if cfg!(target_os = "macos") {
-    "Up to about 8 workers a scan finishes sooner: a whole drive took a \
-     third less time with 8 than with Balanced. Past that it is no faster, \
-     but uses over twice the CPU and runs the fans at full speed."
-} else {
-    "More workers finish a scan sooner only up to a point. Past it they \
-     use more CPU for no gain, and can run the fans at full speed."
-};
-
 /// How hard a scan may work, as a signal gauge framed like Depth; the
 /// presets are in a menu built like the sibling menu, so the control costs
 /// the bar no more than one button. Like the other settings, focus returns
@@ -1005,10 +1002,14 @@ const POWER_TRADEOFF: &str = if cfg!(target_os = "macos") {
 fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
     use crate::power::{self, PowerEfficiency};
 
+    let locale = app.locale;
     let theme = cx.omarchy().clone();
     let cpus = app.cpu_threads;
     let threads = app.options.threads.max_threads.min(cpus);
-    let name = app.power_choice.map_or("Custom", PowerEfficiency::name);
+    let name = app.power_choice.map_or_else(
+        || crate::i18n::common::power_custom_name(locale),
+        |preset| preset.name_in(locale),
+    );
     let open = app.power_menu.is_some();
     let trigger = div()
         .id("power-efficiency")
@@ -1024,7 +1025,11 @@ fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
         }))
         .child(
             button("power-toggle", "", ButtonVariant::Secondary, cx)
-                .accessibility_label(format!("Power Efficiency: {name}"))
+                .accessibility_label(
+                    crate::i18n::explore::power_accessibility_label(
+                        name, locale,
+                    ),
+                )
                 .selected(open)
                 .tab_stop(false)
                 .child(widgets::signal(
@@ -1046,12 +1051,15 @@ fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
     let trigger = if open {
         trigger
     } else {
+        let workers = power::workers_in(threads, locale);
         with_tooltip(
             trigger,
-            format!(
-                "Power Efficiency: {name} \u{00b7} {} of {cpus} CPUs\n\
-                 {POWER_TRADEOFF}\nUsed from the next scan, and remembered.",
-                power::workers(threads)
+            crate::i18n::explore::power_tooltip(
+                name,
+                &workers,
+                cpus,
+                cfg!(target_os = "macos"),
+                locale,
             ),
         )
     };
@@ -1087,8 +1095,8 @@ fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                 .py(space::XS)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.8))
-                .child("Scan workers")
-                .child(format!("{cpus} CPUs")),
+                .child(crate::i18n::explore::scan_workers_header(locale))
+                .child(crate::i18n::explore::cpus_count(cpus, locale)),
         );
     for (index, preset) in PowerEfficiency::ALL.into_iter().enumerate() {
         let offered = preset.available(cpus);
@@ -1125,7 +1133,7 @@ fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(preset.name()),
+                    .child(preset.name_in(locale)),
             )
             .child(div().flex_shrink_0().w(size::ROW_BAR).child(widgets::bar(
                 count as f32 / cpus as f32,
@@ -1140,7 +1148,7 @@ fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                     .justify_end()
                     .text_size(text::BODY)
                     .text_color(theme.secondary)
-                    .child(power::workers(count)),
+                    .child(power::workers_in(count, locale)),
             );
         // A preset this machine cannot tell apart from the one below it is
         // shown, so the scale stays the same everywhere, but not offered.
@@ -1158,10 +1166,10 @@ fn power_efficiency(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                 window.focus(&this.focus, cx);
             }))
         } else {
-            let below = PowerEfficiency::ALL[index - 1].name();
+            let below = PowerEfficiency::ALL[index - 1].name_in(locale);
             with_tooltip(
                 row.opacity(0.45),
-                format!("Same as {below} with {cpus} CPUs"),
+                crate::i18n::explore::same_as_preset(below, cpus, locale),
             )
         };
         menu = menu.child(row);
@@ -1205,6 +1213,7 @@ fn trail_and_legend(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 /// What the whole scan found, as one quiet line; unreadable paths are
 /// flagged in the warning colour when there are any.
 fn scan_totals(app: &Ruum, theme: &Theme) -> Div {
+    let locale = app.locale;
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
     let files = tree.map_or(app.progress.files, |node| node.files);
@@ -1219,22 +1228,20 @@ fn scan_totals(app: &Ruum, theme: &Theme) -> Div {
         .text_size(text::CAPTION)
         .text_color(theme.secondary)
         .child(div().text_color(theme.foreground).child(human_bytes(bytes)))
-        .child(format!(
-            "· {} files · {} dirs",
-            widgets::human_count(files),
-            widgets::human_count(dirs)
+        .child(crate::i18n::explore::scan_totals_counts(
+            files, dirs, locale,
         ))
         .when(errors > 0, |this| {
-            this.child(div().text_color(theme.warning).child(format!(
-                "· {} unreadable",
-                widgets::human_count(errors)
-            )))
+            this.child(div().text_color(theme.warning).child(
+                crate::i18n::explore::scan_totals_unreadable(errors, locale),
+            ))
         })
 }
 
 /// The key to the colours: the categories, or the age ramp in age mode.
 /// Clipped from the trailing end when the row runs out of room.
 fn legend(app: &Ruum, theme: &Theme, cx: &App) -> Div {
+    let locale = app.locale;
     let item = |swatch: Div, label: &'static str| {
         div()
             .flex()
@@ -1258,17 +1265,17 @@ fn legend(app: &Ruum, theme: &Theme, cx: &App) -> Div {
         .min_w_0()
         .overflow_hidden();
     if app.color_mode == ColorMode::Age {
-        for (bucket, (_, label)) in palette::AGE_BUCKETS.iter().enumerate() {
+        for bucket in 0..palette::AGE_BUCKETS.len() {
             lane = lane.child(item(
                 widgets::swatch(palette::age_accent(theme, bucket)),
-                label,
+                palette::age_bucket_label(bucket, locale),
             ));
         }
     } else {
         for category in Category::LEGEND {
             lane = lane.child(item(
                 widgets::swatch(palette::category_accent(theme, category)),
-                category.label(),
+                category.label_in(locale),
             ));
         }
     }
@@ -1281,7 +1288,10 @@ fn legend(app: &Ruum, theme: &Theme, cx: &App) -> Div {
         .gap(space::MD)
         .min_w_0()
         .overflow_hidden()
-        .child(item(widgets::hatch_swatch(hatch, ground), "Reclaimable"))
+        .child(item(
+            widgets::hatch_swatch(hatch, ground),
+            crate::i18n::explore::legend_reclaimable(locale),
+        ))
         .child(lane)
 }
 
@@ -1349,17 +1359,22 @@ fn side_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 /// share of the scan, when it was last written, what git says, and the two
 /// things to do with it.
 fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
-    let section = div()
-        .flex()
-        .flex_col()
-        .gap(space::MD)
-        .child(widgets::eyebrow("Selection", cx));
+    let locale = app.locale;
+    let section =
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::MD)
+            .child(widgets::eyebrow(
+                crate::i18n::explore::panel::selection_eyebrow(locale),
+                cx,
+            ));
     let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
     let Some(node) = app.node_at(&target) else {
         return section.child(
             div()
                 .text_color(theme.secondary)
-                .child("Point at a tile or select one with the arrows"),
+                .child(crate::i18n::explore::panel::selection_empty(locale)),
         );
     };
     let path = app.path_at(&target);
@@ -1413,7 +1428,10 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 
     let (number, unit) = match app.options.metric {
         Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
-        Metric::Files => (widgets::human_count(node.files), "files".into()),
+        Metric::Files => (
+            widgets::human_count(node.files),
+            crate::i18n::explore::panel::unit_files(locale).into(),
+        ),
     };
     let share = node.bytes as f32 / root_value.max(1) as f32;
     let measure = div()
@@ -1435,26 +1453,36 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         && crate::git::is_checkout(path)
     {
         let value = match app.git.get(path) {
-            Some(Some(state)) => state.summary(),
-            Some(None) => "not readable".to_string(),
-            None => "asking\u{2026}".to_string(),
+            Some(Some(state)) => state.summary_in(locale),
+            Some(None) => crate::i18n::explore::panel::git_not_readable(locale)
+                .to_string(),
+            None => crate::i18n::explore::panel::git_asking(locale).to_string(),
         };
         let clean =
             matches!(app.git.get(path), Some(Some(state)) if state.is_clean());
         widgets::figure(
-            "Git",
+            crate::i18n::explore::panel::git_eyebrow(locale),
             value,
             if clean { theme.success } else { theme.bright },
             cx,
         )
     } else {
         let kind = node.reclaim.map_or_else(
-            || node.category.label().to_string(),
+            || node.category.label_in(locale).to_string(),
             |reason| {
-                format!("{} \u{00b7} {}", node.category.label(), reason.label())
+                format!(
+                    "{} \u{00b7} {}",
+                    node.category.label_in(locale),
+                    reason.label_in(locale)
+                )
             },
         );
-        widgets::figure("Kind", kind, theme.bright, cx)
+        widgets::figure(
+            crate::i18n::explore::panel::kind_eyebrow(locale),
+            kind,
+            theme.bright,
+            cx,
+        )
     };
     let grid = div()
         .flex()
@@ -1465,13 +1493,13 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .flex()
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Of scan",
+                    crate::i18n::explore::panel::of_scan_eyebrow(locale),
                     widgets::percent(node.bytes, root_value),
                     theme.bright,
                     cx,
                 )))
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Files",
+                    crate::i18n::explore::panel::files_eyebrow(locale),
                     widgets::human_count(node.files),
                     theme.bright,
                     cx,
@@ -1482,8 +1510,12 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .flex()
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Last write",
-                    widgets::ago(crate::state::now_seconds(), node.modified),
+                    crate::i18n::explore::panel::last_write_eyebrow(locale),
+                    widgets::ago_in(
+                        crate::state::now_seconds(),
+                        node.modified,
+                        locale,
+                    ),
                     theme.bright,
                     cx,
                 )))
@@ -1493,17 +1525,25 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
     // Only states that change the decision earn a badge.
     let mut chips = Vec::new();
     if marked {
-        chips.push(widgets::chip("Marked", theme.danger, cx));
+        chips.push(widgets::chip(
+            crate::i18n::explore::panel::badge_marked(locale),
+            theme.danger,
+            cx,
+        ));
     }
     if let Some(ancestor) = &covered_by {
         chips.push(widgets::chip(
-            format!("Goes with {ancestor}"),
+            crate::i18n::explore::panel::badge_goes_with(ancestor, locale),
             theme.danger,
             cx,
         ));
     }
     if node.read_error {
-        chips.push(widgets::chip("Partly unreadable", theme.warning, cx));
+        chips.push(widgets::chip(
+            crate::i18n::explore::panel::badge_partly_unreadable(locale),
+            theme.warning,
+            cx,
+        ));
     }
     let badges = (!chips.is_empty()).then(|| {
         div()
@@ -1521,14 +1561,21 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         if node.is_dir() {
             let crumbs = target.clone();
             actions = actions.child(
-                button("open", "Open", ButtonVariant::Outline, cx)
-                    .tab_stop(false)
-                    .flex_1()
-                    .justify_center()
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                button(
+                    "open",
+                    crate::i18n::explore::panel::action_open(locale),
+                    ButtonVariant::Outline,
+                    cx,
+                )
+                .tab_stop(false)
+                .flex_1()
+                .justify_center()
+                .on_click(cx.listener(
+                    move |this, _, window, cx| {
                         this.go_to(crumbs.clone(), cx);
                         window.focus(&this.focus, cx);
-                    })),
+                    },
+                )),
             );
         }
         // Inside a marked directory there is nothing to mark on its own: it
@@ -1539,10 +1586,16 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         let crumbs = target;
         let label = match &ancestor {
             Some(ancestor) if !marked => {
-                format!("Unmark {}", short_name(ancestor))
+                crate::i18n::explore::panel::action_unmark_ancestor(
+                    &short_name(ancestor),
+                    locale,
+                )
             }
-            _ if marked => "Unmark".to_string(),
-            _ => "Mark for removal".to_string(),
+            _ if marked => {
+                crate::i18n::explore::panel::action_unmark(locale).to_string()
+            }
+            _ => crate::i18n::explore::panel::action_mark_for_removal(locale)
+                .to_string(),
         };
         let mark = button("mark", label, ButtonVariant::Primary, cx)
             .tab_stop(false)
@@ -1582,6 +1635,7 @@ fn selection_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 
 /// The biggest things that could plausibly go, with their total.
 fn worth_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
     let total: u64 = app.insights.iter().map(|candidate| candidate.bytes).sum();
     let largest = app.insights.first().map_or(1, |candidate| candidate.bytes);
     let highlight = palette::highlight(theme);
@@ -1592,7 +1646,10 @@ fn worth_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             .items_center()
             .justify_between()
             .pb(space::XS)
-            .child(widgets::eyebrow("Worth a look", cx))
+            .child(widgets::eyebrow(
+                crate::i18n::explore::panel::worth_eyebrow(locale),
+                cx,
+            ))
             .when(total > 0, |this| {
                 this.child(
                     div()
@@ -1608,9 +1665,9 @@ fn worth_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
                 .child(if app.tree().is_some() {
-                    "Nothing obviously disposable"
+                    crate::i18n::explore::panel::worth_empty_done(locale)
                 } else {
-                    "Waiting for the scan"
+                    crate::i18n::explore::panel::worth_empty_waiting(locale)
                 }),
         );
     }
@@ -1692,6 +1749,7 @@ fn worth_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 /// A finding's title, as the last two parts of its path, and why it is on
 /// the list.
 fn insight_text(app: &Ruum, candidate: &Candidate) -> (String, String) {
+    let locale = app.locale;
     let tree = app.tree();
     let chain = tree
         .map_or_else(Vec::new, |tree| tree.resolve_chain(&candidate.crumbs));
@@ -1699,26 +1757,31 @@ fn insight_text(app: &Ruum, candidate: &Candidate) -> (String, String) {
         chain.iter().skip(1).map(|node| &*node.name).collect();
     let tail = names[names.len().saturating_sub(2)..].join("/");
     match &candidate.finding {
-        Finding::Reclaimable(reason) => (tail, reason.label().to_string()),
+        Finding::Reclaimable(reason) => {
+            (tail, reason.label_in(locale).to_string())
+        }
         Finding::Worktrees { count, oldest_days } => (
             tail,
-            format!(
-                "{count} worktree{} \u{00b7} oldest {oldest_days} d",
-                if *count == 1 { "" } else { "s" }
+            crate::i18n::explore::panel::insight_worktrees(
+                *count,
+                u64::try_from(*oldest_days).unwrap_or(0),
+                locale,
             ),
         ),
         Finding::StaleExperiments { count } => (
-            format!("{tail} > {STALE_DAYS} days"),
-            format!(
-                "{count} experiment{} untouched",
-                if *count == 1 { "" } else { "s" }
+            crate::i18n::explore::panel::insight_stale_title(
+                &tail,
+                u64::try_from(STALE_DAYS).unwrap_or(0),
+                locale,
             ),
+            crate::i18n::explore::panel::insight_stale_detail(*count, locale),
         ),
     }
 }
 
 /// What is queued for removal, each with a way off the list.
 fn marked_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
     let plan = app.plan();
     let count = app.marks.len();
     let header = div()
@@ -1727,11 +1790,7 @@ fn marked_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         .items_center()
         .justify_between()
         .child(widgets::eyebrow(
-            if count == 0 {
-                "Marked".to_string()
-            } else {
-                format!("Marked · {count}")
-            },
+            crate::i18n::explore::panel::marked_header(count, locale),
             cx,
         ))
         .when(count > 0, |this| {
@@ -1748,7 +1807,7 @@ fn marked_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Space marks the tile you point at"),
+                .child(crate::i18n::explore::panel::marked_empty(locale)),
         );
     }
     for (index, item) in app.marks.items().iter().take(MARKED_ROWS).enumerate()
@@ -1811,9 +1870,9 @@ fn marked_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "+{} more on the review screen",
-                    count - MARKED_ROWS
+                .child(crate::i18n::explore::panel::marked_more_on_review(
+                    count - MARKED_ROWS,
+                    locale,
                 )),
         );
     }
@@ -1822,10 +1881,10 @@ fn marked_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} nested \u{00b7} {} kept back",
+                .child(crate::i18n::explore::panel::marked_nested_blocked(
                     plan.covered.len(),
-                    plan.blocked.len()
+                    plan.blocked.len(),
+                    locale,
                 )),
         );
     }
@@ -1913,9 +1972,9 @@ fn privacy_line(
     if app.progress.errors == 0 || app.full_disk_access != Some(false) {
         return None;
     }
+    let locale = app.locale;
     let color = theme.warning;
     let errors = app.progress.errors;
-    let noun = if errors == 1 { "item" } else { "items" };
     Some(
         div()
             .flex()
@@ -1926,16 +1985,13 @@ fn privacy_line(
             .border_1()
             .border_color(color.opacity(0.5))
             .text_size(text::CAPTION)
-            .child(div().text_color(color).child(format!(
-                "macOS kept {} {noun} unreadable. Give ruum Full Disk \
-                 Access, or your terminal if you started it there, then \
-                 reopen it.",
-                widgets::human_count(errors)
-            )))
+            .child(div().text_color(color).child(
+                crate::i18n::explore::panel::privacy_message(errors, locale),
+            ))
             .child(
                 button(
                     "privacy",
-                    "Open Privacy Settings",
+                    crate::i18n::explore::panel::privacy_button(locale),
                     ButtonVariant::Outline,
                     cx,
                 )
@@ -1970,24 +2026,17 @@ fn administrator_line(
     {
         return None;
     }
+    let locale = app.locale;
     let errors = app.progress.errors;
     let message = if errors > 0 {
-        let noun = if errors == 1 { "item" } else { "items" };
         // With `-l` the elevated copy walks too: only the reading is gained.
-        let faster = if app.options.follow_links {
-            ""
-        } else {
-            ", and a whole drive several times faster"
-        };
-        format!(
-            "Windows kept {} {noun} unreadable. Run as administrator to read \
-             them{faster}.",
-            widgets::human_count(errors)
+        crate::i18n::explore::panel::admin_unreadable(
+            errors,
+            app.options.follow_links,
+            locale,
         )
     } else if app.file_table && !app.options.follow_links {
-        "Run as administrator to read the whole drive from its file table: \
-         several times faster than this walk."
-            .to_owned()
+        crate::i18n::explore::panel::admin_file_table(locale).to_owned()
     } else {
         return None;
     };
@@ -1995,7 +2044,7 @@ fn administrator_line(
     let message = if app.marks.is_empty() {
         message
     } else {
-        format!("{message} Restarting drops the marks.")
+        crate::i18n::explore::panel::admin_marks_warning(&message, locale)
     };
     let color = theme.warning;
     Some(
@@ -2012,7 +2061,7 @@ fn administrator_line(
             .child(
                 button(
                     "administrator",
-                    "Restart as Administrator",
+                    crate::i18n::explore::panel::admin_button(locale),
                     ButtonVariant::Outline,
                     cx,
                 )
@@ -2030,6 +2079,7 @@ fn administrator_line(
 
 /// Free space on the volume now, and after the marks go.
 fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
     let device = app.device.clone().unwrap_or_default();
     // The disk header doubles as the way to another volume: it opens the
     // picker, like `V` does. A plain label would hide that the scan can move.
@@ -2038,7 +2088,10 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         .flex_row()
         .items_center()
         .gap(space::SM)
-        .child(widgets::eyebrow("Disk", cx))
+        .child(widgets::eyebrow(
+            crate::i18n::explore::panel::disk_eyebrow(locale),
+            cx,
+        ))
         .child(
             div()
                 .text_size(text::CAPTION)
@@ -2047,12 +2100,17 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
         )
         .child(div().flex_1())
         .child(
-            button("volumes", "Source…", ButtonVariant::Secondary, cx)
-                .tab_stop(false)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_volumes(cx);
-                    this.apply_focus(window, cx);
-                })),
+            button(
+                "volumes",
+                crate::i18n::explore::panel::source_button(locale),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .tab_stop(false)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_volumes(cx);
+                this.apply_focus(window, cx);
+            })),
         );
     let mut section = div().flex().flex_col().gap(space::SM).child(header);
     let Some(space_info) = app.space else {
@@ -2060,7 +2118,9 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Free space is not available here"),
+                .child(crate::i18n::explore::panel::free_space_unavailable(
+                    locale,
+                )),
         );
     };
     let plan = app.plan();
@@ -2083,7 +2143,7 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             .child(widgets::measure(
                 number,
                 text::FIGURE,
-                format!("{unit} free"),
+                crate::i18n::explore::panel::unit_free(&unit, locale),
                 text::BODY,
                 cx,
             ))
@@ -2098,9 +2158,9 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                             (text::FIGURE.0 - text::TITLE.0) * 0.2,
                         ))
                         .text_color(highlight)
-                        .child(format!(
-                            "→ {} free",
-                            human_bytes(after.available)
+                        .child(crate::i18n::explore::panel::arrow_free(
+                            &human_bytes(after.available),
+                            locale,
                         )),
                 )
             }),
@@ -2137,12 +2197,14 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                     ),
             ),
     );
-    if let Some(left_out) = not_counted(&plan) {
+    if let Some(left_out) = not_counted(&plan, locale) {
         section = section.child(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("not counted here: {left_out}")),
+                .child(crate::i18n::explore::panel::not_counted_here(
+                    &left_out, locale,
+                )),
         );
     }
     section
@@ -2152,9 +2214,15 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .flex_row()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("{} used", human_bytes(space_info.used())))
+                .child(crate::i18n::explore::panel::used_amount(
+                    &human_bytes(space_info.used()),
+                    locale,
+                ))
                 .child(div().flex_1())
-                .child(format!("{} total", human_bytes(space_info.total))),
+                .child(crate::i18n::explore::panel::total_amount(
+                    &human_bytes(space_info.total),
+                    locale,
+                )),
         )
         .children(
             (!app.marks.is_empty())
@@ -2166,15 +2234,18 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
 /// bytes marked on another volume come back there, and bytes no volume can
 /// be found for are not claimed at all. `None` when every marked byte is
 /// this volume's, which is the usual case.
-fn not_counted(plan: &Plan) -> Option<String> {
+fn not_counted(plan: &Plan, locale: crate::i18n::Locale) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if plan.foreign() > 0 {
-        parts.push(format!("{} on other volumes", human_bytes(plan.foreign())));
+        parts.push(crate::i18n::explore::panel::other_volumes(
+            &human_bytes(plan.foreign()),
+            locale,
+        ));
     }
     if plan.unattributed() > 0 {
-        parts.push(format!(
-            "{} could not be placed",
-            human_bytes(plan.unattributed())
+        parts.push(crate::i18n::explore::panel::unattributed_bytes(
+            &human_bytes(plan.unattributed()),
+            locale,
         ));
     }
     (!parts.is_empty()).then(|| parts.join(", "))
@@ -2220,9 +2291,10 @@ fn review_button(
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(format!(
-                    "Review {count} marked · frees {}…",
-                    human_bytes(reclaiming)
+                .child(crate::i18n::explore::panel::review_marked_button(
+                    count,
+                    &human_bytes(reclaiming),
+                    app.locale,
                 )),
         )
         .child(gpui_omarchy::keycap("c", cx))
@@ -2233,20 +2305,9 @@ fn review_button(
 /// The keys, quietly: outlines and light labels, there when needed. The key
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Ruum, theme: &Theme, cx: &App) -> Div {
+    let locale = app.locale;
     // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
-        ("space", "mark"),
-        ("enter", "open"),
-        ("\u{232b}", "up"),
-        ("c", "review"),
-        ("hjkl", "move"),
-        ("/", "filter"),
-        ("[ ]", "depth"),
-        ("t", "mode"),
-        ("0", "reset"),
-        ("v", "volumes"),
-        ("r", "rescan"),
-    ];
+    let hints = crate::i18n::explore::key_hints(locale);
     let mut lane = div()
         .flex()
         .flex_row()
@@ -2279,37 +2340,36 @@ fn key_bar(app: &Ruum, theme: &Theme, cx: &App) -> Div {
         );
     }
     let scan = if app.is_indexing() {
-        format!(
-            "scanning \u{00b7} {} entries \u{00b7} {}",
-            widgets::human_count(app.progress.files),
-            human_bytes(app.progress.bytes)
+        crate::i18n::explore::scan_status_scanning(
+            app.progress.files,
+            &human_bytes(app.progress.bytes),
+            locale,
         )
     } else if app.progress.cancelled {
-        format!(
-            "scan cancelled \u{00b7} {} entries \u{00b7} r scans again",
-            widgets::human_count(app.progress.files)
-        )
+        crate::i18n::explore::scan_status_cancelled(app.progress.files, locale)
     } else {
-        let elapsed = app.scan_elapsed.map_or_else(String::new, |time| {
-            format!(" \u{00b7} {:.1} s", time.as_secs_f32())
-        });
-        format!(
-            "scan {} entries{elapsed}",
-            widgets::human_count(app.progress.files)
+        crate::i18n::explore::scan_status_done(
+            app.progress.files,
+            app.scan_elapsed.map(|time| time.as_secs_f32()),
+            locale,
         )
     };
-    row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary.opacity(0.7))
-                .child(scan),
-        )
+    row.child(
+        widgets::hint("?", crate::i18n::explore::all_keys_hint(locale), cx)
+            .flex_shrink_0(),
+    )
+    .child(
+        div()
+            .flex_shrink_0()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary.opacity(0.7))
+            .child(scan),
+    )
 }
 
 /// What the viewport shows while the first scan is running.
 fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
     if let Some(error) = &app.scan_error {
         return div()
             .debug_selector(|| "scan-error".into())
@@ -2330,7 +2390,7 @@ fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 div()
                     .text_size(text::TITLE)
                     .text_color(theme.bright)
-                    .child("Scan failed"),
+                    .child(crate::i18n::explore::scanning::scan_failed(locale)),
             )
             .child(
                 div()
@@ -2348,9 +2408,16 @@ fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                     .truncate()
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
-                    .child(format!("Last directory: {}", path.display()))
+                    .child(crate::i18n::explore::scanning::last_directory(
+                        &path.display().to_string(),
+                        locale,
+                    ))
             }))
-            .child(widgets::hint("r", "retry scan", cx));
+            .child(widgets::hint(
+                "r",
+                crate::i18n::explore::scanning::retry_scan(locale),
+                cx,
+            ));
     }
     let progress = &app.progress;
     let cancelled =
@@ -2362,6 +2429,7 @@ fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             .as_ref()
             .and_then(|preview| preview.directory.as_ref())
     };
+    let root_disp = widgets::display_root(app);
     div()
         .debug_selector(|| "scan-reading".into())
         .flex()
@@ -2385,9 +2453,13 @@ fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.bright)
                 .child(if cancelled {
-                    format!("Stopped reading {}", widgets::display_root(app))
+                    crate::i18n::explore::scanning::stopped_reading(
+                        &root_disp, locale,
+                    )
                 } else {
-                    format!("Reading {}", widgets::display_root(app))
+                    crate::i18n::explore::scanning::reading_root(
+                        &root_disp, locale,
+                    )
                 }),
         )
         .child(
@@ -2396,22 +2468,22 @@ fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .flex_row()
                 .gap(space::XL)
                 .child(widgets::stat(
-                    "files",
+                    crate::i18n::explore::scanning::stat_files(locale),
                     widgets::human_count(progress.files),
                     cx,
                 ))
                 .child(widgets::stat(
-                    "directories",
+                    crate::i18n::explore::scanning::stat_directories(locale),
                     widgets::human_count(progress.dirs),
                     cx,
                 ))
                 .child(widgets::stat(
-                    "measured",
+                    crate::i18n::explore::scanning::stat_measured(locale),
                     human_bytes(progress.bytes),
                     cx,
                 ))
                 .child(widgets::stat_colored(
-                    "unreadable",
+                    crate::i18n::explore::scanning::stat_unreadable(locale),
                     widgets::human_count(progress.errors),
                     if progress.errors > 0 {
                         theme.warning
@@ -2443,31 +2515,44 @@ fn scanning_panel(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
                 .truncate()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("Recent directory: {}", path.display()))
+                .child(crate::i18n::explore::scanning::recent_directory(
+                    &path.display().to_string(),
+                    locale,
+                ))
         }))
         .child(
             div()
                 .text_size(text::BODY)
                 .text_color(theme.secondary)
                 .child(if cancelled {
-                    "Nothing is shown from a scan that did not finish."
+                    crate::i18n::explore::scanning::scan_cancelled_note(locale)
                 } else {
-                    "Marking, zooming and the free-space meter all work as soon as it lands."
+                    crate::i18n::explore::scanning::scan_running_note(locale)
                 }),
         )
         // A failed scan has nothing left to cancel either.
         .child(if app.scan.is_none() && app.remote_scan.is_none() {
-            button("scan-again", "Scan again", ButtonVariant::Outline, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.start_scan(cx);
-                    window.focus(&this.focus, cx);
-                }))
+            button(
+                "scan-again",
+                crate::i18n::explore::scanning::scan_again(locale),
+                ButtonVariant::Outline,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.start_scan(cx);
+                window.focus(&this.focus, cx);
+            }))
         } else {
-            button("cancel-scan", "Cancel", ButtonVariant::Outline, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.cancel_scan(cx);
-                    window.focus(&this.focus, cx);
-                }))
+            button(
+                "cancel-scan",
+                crate::i18n::explore::scanning::cancel(locale),
+                ButtonVariant::Outline,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.cancel_scan(cx);
+                window.focus(&this.focus, cx);
+            }))
         })
 }
 
@@ -2484,27 +2569,32 @@ fn progress_estimate(files: u64) -> f32 {
 }
 
 fn find_field(app: &Ruum, theme: &Theme) -> Div {
+    let locale = app.locale;
     // What the text matches, said beside it as it is typed, and what Enter
     // and Escape will do with it.
     let (summary, hint) = match app.matches.as_deref() {
-        _ if app.finding && app.matches.is_none() => {
-            ("searching…".to_string(), "")
-        }
-        None => (String::new(), "type to filter"),
-        Some(matches) if matches.count == 0 => {
-            ("no matches".to_string(), "esc clears")
-        }
+        _ if app.finding && app.matches.is_none() => (
+            crate::i18n::explore::scanning::find_searching(locale).to_string(),
+            "",
+        ),
+        None => (
+            String::new(),
+            crate::i18n::explore::scanning::find_type_to_filter(locale),
+        ),
+        Some(matches) if matches.count == 0 => (
+            crate::i18n::explore::scanning::find_no_matches(locale).to_string(),
+            crate::i18n::explore::scanning::find_esc_clears(locale),
+        ),
         Some(matches) => (
-            format!(
-                "{} match{} · {}",
-                widgets::human_count(matches.count as u64),
-                if matches.count == 1 { "" } else { "es" },
-                human_bytes(matches.bytes)
+            crate::i18n::explore::scanning::find_matches(
+                matches.count,
+                &human_bytes(matches.bytes),
+                locale,
             ),
             if app.filter_applied {
-                "esc clears"
+                crate::i18n::explore::scanning::find_esc_clears(locale)
             } else {
-                "enter shows only these"
+                crate::i18n::explore::scanning::find_enter_shows_only(locale)
             },
         ),
     };
@@ -2539,7 +2629,7 @@ fn find_field(app: &Ruum, theme: &Theme) -> Div {
         .child(if app.find.is_empty() {
             div()
                 .text_color(theme.secondary.opacity(0.7))
-                .child("Filter by name")
+                .child(crate::i18n::explore::scanning::find_placeholder(locale))
         } else {
             div().text_color(theme.bright).child(app.find.clone())
         })
@@ -2589,6 +2679,7 @@ fn marks_ancestor(
 // ── review ──────────────────────────────────────────────────────────────
 
 fn review(app: &Ruum, window: &mut Window, cx: &mut Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
     let theme = cx.omarchy().clone();
     let plan = app.plan();
     let items: Vec<Target> = app.marks.items().to_vec();
@@ -2611,7 +2702,7 @@ fn review(app: &Ruum, window: &mut Window, cx: &mut Context<'_, Ruum>) -> Div {
             div()
                 .p(space::XXL)
                 .text_color(theme.secondary)
-                .child("Nothing is marked. Go back and mark what should go."),
+                .child(crate::i18n::review::review_empty(locale)),
         );
     }
 
@@ -2639,9 +2730,9 @@ fn review(app: &Ruum, window: &mut Window, cx: &mut Context<'_, Ruum>) -> Div {
                 .py(space::SM)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} more are marked and will be removed too. Unmark them in the treemap.",
-                    items.len() - LIST_LIMIT
+                .child(crate::i18n::review::review_list_truncated(
+                    items.len() - LIST_LIMIT,
+                    locale,
                 )),
         );
     }
@@ -2653,11 +2744,11 @@ fn review(app: &Ruum, window: &mut Window, cx: &mut Context<'_, Ruum>) -> Div {
         .flex_1()
         .min_h_0()
         .child(screen_header(
-            "Review",
-            &format!(
-                "{} marked \u{00b7} {} to free",
+            crate::i18n::review::review_title(locale),
+            &crate::i18n::review::review_subtitle(
                 app.marks.len(),
-                human_bytes(plan.bytes())
+                &human_bytes(plan.bytes()),
+                locale,
             ),
             &theme,
             cx,
@@ -2687,6 +2778,7 @@ fn mark_row(
     theme: &Theme,
     cx: &Context<'_, Ruum>,
 ) -> Div {
+    let locale = app.locale;
     let root_value = app.tree().map_or(0, |tree| tree.bytes);
     let path_text = crate::marks::display_path(&item.path, app.home.as_deref());
     let color = if blocked.is_some() || covered {
@@ -2734,11 +2826,19 @@ fn mark_row(
                 ),
         )
         .children(covered.then(|| {
-            widgets::chip("Inside a marked directory", theme.secondary, cx)
+            widgets::chip(
+                crate::i18n::review::inside_marked_dir(locale),
+                theme.secondary,
+                cx,
+            )
         }))
-        .children(
-            blocked.map(|reason| widgets::chip(reason, theme.warning, cx)),
-        )
+        .children(blocked.map(|reason| {
+            widgets::chip(
+                crate::i18n::review::blocked_reason(&reason, locale),
+                theme.warning,
+                cx,
+            )
+        }))
         .child(div().w(size::SHARE_LANE).flex_shrink_0().child(
             widgets::glyph_bar(
                 item.bytes,
@@ -2761,7 +2861,7 @@ fn mark_row(
         .child(
             button(
                 ElementId::Name(SharedString::from(format!("unmark-{index}"))),
-                "Unmark",
+                crate::i18n::review::unmark(locale),
                 ButtonVariant::Outline,
                 cx,
             )
@@ -2779,13 +2879,19 @@ fn review_summary(
     window: &mut Window,
     cx: &mut Context<'_, Ruum>,
 ) -> Div {
+    let locale = app.locale;
     // What comes back to the volume on screen, which is all its meter can
     // project; the totals below say what the removal does in full.
     let reclaiming = plan.reclaim();
     // The part of the saving that lands elsewhere, said rather than added to
     // this volume's projection, so the two numbers cannot be confused.
-    let left_out = not_counted(plan)
-        .map(|left_out| widgets::row("Not counted here", left_out, cx));
+    let left_out = not_counted(plan, locale).map(|left_out| {
+        widgets::row(
+            crate::i18n::review::not_counted_label(locale),
+            left_out,
+            cx,
+        )
+    });
     let trash = app.trash_backend.is_available();
 
     // One silhouette for one either-or choice, reversible option first.
@@ -2793,8 +2899,12 @@ fn review_summary(
     let mode = button_group(
         "removal-mode",
         vec![
-            ChoiceItem::new("trash", "Move to trash").disabled(!trash),
-            ChoiceItem::new("permanent", "Delete permanently"),
+            ChoiceItem::new("trash", crate::i18n::review::mode_trash(locale))
+                .disabled(!trash),
+            ChoiceItem::new(
+                "permanent",
+                crate::i18n::review::mode_permanent(locale),
+            ),
         ],
         Some(usize::from(app.removal_mode == RemovalMode::Permanent)),
         move |index, _, cx| {
@@ -2812,18 +2922,15 @@ fn review_summary(
     );
 
     let explanation = if app.remote.is_some() {
-        "Read-only SSH session. Export the selection; nothing is \
-         deleted here. Free space is sampled at scan time."
-            .to_string()
+        crate::i18n::review::explanation_remote(locale).to_string()
     } else {
         match app.removal_mode {
-            RemovalMode::Trash => format!(
-                "Recoverable from the trash until it is emptied. Uses {}.",
-                app.trash_backend.label()
+            RemovalMode::Trash => crate::i18n::review::explanation_trash(
+                app.trash_backend.label_in(locale),
+                locale,
             ),
             RemovalMode::Permanent => {
-                "Deleted at once, like rm -rf. Nothing is recoverable."
-                    .to_string()
+                crate::i18n::review::explanation_permanent(locale).to_string()
             }
         }
     };
@@ -2843,7 +2950,10 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::SM)
-                .child(widgets::section("What happens", cx))
+                .child(widgets::section(
+                    crate::i18n::review::section_what_happens(locale),
+                    cx,
+                ))
                 .children(app.remote.is_none().then_some(mode))
                 .child(
                     div()
@@ -2857,29 +2967,32 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::SM)
-                .child(widgets::section("Totals", cx))
+                .child(widgets::section(
+                    crate::i18n::review::section_totals(locale),
+                    cx,
+                ))
                 .child(widgets::row(
-                    "Marked",
+                    crate::i18n::review::row_marked(locale),
                     format!("{}", app.marks.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Acted on",
+                    crate::i18n::review::row_acted_on(locale),
                     format!("{}", plan.targets.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Nested, go with a parent",
+                    crate::i18n::review::row_nested(locale),
                     format!("{}", plan.covered.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Kept back",
+                    crate::i18n::review::row_kept_back(locale),
                     format!("{}", plan.blocked.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Space freed",
+                    crate::i18n::review::row_space_freed(locale),
                     human_bytes(plan.bytes()),
                     cx,
                 ))
@@ -2892,8 +3005,11 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::SM)
-                .child(widgets::section("Volume", cx))
-                .child(widgets::space_meter(volume, reclaiming, cx)),
+                .child(widgets::section(
+                    crate::i18n::review::section_volume(locale),
+                    cx,
+                ))
+                .child(widgets::space_meter_in(volume, reclaiming, locale, cx)),
         );
     }
 
@@ -2907,7 +3023,10 @@ fn review_summary(
                     .child(format!(
                         "{}: {}",
                         short_name(&item.path),
-                        item.reason
+                        crate::i18n::review::blocked_reason(
+                            &item.reason,
+                            locale
+                        )
                     )),
             );
         }
@@ -2916,14 +3035,17 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::XS)
-                .child(widgets::section("Kept back", cx))
+                .child(widgets::section(
+                    crate::i18n::review::section_kept_back(locale),
+                    cx,
+                ))
                 .child(blocked),
         );
     }
 
     panel
         .child(div().flex_1())
-        .child(export_controls(plan, cx))
+        .child(export_controls(plan, locale, cx))
         .children(app.remote.is_none().then(|| commit_controls(app, plan, cx)))
 }
 
@@ -2931,6 +3053,7 @@ fn review_summary(
 /// prompt for a coding agent to do the cleanup with care.
 fn export_controls(
     plan: &ruum_core::removal::Plan,
+    locale: crate::i18n::Locale,
     cx: &Context<'_, Ruum>,
 ) -> Div {
     div()
@@ -2941,7 +3064,7 @@ fn export_controls(
         .child(
             button(
                 "save-list",
-                "Save list\u{2026}",
+                crate::i18n::review::save_list(locale),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -2953,7 +3076,7 @@ fn export_controls(
         .child(
             button(
                 "copy-prompt",
-                "Copy as prompt",
+                crate::i18n::review::copy_prompt(locale),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -2965,7 +3088,7 @@ fn export_controls(
         .child(
             button(
                 "save-script",
-                "Save delete script…",
+                crate::i18n::review::save_script(locale),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -2977,7 +3100,7 @@ fn export_controls(
         .child(
             button(
                 "copy-script",
-                "Copy delete script",
+                crate::i18n::review::copy_script(locale),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -2996,15 +3119,15 @@ fn commit_controls(
     plan: &ruum_core::removal::Plan,
     cx: &Context<'_, Ruum>,
 ) -> Div {
+    let locale = app.locale;
     let count = plan.targets.len();
-    let noun = if count == 1 { "item" } else { "items" };
     let (label, variant) = match app.removal_mode {
         RemovalMode::Trash => (
-            format!("Move {count} {noun} to trash"),
+            crate::i18n::review::move_to_trash_button(count, locale),
             ButtonVariant::Primary,
         ),
         RemovalMode::Permanent => (
-            format!("Delete {count} {noun}\u{2026}"),
+            crate::i18n::review::delete_button(count, locale),
             ButtonVariant::Danger,
         ),
     };
@@ -3018,13 +3141,17 @@ fn commit_controls(
         .justify_end()
         .gap(space::SM)
         .child(
-            button("back", "Back", ButtonVariant::Secondary, cx).on_click(
-                cx.listener(|this, _, window, cx| {
-                    this.screen = Screen::Explore;
-                    cx.notify();
-                    window.focus(&this.focus, cx);
-                }),
-            ),
+            button(
+                "back",
+                crate::i18n::review::back(locale),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.screen = Screen::Explore;
+                cx.notify();
+                window.focus(&this.focus, cx);
+            })),
         )
         .child(
             button("commit", label, variant, cx)
@@ -3037,10 +3164,16 @@ fn commit_controls(
 }
 
 fn review_footer(app: &Ruum, theme: &Theme, cx: &App) -> Div {
+    let locale = app.locale;
     let commit = match app.removal_mode {
-        RemovalMode::Trash => "move to trash",
-        RemovalMode::Permanent => "delete\u{2026}",
+        RemovalMode::Trash => crate::i18n::review::commit_trash_hint(locale),
+        RemovalMode::Permanent => {
+            crate::i18n::review::commit_delete_hint(locale)
+        }
     };
+    let avail = app
+        .space
+        .map_or_else(|| "?".into(), |space| human_bytes(space.available));
     div()
         .flex()
         .flex_row()
@@ -3055,34 +3188,48 @@ fn review_footer(app: &Ruum, theme: &Theme, cx: &App) -> Div {
                 .is_none()
                 .then(|| widgets::hint("enter", commit, cx)),
         )
-        .children(
-            app.remote
-                .is_none()
-                .then(|| widgets::hint("m", "trash", cx)),
-        )
-        .children(
-            app.remote
-                .is_none()
-                .then(|| widgets::hint("p", "permanent", cx)),
-        )
-        .child(widgets::hint("e", "save script", cx))
-        .child(widgets::hint("y", "copy script", cx))
-        .child(widgets::hint("!", "unmark all", cx))
-        .child(widgets::hint("s", "save list", cx))
-        .child(widgets::hint("a", "copy as prompt", cx))
-        .child(widgets::hint("esc", "back", cx))
+        .children(app.remote.is_none().then(|| {
+            widgets::hint("m", crate::i18n::review::trash_hint(locale), cx)
+        }))
+        .children(app.remote.is_none().then(|| {
+            widgets::hint("p", crate::i18n::review::permanent_hint(locale), cx)
+        }))
+        .child(widgets::hint(
+            "e",
+            crate::i18n::review::save_script_hint(locale),
+            cx,
+        ))
+        .child(widgets::hint(
+            "y",
+            crate::i18n::review::copy_script_hint(locale),
+            cx,
+        ))
+        .child(widgets::hint(
+            "!",
+            crate::i18n::review::unmark_all_hint(locale),
+            cx,
+        ))
+        .child(widgets::hint(
+            "s",
+            crate::i18n::review::save_list_hint(locale),
+            cx,
+        ))
+        .child(widgets::hint(
+            "a",
+            crate::i18n::review::copy_prompt_hint(locale),
+            cx,
+        ))
+        .child(widgets::hint(
+            "esc",
+            crate::i18n::review::back_hint(locale),
+            cx,
+        ))
         .child(div().flex_1())
         .child(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} available",
-                    app.space.map_or_else(
-                        || "?".into(),
-                        |space| human_bytes(space.available)
-                    )
-                )),
+                .child(crate::i18n::review::available_footer(&avail, locale)),
         )
 }
 
@@ -3152,14 +3299,19 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
         );
     }
 
+    let locale = app.locale;
     div()
         .flex()
         .flex_col()
         .flex_1()
         .min_h_0()
         .child(screen_header(
-            "Removing",
-            &format!("{} of {} done", done, summary.total),
+            crate::i18n::review::removing_title(locale),
+            &crate::i18n::review::removing_subtitle(
+                done,
+                summary.total,
+                locale,
+            ),
             &theme,
             cx,
         ))
@@ -3172,11 +3324,11 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 .flex_1()
                 .min_h_0()
                 .child(widgets::meter_row(
-                    "progress",
-                    format!(
-                        "{} removed · {} to free",
+                    crate::i18n::review::progress_label(locale),
+                    crate::i18n::review::progress_value(
                         summary.removed,
-                        human_bytes(summary.bytes)
+                        &human_bytes(summary.bytes),
+                        locale,
                     ),
                     progress,
                     if app.removal_mode == RemovalMode::Permanent {
@@ -3187,7 +3339,9 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                     cx,
                 ))
                 .children(
-                    app.space.map(|space| widgets::space_meter(space, 0, cx)),
+                    app.space.map(|space| {
+                        widgets::space_meter_in(space, 0, locale, cx)
+                    }),
                 )
                 .child(log),
         )
@@ -3201,13 +3355,18 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 .py(space::SM)
                 .border_t_1()
                 .border_color(theme.divider())
-                .child(widgets::hint("esc", "stop after the current item", cx)),
+                .child(widgets::hint(
+                    "esc",
+                    crate::i18n::review::stop_hint(locale),
+                    cx,
+                )),
         )
 }
 
 // ── done ────────────────────────────────────────────────────────────────
 
 fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
     let measured = match (app.space_baseline, app.space) {
@@ -3253,14 +3412,21 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 .flex_row()
                 .gap(space::XXL)
                 .child(widgets::stat_colored(
-                    "removed",
-                    format!("{} items", summary.removed),
+                    crate::i18n::review::stat_removed(locale),
+                    crate::i18n::review::stat_removed_value(
+                        summary.removed,
+                        locale,
+                    ),
                     theme.success,
                     cx,
                 ))
-                .child(widgets::stat("bytes claimed", human_bytes(summary.bytes), cx))
+                .child(widgets::stat(
+                    crate::i18n::review::stat_bytes_claimed(locale),
+                    human_bytes(summary.bytes),
+                    cx,
+                ))
                 .child(widgets::stat_colored(
-                    "failed",
+                    crate::i18n::review::stat_failed(locale),
                     format!("{}", summary.failed),
                     if summary.failed > 0 {
                         theme.danger
@@ -3271,13 +3437,17 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 ))
                 .children(measured.map(|delta| {
                     widgets::stat_colored(
-                        "volume freed",
+                        crate::i18n::review::stat_volume_freed(locale),
                         if delta >= 0 {
                             format!("+{}", human_bytes(delta.unsigned_abs()))
                         } else {
                             format!("-{}", human_bytes(delta.unsigned_abs()))
                         },
-                        if delta >= 0 { theme.success } else { theme.warning },
+                        if delta >= 0 {
+                            theme.success
+                        } else {
+                            theme.warning
+                        },
                         cx,
                     )
                 })),
@@ -3286,16 +3456,16 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("The treemap is being re-scanned so the numbers on screen match the disk again."),
+                .child(crate::i18n::review::done_rescan_note(locale)),
         );
 
     if let Some(space) = app.space {
-        body = body.child(widgets::space_meter(space, 0, cx));
+        body = body.child(widgets::space_meter_in(space, 0, locale, cx));
     }
     if app.scan.is_some() {
         body = body.child(widgets::meter_row(
-            "re-scanning",
-            format!("{} files", widgets::human_count(app.progress.files)),
+            crate::i18n::review::rescanning_label(locale),
+            crate::i18n::review::rescanning_files(app.progress.files, locale),
             progress_estimate(app.progress.files),
             theme.accent,
             cx,
@@ -3304,7 +3474,10 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
     if summary.failed > 0 {
         body = body
             .child(separator(cx))
-            .child(widgets::section("what could not be removed", cx))
+            .child(widgets::section(
+                crate::i18n::review::what_could_not_be_removed(locale),
+                cx,
+            ))
             .child(failures);
     }
 
@@ -3313,7 +3486,12 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(screen_header("Done", "removal finished", &theme, cx))
+        .child(screen_header(
+            crate::i18n::review::done_title(locale),
+            crate::i18n::review::done_subtitle(locale),
+            &theme,
+            cx,
+        ))
         .child(body)
         .child(
             div()
@@ -3327,14 +3505,25 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 .border_color(theme.divider())
                 .child(
                     // An acknowledgement: the result is already on screen.
-                    button("continue", "Done", ButtonVariant::Primary, cx)
-                        .on_click(cx.listener(|this, _, window, cx| {
+                    button(
+                        "continue",
+                        crate::i18n::review::done_title(locale),
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
                             this.screen = Screen::Explore;
                             cx.notify();
                             window.focus(&this.focus, cx);
-                        })),
+                        },
+                    )),
                 )
-                .child(widgets::hint("enter", "continue", cx)),
+                .child(widgets::hint(
+                    "enter",
+                    crate::i18n::review::continue_hint(locale),
+                    cx,
+                )),
         )
 }
 
@@ -3444,10 +3633,17 @@ fn card_surface(cx: &gpui_kit::App) -> Div {
 /// before going. Drawn by the app rather than as a tooltip, which GPUI puts
 /// at the pointer, over the button itself.
 fn history_card(app: &Ruum, back: bool, cx: &gpui_kit::App) -> Div {
+    let locale = app.locale;
     let (label, keys) = if back {
-        ("Back", "alt \u{2190} \u{00b7} side button")
+        (
+            crate::i18n::review::history_back_label(locale),
+            crate::i18n::review::history_back_keys(locale),
+        )
     } else {
-        ("Forward", "alt \u{2192} \u{00b7} side button")
+        (
+            crate::i18n::review::history_forward_label(locale),
+            crate::i18n::review::history_forward_keys(locale),
+        )
     };
     let card = app
         .history_target(back)
@@ -3465,11 +3661,7 @@ fn history_card(app: &Ruum, back: bool, cx: &gpui_kit::App) -> Div {
 pub fn hover_tooltip(app: &Ruum, cx: &gpui_kit::App) -> Option<Div> {
     let crumbs = app.hovered.as_deref()?;
     let is_dir = app.node_at(crumbs)?.is_dir();
-    let keys = if is_dir {
-        "space mark · enter open"
-    } else {
-        "space mark"
-    };
+    let keys = crate::i18n::explore::scanning::hover_keys(is_dir, app.locale);
     node_card(app, crumbs, keys, cx)
 }
 
@@ -3556,28 +3748,37 @@ fn node_card(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} files · {} dirs · {} direct",
-                    widgets::human_count(node.files),
-                    widgets::human_count(
-                        u64::from(node.dirs)
-                            .saturating_sub(u64::from(node.is_dir()))
-                    ),
-                    human_bytes(node.own_bytes())
+                .child(crate::i18n::explore::scanning::node_card_counts(
+                    node.files,
+                    u64::from(node.dirs)
+                        .saturating_sub(u64::from(node.is_dir())),
+                    &human_bytes(node.own_bytes()),
+                    app.locale,
                 )),
         );
 
     let mut badges = div().flex().flex_row().gap(space::XS).flex_wrap();
     if hidden {
-        badges = badges.child(widgets::chip("Hidden", theme.secondary, cx));
+        badges = badges.child(widgets::chip(
+            crate::i18n::explore::scanning::badge_hidden(app.locale),
+            theme.secondary,
+            cx,
+        ));
     }
     if marked {
-        badges =
-            badges.child(widgets::chip("Marked for removal", theme.danger, cx));
+        badges = badges.child(widgets::chip(
+            crate::i18n::explore::scanning::badge_marked_for_removal(
+                app.locale,
+            ),
+            theme.danger,
+            cx,
+        ));
     }
     if let Some(ancestor) = covered {
         badges = badges.child(widgets::chip(
-            format!("Inside marked {ancestor}"),
+            crate::i18n::explore::scanning::badge_inside_marked(
+                &ancestor, app.locale,
+            ),
             theme.secondary,
             cx,
         ));
@@ -3592,81 +3793,9 @@ fn node_card(
     Some(tip)
 }
 
-/// The modifier the help names for clicks and interface zoom. Both are
-/// accepted everywhere; this is the one each platform's users reach for, and
-/// on macOS ctrl-click is a right-click.
-const MODIFIER_CLICK: &str = if cfg!(target_os = "macos") {
-    "\u{2318}-click"
-} else {
-    "ctrl-click"
-};
-const MODIFIER_ZOOM: &str = if cfg!(target_os = "macos") {
-    "\u{2318} = / - / 0"
-} else {
-    "ctrl = / - / 0"
-};
-const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
-    "\u{2318}O"
-} else {
-    "ctrl-o"
-};
-
 fn help_overlay(app: &Ruum, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
-    // Sentence case, and the tile a key acts on is always the one under the
-    // pointer if the pointer moved last, else the keyboard selection.
-    let rows = [
-        ("space / x", "Mark or unmark the tile you point at"),
-        (MODIFIER_CLICK, "Mark without moving the selection"),
-        ("enter", "Open that directory, at any depth"),
-        ("\u{232b} / esc", "Go up one directory"),
-        (
-            "alt \u{2190} / \u{2192}",
-            "Back or forward, as do the mouse's side buttons",
-        ),
-        (
-            "\u{2190} \u{2191} \u{2193} \u{2192}",
-            "Move between tiles at this level",
-        ),
-        ("tab", "Next largest sibling"),
-        ("scroll", "Zoom toward a directory, then go into it"),
-        ("shift-scroll", "Pan the magnified view"),
-        ("[ / ]", "Draw fewer or more levels at once"),
-        ("- / = / 0", "Magnify, shrink, or reset the view"),
-        (MODIFIER_ZOOM, "Interface zoom"),
-        (
-            "/",
-            "Filter by name: only matches keep their colour; enter shows only them",
-        ),
-        ("c", "Review the marked list"),
-        ("t", "Size, files or age: what areas and colours say"),
-        ("r", "Scan again from the same root"),
-        ("esc", "Stop a scan in progress"),
-        ("v", "Scan another volume"),
-        (MODIFIER_OPEN, "Choose another directory to scan"),
-        ("g", "The whole disk; click any directory above to widen"),
-        ("d", "Disk usage or apparent size"),
-        ("i", "Include or skip hidden entries"),
-        ("p", "Show or hide the selection line"),
-        (
-            "o",
-            if cfg!(target_os = "macos") {
-                "Show it in Finder"
-            } else if cfg!(windows) {
-                "Show it in File Explorer"
-            } else {
-                "Show it in the file manager"
-            },
-        ),
-        ("q", "Quit"),
-        ("", ""),
-        (
-            "Review screen",
-            "m trash \u{00b7} p permanent \u{00b7} ! unmark all \u{00b7} s save list \u{00b7} a copy as prompt",
-        ),
-        ("", "enter commits \u{00b7} esc goes back"),
-        ("", "A permanent deletion always asks first"),
-    ];
+    let rows = crate::i18n::explore::help::help_rows(app.locale);
 
     let mut keys = div().flex().flex_col().gap(space::SM);
     for (key, label) in rows {
@@ -3731,7 +3860,9 @@ fn help_overlay(app: &Ruum, cx: &gpui_kit::App) -> Div {
                                 .text_size(text::TITLE)
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(theme.bright)
-                                .child("Keyboard and mouse"),
+                                .child(crate::i18n::explore::help::help_title(
+                                    app.locale,
+                                )),
                         ),
                 )
                 .child(keys)
@@ -3739,10 +3870,10 @@ fn help_overlay(app: &Ruum, cx: &gpui_kit::App) -> Div {
                     div()
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
-                        .child(format!(
-                            "? or esc closes \u{00b7} {} \u{00b7} {}",
-                            app.root_path.display(),
-                            app.options.metric.label()
+                        .child(crate::i18n::explore::help::help_footer(
+                            &app.root_path.display().to_string(),
+                            app.options.metric.label_in(app.locale),
+                            app.locale,
                         )),
                 ),
         )

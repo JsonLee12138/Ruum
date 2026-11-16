@@ -14,6 +14,7 @@
 mod app_menu;
 mod appearance;
 pub use ruum_core::git;
+mod i18n;
 mod marks;
 mod palette;
 mod power;
@@ -66,55 +67,6 @@ struct Args {
     power: Option<power::PowerEfficiency>,
 }
 
-const USAGE: &str = "\
-ruum — a treemap of what is using your disk
-
-usage: ruum [OPTIONS] [PATH]
-       ruum ssh HOST [OPTIONS] [PATH]
-       ruum mcp [--read-only]
-       ruum watchdog [--once]
-       ruum --confirm-cleanup REQ --response RESP
-       ruum extract-scanner ARCH OUTPUT
-
-Linux packaged builds deploy an embedded static scanner over SSH on demand.
-Unbundled development builds need ruum-scan on the remote PATH or in
-~/.local/bin. ARCH for extraction is x86_64 or aarch64.
-SSH uses your config, keys and agent; password prompts use the terminal.
-Remote sessions are read-only: mark, export list/prompt/delete script.
-Use --check with ssh to deploy and scan without opening a window.
-
-arguments:
-  PATH              explicit directory to scan; omitted defaults to ~ (home)
-
-Without PATH, ruum scans the home directory directly, largest first.
-Use --choose to select a local mount or SSH source before scanning.
-Nested mounts are excluded. Space marks the selected tile, Enter opens it,
-c reviews the marked list, ? lists every key.
-
-options:
-      --choose          open the source and mount selection dialog before scanning
-  -a, --apparent-size   measure apparent length instead of allocated blocks
-  -l, --follow-links    follow symlinks (local scans only)
-  -H, --no-hidden       skip dotfiles and dot-directories
-  -D, --disk            scan the whole disk the home directory is on
-  -X, --cross-filesystems
-                        also measure other disks, network shares and pseudo
-                        filesystems mounted below PATH (local only; off by default)
-  -d, --depth N         how many levels to draw at once (1-6, default 3)
-      --power-efficiency PRESET
-                        miser, balanced (default), aggressive, drain-my-battery
-      --scan-threads N  fixed scan workers, capped by available CPU count
-      --adaptive-threads
-                        experimental adaptive admission (opt-in)
-      --fixed-threads   disable adaptive admission and CPU governor
-      --thread-throughput-percent N
-                        retain this percent of sampled initial throughput (80)
-      --thread-system-cpu-percent N
-                        best-effort host CPU budget; 0 disables it (80)
-      --metric files    rank by file count instead of bytes
-  -h, --help            show this help
-";
-
 fn main() -> Result<()> {
     #[cfg(windows)]
     console::attach();
@@ -139,7 +91,13 @@ fn run() -> Result<()> {
             |path| power::load(&path),
         )
         .unwrap_or_else(|error| {
-            eprintln!("Cannot load Power Efficiency: {error}; using Balanced");
+            eprintln!(
+                "{}",
+                i18n::messages::cannot_load_power(
+                    &error.to_string(),
+                    i18n::Locale::current(),
+                )
+            );
             power::PowerEfficiency::default()
         });
     let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
@@ -162,12 +120,15 @@ fn run() -> Result<()> {
             if let Some(result) = scan.poll() {
                 let snapshot = result?;
                 println!(
-                    "{}:{} — {} bytes, {} files, {} directories",
-                    host,
-                    snapshot.header.root.display(),
-                    snapshot.tree.bytes,
-                    snapshot.tree.files,
-                    snapshot.tree.dirs
+                    "{}",
+                    i18n::messages::check_summary(
+                        host,
+                        &snapshot.header.root.display().to_string(),
+                        snapshot.tree.bytes,
+                        snapshot.tree.files,
+                        snapshot.tree.dirs,
+                        i18n::Locale::current(),
+                    )
                 );
                 return Ok(());
             }
@@ -219,7 +180,7 @@ fn run() -> Result<()> {
     });
     app.run(move |cx| {
         gpui_omarchy::init(cx);
-        app_menu::install(cx);
+        app_menu::install_for(i18n::Locale::current(), cx);
         if native_look {
             appearance::apply(cx.window_appearance(), cx);
         }
@@ -270,16 +231,18 @@ fn run() -> Result<()> {
         // closing the main window still quits normally.
         let tray_signal = Arc::new(AsyncSignal::default());
         let waker_signal = Arc::clone(&tray_signal);
-        cx.defer(move |cx| match tray_menu::TrayMenu::install() {
-            Ok(tray) => {
-                tray.set_event_waker(move || waker_signal.notify());
-                app_menu::set_tray_active(cx, true);
-                with_runtime_mut(cx, |rt| rt.tray = Some(tray));
-                refresh_tray_status(cx);
-            }
-            Err(err) => {
-                eprintln!("ruum: tray icon unavailable: {err}");
-                app_menu::set_tray_active(cx, false);
+        cx.defer(move |cx| {
+            match tray_menu::TrayMenu::install(i18n::Locale::current()) {
+                Ok(tray) => {
+                    tray.set_event_waker(move || waker_signal.notify());
+                    app_menu::set_tray_active(cx, true);
+                    with_runtime_mut(cx, |rt| rt.tray = Some(tray));
+                    refresh_tray_status(cx);
+                }
+                Err(err) => {
+                    eprintln!("ruum: tray icon unavailable: {err}");
+                    app_menu::set_tray_active(cx, false);
+                }
             }
         });
 
@@ -329,6 +292,7 @@ pub struct CleanupConfirmWindow {
     pub focus: FocusHandle,
     pub confirm_only: bool,
     pub handled: bool,
+    pub locale: i18n::Locale,
 }
 
 impl CleanupConfirmWindow {
@@ -344,7 +308,13 @@ impl CleanupConfirmWindow {
             focus: cx.focus_handle(),
             confirm_only,
             handled: false,
+            locale: i18n::Locale::current(),
         }
+    }
+
+    #[cfg(test)]
+    pub const fn set_locale(&mut self, locale: i18n::Locale) {
+        self.locale = locale;
     }
 
     pub fn replace_request(
@@ -417,6 +387,7 @@ impl CleanupConfirmWindow {
                     .collect();
             if !approved_items.is_empty() {
                 let root = self.modal.request.root.clone();
+                let locale = self.locale;
                 let task = cx.background_executor().spawn(async move {
                     ruum_core::watchdog::execute_confirmed_cleanup(
                         &approved_items,
@@ -425,14 +396,14 @@ impl CleanupConfirmWindow {
                 });
                 cx.spawn(async move |_, cx| {
                     let (bytes, count) = task.await;
-                    let summary = format!(
-                        "Cleaned {} items, freeing {}",
-                        count,
-                        ruum_core::size::human_bytes(bytes)
+                    let summary = i18n::messages::cleaned_items_summary(
+                        count, bytes, locale,
                     );
                     if !cfg!(test) && count > 0 {
                         let _ = ruum_core::watchdog::send_os_notification(
-                            "ruum Cleanup Complete",
+                            i18n::messages::cleanup_complete_notif_title(
+                                locale,
+                            ),
                             &summary,
                         );
                     }
@@ -440,8 +411,12 @@ impl CleanupConfirmWindow {
                         refresh_tray_status(cx);
                         update_open_main_window(cx, |app, cx| {
                             app.reload_watchdog_state();
-                            app.notice =
-                                Some((summary, gpui_omarchy::Status::Success));
+                            app.notice = Some((
+                                i18n::messages::cleaned_items_summary(
+                                    count, bytes, app.locale,
+                                ),
+                                gpui_omarchy::Status::Success,
+                            ));
                             cx.notify();
                         });
                     });
@@ -462,7 +437,12 @@ impl Render for CleanupConfirmWindow {
         _window: &mut Window,
         cx: &mut gpui_kit::Context<'_, Self>,
     ) -> impl IntoElement {
-        rail_pages::cleanup_confirm_view(&self.modal, &self.focus, cx)
+        rail_pages::cleanup_confirm_view(
+            &self.modal,
+            &self.focus,
+            self.locale,
+            cx,
+        )
     }
 }
 
@@ -531,7 +511,12 @@ fn open_confirm_window_with_mode(
                     ),
                 )),
                 titlebar: Some(gpui_kit::TitlebarOptions {
-                    title: Some("ruum · Confirm Cleanup".into()),
+                    title: Some(
+                        i18n::messages::title_confirm_cleanup(
+                            i18n::Locale::current(),
+                        )
+                        .into(),
+                    ),
                     ..Default::default()
                 }),
                 app_id: Some("ruum".to_owned()),
@@ -726,10 +711,20 @@ fn open_main_window(
                 )),
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some(
-                        format!(
-                            "ruum · {}",
-                            marks::display_path(&title_root, home.as_deref())
-                        )
+                        if launch.choose_root {
+                            i18n::messages::title_choose_source(
+                                i18n::Locale::current(),
+                            )
+                            .to_owned()
+                        } else {
+                            format!(
+                                "ruum · {}",
+                                marks::display_path(
+                                    &title_root,
+                                    home.as_deref(),
+                                )
+                            )
+                        }
                         .into(),
                     ),
                     ..Default::default()
@@ -1003,13 +998,11 @@ fn trigger_tray_space_check(cx: &App) {
         let result = task.await;
         cx.update(|cx| {
             if let Some((avail, checked_at)) = result {
-                let msg = format!(
-                    "Disk check: {} available",
-                    ruum_core::size::human_bytes(avail)
-                );
                 update_open_main_window(cx, |app, cx| {
                     app.reload_watchdog_state();
                     app.watchdog_space_checked_at = Some(checked_at);
+                    let msg =
+                        i18n::messages::disk_check_available(avail, app.locale);
                     app.push_toast(msg, gpui_omarchy::Status::Success, cx);
                 });
             }
@@ -1080,22 +1073,24 @@ fn trigger_background_ai_analysis(cx: &mut App) {
                 cx.notify();
             });
             refresh_tray_status(cx);
+            let locale = i18n::Locale::current();
             match res {
                 Ok((home, proposal)) => {
                     if proposal.items.is_empty() {
                         let _ = ruum_core::watchdog::send_os_notification(
-                            "ruum AI Analysis",
-                            "No reclaimable files found.",
+                            i18n::messages::ai_analysis_notif_title(locale),
+                            i18n::messages::ai_analysis_no_reclaimable(locale),
                         );
                     } else {
-                        let request =
-                            state::proposal_confirm_request(home, &proposal);
+                        let request = state::proposal_confirm_request(
+                            home, &proposal, locale,
+                        );
                         open_confirm_window(request, None, None, cx);
                     }
                 }
                 Err(err) => {
                     let _ = ruum_core::watchdog::send_os_notification(
-                        "ruum AI Analysis Failed",
+                        i18n::messages::ai_analysis_failed_notif_title(locale),
                         &err.to_string(),
                     );
                 }
@@ -1119,7 +1114,8 @@ fn review_latest_proposal_from_tray(cx: &mut App) {
         open_or_navigate_main_window(Some(Screen::Watchdog), cx);
         return;
     };
-    let request = state::proposal_confirm_request(home, &prop);
+    let request =
+        state::proposal_confirm_request(home, &prop, i18n::Locale::current());
     open_confirm_window(request, None, None, cx);
 }
 
@@ -1151,8 +1147,12 @@ fn extract_scanner() -> Result<bool> {
         output.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
     println!(
-        "Extracted Linux {arch} scanner to {}",
-        PathBuf::from(&args[2]).display()
+        "{}",
+        i18n::messages::extracted_scanner(
+            arch,
+            &PathBuf::from(&args[2]).display().to_string(),
+            i18n::Locale::current(),
+        )
     );
     Ok(true)
 }
@@ -1196,10 +1196,7 @@ fn run_mcp() -> Result<bool> {
     match parse_mcp_command(std::env::args_os().skip(1))? {
         McpCommand::NotMcp => Ok(false),
         McpCommand::Help => {
-            println!(
-                "ruum mcp — Model Context Protocol (MCP) server over \
-                 stdio\n\nusage: ruum mcp [--read-only]"
-            );
+            println!("{}", i18n::messages::mcp_help(i18n::Locale::current()));
             Ok(true)
         }
         McpCommand::Serve { read_only } => {
@@ -1258,8 +1255,8 @@ fn run_watchdog() -> Result<bool> {
         WatchdogCommand::NotWatchdog => Ok(false),
         WatchdogCommand::Help => {
             println!(
-                "ruum watchdog — background volume monitor and AI cleanup \
-                 poller\n\nusage: ruum watchdog [--once]"
+                "{}",
+                i18n::messages::watchdog_help(i18n::Locale::current())
             );
             Ok(true)
         }
@@ -1315,7 +1312,7 @@ fn run_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
-            app_menu::install(cx);
+            app_menu::install_for(i18n::Locale::current(), cx);
             app_menu::set_confirm_only(cx, true);
             let home = std::env::home_dir();
             let native_look = appearance::follows_system(home.as_deref());
@@ -1374,7 +1371,7 @@ fn parse_args_with_power(
     while let Some(arg) = args.next() {
         match arg.to_str().unwrap_or_default() {
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{}", i18n::messages::usage(i18n::Locale::current()));
                 std::process::exit(0);
             }
             "-a" | "--apparent-size" => options.apparent_size = true,
@@ -1463,7 +1460,8 @@ fn parse_args_with_power(
             // app from Finder until OS X 10.9, and some launchers still do.
             other if other.starts_with("-psn_") => {}
             other if other.starts_with('-') => {
-                anyhow::bail!("unknown option {other}\n\n{USAGE}");
+                let usage = i18n::messages::usage(i18n::Locale::current());
+                anyhow::bail!("unknown option {other}\n\n{usage}");
             }
             _ => {
                 anyhow::ensure!(root.is_none(), "only one path can be scanned");
@@ -1748,7 +1746,9 @@ mod argument_tests {
             McpCommand::Help
         );
         assert!(parse_mcp_command(["mcp", "--unknown"]).is_err());
-        assert!(USAGE.contains("ruum mcp"));
+        for locale in i18n::ALL_LOCALES {
+            assert!(i18n::messages::usage(locale).contains("ruum mcp"));
+        }
     }
 
     #[test]
@@ -1776,7 +1776,9 @@ mod argument_tests {
             WatchdogCommand::Help
         );
         assert!(parse_watchdog_command(["watchdog", "--invalid"]).is_err());
-        assert!(USAGE.contains("ruum watchdog"));
+        for locale in i18n::ALL_LOCALES {
+            assert!(i18n::messages::usage(locale).contains("ruum watchdog"));
+        }
     }
 
     #[test]
@@ -1802,6 +1804,10 @@ mod argument_tests {
                 resp_path: PathBuf::from("resp.json"),
             })
         );
-        assert!(USAGE.contains("--confirm-cleanup"));
+        for locale in i18n::ALL_LOCALES {
+            assert!(
+                i18n::messages::usage(locale).contains("--confirm-cleanup")
+            );
+        }
     }
 }

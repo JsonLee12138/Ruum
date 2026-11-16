@@ -16,6 +16,7 @@ rustc-hash = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sys-locale = { workspace = true }
 tempfile = "3"
 
 # rustix has no filesystem calls on Windows; `windows.rs` covers them there.

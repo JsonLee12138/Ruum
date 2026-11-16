@@ -14,6 +14,7 @@ ruum-core = { path = "crates/ruum-core" }
 anyhow = "1"
 rayon = "1"
 rustc-hash = "2"
+sys-locale = "0.3.2"
 
 # Lint gates follow omatrack's policy: the checks that catch real defects are
 # errors, and every deliberate omission is written down instead of silently

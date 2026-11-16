@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::classify::{Category, Reclaim};
+use crate::i18n::Locale;
 
 /// What a node represents on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,9 +48,21 @@ pub enum Metric {
 
 impl Metric {
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::Bytes => "size",
-            Self::Files => "files",
+        self.label_in(Locale::En)
+    }
+
+    /// Localized label for this metric.
+    #[must_use]
+    pub const fn label_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::Bytes, Locale::En) => "size",
+            (Self::Bytes, Locale::Zh) => "大小",
+            (Self::Bytes, Locale::Ja) => "サイズ",
+            (Self::Bytes, Locale::Ko) => "크기",
+            (Self::Files, Locale::En) => "files",
+            (Self::Files, Locale::Zh) => "文件数",
+            (Self::Files, Locale::Ja) => "ファイル数",
+            (Self::Files, Locale::Ko) => "파일 수",
         }
     }
 

@@ -3,6 +3,7 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::i18n::{Locale, common};
 use ruum_core::scan_threads::ScanThreads;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,13 +32,9 @@ impl PowerEfficiency {
         }
     }
 
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Miser => "Miser",
-            Self::Balanced => "Balanced",
-            Self::Aggressive => "Aggressive",
-            Self::DrainMyBattery => "Drain My Battery",
-        }
+    #[must_use]
+    pub const fn name_in(self, locale: Locale) -> &'static str {
+        common::power_name(self, locale)
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -54,8 +51,13 @@ impl PowerEfficiency {
         }
     }
 
-    pub fn label(self, cpus: usize) -> String {
-        format!("{} ({})", self.name(), workers(self.threads(cpus)))
+    #[must_use]
+    pub fn label_in(self, cpus: usize, locale: Locale) -> String {
+        common::power_label(
+            self.name_in(locale),
+            &workers_in(self.threads(cpus), locale),
+            locale,
+        )
     }
 
     /// A preset that would run no more workers than the one below it, on a
@@ -89,9 +91,9 @@ impl PowerEfficiency {
     }
 }
 
-pub fn workers(count: usize) -> String {
-    let unit = if count == 1 { "worker" } else { "workers" };
-    format!("{count} {unit}")
+#[must_use]
+pub fn workers_in(count: usize, locale: Locale) -> String {
+    common::workers(count, locale)
 }
 
 pub fn cpu_threads() -> usize {
@@ -157,7 +159,7 @@ mod tests {
         }
         assert_eq!(PowerEfficiency::Balanced.threads(3), 3);
         assert_eq!(
-            PowerEfficiency::DrainMyBattery.label(18),
+            PowerEfficiency::DrainMyBattery.label_in(18, Locale::En),
             "Drain My Battery (18 workers)"
         );
     }
@@ -203,5 +205,31 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert!(save(dir.path(), PowerEfficiency::Miser).is_err());
+    }
+
+    #[test]
+    fn localized_names_workers_and_labels_cover_all_locales() {
+        for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+            for preset in PowerEfficiency::ALL {
+                let name = preset.name_in(locale);
+                let label = preset.label_in(18, locale);
+                assert!(!name.is_empty());
+                assert!(label.contains(name));
+            }
+            assert!(!workers_in(1, locale).is_empty());
+            assert!(!workers_in(4, locale).is_empty());
+        }
+        assert_ne!(
+            PowerEfficiency::Balanced.name_in(Locale::Zh),
+            PowerEfficiency::Balanced.name_in(Locale::En)
+        );
+        assert_ne!(
+            PowerEfficiency::Balanced.name_in(Locale::Ja),
+            PowerEfficiency::Balanced.name_in(Locale::En)
+        );
+        assert_ne!(
+            PowerEfficiency::Balanced.name_in(Locale::Ko),
+            PowerEfficiency::Balanced.name_in(Locale::En)
+        );
     }
 }

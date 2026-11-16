@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::i18n::Locale;
+
 /// A checkout's state, as far as losing work is concerned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitState {
@@ -30,23 +32,63 @@ impl GitState {
 
     /// One short line: `clean, no stash`, `3 changed, 1 stash, 2 unpushed`.
     pub fn summary(&self) -> String {
+        self.summary_in(Locale::En)
+    }
+
+    /// Localized one-line summary of this checkout's git status.
+    #[must_use]
+    pub fn summary_in(&self, locale: Locale) -> String {
         let mut parts = Vec::new();
-        parts.push(match self.changed {
-            Some(0) => "clean".to_string(),
-            Some(count) => format!("{count} changed"),
-            None => "changes unknown".to_string(),
+        parts.push(match (self.changed, locale) {
+            (Some(0), Locale::En) => "clean".to_string(),
+            (Some(0), Locale::Zh) => "工作区干净".to_string(),
+            (Some(0), Locale::Ja) => "クリーン".to_string(),
+            (Some(0), Locale::Ko) => "변경 없음".to_string(),
+            (Some(count), Locale::En) => format!("{count} changed"),
+            (Some(count), Locale::Zh) => format!("{count} 处变更"),
+            (Some(count), Locale::Ja) => format!("{count} 件の変更"),
+            (Some(count), Locale::Ko) => format!("변경 {count}건"),
+            (None, Locale::En) => "changes unknown".to_string(),
+            (None, Locale::Zh) => "变更未知".to_string(),
+            (None, Locale::Ja) => "変更不明".to_string(),
+            (None, Locale::Ko) => "변경 상태 알 수 없음".to_string(),
         });
-        parts.push(match self.stashes {
-            0 => "no stash".to_string(),
-            1 => "1 stash".to_string(),
-            count => format!("{count} stashes"),
+        parts.push(match (self.stashes, locale) {
+            (0, Locale::En) => "no stash".to_string(),
+            (0, Locale::Zh) => "无暂存".to_string(),
+            (0, Locale::Ja) => "スタッシュなし".to_string(),
+            (0, Locale::Ko) => "스태시 없음".to_string(),
+            (1, Locale::En) => "1 stash".to_string(),
+            (count, Locale::En) => format!("{count} stashes"),
+            (count, Locale::Zh) => format!("{count} 个暂存"),
+            (count, Locale::Ja) => format!("スタッシュ {count} 件"),
+            (count, Locale::Ko) => format!("스태시 {count}건"),
         });
-        match self.unpushed {
-            Some(0) => {}
-            Some(count) => parts.push(format!("{count} unpushed")),
-            None => parts.push("no upstream".to_string()),
+        match (self.unpushed, locale) {
+            (Some(0), _) => {}
+            (Some(count), Locale::En) => {
+                parts.push(format!("{count} unpushed"));
+            }
+            (Some(count), Locale::Zh) => {
+                parts.push(format!("{count} 个未推送"));
+            }
+            (Some(count), Locale::Ja) => {
+                parts.push(format!("未プッシュ {count} 件"));
+            }
+            (Some(count), Locale::Ko) => {
+                parts.push(format!("미푸시 {count}건"));
+            }
+            (None, Locale::En) => parts.push("no upstream".to_string()),
+            (None, Locale::Zh) => parts.push("无上游分支".to_string()),
+            (None, Locale::Ja) => parts.push("上流ブランチなし".to_string()),
+            (None, Locale::Ko) => parts.push("업스트림 없음".to_string()),
         }
-        parts.join(", ")
+        let sep = match locale {
+            Locale::En | Locale::Ko => ", ",
+            Locale::Zh => "，",
+            Locale::Ja => "、",
+        };
+        parts.join(sep)
     }
 }
 

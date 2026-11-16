@@ -13,6 +13,7 @@ use ruum_core::size::{human_bytes, human_bytes_short, share, share_bar};
 use ruum_core::space::SpaceInfo;
 use ruum_core::tree::{Metric, Node};
 
+use crate::i18n::{Locale, common};
 use crate::ui::{space, text};
 
 /// The scanned root, shortened to `~` where it is the home directory.
@@ -143,11 +144,16 @@ pub fn meter_row(
         )
 }
 
-/// The volume meter: what is used, what is free, and what the marks will free.
+/// Locale-aware disk free-space bar with projected reclamation segment.
 ///
 /// The projection is drawn as a separate segment so "this much comes back" is
 /// visible rather than only stated.
-pub fn space_meter(space: SpaceInfo, reclaiming: u64, cx: &App) -> Div {
+pub fn space_meter_in(
+    space: SpaceInfo,
+    reclaiming: u64,
+    locale: Locale,
+    cx: &App,
+) -> Div {
     let theme = cx.omarchy();
     let total = space.total.max(1);
     let projected = space.after_removing(reclaiming);
@@ -157,17 +163,17 @@ pub fn space_meter(space: SpaceInfo, reclaiming: u64, cx: &App) -> Div {
     let gained = gained.clamp(0.0, used_now);
 
     let label = if reclaiming > 0 {
-        format!(
-            "{} free · {} after removing {}",
-            human_bytes(space.available),
-            human_bytes(projected.available),
-            human_bytes(reclaiming)
+        common::space_meter_reclaiming(
+            &human_bytes(space.available),
+            &human_bytes(projected.available),
+            &human_bytes(reclaiming),
+            locale,
         )
     } else {
-        format!(
-            "{} free of {}",
-            human_bytes(space.available),
-            human_bytes(space.total)
+        common::space_meter_total(
+            &human_bytes(space.available),
+            &human_bytes(space.total),
+            locale,
         )
     };
 
@@ -379,27 +385,10 @@ pub fn split_size(text: &str) -> (String, String) {
     )
 }
 
-/// How long ago a Unix time was, in the unit a person would use.
-pub fn ago(now: i64, then: i64) -> String {
-    if then <= 0 {
-        return "unknown".to_string();
-    }
-    let seconds = (now - then).max(0);
-    let plural = |count: i64, unit: &str| {
-        if count == 1 {
-            format!("1 {unit} ago")
-        } else {
-            format!("{count} {unit}s ago")
-        }
-    };
-    match seconds {
-        0..60 => "just now".to_string(),
-        60..3_600 => plural(seconds / 60, "minute"),
-        3_600..86_400 => plural(seconds / 3_600, "hour"),
-        86_400..5_184_000 => plural(seconds / 86_400, "day"),
-        5_184_000..63_072_000 => plural(seconds / 2_592_000, "month"),
-        _ => plural(seconds / 31_536_000, "year"),
-    }
+/// Locale-aware relative timestamp formatting.
+#[must_use]
+pub fn ago_in(now: i64, then: i64, locale: Locale) -> String {
+    common::ago(now, then, locale)
 }
 
 /// A thin bar: `fraction` of a track, in `color`.
@@ -522,13 +511,29 @@ mod tests {
     #[test]
     fn ages_read_in_the_unit_a_person_would_use() {
         let now = 1_800_000_000;
-        assert_eq!(ago(now, now - 5), "just now");
-        assert_eq!(ago(now, now - 120), "2 minutes ago");
-        assert_eq!(ago(now, now - 3_600), "1 hour ago");
-        assert_eq!(ago(now, now - 19 * 86_400), "19 days ago");
-        assert_eq!(ago(now, now - 90 * 86_400), "3 months ago");
-        assert_eq!(ago(now, now - 800 * 86_400), "2 years ago");
-        assert_eq!(ago(now, 0), "unknown");
+        assert_eq!(ago_in(now, now - 5, Locale::En), "just now");
+        assert_eq!(ago_in(now, now - 120, Locale::En), "2 minutes ago");
+        assert_eq!(ago_in(now, now - 3_600, Locale::En), "1 hour ago");
+        assert_eq!(ago_in(now, now - 19 * 86_400, Locale::En), "19 days ago");
+        assert_eq!(ago_in(now, now - 90 * 86_400, Locale::En), "3 months ago");
+        assert_eq!(ago_in(now, now - 800 * 86_400, Locale::En), "2 years ago");
+        assert_eq!(ago_in(now, 0, Locale::En), "unknown");
+
+        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            for ts in [
+                0,
+                now - 5,
+                now - 120,
+                now - 3_600,
+                now - 19 * 86_400,
+                now - 90 * 86_400,
+                now - 800 * 86_400,
+            ] {
+                let text = ago_in(now, ts, locale);
+                assert!(!text.is_empty());
+                assert_ne!(text, ago_in(now, ts, Locale::En));
+            }
+        }
     }
 
     #[test]

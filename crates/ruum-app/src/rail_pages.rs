@@ -116,6 +116,7 @@ fn rail_button(
 /// Global left navigation rail.
 pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
     let theme = cx.omarchy().clone();
+    let locale = app.locale;
     let is_explore = app.screen == Screen::Explore && !app.volumes_open;
     let is_sources = app.screen == Screen::Sources || app.volumes_open;
     let is_watchdog = app.screen == Screen::Watchdog;
@@ -143,7 +144,7 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
                 .child(rail_button(
                     "rail-explore",
                     IconName::LayoutDashboard,
-                    "Explore treemap",
+                    crate::i18n::pages::rail_explore(locale),
                     is_explore,
                     |this, _, cx| {
                         this.navigate_rail(Screen::Explore, cx);
@@ -153,7 +154,7 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
                 .child(rail_button(
                     "rail-sources",
                     IconName::HardDrive,
-                    "Sources & Drives · v",
+                    crate::i18n::pages::rail_sources(locale),
                     is_sources,
                     |this, _, cx| {
                         this.navigate_rail(Screen::Sources, cx);
@@ -163,7 +164,7 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
                 .child(rail_button(
                     "rail-watchdog",
                     IconName::Eye,
-                    "Watchdog",
+                    crate::i18n::pages::rail_watchdog(locale),
                     is_watchdog,
                     |this, _, cx| {
                         this.navigate_rail(Screen::Watchdog, cx);
@@ -174,11 +175,10 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
         .child(div().flex().flex_col().items_center().child(rail_button(
             "rail-settings",
             IconName::Settings,
-            if cfg!(target_os = "macos") {
-                "Settings · ⌘,"
-            } else {
-                "Settings · Ctrl+,"
-            },
+            crate::i18n::pages::rail_settings(
+                cfg!(target_os = "macos"),
+                locale,
+            ),
             is_settings,
             |this, _, cx| {
                 this.navigate_rail(Screen::Settings, cx);
@@ -194,10 +194,11 @@ pub fn sources_page(
     cx: &mut Context<'_, Ruum>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
+    let locale = app.locale;
     let source_ready = app.picker_source_matches(cx);
     let source = app.volumes_source.as_ref().map_or_else(
-        || "This computer".to_owned(),
-        |host| format!("{host} · SSH · read-only"),
+        || crate::i18n::pages::this_computer(locale).to_owned(),
+        |host| crate::i18n::pages::ssh_read_only(host, locale),
     );
 
     let mut rows = div()
@@ -211,14 +212,14 @@ pub fn sources_page(
 
     if app.volumes_loading {
         rows = rows.child(dialog_description(
-            "Listing mounts, not scanning files…",
+            crate::i18n::pages::listing_mounts(locale),
             cx,
         ));
     } else if let Some(error) = &app.volumes_error {
         rows = rows.child(div().text_color(theme.danger).child(error.clone()));
     } else if app.volumes.is_empty() {
         rows = rows.child(dialog_description(
-            "No mounts listed. Enter a directory below.",
+            crate::i18n::pages::no_mounts_listed(locale),
             cx,
         ));
     }
@@ -228,7 +229,10 @@ pub fn sources_page(
         let label = format!(
             "{}  ·  {}",
             volume.point.display(),
-            volume.device.as_deref().unwrap_or("Mounted volume")
+            volume
+                .device
+                .as_deref()
+                .unwrap_or_else(|| crate::i18n::pages::mounted_volume(locale))
         );
         rows = rows.child(
             div()
@@ -265,9 +269,12 @@ pub fn sources_page(
 
     let source_card = dialog_popup(cx)
         .w_full()
-        .child(dialog_title("Source", cx))
+        .child(dialog_title(
+            crate::i18n::pages::card_source_title(locale),
+            cx,
+        ))
         .child(dialog_description(
-            "Choose this computer or connect to a remote host over SSH.",
+            crate::i18n::pages::card_source_desc(locale),
             cx,
         ))
         .child(
@@ -278,7 +285,7 @@ pub fn sources_page(
                 .child(
                     button(
                         "source-local",
-                        "This computer",
+                        crate::i18n::pages::this_computer(locale),
                         ButtonVariant::Secondary,
                         cx,
                     )
@@ -296,7 +303,7 @@ pub fn sources_page(
                 .child(
                     button(
                         "source-connect",
-                        "Connect SSH",
+                        crate::i18n::pages::connect_ssh(locale),
                         ButtonVariant::Secondary,
                         cx,
                     )
@@ -312,11 +319,12 @@ pub fn sources_page(
     let mounts_card =
         dialog_popup(cx)
             .w_full()
-            .child(dialog_title("Mounts & Root Directory", cx))
+            .child(dialog_title(
+                crate::i18n::pages::card_mounts_title(locale),
+                cx,
+            ))
             .child(dialog_description(
-                "Select a mount or enter an absolute directory path. Nested \
-             mounts and symlinks are not traversed; space is measured only \
-             after selection.",
+                crate::i18n::pages::card_mounts_desc(locale),
                 cx,
             ))
             .child(rows)
@@ -333,7 +341,7 @@ pub fn sources_page(
                     .child(
                         button(
                             "source-scan-path",
-                            "Scan directory",
+                            crate::i18n::pages::scan_directory(locale),
                             ButtonVariant::Secondary,
                             cx,
                         )
@@ -356,7 +364,7 @@ pub fn sources_page(
                 div().flex().flex_row().justify_end().gap(space::SM).child(
                     dialog_button(
                         "source-scan",
-                        "Scan selected root",
+                        crate::i18n::pages::scan_selected_root(locale),
                         ButtonVariant::Primary,
                         cx,
                     )
@@ -376,10 +384,9 @@ pub fn sources_page(
             );
 
     let subtitle = if app.awaiting_root {
-        "Choose a source. Then choose a root to start scanning."
+        crate::i18n::pages::sources_subtitle_awaiting(locale)
     } else {
-        "Connect, then select a mount or directory. No new scan starts until \
-         you choose Scan."
+        crate::i18n::pages::sources_subtitle_ready(locale)
     };
 
     let mut subtitle_row = div().text_color(theme.secondary).child(subtitle);
@@ -399,7 +406,11 @@ pub fn sources_page(
         .p(space::XXL)
         .gap(space::LG)
         .overflow_hidden()
-        .child(div().text_size(text::TITLE).child("Sources & Drives"))
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .child(crate::i18n::pages::sources_title(locale)),
+        )
         .child(subtitle_row)
         .child(
             div()
@@ -419,25 +430,14 @@ pub fn sources_page(
 
 /// Watchdog monitor and recommendation page.
 /// Format a unix-seconds check timestamp as a concise human-readable age.
-fn format_checked_age(checked_secs: Option<u64>) -> String {
-    let Some(checked) = checked_secs else {
-        return "Not checked yet".to_string();
-    };
+fn format_checked_age(
+    checked_secs: Option<u64>,
+    locale: crate::i18n::Locale,
+) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let delta = now.saturating_sub(checked);
-    if delta < 5 {
-        "Just now".to_string()
-    } else if delta < 60 {
-        format!("{delta}s ago")
-    } else if delta < 3600 {
-        format!("{}m ago", delta / 60)
-    } else if delta < 86_400 {
-        format!("{}h ago", delta / 3600)
-    } else {
-        format!("{}d ago", delta / 86_400)
-    }
+    crate::i18n::pages::format_checked_age(checked_secs, now, locale)
 }
 
 /// Watchdog monitor status, manual trigger, and proposal history.
@@ -447,6 +447,7 @@ pub fn watchdog_page(
     cx: &Context<'_, Ruum>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
+    let locale = app.locale;
     let home = std::env::home_dir();
     let home_display = home
         .as_ref()
@@ -459,18 +460,15 @@ pub fn watchdog_page(
             space.available,
         )
     } else {
-        ("Unknown".to_string(), "Unknown".to_string(), 0)
+        let unknown = crate::i18n::pages::unknown(locale).to_string();
+        (unknown.clone(), unknown, 0)
     };
 
     let thresh_bytes = app.watchdog_config.min_free_gb * 1024 * 1024 * 1024;
     let is_breached = free_bytes < thresh_bytes;
 
-    let service_label = match app.watchdog_service_status {
-        Some(ServiceStatus::Active) => "Active (Running)",
-        Some(ServiceStatus::Inactive) => "Inactive (Stopped)",
-        Some(ServiceStatus::NotInstalled) => "Not Installed",
-        Some(ServiceStatus::Unsupported) | None => "Not Registered",
-    };
+    let service_label =
+        crate::i18n::pages::service_status(app.watchdog_service_status, locale);
     let service_color = match app.watchdog_service_status {
         Some(ServiceStatus::Active) => theme.accent,
         Some(
@@ -483,7 +481,10 @@ pub fn watchdog_page(
 
     let status_card = dialog_popup(cx)
         .w_full()
-        .child(dialog_title("Volume Status", cx))
+        .child(dialog_title(
+            crate::i18n::pages::volume_status_title(locale),
+            cx,
+        ))
         .child(
             div()
                 .flex()
@@ -495,9 +496,9 @@ pub fn watchdog_page(
                         .flex_row()
                         .justify_between()
                         .child(
-                            div()
-                                .text_color(theme.secondary)
-                                .child("Monitored Root:"),
+                            div().text_color(theme.secondary).child(
+                                crate::i18n::pages::monitored_root(locale),
+                            ),
                         )
                         .child(
                             div().text_color(theme.bright).child(home_display),
@@ -508,11 +509,9 @@ pub fn watchdog_page(
                         .flex()
                         .flex_row()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_color(theme.secondary)
-                                .child("Free Space:"),
-                        )
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::free_space_label(locale),
+                        ))
                         .child(
                             div()
                                 .text_color(if is_breached {
@@ -520,7 +519,9 @@ pub fn watchdog_page(
                                 } else {
                                     theme.bright
                                 })
-                                .child(format!("{free_str} of {total_str}")),
+                                .child(crate::i18n::pages::free_of_total(
+                                    &free_str, &total_str, locale,
+                                )),
                         ),
                 )
                 .child(
@@ -528,11 +529,9 @@ pub fn watchdog_page(
                         .flex()
                         .flex_row()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_color(theme.secondary)
-                                .child("Alert Threshold:"),
-                        )
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::alert_threshold_label(locale),
+                        ))
                         .child(div().text_color(theme.bright).child(format!(
                             "{} GB",
                             app.watchdog_config.min_free_gb
@@ -544,7 +543,9 @@ pub fn watchdog_page(
                         .flex_row()
                         .justify_between()
                         .child(
-                            div().text_color(theme.secondary).child("Status:"),
+                            div().text_color(theme.secondary).child(
+                                crate::i18n::pages::status_label(locale),
+                            ),
                         )
                         .child(
                             div()
@@ -554,9 +555,9 @@ pub fn watchdog_page(
                                     theme.accent
                                 })
                                 .child(if is_breached {
-                                    "Low Disk Space (Below threshold)"
+                                    crate::i18n::pages::status_low_disk(locale)
                                 } else {
-                                    "Healthy (Above threshold)"
+                                    crate::i18n::pages::status_healthy(locale)
                                 }),
                         ),
                 )
@@ -565,11 +566,11 @@ pub fn watchdog_page(
                         .flex()
                         .flex_row()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_color(theme.secondary)
-                                .child("Background Service:"),
-                        )
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::background_service_label(
+                                locale,
+                            ),
+                        ))
                         .child(
                             div()
                                 .text_color(service_color)
@@ -581,11 +582,9 @@ pub fn watchdog_page(
                         .flex()
                         .flex_row()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_color(theme.secondary)
-                                .child("Last Checked:"),
-                        )
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::last_checked_label(locale),
+                        ))
                         .child(
                             div()
                                 .debug_selector(|| {
@@ -594,6 +593,7 @@ pub fn watchdog_page(
                                 .text_color(theme.bright)
                                 .child(format_checked_age(
                                     app.watchdog_space_checked_at,
+                                    locale,
                                 )),
                         ),
                 ),
@@ -601,7 +601,7 @@ pub fn watchdog_page(
 
     let actions_card = dialog_popup(cx)
         .w_full()
-        .child(dialog_title("Actions", cx))
+        .child(dialog_title(crate::i18n::pages::actions_title(locale), cx))
         .child(
             div()
                 .flex()
@@ -613,7 +613,9 @@ pub fn watchdog_page(
                         .child(
                             button(
                                 "watchdog-check-space",
-                                "Check Disk Space Now",
+                                crate::i18n::pages::check_disk_space_now(
+                                    locale,
+                                ),
                                 ButtonVariant::Secondary,
                                 cx,
                             )
@@ -631,9 +633,11 @@ pub fn watchdog_page(
                             button(
                                 "watchdog-ai-analyze",
                                 if app.watchdog_analyzing {
-                                    "Analyzing…"
+                                    crate::i18n::pages::analyzing(locale)
                                 } else {
-                                    "Run AI Analysis Now"
+                                    crate::i18n::pages::run_ai_analysis_now(
+                                        locale,
+                                    )
                                 },
                                 if app.watchdog_analyzing {
                                     ButtonVariant::Secondary
@@ -657,7 +661,10 @@ pub fn watchdog_page(
                 prop.items.iter().map(|i| i.bytes).sum();
             dialog_popup(cx)
                 .w_full()
-                .child(dialog_title("Latest AI Cleanup Proposal", cx))
+                .child(dialog_title(
+                    crate::i18n::pages::latest_proposal_title(locale),
+                    cx,
+                ))
                 .child(dialog_description(&prop.summary, cx))
                 .child(
                     div()
@@ -666,11 +673,13 @@ pub fn watchdog_page(
                         .justify_between()
                         .items_center()
                         .py(space::SM)
-                        .child(div().text_color(theme.bright).child(format!(
-                            "{} candidate items · {}",
-                            prop.items.len(),
-                            human_bytes(total_candidate_bytes)
-                        )))
+                        .child(div().text_color(theme.bright).child(
+                            crate::i18n::pages::candidate_items_summary(
+                                prop.items.len(),
+                                &human_bytes(total_candidate_bytes),
+                                locale,
+                            ),
+                        ))
                         .child(
                             div()
                                 .debug_selector(|| {
@@ -679,7 +688,9 @@ pub fn watchdog_page(
                                 .child(
                                     button(
                                         "watchdog-review-proposal",
-                                        "Review & Confirm…",
+                                        crate::i18n::pages::review_and_confirm(
+                                            locale,
+                                        ),
                                         ButtonVariant::Primary,
                                         cx,
                                     )
@@ -692,10 +703,12 @@ pub fn watchdog_page(
         } else {
             dialog_popup(cx)
                 .w_full()
-                .child(dialog_title("Latest AI Cleanup Proposal", cx))
+                .child(dialog_title(
+                    crate::i18n::pages::latest_proposal_title(locale),
+                    cx,
+                ))
                 .child(dialog_description(
-                    "No proposals recorded yet. Run AI Analysis or wait \
-                 for watchdog trigger.",
+                    crate::i18n::pages::no_proposals_yet(locale),
                     cx,
                 ))
         };
@@ -710,11 +723,16 @@ pub fn watchdog_page(
         .p(space::XXL)
         .gap(space::LG)
         .overflow_y_scroll()
-        .child(div().text_size(text::TITLE).child("Disk Space Watchdog"))
-        .child(div().text_color(theme.secondary).child(
-            "Low-overhead disk monitoring with proactive AI cleanup \
-             suggestions.",
-        ))
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .child(crate::i18n::pages::watchdog_title(locale)),
+        )
+        .child(
+            div()
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::watchdog_subtitle(locale)),
+        )
         .child(status_card)
         .child(actions_card)
         .child(proposal_card)
@@ -727,6 +745,7 @@ pub fn settings_page(
     cx: &mut Context<'_, Ruum>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
+    let locale = app.locale;
 
     let input_min_free = app
         .watchdog_input_min_free
@@ -754,7 +773,10 @@ pub fn settings_page(
 
     let watchdog_section = dialog_popup(cx)
         .w_full()
-        .child(dialog_title("Watchdog Monitoring", cx))
+        .child(dialog_title(
+            crate::i18n::pages::watchdog_monitoring_title(locale),
+            cx,
+        ))
         .child(
             div()
                 .flex()
@@ -766,7 +788,7 @@ pub fn settings_page(
                         .child(
                             checkbox(
                                 "setting-enable-watchdog",
-                                "Enable Watchdog Free-Space Monitoring",
+                                crate::i18n::pages::enable_watchdog(locale),
                                 if is_enabled {
                                     CheckboxState::Checked
                                 } else {
@@ -795,8 +817,7 @@ pub fn settings_page(
                         .child(
                             checkbox(
                                 "setting-enable-service",
-                                "Run as OS Background Service at Login \
-                                 (launchd / systemd)",
+                                crate::i18n::pages::enable_service(locale),
                                 if is_service {
                                     CheckboxState::Checked
                                 } else {
@@ -826,11 +847,9 @@ pub fn settings_page(
                         .flex()
                         .flex_col()
                         .gap(space::XS)
-                        .child(
-                            div()
-                                .text_color(theme.secondary)
-                                .child("Minimum Free Space Threshold (GB):"),
-                        )
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::min_free_threshold(locale),
+                        ))
                         .child(
                             gpui_omarchy::input(
                                 "setting-min-free-input",
@@ -855,7 +874,7 @@ pub fn settings_page(
         provider_buttons = provider_buttons.child(
             button(
                 id,
-                provider.label(),
+                provider.label_in(locale),
                 if is_selected {
                     ButtonVariant::Primary
                 } else {
@@ -871,10 +890,12 @@ pub fn settings_page(
 
     let mut ai_section = dialog_popup(cx)
         .w_full()
-        .child(dialog_title("AI Assistant CLI", cx))
+        .child(dialog_title(
+            crate::i18n::pages::ai_assistant_cli_title(locale),
+            cx,
+        ))
         .child(dialog_description(
-            "Select which AI CLI to invoke when free space drops \
-             below threshold.",
+            crate::i18n::pages::ai_assistant_cli_desc(locale),
             cx,
         ))
         .child(provider_buttons);
@@ -887,9 +908,9 @@ pub fn settings_page(
                     .flex_col()
                     .gap(space::XS)
                     .child(
-                        div()
-                            .text_color(theme.secondary)
-                            .child("Custom Executable Command / Path:"),
+                        div().text_color(theme.secondary).child(
+                            crate::i18n::pages::custom_executable(locale),
+                        ),
                     )
                     .child(
                         gpui_omarchy::input(
@@ -907,9 +928,9 @@ pub fn settings_page(
                     .flex_col()
                     .gap(space::XS)
                     .child(
-                        div()
-                            .text_color(theme.secondary)
-                            .child("Custom Extra Arguments:"),
+                        div().text_color(theme.secondary).child(
+                            crate::i18n::pages::custom_extra_args(locale),
+                        ),
                     )
                     .child(
                         gpui_omarchy::input(
@@ -932,7 +953,7 @@ pub fn settings_page(
                 .child(
                     div()
                         .text_color(theme.secondary)
-                        .child("Model Override (optional):"),
+                        .child(crate::i18n::pages::model_override(locale)),
                 )
                 .child(
                     gpui_omarchy::input(
@@ -956,9 +977,9 @@ pub fn settings_page(
                         button(
                             "setting-test-cli",
                             if app.watchdog_testing {
-                                "Testing…"
+                                crate::i18n::pages::testing(locale)
                             } else {
-                                "Test CLI Connection"
+                                crate::i18n::pages::test_cli_connection(locale)
                             },
                             ButtonVariant::Secondary,
                             cx,
@@ -977,9 +998,9 @@ pub fn settings_page(
                             button(
                                 "setting-fetch-models",
                                 if app.watchdog_fetching_models {
-                                    "Fetching…"
+                                    crate::i18n::pages::fetching(locale)
                                 } else {
-                                    "Fetch Models"
+                                    crate::i18n::pages::fetch_models(locale)
                                 },
                                 ButtonVariant::Secondary,
                                 cx,
@@ -1020,11 +1041,11 @@ pub fn settings_page(
                 (model.label != model.id).then(|| format!("  {}", model.label));
 
             let speed_tooltip = if is_benchmarking {
-                "Benchmarking model speed…"
+                crate::i18n::pages::benchmarking_speed_tooltip(locale)
             } else if speed_opt.is_some() {
-                "Click to re-test model speed"
+                crate::i18n::pages::retest_speed_tooltip(locale)
             } else {
-                "Test model speed"
+                crate::i18n::pages::test_speed_tooltip(locale)
             };
             let speed_control = with_tooltip(
                 div()
@@ -1071,7 +1092,10 @@ pub fn settings_page(
                             .child(if res.ok {
                                 format!("{} ms", res.elapsed_ms)
                             } else {
-                                format!("retry ({} ms)", res.elapsed_ms)
+                                crate::i18n::pages::speed_retry(
+                                    u128::from(res.elapsed_ms),
+                                    locale,
+                                )
                             })
                             .into_any_element()
                     } else {
@@ -1103,7 +1127,7 @@ pub fn settings_page(
                             .size(icon::SM)
                             .text_color(theme.accent),
                     )
-                    .child("Selected")
+                    .child(crate::i18n::pages::selected(locale))
                     .into_any_element()
             } else {
                 div()
@@ -1116,7 +1140,7 @@ pub fn settings_page(
                                 format!("setting-model-select-btn-{index}")
                                     .into(),
                             ),
-                            "Select",
+                            crate::i18n::pages::select(locale),
                             ButtonVariant::Secondary,
                             cx,
                         )
@@ -1216,9 +1240,9 @@ pub fn settings_page(
                 div()
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
-                    .child(format!(
-                        "Available Models ({}):",
-                        app.watchdog_models.len()
+                    .child(crate::i18n::pages::available_models(
+                        app.watchdog_models.len(),
+                        locale,
                     )),
             )
             .child(with_tooltip(
@@ -1244,7 +1268,7 @@ pub fn settings_page(
                     } else {
                         zap_icon(theme.accent).into_any_element()
                     }),
-                "Test speed of all models",
+                crate::i18n::pages::test_all_models_tooltip(locale),
             ));
 
         ai_section = ai_section.child(models_header).child(model_rows);
@@ -1261,9 +1285,9 @@ pub fn settings_page(
                 button(
                     "setting-save-btn",
                     if app.watchdog_saving {
-                        "Saving…"
+                        crate::i18n::pages::saving(locale)
                     } else {
-                        "Save Settings"
+                        crate::i18n::pages::save_settings(locale)
                     },
                     ButtonVariant::Primary,
                     cx,
@@ -1284,11 +1308,16 @@ pub fn settings_page(
         .p(space::XXL)
         .gap(space::LG)
         .overflow_y_scroll()
-        .child(div().text_size(text::TITLE).child("Settings"))
-        .child(div().text_color(theme.secondary).child(
-            "Configure Watchdog threshold, background daemon service, \
-             and AI assistant.",
-        ))
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .child(crate::i18n::pages::settings_title(locale)),
+        )
+        .child(
+            div()
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::settings_subtitle(locale)),
+        )
         .child(watchdog_section)
         .child(ai_section)
         .child(save_bar)
@@ -1298,6 +1327,7 @@ pub fn settings_page(
 pub fn cleanup_confirm_view(
     modal: &CleanupConfirmModal,
     focus: &FocusHandle,
+    locale: crate::i18n::Locale,
     cx: &Context<'_, crate::CleanupConfirmWindow>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
@@ -1315,7 +1345,7 @@ pub fn cleanup_confirm_view(
 
     if modal.request.items.is_empty() {
         rows = rows.child(dialog_description(
-            "No candidate items proposed for cleanup.",
+            crate::i18n::pages::no_candidate_items(locale),
             cx,
         ));
     }
@@ -1333,8 +1363,10 @@ pub fn cleanup_confirm_view(
             crate::marks::display_path(&item.path, home.as_deref());
 
         let mode_label = match item.mode {
-            RemovalMode::Trash => "Trash",
-            RemovalMode::Permanent => "Permanent",
+            RemovalMode::Trash => crate::i18n::pages::mode_trash_short(locale),
+            RemovalMode::Permanent => {
+                crate::i18n::pages::mode_permanent_short(locale)
+            }
         };
         let mode_color = match item.mode {
             RemovalMode::Trash => theme.accent,
@@ -1439,11 +1471,11 @@ pub fn cleanup_confirm_view(
         rows = rows.child(row);
     }
 
-    let summary_text = format!(
-        "Selected {} of {} items · {}",
+    let summary_text = crate::i18n::pages::confirm_summary(
         modal.selected_count(),
         modal.request.items.len(),
-        human_bytes(modal.selected_bytes())
+        &human_bytes(modal.selected_bytes()),
+        locale,
     );
 
     let card = div()
@@ -1463,9 +1495,9 @@ pub fn cleanup_confirm_view(
                 .min_h_0()
                 .child(dialog_title(modal.request.title.clone(), cx))
                 .child(dialog_description(
-                    modal.request.summary.as_deref().unwrap_or(
-                        "Review and uncheck any items you wish to keep.",
-                    ),
+                    modal.request.summary.as_deref().unwrap_or_else(|| {
+                        crate::i18n::pages::confirm_default_desc(locale)
+                    }),
                     cx,
                 ))
                 .child(
@@ -1483,7 +1515,7 @@ pub fn cleanup_confirm_view(
                                 .child(
                                     button(
                                         "select-all-btn",
-                                        "Select All",
+                                        crate::i18n::pages::select_all(locale),
                                         ButtonVariant::Secondary,
                                         cx,
                                     )
@@ -1495,7 +1527,7 @@ pub fn cleanup_confirm_view(
                                 .child(
                                     button(
                                         "select-none-btn",
-                                        "Select None",
+                                        crate::i18n::pages::select_none(locale),
                                         ButtonVariant::Secondary,
                                         cx,
                                     )
@@ -1525,7 +1557,7 @@ pub fn cleanup_confirm_view(
                                 .child(
                                     dialog_button(
                                         "confirm-cancel",
-                                        "Cancel",
+                                        crate::i18n::pages::cancel(locale),
                                         ButtonVariant::Secondary,
                                         cx,
                                     )
@@ -1542,9 +1574,9 @@ pub fn cleanup_confirm_view(
                                 .child(
                                     dialog_button(
                                         "confirm-clean",
-                                        format!(
-                                            "Confirm & Clean ({})",
-                                            modal.selected_count()
+                                        crate::i18n::pages::confirm_and_clean(
+                                            modal.selected_count(),
+                                            locale,
                                         ),
                                         ButtonVariant::Danger,
                                         cx,

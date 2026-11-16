@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::confirm::removal_mode_serde;
+use crate::i18n::Locale;
 use crate::removal::RemovalMode;
 
 /// Minimum allowable free-space threshold in gigabytes.
@@ -54,11 +55,20 @@ impl AiCliProvider {
     /// Human-friendly display label.
     #[must_use]
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::Pi => "Pi",
-            Self::Agy => "Agy",
-            Self::Codex => "Codex",
-            Self::Custom => "Custom",
+        self.label_in(Locale::En)
+    }
+
+    /// Localized display label for this AI CLI provider.
+    #[must_use]
+    pub const fn label_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::Pi, _) => "Pi",
+            (Self::Agy, _) => "Agy",
+            (Self::Codex, _) => "Codex",
+            (Self::Custom, Locale::En) => "Custom",
+            (Self::Custom, Locale::Zh) => "自定义",
+            (Self::Custom, Locale::Ja) => "カスタム",
+            (Self::Custom, Locale::Ko) => "사용자 지정",
         }
     }
 }

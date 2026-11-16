@@ -454,6 +454,7 @@ impl Drop for CleanupConfirmModal {
 pub fn proposal_confirm_request(
     root: PathBuf,
     proposal: &ruum_core::watchdog_config::CleanupProposal,
+    locale: crate::i18n::Locale,
 ) -> CleanupConfirmRequest {
     let items = proposal
         .items
@@ -468,7 +469,7 @@ pub fn proposal_confirm_request(
         .collect();
     CleanupConfirmRequest {
         root,
-        title: "AI Cleanup Proposal".to_string(),
+        title: crate::i18n::messages::ai_proposal_title(locale).to_string(),
         summary: Some(proposal.summary.clone()),
         items,
     }
@@ -485,6 +486,8 @@ fn write_decision_file(
 
 /// Everything the app knows and everything it can do.
 pub struct Ruum {
+    /// Active UI locale (`En`, `Zh`, `Ja`, `Ko`).
+    pub locale: crate::i18n::Locale,
     /// The directory the tree was scanned from.
     pub root_path: PathBuf,
     pub remote: Option<String>,
@@ -855,6 +858,7 @@ impl Ruum {
             watchdog_analysis_epoch: 0,
             watchdog_space_checked_at,
             watchdog_service_status,
+            locale: crate::i18n::Locale::current(),
         };
         if local && start {
             tree.device = device_for(&tree.root_path);
@@ -1101,6 +1105,7 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         self.volumes_loading = false;
+        let locale = self.locale;
         match result {
             Ok((mut volumes, home)) => {
                 if let Some(home) = home
@@ -1110,7 +1115,10 @@ impl Ruum {
                         0,
                         ruum_core::space::Volume {
                             point: home,
-                            device: Some("Home directory".into()),
+                            device: Some(
+                                crate::i18n::messages::home_directory(locale)
+                                    .into(),
+                            ),
                             space: None,
                         },
                     );
@@ -1127,11 +1135,14 @@ impl Ruum {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let locale = self.locale;
         if self.picker_host.is_none() {
             let value = self.volumes_source.clone().unwrap_or_default();
             let host = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("SSH alias or user@host")
+                    .placeholder(crate::i18n::messages::placeholder_ssh_host(
+                        locale,
+                    ))
                     .default_value(value)
             });
             cx.subscribe(&host, |this, _, event, cx| {
@@ -1145,7 +1156,9 @@ impl Ruum {
         }
         if self.picker_path.is_none() {
             let path = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("/absolute/path")
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::messages::placeholder_abs_path(locale),
+                )
             });
             cx.subscribe(&path, |this, _, event, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -1188,6 +1201,7 @@ impl Ruum {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let locale = self.locale;
         if self.watchdog_input_min_free.is_none() {
             let val = self.watchdog_config.min_free_gb.to_string();
             let input = cx.new(|cx| {
@@ -1201,7 +1215,9 @@ impl Ruum {
             let val = self.watchdog_config.custom_command.clone();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("e.g. /usr/local/bin/my-ai")
+                    .placeholder(crate::i18n::messages::placeholder_custom_cmd(
+                        locale,
+                    ))
                     .default_value(val)
             });
             self.watchdog_input_custom_cmd = Some(input);
@@ -1210,7 +1226,9 @@ impl Ruum {
             let val = self.watchdog_config.extra_args.clone();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("e.g. --timeout 60")
+                    .placeholder(crate::i18n::messages::placeholder_extra_args(
+                        locale,
+                    ))
                     .default_value(val)
             });
             self.watchdog_input_extra_args = Some(input);
@@ -1219,7 +1237,11 @@ impl Ruum {
             let val = self.watchdog_config.model.clone().unwrap_or_default();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("optional model override")
+                    .placeholder(
+                        crate::i18n::messages::placeholder_model_override(
+                            locale,
+                        ),
+                    )
                     .default_value(val)
             });
             self.watchdog_input_model = Some(input);
@@ -1246,6 +1268,18 @@ impl Ruum {
             cfg.model = (!text.is_empty()).then_some(text);
         }
         cfg
+    }
+
+    /// Switch the active UI locale in tests.
+    #[cfg(test)]
+    pub const fn set_locale(&mut self, locale: crate::i18n::Locale) {
+        self.locale = locale;
+    }
+
+    /// Current resolved window title in tests.
+    #[cfg(test)]
+    pub fn window_title(&self) -> &str {
+        &self.window_title
     }
 
     /// Show a floating toast notification that auto-dismisses after 4 seconds.
@@ -1333,7 +1367,10 @@ impl Ruum {
             )
         {
             self.push_toast(
-                format!("Failed to save settings: {err}"),
+                crate::i18n::messages::failed_save_settings(
+                    &err.to_string(),
+                    self.locale,
+                ),
                 Status::Error,
                 cx,
             );
@@ -1341,7 +1378,11 @@ impl Ruum {
         }
 
         if cfg!(test) {
-            self.push_toast("Settings saved", Status::Success, cx);
+            self.push_toast(
+                crate::i18n::messages::settings_saved(self.locale),
+                Status::Success,
+                cx,
+            );
             return;
         }
 
@@ -1350,7 +1391,7 @@ impl Ruum {
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
         self.watchdog_saving = true;
         self.push_toast(
-            "Settings saved; updating background service…",
+            crate::i18n::messages::settings_saved_updating_service(self.locale),
             Status::Success,
             cx,
         );
@@ -1373,29 +1414,26 @@ impl Ruum {
             let _ = this.update(cx, |this, cx| {
                 this.watchdog_saving = false;
                 this.watchdog_service_status = status;
+                let locale = this.locale;
                 match sync_res {
                     Ok(()) => {
-                        let service_note = match status {
-                            Some(ServiceStatus::Active) => "Service: Active",
-                            Some(ServiceStatus::Inactive) => {
-                                "Service: Inactive"
-                            }
-                            Some(ServiceStatus::NotInstalled) | None => {
-                                "Service: Off"
-                            }
-                            Some(ServiceStatus::Unsupported) => {
-                                "Service: Unsupported"
-                            }
-                        };
+                        let service_note =
+                            crate::i18n::messages::service_note(status, locale);
                         this.push_toast(
-                            format!("Settings saved ({service_note})"),
+                            crate::i18n::messages::settings_saved_with_service(
+                                service_note,
+                                locale,
+                            ),
                             Status::Success,
                             cx,
                         );
                     }
                     Err(err) => {
                         this.push_toast(
-                            format!("Settings saved; service error: {err}"),
+                            crate::i18n::messages::settings_saved_service_error(
+                                &err.to_string(),
+                                locale,
+                            ),
                             Status::Warning,
                             cx,
                         );
@@ -1412,12 +1450,15 @@ impl Ruum {
             return;
         }
         let temp_cfg = self.snapshot_watchdog_config(cx);
-        let provider_label = temp_cfg.ai_provider.label();
+        let provider_label = temp_cfg.ai_provider.label_in(self.locale);
         self.watchdog_testing = true;
         self.watchdog_test_epoch += 1;
         let epoch = self.watchdog_test_epoch;
         self.push_toast(
-            format!("Testing {provider_label} CLI connection…"),
+            crate::i18n::messages::testing_cli_connection(
+                provider_label,
+                self.locale,
+            ),
             Status::Neutral,
             cx,
         );
@@ -1457,12 +1498,12 @@ impl Ruum {
             return;
         }
         let temp_cfg = self.snapshot_watchdog_config(cx);
-        let provider_label = temp_cfg.ai_provider.label();
+        let provider_label = temp_cfg.ai_provider.label_in(self.locale);
         self.watchdog_fetching_models = true;
         self.watchdog_fetch_epoch += 1;
         let epoch = self.watchdog_fetch_epoch;
         self.push_toast(
-            format!("Fetching {provider_label} models…"),
+            crate::i18n::messages::fetching_models(provider_label, self.locale),
             Status::Neutral,
             cx,
         );
@@ -1483,6 +1524,7 @@ impl Ruum {
                     return;
                 }
                 this.watchdog_fetching_models = false;
+                let locale = this.locale;
                 match res {
                     Ok((models, note)) => {
                         let count = models.len();
@@ -1490,18 +1532,25 @@ impl Ruum {
                         let (msg, status) = match (count, note) {
                             (0, Some(n)) => (n, Status::Warning),
                             (0, None) => (
-                                format!(
-                                    "No models discovered for {provider_label}"
+                                crate::i18n::messages::no_models_discovered(
+                                    provider_label,
+                                    locale,
                                 ),
                                 Status::Warning,
                             ),
                             (n, Some(n_note)) => (
-                                format!("Loaded {n} models ({n_note})"),
+                                crate::i18n::messages::loaded_models_with_note(
+                                    n,
+                                    &n_note,
+                                    locale,
+                                ),
                                 Status::Success,
                             ),
                             (n, None) => (
-                                format!(
-                                    "Loaded {n} models for {provider_label}"
+                                crate::i18n::messages::loaded_models_for_provider(
+                                    n,
+                                    provider_label,
+                                    locale,
                                 ),
                                 Status::Success,
                             ),
@@ -1576,9 +1625,10 @@ impl Ruum {
                     return;
                 }
                 let failed = (!result.ok).then(|| {
-                    format!(
-                        "Model {} speed test failed: {}",
-                        result.model, result.detail
+                    crate::i18n::messages::model_speed_failed(
+                        &result.model,
+                        &result.detail,
+                        this.locale,
                     )
                 });
                 this.upsert_speed_result(result);
@@ -1607,7 +1657,7 @@ impl Ruum {
         if models_to_test.is_empty() {
             if self.watchdog_models.is_empty() {
                 self.push_toast(
-                    "Fetch models first before testing all models",
+                    crate::i18n::messages::fetch_models_first(self.locale),
                     Status::Warning,
                     cx,
                 );
@@ -1620,7 +1670,7 @@ impl Ruum {
         let epoch = self.watchdog_benchmark_epoch;
         let total = models_to_test.len();
         self.push_toast(
-            format!("Benchmarking {total} models…"),
+            crate::i18n::messages::benchmarking_models(total, self.locale),
             Status::Neutral,
             cx,
         );
@@ -1675,8 +1725,10 @@ impl Ruum {
                     Status::Warning
                 };
                 this.push_toast(
-                    format!(
-                        "Speed test finished: {ok_count}/{total} succeeded"
+                    crate::i18n::messages::speed_test_finished(
+                        ok_count,
+                        total,
+                        this.locale,
                     ),
                     status,
                     cx,
@@ -1706,16 +1758,18 @@ impl Ruum {
                 let free = ruum_core::size::human_bytes(info.available);
                 let total = ruum_core::size::human_bytes(info.total);
                 let msg = if breached {
-                    format!(
-                        "Checked: {free} free of {total} — below {} GB \
-                         threshold",
-                        self.watchdog_config.min_free_gb
+                    crate::i18n::messages::disk_checked_below(
+                        &free,
+                        &total,
+                        self.watchdog_config.min_free_gb,
+                        self.locale,
                     )
                 } else {
-                    format!(
-                        "Checked: {free} free of {total} — healthy (above {} \
-                         GB threshold)",
-                        self.watchdog_config.min_free_gb
+                    crate::i18n::messages::disk_checked_healthy(
+                        &free,
+                        &total,
+                        self.watchdog_config.min_free_gb,
+                        self.locale,
                     )
                 };
                 let status = if breached {
@@ -1727,7 +1781,10 @@ impl Ruum {
             }
             Err(err) => {
                 self.push_toast(
-                    format!("Failed to check disk space: {err}"),
+                    crate::i18n::messages::failed_check_disk_space(
+                        &err.to_string(),
+                        self.locale,
+                    ),
                     Status::Error,
                     cx,
                 );
@@ -1758,11 +1815,15 @@ impl Ruum {
             return;
         }
         let Some(home) = std::env::home_dir() else {
-            self.push_toast("Cannot find home directory", Status::Error, cx);
+            self.push_toast(
+                crate::i18n::messages::cannot_find_home_dir(self.locale),
+                Status::Error,
+                cx,
+            );
             return;
         };
         let cfg = self.snapshot_watchdog_config(cx);
-        let provider_label = cfg.ai_provider.label();
+        let provider_label = cfg.ai_provider.label_in(self.locale);
         let current_exe =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
@@ -1774,7 +1835,10 @@ impl Ruum {
         self.watchdog_analysis_epoch += 1;
         let epoch = self.watchdog_analysis_epoch;
         self.push_toast(
-            format!("Running AI analysis via {provider_label}…"),
+            crate::i18n::messages::running_ai_analysis(
+                provider_label,
+                self.locale,
+            ),
             Status::Neutral,
             cx,
         );
@@ -1799,6 +1863,7 @@ impl Ruum {
                     return;
                 }
                 this.watchdog_analyzing = false;
+                let locale = this.locale;
                 match res {
                     Ok(proposal) => {
                         this.watchdog_state.last_proposal =
@@ -1815,20 +1880,22 @@ impl Ruum {
                         }
                         if proposal.items.is_empty() {
                             this.push_toast(
-                                "AI analysis found no reclaimable files",
+                                crate::i18n::messages::ai_found_no_files(
+                                    locale,
+                                ),
                                 Status::Success,
                                 cx,
                             );
                         } else {
                             let count = proposal.items.len();
-                            let request =
-                                proposal_confirm_request(home, &proposal);
+                            let request = proposal_confirm_request(
+                                home, &proposal, locale,
+                            );
                             crate::open_confirm_window(request, None, None, cx);
                             crate::refresh_tray_status(cx);
                             this.push_toast(
-                                format!(
-                                    "AI proposed {count} candidate items for \
-                                     review"
+                                crate::i18n::messages::ai_proposed_items(
+                                    count, locale,
                                 ),
                                 Status::Success,
                                 cx,
@@ -1837,7 +1904,9 @@ impl Ruum {
                     }
                     Err(err) => {
                         this.push_toast(
-                            format!("AI analysis error: {err}"),
+                            crate::i18n::messages::ai_analysis_error(
+                                &err, locale,
+                            ),
                             Status::Error,
                             cx,
                         );
@@ -1856,7 +1925,7 @@ impl Ruum {
         let Some(home) = std::env::home_dir() else {
             return;
         };
-        let request = proposal_confirm_request(home, proposal);
+        let request = proposal_confirm_request(home, proposal, self.locale);
         crate::open_confirm_window(request, None, None, cx);
         cx.notify();
     }
@@ -1911,14 +1980,15 @@ impl Ruum {
         }
         if !self.picker_source_matches(cx) {
             self.picker_error = Some(
-                "Connect SSH or choose This computer before scanning.".into(),
+                crate::i18n::messages::picker_connect_first(self.locale).into(),
             );
             cx.notify();
             return;
         }
         if !path.is_absolute() {
-            self.picker_error =
-                Some("Enter an absolute directory path.".into());
+            self.picker_error = Some(
+                crate::i18n::messages::picker_abs_path(self.locale).into(),
+            );
             cx.notify();
             return;
         }
@@ -1926,8 +1996,12 @@ impl Ruum {
             match dunce::canonicalize(&path) {
                 Ok(root) if root.is_dir() => path = root,
                 _ => {
-                    self.picker_error =
-                        Some("Cannot open that local directory.".into());
+                    self.picker_error = Some(
+                        crate::i18n::messages::picker_cannot_open_dir(
+                            self.locale,
+                        )
+                        .into(),
+                    );
                     cx.notify();
                     return;
                 }
@@ -2116,26 +2190,24 @@ impl Ruum {
         }
         self.options.threads = preset.policy(self.cpu_threads);
         self.power_choice = Some(preset);
-        let label = preset.label(self.cpu_threads);
+        let label = preset.label_in(self.cpu_threads, self.locale);
         self.notice = Some(match self.power_settings_path.as_deref() {
             Some(path) => match crate::power::save(path, preset) {
                 Ok(()) => (
-                    format!("{label} from the next scan; r rescans now"),
+                    crate::i18n::messages::power_saved(&label, self.locale),
                     Status::Success,
                 ),
                 Err(error) => (
-                    format!(
-                        "{label} from the next scan, but it could not be \
-                         saved: {error}"
+                    crate::i18n::messages::power_save_failed(
+                        &label,
+                        &error.to_string(),
+                        self.locale,
                     ),
                     Status::Warning,
                 ),
             },
             None => (
-                format!(
-                    "{label} from the next scan; no settings directory to \
-                     save it in"
-                ),
+                crate::i18n::messages::power_no_dir(&label, self.locale),
                 Status::Warning,
             ),
         });
@@ -2287,7 +2359,8 @@ impl Ruum {
         if self.remote_identity != identity && !self.marks.is_empty() {
             self.marks.clear();
             self.notice = Some((
-                "Remote identity changed; previous marks were cleared.".into(),
+                crate::i18n::messages::remote_identity_changed(self.locale)
+                    .into(),
                 Status::Warning,
             ));
         }
@@ -2326,7 +2399,10 @@ impl Ruum {
                     self.remote_platform = snapshot.header.platform;
                     self.update_remote_identity(snapshot.header.identity);
                     self.device = self.remote.as_ref().map(|host| {
-                        format!("{host} · read-only · space at scan")
+                        crate::i18n::messages::device_remote_read_only(
+                            host,
+                            self.locale,
+                        )
                     });
                     let node = snapshot.tree;
                     self.marks.refresh(
@@ -3058,8 +3134,7 @@ impl Ruum {
         };
         if crumbs.is_empty() {
             self.notice = Some((
-                "the scanned root cannot be removed; open a directory first"
-                    .into(),
+                crate::i18n::messages::cannot_remove_root(self.locale).into(),
                 Status::Warning,
             ));
             cx.notify();
@@ -3086,11 +3161,13 @@ impl Ruum {
         if !self.marks.contains(&target.path)
             && let Some(ancestor) = self.marked_ancestor(&target.path)
         {
+            let target_disp = display_path(&target.path, self.home.as_deref());
+            let ancestor_disp = display_path(&ancestor, self.home.as_deref());
             self.notice = Some((
-                format!(
-                    "{} goes with the marked {}; unmark that to keep it",
-                    display_path(&target.path, self.home.as_deref()),
-                    display_path(&ancestor, self.home.as_deref())
+                crate::i18n::messages::goes_with_marked(
+                    &target_disp,
+                    &ancestor_disp,
+                    self.locale,
                 ),
                 Status::Warning,
             ));
@@ -3113,12 +3190,12 @@ impl Ruum {
                 self.marks.remove(inner);
             }
             if !inside.is_empty() {
+                let path_disp = display_path(&path, self.home.as_deref());
                 self.notice = Some((
-                    format!(
-                        "{} now covers {} mark{} inside it",
-                        display_path(&path, self.home.as_deref()),
+                    crate::i18n::messages::covers_marks_inside(
+                        &path_disp,
                         inside.len(),
-                        if inside.len() == 1 { "" } else { "s" }
+                        self.locale,
                     ),
                     Status::Neutral,
                 ));
@@ -3287,7 +3364,7 @@ impl Ruum {
                     });
                 }
                 TileKind::Others { count, .. } => labels.push(Label {
-                    text: format!("+{count} more"),
+                    text: crate::i18n::messages::plus_more(*count, self.locale),
                     rect: self.animated_rect(tile.rect),
                     header: None,
                     depth: tile.depth,
@@ -3600,7 +3677,10 @@ impl Ruum {
         }
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing is marked".into(), Status::Warning));
+            self.notice = Some((
+                crate::i18n::messages::nothing_is_marked(self.locale).into(),
+                Status::Warning,
+            ));
             cx.notify();
             return;
         }
@@ -3608,7 +3688,7 @@ impl Ruum {
         // would stop a permanent delete halfway.
         if self.restarting {
             self.notice = Some((
-                "not while restarting as administrator".into(),
+                crate::i18n::messages::not_while_restarting(self.locale).into(),
                 Status::Warning,
             ));
             cx.notify();
@@ -3756,7 +3836,10 @@ impl Ruum {
         };
         if matches.count == 0 {
             self.notice = Some((
-                format!("nothing here matches {}", matches.needle),
+                crate::i18n::messages::nothing_matches(
+                    &matches.needle,
+                    self.locale,
+                ),
                 Status::Warning,
             ));
             cx.notify();
@@ -3825,7 +3908,9 @@ impl Ruum {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Scan".into()),
+            prompt: Some(
+                crate::i18n::messages::prompt_scan(self.locale).into(),
+            ),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = chosen.await else {
@@ -3861,7 +3946,10 @@ impl Ruum {
     fn save_export(&mut self, script: bool, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing to save".into(), Status::Warning));
+            self.notice = Some((
+                crate::i18n::messages::nothing_to_save(self.locale).into(),
+                Status::Warning,
+            ));
             cx.notify();
             return;
         }
@@ -3878,22 +3966,26 @@ impl Ruum {
         } else {
             "ruum-delete-list.txt"
         };
+        let locale = self.locale;
         let chosen = cx.prompt_for_new_path(&directory, Some(filename));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
             };
+            let path_disp = path.display().to_string();
             let notice = match std::fs::write(&path, list) {
                 Ok(()) => (
-                    format!(
-                        "saved {count} {} to {}",
-                        if count == 1 { "path" } else { "paths" },
-                        path.display()
+                    crate::i18n::messages::saved_paths_to(
+                        count, &path_disp, locale,
                     ),
                     Status::Success,
                 ),
                 Err(error) => (
-                    format!("could not save {}: {error}", path.display()),
+                    crate::i18n::messages::could_not_save_path(
+                        &path_disp,
+                        &error.to_string(),
+                        locale,
+                    ),
                     Status::Error,
                 ),
             };
@@ -3922,12 +4014,15 @@ impl Ruum {
     pub fn copy_delete_script(&mut self, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing to copy".into(), Status::Warning));
+            self.notice = Some((
+                crate::i18n::messages::nothing_to_copy(self.locale).into(),
+                Status::Warning,
+            ));
         } else {
             let script = self.delete_script(&plan.targets);
             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(script));
             self.notice = Some((
-                "copied delete script; previews by default, checks host before deletion".into(),
+                crate::i18n::messages::copied_delete_script(self.locale).into(),
                 Status::Success,
             ));
         }
@@ -3939,7 +4034,10 @@ impl Ruum {
     pub fn copy_agent_prompt(&mut self, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing to copy".into(), Status::Warning));
+            self.notice = Some((
+                crate::i18n::messages::nothing_to_copy(self.locale).into(),
+                Status::Warning,
+            ));
             cx.notify();
             return;
         }
@@ -3969,11 +4067,12 @@ impl Ruum {
         }
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(prompt));
         let count = plan.targets.len();
+        let bytes = ruum_core::size::human_bytes(plan.bytes());
         self.notice = Some((
-            format!(
-                "copied a prompt for your agent: {count} {}, {}",
-                if count == 1 { "path" } else { "paths" },
-                ruum_core::size::human_bytes(plan.bytes())
+            crate::i18n::messages::copied_agent_prompt(
+                count,
+                &bytes,
+                self.locale,
             ),
             Status::Success,
         ));
@@ -3992,11 +4091,9 @@ impl Ruum {
         };
         // GPUI's reveal cannot report failure, so check what it can't.
         if std::fs::symlink_metadata(&path).is_err() {
+            let disp = crate::marks::display_path(&path, self.home.as_deref());
             self.notice = Some((
-                format!(
-                    "{} is no longer on disk",
-                    crate::marks::display_path(&path, self.home.as_deref())
-                ),
+                crate::i18n::messages::no_longer_on_disk(&disp, self.locale),
                 Status::Warning,
             ));
             cx.notify();
@@ -4119,7 +4216,10 @@ impl Ruum {
                 {
                     run.cancel();
                     self.notice = Some((
-                        "stopping after the current item".into(),
+                        crate::i18n::messages::stopping_after_current(
+                            self.locale,
+                        )
+                        .into(),
                         Status::Warning,
                     ));
                     cx.notify();
@@ -4196,8 +4296,10 @@ impl Ruum {
             "c" if !control => {
                 if self.marks.is_empty() {
                     self.notice = Some((
-                        "mark something first: space marks the selected tile"
-                            .into(),
+                        crate::i18n::messages::mark_something_first(
+                            self.locale,
+                        )
+                        .into(),
                         Status::Warning,
                     ));
                 } else {
@@ -4590,7 +4692,10 @@ impl Ruum {
                 Err(error) => {
                     this.restarting = false;
                     this.notice = Some((
-                        format!("still not an administrator: {error}"),
+                        crate::i18n::messages::still_not_admin(
+                            &error.to_string(),
+                            this.locale,
+                        ),
                         Status::Warning,
                     ));
                     cx.notify();
@@ -4702,12 +4807,15 @@ impl Render for Ruum {
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
         let title = if self.awaiting_root {
-            "ruum · Choose a source".into()
+            crate::i18n::messages::title_choose_source(self.locale).into()
         } else {
             format!(
                 "ruum{} · {}",
                 self.remote.as_ref().map_or_else(String::new, |host| {
-                    format!(" · {host} · read-only")
+                    crate::i18n::messages::title_remote_suffix(
+                        host,
+                        self.locale,
+                    )
                 }),
                 crate::marks::display_path(
                     &self.current_path(),

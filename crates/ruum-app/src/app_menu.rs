@@ -5,6 +5,7 @@
 //! draws no menu bar on Linux or Windows, so there the same actions get the
 //! shortcuts their users expect, with ctrl, and nothing else.
 
+use crate::i18n::{Locale, common};
 use gpui_kit::{App, Global, KeyBinding, Menu, MenuItem, SystemMenuType};
 
 pub use menu_actions::*;
@@ -113,8 +114,8 @@ pub fn should_quit_on_all_windows_closed(cx: &App) -> bool {
         .is_none_or(|lifecycle| lifecycle.should_quit_when_empty())
 }
 
-/// Install the menus, the shortcuts and the tray-aware quit-on-close rule.
-pub fn install(cx: &mut App) {
+/// Install the menus, shortcuts and tray-aware quit-on-close rule for `locale`.
+pub fn install_for(locale: Locale, cx: &mut App) {
     if cx.try_global::<AppLifecycle>().is_none() {
         cx.set_global(AppLifecycle::default());
     }
@@ -166,39 +167,52 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-]", GoForward, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
-    cx.set_menus([
+    cx.set_menus(build_menus(locale));
+}
+
+fn build_menus(locale: Locale) -> [Menu; 4] {
+    [
         Menu::new("ruum").items([
-            MenuItem::action("Settings\u{2026}", OpenSettings),
+            MenuItem::action(common::menu_settings(locale), OpenSettings),
             MenuItem::separator(),
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::os_submenu(
+                common::menu_services(locale),
+                SystemMenuType::Services,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Hide ruum", Hide),
-            MenuItem::action("Hide Others", HideOthers),
-            MenuItem::action("Show All", ShowAll),
+            MenuItem::action(common::menu_hide_app(locale), Hide),
+            MenuItem::action(common::menu_hide_others(locale), HideOthers),
+            MenuItem::action(common::menu_show_all(locale), ShowAll),
             MenuItem::separator(),
-            MenuItem::action("Quit ruum", Quit),
+            MenuItem::action(common::menu_quit_app(locale), Quit),
         ]),
-        Menu::new("File").items([
-            MenuItem::action("Open Folder\u{2026}", OpenFolder),
-            MenuItem::action("Show in Finder", ShowInFinder),
+        Menu::new(common::menu_file(locale)).items([
+            MenuItem::action(common::menu_open_folder(locale), OpenFolder),
+            MenuItem::action(common::menu_show_in_finder(locale), ShowInFinder),
             MenuItem::separator(),
-            MenuItem::action("Rescan", Rescan),
+            MenuItem::action(common::menu_rescan(locale), Rescan),
             MenuItem::separator(),
-            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::action(common::menu_close_window(locale), CloseWindow),
         ]),
-        Menu::new("View").items([
-            MenuItem::action("Explore", OpenExplore),
-            MenuItem::action("Sources & Drives", OpenSources),
-            MenuItem::action("Watchdog", OpenWatchdog),
-            MenuItem::action("Settings\u{2026}", OpenSettings),
+        Menu::new(common::menu_view(locale)).items([
+            MenuItem::action(common::menu_explore(locale), OpenExplore),
+            MenuItem::action(
+                common::menu_sources_and_drives(locale),
+                OpenSources,
+            ),
+            MenuItem::action(common::menu_watchdog(locale), OpenWatchdog),
+            MenuItem::action(common::menu_settings(locale), OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Show Main Window", ShowMainWindow),
+            MenuItem::action(
+                common::menu_show_main_window(locale),
+                ShowMainWindow,
+            ),
         ]),
-        Menu::new("Go").items([
-            MenuItem::action("Back", GoBack),
-            MenuItem::action("Forward", GoForward),
+        Menu::new(common::menu_go(locale)).items([
+            MenuItem::action(common::menu_back(locale), GoBack),
+            MenuItem::action(common::menu_forward(locale), GoForward),
         ]),
-    ]);
+    ]
 }
 
 #[cfg(test)]
@@ -251,6 +265,38 @@ mod tests {
 
             set_confirm_only(cx, false);
             assert!(!should_quit_on_all_windows_closed(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "gpui_kit::test passes &mut TestAppContext"
+    )]
+    fn install_for_all_locales_populates_localized_menus(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+                install_for(locale, cx);
+                let menus = build_menus(locale);
+                assert_eq!(menus.len(), 4);
+                assert!(!common::menu_file(locale).is_empty());
+                assert!(!common::menu_view(locale).is_empty());
+                assert!(!common::menu_go(locale).is_empty());
+            }
+            assert_ne!(
+                common::menu_file(Locale::Zh),
+                common::menu_file(Locale::En)
+            );
+            assert_ne!(
+                common::menu_file(Locale::Ja),
+                common::menu_file(Locale::En)
+            );
+            assert_ne!(
+                common::menu_file(Locale::Ko),
+                common::menu_file(Locale::En)
+            );
         });
     }
 }

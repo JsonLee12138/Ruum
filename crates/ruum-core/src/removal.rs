@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use crate::i18n::Locale;
+
 /// One path the user asked to remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -46,16 +48,42 @@ pub enum RemovalMode {
 
 impl RemovalMode {
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::Permanent => "Delete permanently",
-            Self::Trash => "Move to trash",
+        self.label_in(Locale::En)
+    }
+
+    /// Localized action label for this removal mode.
+    #[must_use]
+    pub const fn label_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::Permanent, Locale::En) => "Delete permanently",
+            (Self::Permanent, Locale::Zh) => "永久删除",
+            (Self::Permanent, Locale::Ja) => "完全に削除",
+            (Self::Permanent, Locale::Ko) => "영구 삭제",
+            (Self::Trash, Locale::En) => "Move to trash",
+            (Self::Trash, Locale::Zh) => "移至废纸篓",
+            (Self::Trash, Locale::Ja) => "ゴミ箱へ移動",
+            (Self::Trash, Locale::Ko) => "휴지통으로 이동",
         }
     }
 
     pub const fn detail(self) -> &'static str {
-        match self {
-            Self::Permanent => "rm -rf: unrecoverable",
-            Self::Trash => "recoverable until the trash is emptied",
+        self.detail_in(Locale::En)
+    }
+
+    /// Localized explanation of this removal mode's behaviour.
+    #[must_use]
+    pub const fn detail_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::Permanent, Locale::En) => "rm -rf: unrecoverable",
+            (Self::Permanent, Locale::Zh) => "直接从磁盘抹除：不可恢复",
+            (Self::Permanent, Locale::Ja) => "完全削除：復元できません",
+            (Self::Permanent, Locale::Ko) => "즉시 삭제: 복구할 수 없음",
+            (Self::Trash, Locale::En) => {
+                "recoverable until the trash is emptied"
+            }
+            (Self::Trash, Locale::Zh) => "在清空废纸篓前可恢复",
+            (Self::Trash, Locale::Ja) => "ゴミ箱を空にするまで復元可能",
+            (Self::Trash, Locale::Ko) => "휴지통을 비우기 전까지 복구 가능",
         }
     }
 }
@@ -887,29 +915,98 @@ impl TrashBackend {
     }
 
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::MacOs => "the Trash",
-            Self::TrashPut => "trash-put",
-            Self::Gio => "gio trash",
-            Self::XdgHome => "XDG trash",
-            Self::RecycleBin => "the Recycle Bin",
-            Self::Unavailable => "no trash tool found",
+        self.label_in(Locale::En)
+    }
+
+    /// Localized display name for this trash backend.
+    #[must_use]
+    pub const fn label_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::MacOs, Locale::En) => "the Trash",
+            (Self::MacOs, Locale::Zh) => "废纸篓",
+            (Self::MacOs, Locale::Ja) => "ゴミ箱",
+            (Self::MacOs | Self::RecycleBin, Locale::Ko) => "휴지통",
+            (Self::TrashPut, _) => "trash-put",
+            (Self::Gio, _) => "gio trash",
+            (Self::XdgHome, Locale::En) => "XDG trash",
+            (Self::XdgHome, Locale::Zh) => "XDG 回收站",
+            (Self::XdgHome, Locale::Ja) => "XDG ゴミ箱",
+            (Self::XdgHome, Locale::Ko) => "XDG 휴지통",
+            (Self::RecycleBin, Locale::En) => "the Recycle Bin",
+            (Self::RecycleBin, Locale::Zh) => "回收站",
+            (Self::RecycleBin, Locale::Ja) => "ごみ箱",
+            (Self::Unavailable, Locale::En) => "no trash tool found",
+            (Self::Unavailable, Locale::Zh) => "未找到回收站工具",
+            (Self::Unavailable, Locale::Ja) => "ゴミ箱ツールが見つかりません",
+            (Self::Unavailable, Locale::Ko) => "휴지통 도구를 찾을 수 없음",
         }
     }
 
     pub const fn detail(self) -> &'static str {
-        match self {
-            Self::MacOs => "the same Trash as Finder, on the item's own disk",
-            Self::TrashPut => {
+        self.detail_in(Locale::En)
+    }
+
+    /// Localized explanation for this trash backend.
+    #[must_use]
+    pub const fn detail_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::MacOs, Locale::En) => {
+                "the same Trash as Finder, on the item's own disk"
+            }
+            (Self::MacOs, Locale::Zh) => "与访达共用，移至项目所在磁盘的废纸篓",
+            (Self::MacOs, Locale::Ja) => {
+                "Finder と同じ各ボリュームのゴミ箱へ移動"
+            }
+            (Self::MacOs, Locale::Ko) => {
+                "Finder와 동일한 해당 볼륨의 휴지통으로 이동"
+            }
+            (Self::TrashPut, Locale::En) => {
                 "uses trash-cli, the same trash as your file manager"
             }
-            Self::Gio => "uses GLib, the same trash as your file manager",
-            Self::XdgHome => {
+            (Self::TrashPut, Locale::Zh) => {
+                "使用 trash-cli，与文件管理器共用回收站"
+            }
+            (Self::TrashPut, Locale::Ja) => {
+                "trash-cli を使用（ファイルマネージャと同じゴミ箱）"
+            }
+            (Self::TrashPut, Locale::Ko) => {
+                "trash-cli 사용(파일 관리자와 동일한 휴지통)"
+            }
+            (Self::Gio, Locale::En) => {
+                "uses GLib, the same trash as your file manager"
+            }
+            (Self::Gio, Locale::Zh) => "使用 GLib，与文件管理器共用回收站",
+            (Self::Gio, Locale::Ja) => {
+                "GLib を使用（ファイルマネージャと同じゴミ箱）"
+            }
+            (Self::Gio, Locale::Ko) => "GLib 사용(파일 관리자와 동일한 휴지통)",
+            (Self::XdgHome, Locale::En) => {
                 "moves into ~/.local/share/Trash on the same volume"
             }
-            Self::RecycleBin => "the same Recycle Bin as File Explorer",
-            Self::Unavailable => {
+            (Self::XdgHome, Locale::Zh) => "移至同卷下的 ~/.local/share/Trash",
+            (Self::XdgHome, Locale::Ja) => {
+                "同一ボリュームの ~/.local/share/Trash へ移動"
+            }
+            (Self::XdgHome, Locale::Ko) => {
+                "동일 볼륨의 ~/.local/share/Trash로 이동"
+            }
+            (Self::RecycleBin, Locale::En) => {
+                "the same Recycle Bin as File Explorer"
+            }
+            (Self::RecycleBin, Locale::Zh) => "与文件资源管理器共用回收站",
+            (Self::RecycleBin, Locale::Ja) => "エクスプローラーと同じごみ箱",
+            (Self::RecycleBin, Locale::Ko) => "파일 탐색기와 동일한 휴지통",
+            (Self::Unavailable, Locale::En) => {
                 "install trash-cli or keep deleting permanently"
+            }
+            (Self::Unavailable, Locale::Zh) => {
+                "请安装 trash-cli 或继续使用永久删除"
+            }
+            (Self::Unavailable, Locale::Ja) => {
+                "trash-cli をインストールするか完全削除を使用"
+            }
+            (Self::Unavailable, Locale::Ko) => {
+                "trash-cli를 설치하거나 영구 삭제를 사용하세요"
             }
         }
     }

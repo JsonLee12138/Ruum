@@ -18,8 +18,8 @@ use crate::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmItem,
     CleanupConfirmRequest,
 };
+use crate::i18n::{self, Locale};
 use crate::removal::{RemovalEvent, RemovalMode, Target};
-use crate::size::human_bytes;
 use crate::watchdog_config::{
     CleanupProposal, ProposalItem, WatchdogConfig, WatchdogState, load_config,
     load_state, save_state,
@@ -480,6 +480,34 @@ pub fn run_once(
     confirm_adapter: &dyn CleanupConfirmAdapter,
     notifier: &dyn NotificationAdapter,
 ) -> io::Result<WatchdogRunOutcome> {
+    run_once_in(
+        config_path,
+        state_path,
+        home_dir,
+        current_exe,
+        now_secs,
+        cmd_runner,
+        confirm_adapter,
+        notifier,
+        Locale::current(),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "run_once_in isolates locale injection for deterministic tests"
+)]
+fn run_once_in(
+    config_path: &Path,
+    state_path: &Path,
+    home_dir: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    cmd_runner: &dyn CommandRunner,
+    confirm_adapter: &dyn CleanupConfirmAdapter,
+    notifier: &dyn NotificationAdapter,
+    locale: Locale,
+) -> io::Result<WatchdogRunOutcome> {
     let config = load_config(config_path)?;
     let mut state = load_state(state_path)?;
 
@@ -502,14 +530,10 @@ pub fn run_once(
     };
 
     // 1. Notify user of low disk space
-    let avail_gb = available_bytes / (1024 * 1024 * 1024);
-    let thresh_gb = threshold_bytes / (1024 * 1024 * 1024);
+    let min_gb = threshold_bytes / (1024 * 1024 * 1024);
     let _ = notifier.notify(
-        "Low Disk Space",
-        &format!(
-            "Only {avail_gb} GB remaining (threshold: {thresh_gb} GB). \
-             Analyzing reclaimable files..."
-        ),
+        i18n::low_disk_space_title(locale),
+        &i18n::low_disk_space_body(available_bytes, min_gb, locale),
     );
 
     // 2. Invoke AI CLI for analysis if enabled
@@ -555,7 +579,7 @@ pub fn run_once(
 
         let request = CleanupConfirmRequest {
             root: home_dir.to_path_buf(),
-            title: "Ruum Watchdog: Recommended Cleanup".to_string(),
+            title: i18n::recommended_cleanup_title(locale).to_string(),
             summary: Some(prop.summary.clone()),
             items: confirm_items,
         };
@@ -580,10 +604,11 @@ pub fn run_once(
 
                 if removed_items > 0 {
                     let _ = notifier.notify(
-                        "Cleanup Complete",
-                        &format!(
-                            "Cleaned up {removed_items} items ({})",
-                            human_bytes(reclaimed_bytes)
+                        i18n::cleanup_complete_title(locale),
+                        &i18n::cleanup_complete_body(
+                            removed_items,
+                            reclaimed_bytes,
+                            locale,
                         ),
                     );
                 }
@@ -920,10 +945,11 @@ mod tests {
         assert!(outcome.proposal.is_some());
 
         // Notifications sent: warning and completion
+        let locale = Locale::current();
         let notes = notifier.notifications.lock().unwrap().clone();
         assert_eq!(notes.len(), 2);
-        assert_eq!(notes[0].0, "Low Disk Space");
-        assert_eq!(notes[1].0, "Cleanup Complete");
+        assert_eq!(notes[0].0, i18n::low_disk_space_title(locale));
+        assert_eq!(notes[1].0, i18n::cleanup_complete_title(locale));
 
         // State updated
         let reloaded_state = load_state(&state_path).unwrap();
@@ -992,9 +1018,85 @@ mod tests {
         assert!(target_file.exists());
 
         // Only initial warning notification, no completion notification
+        let locale = Locale::current();
         let notes = notifier.notifications.lock().unwrap().clone();
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].0, "Low Disk Space");
+        assert_eq!(notes[0].0, i18n::low_disk_space_title(locale));
+    }
+
+    #[test]
+    fn run_once_in_localizes_notifications_and_confirm_title() {
+        #[derive(Debug, Default)]
+        struct CapturingConfirm {
+            title: Mutex<Option<String>>,
+        }
+        impl CleanupConfirmAdapter for CapturingConfirm {
+            fn confirm(
+                &self,
+                request: &CleanupConfirmRequest,
+            ) -> io::Result<CleanupConfirmDecision> {
+                *self.title.lock().unwrap() = Some(request.title.clone());
+                Ok(CleanupConfirmDecision::Cancelled)
+            }
+        }
+
+        for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let cfg_path = home.join("watchdog.json");
+            let state_path = home.join("watchdog-state.json");
+            let target_file = home.join("cache.bin");
+            fs::write(&target_file, b"abcd").unwrap();
+
+            let fake_ai_json = format!(
+                r#"{{
+                  "summary": "Test summary",
+                  "items": [
+                    {{
+                      "path": "{}",
+                      "mode": "trash",
+                      "reason": "Test item"
+                    }}
+                  ]
+                }}"#,
+                target_file.display()
+            );
+
+            let fake_exe = home.join("ruum");
+            fs::write(&fake_exe, b"").unwrap();
+            let cfg = WatchdogConfig {
+                enabled: true,
+                min_free_gb: 1_000_000,
+                ai_auto_analyze: true,
+                ai_provider: crate::watchdog_config::AiCliProvider::Custom,
+                custom_command: fake_exe.to_string_lossy().to_string(),
+                ..WatchdogConfig::default()
+            };
+            crate::watchdog_config::save_config(&cfg_path, &cfg).unwrap();
+
+            let notifier = MockNotification::default();
+            let confirm = CapturingConfirm::default();
+            run_once_in(
+                &cfg_path,
+                &state_path,
+                home,
+                &fake_exe,
+                1_700_000_000,
+                &AiMock(fake_ai_json),
+                &confirm,
+                &notifier,
+                locale,
+            )
+            .unwrap();
+
+            let notes = notifier.notifications.lock().unwrap().clone();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].0, i18n::low_disk_space_title(locale));
+            assert_eq!(
+                confirm.title.lock().unwrap().as_deref(),
+                Some(i18n::recommended_cleanup_title(locale))
+            );
+        }
     }
 
     #[test]

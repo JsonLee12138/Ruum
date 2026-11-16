@@ -15,6 +15,7 @@ use std::borrow::Cow;
 
 use rayon::prelude::*;
 
+use crate::i18n::Locale;
 use crate::tree::Node;
 
 /// A kind of data, for colour.
@@ -55,16 +56,46 @@ impl Category {
     ];
 
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::Code => "Code",
-            Self::AgentScratch => "Agent scratch",
-            Self::Toolchain => "Toolchains",
-            Self::Synced => "Synced",
-            Self::Git => "Git",
-            Self::Media => "Media",
-            Self::Documents => "Documents",
-            Self::Cache => "Cache",
-            Self::Other => "Other",
+        self.label_in(Locale::En)
+    }
+
+    /// Localized display label for this category.
+    #[must_use]
+    pub const fn label_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::Code, Locale::En) => "Code",
+            (Self::Code, Locale::Zh) => "代码",
+            (Self::Code, Locale::Ja) => "コード",
+            (Self::Code, Locale::Ko) => "코드",
+            (Self::AgentScratch, Locale::En) => "Agent scratch",
+            (Self::AgentScratch, Locale::Zh) => "Agent 临时区",
+            (Self::AgentScratch, Locale::Ja) => "エージェント作業",
+            (Self::AgentScratch, Locale::Ko) => "에이전트 작업",
+            (Self::Toolchain, Locale::En) => "Toolchains",
+            (Self::Toolchain, Locale::Zh) => "工具链",
+            (Self::Toolchain, Locale::Ja) => "ツールチェーン",
+            (Self::Toolchain, Locale::Ko) => "툴체인",
+            (Self::Synced, Locale::En) => "Synced",
+            (Self::Synced, Locale::Zh) => "同步盘",
+            (Self::Synced, Locale::Ja) => "同期",
+            (Self::Synced, Locale::Ko) => "동기화",
+            (Self::Git, _) => "Git",
+            (Self::Media, Locale::En) => "Media",
+            (Self::Media, Locale::Zh) => "媒体",
+            (Self::Media, Locale::Ja) => "メディア",
+            (Self::Media, Locale::Ko) => "미디어",
+            (Self::Documents, Locale::En) => "Documents",
+            (Self::Documents, Locale::Zh) => "文档",
+            (Self::Documents, Locale::Ja) => "書類",
+            (Self::Documents, Locale::Ko) => "문서",
+            (Self::Cache, Locale::En) => "Cache",
+            (Self::Cache, Locale::Zh) => "缓存",
+            (Self::Cache, Locale::Ja) => "キャッシュ",
+            (Self::Cache, Locale::Ko) => "캐시",
+            (Self::Other, Locale::En) => "Other",
+            (Self::Other, Locale::Zh) => "其他",
+            (Self::Other, Locale::Ja) => "その他",
+            (Self::Other, Locale::Ko) => "기타",
         }
     }
 }
@@ -95,16 +126,49 @@ pub enum Reclaim {
 impl Reclaim {
     /// The reason, as the "Worth a look" list says it.
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::Regenerable => "regenerable",
-            Self::SyncHistory => "sync history",
-            Self::PackageStore => "package store",
-            Self::BuildOutput => "build output",
-            Self::Reinstallable => "reinstallable",
-            Self::SandboxLayers => "sandbox layers",
-            Self::Snapshots => "snapshots",
-            Self::Trash => "trash",
-            Self::Temporary => "temporary",
+        self.label_in(Locale::En)
+    }
+
+    /// Localized reason for why this space can be reclaimed.
+    #[must_use]
+    pub const fn label_in(self, locale: Locale) -> &'static str {
+        match (self, locale) {
+            (Self::Regenerable, Locale::En) => "regenerable",
+            (Self::Regenerable, Locale::Zh) => "可重建",
+            (Self::Regenerable, Locale::Ja) => "再生成可能",
+            (Self::Regenerable, Locale::Ko) => "재생성 가능",
+            (Self::SyncHistory, Locale::En) => "sync history",
+            (Self::SyncHistory, Locale::Zh) => "同步历史",
+            (Self::SyncHistory, Locale::Ja) => "同期履歴",
+            (Self::SyncHistory, Locale::Ko) => "동기화 기록",
+            (Self::PackageStore, Locale::En) => "package store",
+            (Self::PackageStore, Locale::Zh) => "包缓存",
+            (Self::PackageStore, Locale::Ja) => "パッケージストア",
+            (Self::PackageStore, Locale::Ko) => "패키지 저장소",
+            (Self::BuildOutput, Locale::En) => "build output",
+            (Self::BuildOutput, Locale::Zh) => "构建产物",
+            (Self::BuildOutput, Locale::Ja) => "ビルド出力",
+            (Self::BuildOutput, Locale::Ko) => "빌드 출력",
+            (Self::Reinstallable, Locale::En) => "reinstallable",
+            (Self::Reinstallable, Locale::Zh) => "可重装依赖",
+            (Self::Reinstallable, Locale::Ja) => "再インストール可",
+            (Self::Reinstallable, Locale::Ko) => "재설치 가능",
+            (Self::SandboxLayers, Locale::En) => "sandbox layers",
+            (Self::SandboxLayers, Locale::Zh) => "沙箱镜像层",
+            (Self::SandboxLayers, Locale::Ja) => "サンドボックス層",
+            (Self::SandboxLayers, Locale::Ko) => "샌드박스 레이어",
+            (Self::Snapshots, Locale::En) => "snapshots",
+            (Self::Snapshots, Locale::Zh) => "快照",
+            (Self::Snapshots, Locale::Ja) => "スナップショット",
+            (Self::Snapshots, Locale::Ko) => "스냅샷",
+            (Self::Trash, Locale::En) => "trash",
+            (Self::Trash, Locale::Zh) => "废纸篓",
+            (Self::Trash, Locale::Ja) => "ゴミ箱",
+            (Self::Trash, Locale::Ko) => "휴지통",
+            (Self::Temporary, Locale::En) => "temporary",
+            (Self::Temporary, Locale::Zh) => "临时文件",
+            (Self::Temporary, Locale::Ja) => "一時ファイル",
+            (Self::Temporary, Locale::Ko) => "임시 파일",
         }
     }
 }

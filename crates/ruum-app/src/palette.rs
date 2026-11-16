@@ -13,6 +13,7 @@
 //! Lightness, saturation and the surface every fill is pulled toward come
 //! from the active Omarchy theme, so the mosaic sits inside it, light or dark.
 
+use crate::i18n::{Locale, common};
 use gpui_kit::base::ThemeAppearance;
 use gpui_kit::{Hsla, Rgba};
 use gpui_omarchy::Theme;
@@ -79,6 +80,12 @@ pub fn age_bucket(days: i64) -> usize {
         .iter()
         .position(|(limit, _)| days <= *limit)
         .unwrap_or(AGE_BUCKETS.len() - 1)
+}
+
+/// Localized label for the `AGE_BUCKETS` entry at `index`.
+#[must_use]
+pub const fn age_bucket_label(index: usize, locale: Locale) -> &'static str {
+    common::age_bucket_label(index, locale)
 }
 
 /// The fill for age mode: recent writes carry the theme accent, and colour
@@ -240,6 +247,18 @@ mod tests {
         assert_eq!(age_bucket(5000), 4);
         let theme = theme(ThemeAppearance::Dark);
         assert!(age_fill(&theme, 0, 0).s > age_fill(&theme, 4, 0).s);
+    }
+
+    #[test]
+    fn age_bucket_labels_cover_every_bucket_in_all_locales() {
+        for (idx, (_, expected_en)) in AGE_BUCKETS.iter().enumerate() {
+            assert_eq!(age_bucket_label(idx, Locale::En), *expected_en);
+            for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+                let label = age_bucket_label(idx, locale);
+                assert!(!label.is_empty());
+                assert_ne!(label, *expected_en);
+            }
+        }
     }
 
     #[test]

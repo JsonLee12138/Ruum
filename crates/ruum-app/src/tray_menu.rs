@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 
+use crate::i18n::{Locale, common};
 use anyhow::Context as _;
-use ruum_core::size::human_bytes;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 #[cfg(target_os = "linux")]
@@ -66,6 +66,7 @@ pub enum TrayAction {
 /// Active OS tray icon and menu handles.
 pub struct TrayMenu {
     instance_id: u64,
+    locale: Locale,
     tray: TrayIcon,
     status_item: MenuItem,
     review_proposal_item: MenuItem,
@@ -94,39 +95,60 @@ impl Drop for TrayMenu {
 
 impl TrayMenu {
     /// Install the system tray icon and menu on the GUI main thread.
-    pub fn install() -> anyhow::Result<Self> {
-        let initial_status = format_status_label(None, false);
+    pub fn install(locale: Locale) -> anyhow::Result<Self> {
+        let initial_status = format_status_label(None, false, locale);
         let status_item =
             MenuItem::with_id(ID_STATUS, initial_status, false, None);
-        let open_item =
-            MenuItem::with_id(ID_OPEN_RUUM, "Open Ruum", true, None);
+        let open_item = MenuItem::with_id(
+            ID_OPEN_RUUM,
+            common::tray_open_ruum(locale),
+            true,
+            None,
+        );
         // `muda` interprets a single `&` as a mnemonic marker on Windows/GTK
         // and strips it on macOS; `&&` renders a literal `&` everywhere.
         let sources_item = MenuItem::with_id(
             ID_OPEN_SOURCES,
-            "Sources && Drives\u{2026}",
+            common::tray_sources_and_drives(locale),
             true,
             None,
         );
-        let watchdog_item =
-            MenuItem::with_id(ID_OPEN_WATCHDOG, "Watchdog", true, None);
-        let settings_item =
-            MenuItem::with_id(ID_OPEN_SETTINGS, "Settings\u{2026}", true, None);
+        let watchdog_item = MenuItem::with_id(
+            ID_OPEN_WATCHDOG,
+            common::tray_watchdog(locale),
+            true,
+            None,
+        );
+        let settings_item = MenuItem::with_id(
+            ID_OPEN_SETTINGS,
+            common::tray_settings(locale),
+            true,
+            None,
+        );
         let check_disk_item = MenuItem::with_id(
             ID_CHECK_DISK,
-            "Check Disk Space Now",
+            common::tray_check_disk_space(locale),
             true,
             None,
         );
-        let run_ai_item =
-            MenuItem::with_id(ID_RUN_AI, "Run AI Analysis Now", true, None);
+        let run_ai_item = MenuItem::with_id(
+            ID_RUN_AI,
+            common::tray_run_ai_analysis(locale),
+            true,
+            None,
+        );
         let review_proposal_item = MenuItem::with_id(
             ID_REVIEW_PROPOSAL,
-            "Review Latest Proposal\u{2026}",
+            common::tray_review_latest_proposal(locale),
             false,
             None,
         );
-        let quit_item = MenuItem::with_id(ID_QUIT, "Quit Ruum", true, None);
+        let quit_item = MenuItem::with_id(
+            ID_QUIT,
+            common::tray_quit_ruum(locale),
+            true,
+            None,
+        );
 
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
@@ -165,6 +187,7 @@ impl TrayMenu {
 
         Ok(Self {
             instance_id,
+            locale,
             tray,
             status_item,
             review_proposal_item,
@@ -179,7 +202,8 @@ impl TrayMenu {
         watchdog_enabled: bool,
         has_proposal: bool,
     ) {
-        let label = format_status_label(free_bytes, watchdog_enabled);
+        let label =
+            format_status_label(free_bytes, watchdog_enabled, self.locale);
         self.status_item.set_text(&label);
         self.review_proposal_item.set_enabled(has_proposal);
         let _ = self
@@ -281,14 +305,9 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
 pub fn format_status_label(
     free_bytes: Option<u64>,
     watchdog_enabled: bool,
+    locale: Locale,
 ) -> String {
-    let free = free_bytes.map_or_else(|| "\u{2014}".to_owned(), human_bytes);
-    let watchdog = if watchdog_enabled {
-        "Watchdog On"
-    } else {
-        "Watchdog Off"
-    };
-    format!("Free: {free} \u{00b7} {watchdog}")
+    common::tray_status_label(free_bytes, watchdog_enabled, locale)
 }
 
 fn build_treemap_icon(size: u32) -> anyhow::Result<Icon> {
@@ -377,13 +396,22 @@ mod tests {
     #[test]
     fn status_label_formats_free_space_and_watchdog_state() {
         assert_eq!(
-            format_status_label(None, false),
+            format_status_label(None, false, Locale::En),
             "Free: \u{2014} \u{00b7} Watchdog Off"
         );
         assert_eq!(
-            format_status_label(Some(1024 * 1024 * 1024), true),
+            format_status_label(Some(1024 * 1024 * 1024), true, Locale::En),
             "Free: 1.0 GiB \u{00b7} Watchdog On"
         );
+        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            let off = format_status_label(None, false, locale);
+            let on =
+                format_status_label(Some(1024 * 1024 * 1024), true, locale);
+            assert!(off.contains('\u{2014}'));
+            assert!(on.contains("1.0 GiB"));
+            assert_ne!(off, on);
+            assert_ne!(off, format_status_label(None, false, Locale::En));
+        }
     }
 
     #[test]

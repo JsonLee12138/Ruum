@@ -388,9 +388,6 @@ jobs:
               }
             }
 
-            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-            if ($cmd) { & $addCandidate $cmd.Source }
-
             foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, ${env:ProgramFiles(Arm)})) {
               if (-not [string]::IsNullOrWhiteSpace($base)) {
                 & $addCandidate (Join-Path $base "Inno Setup 6\ISCC.exe")
@@ -428,69 +425,164 @@ jobs:
               }
             }
 
+            # Last-resort fallback: Chocolatey's bin\ISCC.exe shim reports 0.0.0.0.
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { & $addCandidate $cmd.Source }
+
             return $candidates.ToArray()
+          }
+
+          function ConvertTo-InnoVersion([string]$raw) {
+            if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+            $norm = $raw -replace '\s*,\s*', '.'
+            $best = $null
+            foreach ($m in [regex]::Matches($norm, '\b(\d+\.\d+(?:\.\d+){0,2})\b')) {
+              $v = $null
+              if ([Version]::TryParse($m.Groups[1].Value, [ref]$v) -and $v.Major -gt 0) {
+                if (-not $best -or ($v -gt $best)) { $best = $v }
+              }
+            }
+            return $best
+          }
+
+          function Get-InnoHelpText([string]$exePath) {
+            $prevPref = $ErrorActionPreference
+            $out = ""
+            try {
+              $ErrorActionPreference = "Continue"
+              $out = (& $exePath /? 2>&1 | Out-String)
+              if ($null -eq $out) { $out = "" }
+            } catch {
+              $out = ""
+            } finally {
+              $ErrorActionPreference = $prevPref
+              $global:LASTEXITCODE = 0
+            }
+            return $out
+          }
+
+          function Resolve-InnoVersion([string]$path) {
+            if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              return $null
+            }
+            $dir = Split-Path -Parent $path
+            $bestVer = $null
+
+            $peFiles = @($path)
+            if (-not [string]::IsNullOrWhiteSpace($dir)) {
+              $peFiles += @(
+                (Join-Path $dir "ISCmplr.dll"),
+                (Join-Path $dir "Compil32.exe"),
+                (Join-Path $dir "ISPP.dll")
+              )
+            }
+            foreach ($peFile in $peFiles) {
+              if (-not (Test-Path -LiteralPath $peFile -PathType Leaf)) { continue }
+              $item = Get-Item -LiteralPath $peFile -ErrorAction SilentlyContinue
+              if (-not $item -or -not $item.VersionInfo) { continue }
+              $vi = $item.VersionInfo
+              $peVers = @()
+              if ([int]$vi.FileMajorPart -gt 0) {
+                $peVers += [Version]::new(
+                  [int]$vi.FileMajorPart,
+                  [Math]::Max(0, [int]$vi.FileMinorPart),
+                  [Math]::Max(0, [int]$vi.FileBuildPart)
+                )
+              }
+              if ([int]$vi.ProductMajorPart -gt 0) {
+                $peVers += [Version]::new(
+                  [int]$vi.ProductMajorPart,
+                  [Math]::Max(0, [int]$vi.ProductMinorPart),
+                  [Math]::Max(0, [int]$vi.ProductBuildPart)
+                )
+              }
+              $peVers += ConvertTo-InnoVersion ([string]$vi.ProductVersion)
+              $peVers += ConvertTo-InnoVersion ([string]$vi.FileVersion)
+              foreach ($v in $peVers) {
+                if ($v -and $v.Major -gt 0) {
+                  if (-not $bestVer -or ($v -gt $bestVer)) { $bestVer = $v }
+                  if ($v -ge [Version]"6.3") { return $v }
+                }
+              }
+            }
+
+            $helpText = $null
+            $regPaths = @(
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            )
+            foreach ($regPath in $regPaths) {
+              $parentKey = Split-Path $regPath
+              if (-not (Test-Path -LiteralPath $parentKey)) { continue }
+              $items = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like "Inno Setup*" }
+              foreach ($item in $items) {
+                $regVers = @(
+                  (ConvertTo-InnoVersion ([string]$item.DisplayVersion)),
+                  (ConvertTo-InnoVersion ([string]$item.DisplayName))
+                )
+                foreach ($v in $regVers) {
+                  if ($v -and $v.Major -gt 0) {
+                    $matchesCandidate = ($path -notlike "*\Chocolatey\bin\*")
+                    if (-not $matchesCandidate) {
+                      if ($null -eq $helpText) { $helpText = Get-InnoHelpText $path }
+                      $matchesCandidate = ($helpText -match 'Inno Setup')
+                    }
+                    if ($matchesCandidate) {
+                      if (-not $bestVer -or ($v -gt $bestVer)) { $bestVer = $v }
+                      if ($v -ge [Version]"6.3") { return $v }
+                    }
+                  }
+                }
+              }
+            }
+
+            if ($null -eq $helpText) { $helpText = Get-InnoHelpText $path }
+            $helpVer = ConvertTo-InnoVersion $helpText
+            if ($helpVer) {
+              if (-not $bestVer -or ($helpVer -gt $bestVer)) { $bestVer = $helpVer }
+              if ($helpVer -ge [Version]"6.3") { return $helpVer }
+            }
+
+            if (($helpText -match 'Inno Setup') -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+              $prevPref = $ErrorActionPreference
+              $chocoOut = ""
+              $chocoOk = $false
+              try {
+                $ErrorActionPreference = "Continue"
+                $global:LASTEXITCODE = 0
+                $chocoOut = (& choco list innosetup --exact --limit-output 2>&1 | Out-String)
+                $chocoOk = ($LASTEXITCODE -eq 0)
+              } catch {
+                $chocoOut = ""
+                $chocoOk = $false
+              } finally {
+                $ErrorActionPreference = $prevPref
+                $global:LASTEXITCODE = 0
+              }
+              if ($chocoOk) {
+                $chocoVer = ConvertTo-InnoVersion $chocoOut
+                if ($chocoVer) {
+                  if (-not $bestVer -or ($chocoVer -gt $bestVer)) { $bestVer = $chocoVer }
+                  if ($chocoVer -ge [Version]"6.3") { return $chocoVer }
+                }
+              }
+            }
+
+            return $bestVer
           }
 
           function Test-InnoVersion([string]$path, [switch]$Quiet) {
             if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
               return $false
             }
-            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
-            if (-not $item) { return $false }
-
-            $firstVer = $null
-            $matchedVer = $null
-            $sources = @(
-              [string]$item.VersionInfo.ProductVersion,
-              [string]$item.VersionInfo.FileVersion
-            )
-            foreach ($raw in $sources) {
-              if (-not [string]::IsNullOrWhiteSpace($raw) -and ($raw -match '\b(\d+\.\d+(?:\.\d+)?)\b')) {
-                $candidateVer = $null
-                if ([Version]::TryParse($Matches[1], [ref]$candidateVer) -and $candidateVer -gt [Version]"0.0") {
-                  if (-not $firstVer) { $firstVer = $candidateVer }
-                  if ($candidateVer -ge [Version]"6.3") {
-                    $matchedVer = $candidateVer
-                    break
-                  }
-                }
-              }
-            }
-
-            if (-not $matchedVer) {
-              $prevPref = $ErrorActionPreference
-              try {
-                $ErrorActionPreference = "Continue"
-                $helpText = (& $path /? 2>&1 | Out-String)
-              } catch {
-                $helpText = ""
-              } finally {
-                $ErrorActionPreference = $prevPref
-                $global:LASTEXITCODE = 0
-              }
-              if (-not [string]::IsNullOrWhiteSpace($helpText) -and ($helpText -match '\b(\d+\.\d+(?:\.\d+)?)\b')) {
-                $candidateVer = $null
-                if ([Version]::TryParse($Matches[1], [ref]$candidateVer) -and $candidateVer -gt [Version]"0.0") {
-                  if (-not $firstVer) { $firstVer = $candidateVer }
-                  if ($candidateVer -ge [Version]"6.3") {
-                    $matchedVer = $candidateVer
-                  }
-                }
-              }
-            }
-
-            $reportedVer = if ($matchedVer) { $matchedVer } else { $firstVer }
-            if ($reportedVer) {
-              if (-not $Quiet) {
-                Write-Host "Found ISCC.exe at '$path' (version $reportedVer)"
-              }
-              return ($reportedVer -ge [Version]"6.3")
-            }
-
+            $ver = Resolve-InnoVersion $path
             if (-not $Quiet) {
-              Write-Host "Found ISCC.exe at '$path' (version unknown)"
+              $verLabel = if ($ver) { "version $ver" } else { "version unknown" }
+              Write-Host "Found ISCC.exe at '$path' ($verLabel)"
             }
-            return $false
+            return [bool]($ver -and ($ver -ge [Version]"6.3"))
           }
 
           function Find-InnoCompiler {

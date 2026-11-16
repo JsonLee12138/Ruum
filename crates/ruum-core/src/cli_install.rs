@@ -157,7 +157,7 @@ pub struct MacOsCliInstaller;
 
 impl MacOsCliInstaller {
     fn local_bin_in(env: &CliInstallEnv) -> Option<PathBuf> {
-        env.home.as_ref().map(|h| h.join(".local/bin"))
+        env.home.as_ref().map(|h| h.join(".local").join("bin"))
     }
 }
 
@@ -279,7 +279,7 @@ pub struct LinuxCliInstaller;
 
 impl LinuxCliInstaller {
     fn local_bin_in(env: &CliInstallEnv) -> Option<PathBuf> {
-        env.home.as_ref().map(|h| h.join(".local/bin"))
+        env.home.as_ref().map(|h| h.join(".local").join("bin"))
     }
 }
 
@@ -677,13 +677,52 @@ fn is_same_non_symlink_binary(target: &Path, current_exe: &Path) -> bool {
         && paths_match_file_or_lexical(target, current_exe)
 }
 
+fn split_unix_path_entries(path_var: &str) -> Vec<String> {
+    let parts: Vec<&str> = path_var.split(':').collect();
+    let mut entries = Vec::new();
+    let mut idx = 0;
+    while idx < parts.len() {
+        let cur = parts[idx].trim();
+        // Keep `C:\...` Windows drive prefixes intact in cross-OS tests.
+        if cur.len() == 1
+            && cur.as_bytes()[0].is_ascii_alphabetic()
+            && idx + 1 < parts.len()
+            && parts[idx + 1].starts_with('\\')
+        {
+            entries.push(format!("{cur}:{}", parts[idx + 1].trim_end()));
+            idx += 2;
+        } else {
+            if !cur.is_empty() {
+                entries.push(cur.to_string());
+            }
+            idx += 1;
+        }
+    }
+    entries
+}
+
 fn strip_trailing_slashes_unix(path: &Path) -> &str {
     let raw = path.to_str().unwrap_or_default();
     if raw == "/" {
         return "/";
     }
     let trimmed = raw.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
+    if trimmed.is_empty() {
+        return "/";
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+    {
+        let mut end = trimmed.len();
+        while end > 3 && bytes[end - 1] == b'\\' {
+            end -= 1;
+        }
+        return &trimmed[..end];
+    }
+    trimmed
 }
 
 fn dir_in_path_unix(path_var: Option<&str>, dir: &Path) -> bool {
@@ -692,16 +731,12 @@ fn dir_in_path_unix(path_var: Option<&str>, dir: &Path) -> bool {
     };
     let target_norm = strip_trailing_slashes_unix(dir);
     let target_canon = fs::canonicalize(dir).ok();
-    for entry in path_var.split(':') {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if strip_trailing_slashes_unix(Path::new(trimmed)) == target_norm {
+    for entry in split_unix_path_entries(path_var) {
+        if strip_trailing_slashes_unix(Path::new(&entry)) == target_norm {
             return true;
         }
         if let Some(ref tc) = target_canon
-            && fs::canonicalize(trimmed).ok().as_ref() == Some(tc)
+            && fs::canonicalize(&entry).ok().as_ref() == Some(tc)
         {
             return true;
         }
@@ -936,7 +971,7 @@ mod tests {
     fn macos_cli_installer_detects_local_bin_and_path_membership() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        let local_bin = home.join(".local/bin");
+        let local_bin = home.join(".local").join("bin");
         let usr_local_bin = temp.path().join("usr_local_bin");
         fs::create_dir_all(&local_bin).unwrap();
         fs::create_dir_all(&usr_local_bin).unwrap();
@@ -1091,8 +1126,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         fs::create_dir_all(&home).unwrap();
-        let local_bin = home.join(".local/bin");
-        let current_exe = temp.path().join("opt/ruum/ruum");
+        let local_bin = home.join(".local").join("bin");
+        let current_exe = temp.path().join("opt").join("ruum").join("ruum");
         fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
         fs::write(&current_exe, b"bin").unwrap();
 
@@ -1318,5 +1353,36 @@ mod tests {
         let r_err = ScriptedRunner::with_default(err_out(1, "access denied"));
         assert!(adapter.install(&r_err, &env, &current_exe).is_err());
         assert!(adapter.uninstall(&r_err, &env, &current_exe).is_err());
+    }
+
+    #[test]
+    fn dir_in_path_unix_preserves_windows_drive_prefix_entries() {
+        let win_dir = Path::new(
+            "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\home\\.local\\bin",
+        );
+        assert!(dir_in_path_unix(
+            Some(
+                "/usr/bin:C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\home\\\
+                 .local\\bin/:/bin"
+            ),
+            win_dir,
+        ));
+        assert!(dir_in_path_unix(
+            Some(
+                "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\home\\.local\\\
+                 bin:/usr/bin"
+            ),
+            win_dir,
+        ));
+        assert!(dir_in_path_unix(
+            Some(
+                "/usr/bin:C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\home\\\
+                 .local\\bin\\:/bin"
+            ),
+            win_dir,
+        ));
+        assert!(!dir_in_path_unix(Some("/usr/bin:/bin"), win_dir));
+        assert!(dir_in_path_unix(Some("c:/usr/bin"), Path::new("/usr/bin")));
+        assert!(dir_in_path_unix(Some("C:\\\\:/usr/bin"), Path::new("C:\\")));
     }
 }

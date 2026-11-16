@@ -10,19 +10,19 @@ use std::path::Path;
 #[cfg(any(all(unix, not(target_os = "macos")), windows))]
 use std::process::{Command, Stdio};
 
+#[cfg(not(windows))]
+use ruum_core::watchdog::send_fallback_os_notification;
 #[cfg(any(all(unix, not(target_os = "macos")), windows))]
 use ruum_core::watchdog::try_ipc_open_window;
 #[cfg(any(all(unix, not(target_os = "macos")), windows, test))]
 use ruum_core::watchdog::{NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_LOW_SPACE};
-use ruum_core::watchdog::{
-    NotificationAdapter, send_fallback_os_notification, try_ipc_notification,
-};
+use ruum_core::watchdog::{NotificationAdapter, try_ipc_notification};
 
 pub const RUUM_APP_ID: &str = "io.github.tobi.ruum";
 pub const RUUM_APP_NAME: &str = "ruum";
 
 #[cfg(any(all(unix, not(target_os = "macos")), windows))]
-const NOTIFY_WAIT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const NOTIFY_WAIT_TTL: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Notification adapter for headless `ruum watchdog` execution.
 ///
@@ -63,7 +63,7 @@ impl NotificationAdapter for DesktopNotificationAdapter {
             {
                 return send_fallback_os_notification(title, body);
             }
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(windows)]
@@ -380,8 +380,8 @@ mod win_toast {
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::Foundation::TypedEventHandler;
     use windows::UI::Notifications::{
-        ToastDismissalReason, ToastNotification, ToastNotificationManager,
-        ToastNotifier,
+        ToastDismissalReason, ToastDismissedEventArgs, ToastFailedEventArgs,
+        ToastNotification, ToastNotificationManager, ToastNotifier,
     };
     use windows::core::{HSTRING, IInspectable};
 
@@ -495,8 +495,15 @@ mod win_toast {
         )?;
 
         let tx_dis = tx.clone();
-        toast.Dismissed(&TypedEventHandler::new(
-            move |_sender, event_args: windows::core::Ref<'_, _>| {
+        toast.Dismissed(&TypedEventHandler::<
+            ToastNotification,
+            ToastDismissedEventArgs,
+        >::new(
+            move |_sender,
+                  event_args: windows::core::Ref<
+                '_,
+                ToastDismissedEventArgs,
+            >| {
                 let timed_out = event_args
                     .as_ref()
                     .and_then(|a| a.Reason().ok())
@@ -508,7 +515,10 @@ mod win_toast {
             },
         ))?;
 
-        toast.Failed(&TypedEventHandler::new(move |_sender, _args| {
+        toast.Failed(&TypedEventHandler::<
+            ToastNotification,
+            ToastFailedEventArgs,
+        >::new(move |_sender, _args| {
             let _ = tx.try_send(ToastWaitEvent::Closed);
             Ok(())
         }))?;

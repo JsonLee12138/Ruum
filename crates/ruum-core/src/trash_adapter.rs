@@ -973,6 +973,7 @@ fn unix_remove_paired_trashinfo(info_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, reason = "matches unix signature")]
 const fn unix_remove_paired_trashinfo(_info_path: &Path) -> io::Result<()> {
     Ok(())
 }

@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};

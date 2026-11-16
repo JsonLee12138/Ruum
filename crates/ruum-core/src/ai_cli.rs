@@ -103,8 +103,10 @@ fn run_command_with_timeout(
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
+            // Skip joining reader threads on timeout: grandchildren (e.g.
+            // `sleep 3` spawned by `dash` via `sh -c`) can keep the pipe
+            // write end open after the direct child is killed, blocking join.
+            drop((stdout_handle, stderr_handle));
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(

@@ -597,7 +597,7 @@ impl RemoteScan {
         Self::spawn_with_archive(command, host, request, archive)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn spawn_command(
         command: Command,
         host: &str,
@@ -770,6 +770,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait<T: Send + 'static>(scan: &RemoteJob<T>) -> io::Result<T> {
         wait_for(scan, std::time::Duration::from_secs(10))
     }

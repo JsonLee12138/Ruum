@@ -3923,3 +3923,138 @@ fn watchdog_page_handles_none_space_saturating_mul_and_syncs_checked_at(
     assert!(cx.debug_bounds("watchdog-page").is_some());
     assert!(cx.debug_bounds("watchdog-status-value").is_some());
 }
+
+#[gpui_kit::test]
+fn settings_model_list_scroll_is_isolated_from_outer_page(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::{
+        Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
+    };
+    use ruum_core::ai_cli::DiscoveredModel;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // Resize to a height where `setting-model-list` is visible in the
+    // viewport while the outer `settings-page` still overflows vertically.
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(1050.)));
+    update(&view, cx, |app, _| {
+        app.screen = Screen::Settings;
+        app.watchdog_models = (0..20)
+            .map(|i| DiscoveredModel {
+                id: format!("model-{i:02}"),
+                label: format!("Model {i:02}"),
+                provider: None,
+            })
+            .collect();
+    });
+    draw(cx);
+
+    let list_before = cx
+        .debug_bounds("setting-model-list")
+        .expect("setting-model-list bounds");
+    let row0_before = cx
+        .debug_bounds("setting-model-row-0")
+        .expect("setting-model-row-0 bounds");
+    let test_cli_before = cx
+        .debug_bounds("setting-test-cli")
+        .expect("setting-test-cli bounds");
+    let save_btn_before = cx
+        .debug_bounds("setting-save-btn")
+        .expect("setting-save-btn bounds");
+    assert!(
+        list_before.center().y < px(1050.),
+        "expected setting-model-list center inside viewport: {list_before:?}"
+    );
+    assert!(
+        save_btn_before.bottom() > px(1050.),
+        "expected settings-page to overflow viewport: {save_btn_before:?}"
+    );
+    let initial_rel_y = row0_before.origin.y - list_before.origin.y;
+
+    // 1. Scroll inside `setting-model-list`: inner list must scroll while outer
+    //    `settings-page` controls remain stationary.
+    cx.simulate_event(ScrollWheelEvent {
+        position: list_before.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    draw(cx);
+
+    let list_after_inner = cx
+        .debug_bounds("setting-model-list")
+        .expect("setting-model-list bounds after inner scroll");
+    let row0_after_inner = cx
+        .debug_bounds("setting-model-row-0")
+        .expect("setting-model-row-0 bounds after inner scroll");
+    let test_cli_after_inner = cx
+        .debug_bounds("setting-test-cli")
+        .expect("setting-test-cli bounds after inner scroll");
+    let save_btn_after_inner = cx
+        .debug_bounds("setting-save-btn")
+        .expect("setting-save-btn bounds after inner scroll");
+
+    let rel_after_inner = row0_after_inner.origin.y - list_after_inner.origin.y;
+    assert!(
+        rel_after_inner < initial_rel_y,
+        "expected inner list to scroll upward: before={initial_rel_y:?}, \
+         after={rel_after_inner:?}"
+    );
+    assert_eq!(
+        test_cli_after_inner.origin.y, test_cli_before.origin.y,
+        "outer setting-test-cli should not move when scrolling inside \
+         setting-model-list"
+    );
+    assert_eq!(
+        save_btn_after_inner.origin.y, save_btn_before.origin.y,
+        "outer setting-save-btn should not move when scrolling inside \
+         setting-model-list"
+    );
+
+    // 2. Scroll outside `setting-model-list` (over `setting-test-cli`): outer
+    //    `settings-page` must scroll while inner list offset stays unchanged.
+    cx.simulate_event(ScrollWheelEvent {
+        position: test_cli_after_inner.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    draw(cx);
+
+    let list_after_outer = cx
+        .debug_bounds("setting-model-list")
+        .expect("setting-model-list bounds after outer scroll");
+    let row0_after_outer = cx
+        .debug_bounds("setting-model-row-0")
+        .expect("setting-model-row-0 bounds after outer scroll");
+    let test_cli_after_outer = cx
+        .debug_bounds("setting-test-cli")
+        .expect("setting-test-cli bounds after outer scroll");
+    let save_btn_after_outer = cx
+        .debug_bounds("setting-save-btn")
+        .expect("setting-save-btn bounds after outer scroll");
+
+    assert!(
+        test_cli_after_outer.origin.y < test_cli_after_inner.origin.y,
+        "expected outer setting-test-cli to shift upward: before={:?}, \
+         after={:?}",
+        test_cli_after_inner.origin.y,
+        test_cli_after_outer.origin.y
+    );
+    assert!(
+        save_btn_after_outer.origin.y < save_btn_after_inner.origin.y,
+        "expected outer setting-save-btn to shift upward: before={:?}, \
+         after={:?}",
+        save_btn_after_inner.origin.y,
+        save_btn_after_outer.origin.y
+    );
+    let rel_after_outer = row0_after_outer.origin.y - list_after_outer.origin.y;
+    assert_eq!(
+        rel_after_outer, rel_after_inner,
+        "inner model list scroll offset should stay unchanged when scrolling \
+         outer settings-page"
+    );
+}

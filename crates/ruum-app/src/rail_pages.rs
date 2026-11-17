@@ -1059,7 +1059,8 @@ pub fn settings_page(
             .flex_col()
             .gap(space::XS)
             .max_h(Rems(14.0))
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
 
         let selected_model = app.watchdog_draft.model.as_deref();
         for (index, model) in app.watchdog_models.iter().enumerate() {

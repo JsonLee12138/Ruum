@@ -87,7 +87,8 @@ fn clippy() -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ])
+    ])?;
+    run(&["check", "-p", "ruum-core", "--no-default-features"])
 }
 
 fn test() -> Result<(), String> {

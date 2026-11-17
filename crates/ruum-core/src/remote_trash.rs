@@ -280,6 +280,23 @@ pub fn build_ssh_trash_command(host: &str) -> io::Result<Command> {
     Ok(command)
 }
 
+/// Build the SSH trash command using an active in-memory `SshSession`.
+#[cfg(feature = "service")]
+pub fn build_ssh_trash_command_with_session(
+    session: &crate::ssh_session::SshSession,
+) -> io::Result<Command> {
+    session.build_ssh_command(&[], "sh -s")
+}
+
+/// Build the SSH trash command for a validated `SshEndpoint`.
+#[cfg(feature = "service")]
+#[must_use]
+pub fn build_ssh_trash_command_with_endpoint(
+    endpoint: &crate::ssh_session::SshEndpoint,
+) -> Command {
+    endpoint.build_ssh_command(&[], "sh -s")
+}
+
 /// Execute `trash_script_for` over SSH against `host`.
 pub fn execute_remote_trash(
     host: &str,
@@ -287,6 +304,30 @@ pub fn execute_remote_trash(
     header: &Header,
 ) -> io::Result<()> {
     let command = build_ssh_trash_command(host)?;
+    let script = trash_script_for(targets, header)?;
+    run_trash_command(command, &script)
+}
+
+/// Execute `trash_script_for` over an active in-memory `SshSession`.
+#[cfg(feature = "service")]
+pub fn execute_remote_trash_with_session(
+    session: &crate::ssh_session::SshSession,
+    targets: &[Target],
+    header: &Header,
+) -> io::Result<()> {
+    let command = build_ssh_trash_command_with_session(session)?;
+    let script = trash_script_for(targets, header)?;
+    run_trash_command(command, &script)
+}
+
+/// Execute `trash_script_for` over SSH against a validated `SshEndpoint`.
+#[cfg(feature = "service")]
+pub fn execute_remote_trash_with_endpoint(
+    endpoint: &crate::ssh_session::SshEndpoint,
+    targets: &[Target],
+    header: &Header,
+) -> io::Result<()> {
+    let command = build_ssh_trash_command_with_endpoint(endpoint);
     let script = trash_script_for(targets, header)?;
     run_trash_command(command, &script)
 }
@@ -939,5 +980,48 @@ mod tests {
         )
         .expect_err("trash_script_for must refuse remote trash container");
         assert!(err.to_string().contains(ALREADY_IN_TRASH_REASON), "{err}");
+    }
+
+    #[cfg(feature = "service")]
+    #[test]
+    fn session_and_endpoint_trash_commands_configure_non_config_ssh() {
+        use crate::ssh_session::{SshAuthMaterial, SshEndpoint, SshSession};
+        use zeroize::Zeroizing;
+
+        let endpoint = SshEndpoint::new("10.1.2.4", 2201, "deploy").unwrap();
+        let ep_cmd = build_ssh_trash_command_with_endpoint(&endpoint);
+        let ep_args: Vec<String> = ep_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(ep_args.windows(2).any(|w| w == ["-F", "none"]));
+        assert!(ep_args.windows(2).any(|w| w == ["-p", "2201"]));
+        assert!(ep_args.ends_with(&[
+            "--".to_owned(),
+            "deploy@10.1.2.4".to_owned(),
+            "sh -s".to_owned()
+        ]));
+
+        let mut session = SshSession::start(
+            endpoint,
+            SshAuthMaterial::Password {
+                password: Zeroizing::new("secret".to_owned()),
+            },
+            15,
+        )
+        .unwrap();
+        let sess_cmd = build_ssh_trash_command_with_session(&session).unwrap();
+        let sess_args: Vec<String> = sess_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(sess_args.windows(2).any(|w| w == ["-F", "none"]));
+        assert!(sess_args.ends_with(&[
+            "--".to_owned(),
+            "deploy@10.1.2.4".to_owned(),
+            "sh -s".to_owned()
+        ]));
+        session.close();
+        assert!(build_ssh_trash_command_with_session(&session).is_err());
     }
 }

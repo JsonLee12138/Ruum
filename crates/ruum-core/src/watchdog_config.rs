@@ -55,6 +55,18 @@ impl AiCliProvider {
         }
     }
 
+    /// Parse an AI CLI provider from its canonical short identifier.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "pi" => Some(Self::Pi),
+            "agy" => Some(Self::Agy),
+            "codex" => Some(Self::Codex),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
     /// Human-friendly display label.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -163,6 +175,36 @@ pub struct CleanupProposal {
     pub timestamp_secs: u64,
     pub summary: String,
     pub items: Vec<ProposalItem>,
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    crate::removal::normalize(dunce::simplified(path))
+}
+
+impl CleanupProposal {
+    /// Remove proposed items whose path matches or is nested under any path in
+    /// `removed_paths`. Returns the number of pruned items.
+    pub fn prune_paths(&mut self, removed_paths: &[PathBuf]) -> usize {
+        if removed_paths.is_empty() || self.items.is_empty() {
+            return 0;
+        }
+        let normalized_removed: Vec<PathBuf> = removed_paths
+            .iter()
+            .map(|p| normalize_lexical_path(p))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        if normalized_removed.is_empty() {
+            return 0;
+        }
+        let before = self.items.len();
+        self.items.retain(|item| {
+            let item_norm = normalize_lexical_path(&item.path);
+            !normalized_removed
+                .iter()
+                .any(|rem| item_norm == *rem || item_norm.starts_with(rem))
+        });
+        before.saturating_sub(self.items.len())
+    }
 }
 
 /// Persistent runtime state of the watchdog.
@@ -481,5 +523,53 @@ mod tests {
             config_dir_for(false, false, home, None, None),
             Some(PathBuf::from("/users/tester/.config/ruum"))
         );
+    }
+
+    #[test]
+    fn cleanup_proposal_prune_paths_handles_exact_nested_and_siblings() {
+        let mut proposal = CleanupProposal {
+            timestamp_secs: 100,
+            summary: "test".to_owned(),
+            items: vec![
+                ProposalItem::new(
+                    PathBuf::from("/tmp/cache/a"),
+                    10,
+                    RemovalMode::Trash,
+                    None,
+                    None,
+                ),
+                ProposalItem::new(
+                    PathBuf::from("/tmp/cache/a/nested.bin"),
+                    20,
+                    RemovalMode::Trash,
+                    None,
+                    None,
+                ),
+                ProposalItem::new(
+                    PathBuf::from("/tmp/cache2/keep"),
+                    30,
+                    RemovalMode::Trash,
+                    None,
+                    None,
+                ),
+            ],
+        };
+
+        // Sibling directory `/tmp/cache/a` must not prune `/tmp/cache2/keep`.
+        let pruned = proposal.prune_paths(&[PathBuf::from("/tmp/cache/a/")]);
+        assert_eq!(pruned, 2);
+        assert_eq!(proposal.items.len(), 1);
+        assert_eq!(proposal.items[0].path, PathBuf::from("/tmp/cache2/keep"));
+
+        // Empty removed list is a no-op.
+        assert_eq!(proposal.prune_paths(&[]), 0);
+        assert_eq!(proposal.items.len(), 1);
+
+        // Removing the remaining item empties items.
+        assert_eq!(
+            proposal.prune_paths(&[PathBuf::from("/tmp/cache2/keep")]),
+            1
+        );
+        assert!(proposal.items.is_empty());
     }
 }

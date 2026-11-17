@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Read as _, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustc_hash::FxHashMap;
 use serde_json::{Value, json};
@@ -16,14 +17,21 @@ use crate::auth::{AuthAdapter, AuthFactory, AuthRequest};
 use crate::classify::{Category, Reclaim};
 use crate::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmItem,
-    CleanupConfirmRequest, GuiCleanupConfirm,
+    CleanupConfirmRequest, GuiCleanupConfirm, GuiRemoteConnectConfirm,
+    RemoteConnectConfirmAdapter, RemoteConnectConfirmDecision,
+    RemoteConnectConfirmRequest,
 };
+use crate::credentials::LazyCredentialStore;
 use crate::filter::{Keep, filter};
 use crate::git::{self, GitState};
 use crate::identity::HostIdentity;
 use crate::insights::{Finding, worth_a_look};
-use crate::remote::{Header, RemoteRoots, RemoteScan, Request};
-use crate::remote_trash::{execute_remote_trash, plan_remote};
+use crate::remote::{
+    Header, RemoteRoots, RemoteScan, Request, Roots, Snapshot, validate_host,
+};
+use crate::remote_trash::{
+    execute_remote_trash, execute_remote_trash_with_session, plan_remote,
+};
 use crate::removal::{
     Blocked, Plan, RemovalEvent, RemovalMode, Target, TrashBackend,
     detect_trash_backend, normalize, plan_for_mode, spawn,
@@ -31,6 +39,11 @@ use crate::removal::{
 use crate::scan::{ScanOptions, scan};
 use crate::size::human_bytes;
 use crate::space::{SpaceInfo, space_info, volume_root_for, volumes};
+use crate::ssh_session::{SshAuthMaterial, SshEndpoint, SshSession};
+use crate::storage::{
+    DEFAULT_SSH_PORT, DEFAULT_SSH_SESSION_DURATION_MINUTES, SshProfile,
+    StorageDb,
+};
 use crate::tree::{Node, NodeKind};
 
 /// Maximum UTF-8 bytes accepted for a single JSON-RPC request line (`1 MiB`).
@@ -71,11 +84,219 @@ impl CachedScan {
     }
 }
 
+/// Transport abstraction for remote SSH operations executed by [`McpServer`].
+pub trait RemoteExecutor: Send + Sync + fmt::Debug {
+    fn list_volumes_with_session(
+        &self,
+        session: &SshSession,
+    ) -> io::Result<Roots>;
+    fn list_volumes_raw(&self, host: &str) -> io::Result<Roots>;
+    fn scan_with_session(
+        &self,
+        session: &SshSession,
+        request: &Request,
+    ) -> io::Result<Snapshot>;
+    fn scan_raw(&self, host: &str, request: &Request) -> io::Result<Snapshot>;
+    fn trash_with_session(
+        &self,
+        session: &SshSession,
+        targets: &[Target],
+        header: &Header,
+    ) -> io::Result<()>;
+    fn trash_raw(
+        &self,
+        host: &str,
+        targets: &[Target],
+        header: &Header,
+    ) -> io::Result<()>;
+}
+
+/// Production [`RemoteExecutor`] backed by `ssh` subprocesses and [`SshSession`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemRemoteExecutor;
+
+impl RemoteExecutor for SystemRemoteExecutor {
+    fn list_volumes_with_session(
+        &self,
+        session: &SshSession,
+    ) -> io::Result<Roots> {
+        RemoteRoots::discover_with_session(session).and_then(RemoteRoots::wait)
+    }
+
+    fn list_volumes_raw(&self, host: &str) -> io::Result<Roots> {
+        RemoteRoots::discover(host).and_then(RemoteRoots::wait)
+    }
+
+    fn scan_with_session(
+        &self,
+        session: &SshSession,
+        request: &Request,
+    ) -> io::Result<Snapshot> {
+        RemoteScan::spawn_with_session(session, request)
+            .and_then(RemoteScan::wait)
+    }
+
+    fn scan_raw(&self, host: &str, request: &Request) -> io::Result<Snapshot> {
+        RemoteScan::spawn(host, request).and_then(RemoteScan::wait)
+    }
+
+    fn trash_with_session(
+        &self,
+        session: &SshSession,
+        targets: &[Target],
+        header: &Header,
+    ) -> io::Result<()> {
+        execute_remote_trash_with_session(session, targets, header)
+    }
+
+    fn trash_raw(
+        &self,
+        host: &str,
+        targets: &[Target],
+        header: &Header,
+    ) -> io::Result<()> {
+        execute_remote_trash(host, targets, header)
+    }
+}
+
+/// Composite key identifying an authorized remote SSH endpoint within an MCP
+/// session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RemoteLeaseKey {
+    pub profile_or_host: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+#[derive(Debug)]
+struct RemoteConnectLease {
+    expires_at: Instant,
+    session: Option<SshSession>,
+}
+
+impl RemoteConnectLease {
+    fn is_valid_at(&self, now: Instant) -> bool {
+        now < self.expires_at
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|sess| !sess.is_closed() && !sess.is_expired())
+    }
+}
+
+enum RemoteTarget {
+    Profile {
+        profile: Box<SshProfile>,
+        endpoint: SshEndpoint,
+        cache_key: String,
+    },
+    RawHost {
+        raw_host: String,
+        host: String,
+        port: u16,
+        username: String,
+    },
+}
+
+impl RemoteTarget {
+    fn cache_key(&self) -> &str {
+        match self {
+            Self::Profile { cache_key, .. } => cache_key,
+            Self::RawHost { raw_host, .. } => raw_host,
+        }
+    }
+
+    fn lease_key(&self) -> RemoteLeaseKey {
+        match self {
+            Self::Profile { profile, .. } => RemoteLeaseKey {
+                profile_or_host: profile.id.clone(),
+                host: profile.host.clone(),
+                port: profile.port,
+                username: profile.username.clone(),
+            },
+            Self::RawHost {
+                raw_host,
+                host,
+                port,
+                username,
+            } => RemoteLeaseKey {
+                profile_or_host: raw_host.clone(),
+                host: host.clone(),
+                port: *port,
+                username: username.clone(),
+            },
+        }
+    }
+
+    fn confirm_request(&self, tool_name: &str) -> RemoteConnectConfirmRequest {
+        match self {
+            Self::Profile { profile, .. } => RemoteConnectConfirmRequest {
+                target_label: profile.alias.clone(),
+                alias: Some(profile.alias.clone()),
+                host: profile.host.clone(),
+                port: profile.port,
+                username: profile.username.clone(),
+                auth_mode: profile.auth_mode.as_str().to_owned(),
+                tool_name: tool_name.to_owned(),
+            },
+            Self::RawHost {
+                raw_host,
+                host,
+                port,
+                username,
+            } => RemoteConnectConfirmRequest {
+                target_label: raw_host.clone(),
+                alias: None,
+                host: host.clone(),
+                port: *port,
+                username: username.clone(),
+                auth_mode: "external_ssh".to_owned(),
+                tool_name: tool_name.to_owned(),
+            },
+        }
+    }
+
+    fn display_label(&self) -> &str {
+        match self {
+            Self::Profile { profile, .. } => &profile.alias,
+            Self::RawHost { raw_host, .. } => raw_host,
+        }
+    }
+
+    fn profile_alias(&self) -> Option<&str> {
+        match self {
+            Self::Profile { profile, .. } => Some(&profile.alias),
+            Self::RawHost { .. } => None,
+        }
+    }
+
+    fn raw_ssh_host(&self) -> Option<&str> {
+        match self {
+            Self::Profile { .. } => None,
+            Self::RawHost { raw_host, .. } => Some(raw_host),
+        }
+    }
+
+    fn default_path(&self) -> Option<&str> {
+        match self {
+            Self::Profile { profile, .. } => profile.default_path.as_deref(),
+            Self::RawHost { .. } => None,
+        }
+    }
+}
+
 /// Stateful MCP session server holding the scan cache and OS auth adapter.
 pub struct McpServer {
     cache: FxHashMap<(Option<String>, PathBuf), CachedScan>,
     auth: Box<dyn AuthAdapter>,
     confirm: Box<dyn CleanupConfirmAdapter>,
+    remote_confirm: Box<dyn RemoteConnectConfirmAdapter>,
+    remote_executor: Box<dyn RemoteExecutor>,
+    storage: Option<StorageDb>,
+    credentials: Option<LazyCredentialStore>,
+    remote_connect_leases: FxHashMap<RemoteLeaseKey, RemoteConnectLease>,
+    lease_ttl_override: Option<Duration>,
     read_only: bool,
 }
 
@@ -85,8 +306,12 @@ impl fmt::Debug for McpServer {
             .field("cached_roots", &self.cache.len())
             .field("auth_os", &self.auth.os_kind())
             .field("confirm", &self.confirm)
+            .field("remote_confirm", &self.remote_confirm)
+            .field("has_storage", &self.storage.is_some())
+            .field("has_credentials", &self.credentials.is_some())
+            .field("active_remote_leases", &self.remote_connect_leases.len())
             .field("read_only", &self.read_only)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -111,7 +336,94 @@ impl McpServer {
             cache: FxHashMap::default(),
             auth,
             confirm,
+            remote_confirm: Box::new(GuiRemoteConnectConfirm::new()),
+            remote_executor: Box::new(SystemRemoteExecutor),
+            storage: None,
+            credentials: None,
+            remote_connect_leases: FxHashMap::default(),
+            lease_ttl_override: None,
             read_only: false,
+        }
+    }
+
+    /// Attach default local `StorageDb` and `LazyCredentialStore` without
+    /// touching the OS keychain.
+    #[must_use]
+    pub fn with_default_services(mut self) -> Self {
+        self.storage = StorageDb::open_default().ok();
+        self.credentials = LazyCredentialStore::open_default().ok();
+        self
+    }
+
+    #[must_use]
+    pub fn with_storage(mut self, storage: StorageDb) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    pub fn set_storage(&mut self, storage: Option<StorageDb>) {
+        self.storage = storage;
+    }
+
+    #[must_use]
+    pub fn with_credentials(
+        mut self,
+        credentials: LazyCredentialStore,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    pub fn set_credentials(
+        &mut self,
+        credentials: Option<LazyCredentialStore>,
+    ) {
+        self.credentials = credentials;
+    }
+
+    #[must_use]
+    pub fn with_remote_confirm(
+        mut self,
+        remote_confirm: Box<dyn RemoteConnectConfirmAdapter>,
+    ) -> Self {
+        self.remote_confirm = remote_confirm;
+        self
+    }
+
+    pub fn set_remote_confirm(
+        &mut self,
+        remote_confirm: Box<dyn RemoteConnectConfirmAdapter>,
+    ) {
+        self.remote_confirm = remote_confirm;
+    }
+
+    #[must_use]
+    pub fn with_remote_executor(
+        mut self,
+        remote_executor: Box<dyn RemoteExecutor>,
+    ) -> Self {
+        self.remote_executor = remote_executor;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+        self.lease_ttl_override = Some(ttl);
+        self
+    }
+
+    #[must_use]
+    pub fn remote_lease_count(&self) -> usize {
+        self.remote_connect_leases.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_remote_leases_for_test(&mut self) {
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        for lease in self.remote_connect_leases.values_mut() {
+            lease.expires_at = past;
         }
     }
 
@@ -339,7 +651,8 @@ impl McpServer {
         args: &Value,
     ) -> Result<Value, String> {
         match name {
-            "list_volumes" => Self::tool_list_volumes(args),
+            "list_ssh_profiles" => self.tool_list_ssh_profiles(),
+            "list_volumes" => self.tool_list_volumes(args),
             "scan_directory" => self.tool_scan_directory(args),
             "inspect_subtree" => self.tool_inspect_subtree(args),
             "find_reclaimable" => self.tool_find_reclaimable(args),
@@ -351,16 +664,193 @@ impl McpServer {
         }
     }
 
-    fn tool_list_volumes(args: &Value) -> Result<Value, String> {
-        let ssh_host = optional_host(args);
-        if let Some(host) = ssh_host {
-            let roots = RemoteRoots::discover(&host)
-                .and_then(RemoteRoots::wait)
-                .map_err(|err| err.to_string())?;
+    fn resolved_ssh_session_duration_minutes(&self) -> u64 {
+        self.storage
+            .as_ref()
+            .and_then(|db| db.load_app_settings().ok())
+            .map_or(DEFAULT_SSH_SESSION_DURATION_MINUTES, |s| {
+                s.ssh_session_duration_minutes
+            })
+            .max(1)
+    }
+
+    fn resolve_optional_remote(
+        &self,
+        args: &Value,
+    ) -> Result<Option<RemoteTarget>, String> {
+        let profile_arg = optional_trimmed_str(args, "profile")?;
+        let host_arg = optional_trimmed_str(args, "ssh_host")?;
+        if profile_arg.is_some() && host_arg.is_some() {
+            return Err(
+                "Specify either 'profile' or 'ssh_host', not both.".to_owned()
+            );
+        }
+        if let Some(profile_key) = profile_arg {
+            let db = self.storage.as_ref().ok_or_else(|| {
+                format!(
+                    "SSH profile '{profile_key}' unavailable: profile \
+                     database not initialized"
+                )
+            })?;
+            let profile = db
+                .get_ssh_profile(profile_key)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| {
+                    format!("SSH profile '{profile_key}' not found")
+                })?;
+            let endpoint = SshEndpoint::from_profile(&profile)?;
+            let cache_key = format!("profile:{}", profile.id);
+            return Ok(Some(RemoteTarget::Profile {
+                profile: Box::new(profile),
+                endpoint,
+                cache_key,
+            }));
+        }
+        if let Some(raw_host) = host_arg {
+            let (host, port, username) = parse_raw_ssh_host(raw_host)?;
+            return Ok(Some(RemoteTarget::RawHost {
+                raw_host: raw_host.to_owned(),
+                host,
+                port,
+                username,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn has_valid_lease(&self, lease_key: &RemoteLeaseKey) -> bool {
+        let now = Instant::now();
+        self.remote_connect_leases
+            .get(lease_key)
+            .is_some_and(|lease| lease.is_valid_at(now))
+    }
+
+    /// Enforce Fail-Closed user confirmation or valid session lease BEFORE
+    /// reading any keychain secret or opening any SSH transport.
+    fn ensure_remote_authorized(
+        &mut self,
+        target: &RemoteTarget,
+        tool_name: &str,
+    ) -> Result<RemoteLeaseKey, String> {
+        let lease_key = target.lease_key();
+        if self.has_valid_lease(&lease_key) {
+            return Ok(lease_key);
+        }
+        self.remote_connect_leases.remove(&lease_key);
+
+        let request = target.confirm_request(tool_name);
+        match self.remote_confirm.confirm(&request) {
+            Ok(RemoteConnectConfirmDecision::Approved) => {
+                let duration_minutes =
+                    self.resolved_ssh_session_duration_minutes();
+                let ttl = self.lease_ttl_override.unwrap_or_else(|| {
+                    Duration::from_secs(duration_minutes * 60)
+                });
+                self.remote_connect_leases.insert(
+                    lease_key.clone(),
+                    RemoteConnectLease {
+                        expires_at: Instant::now() + ttl,
+                        session: None,
+                    },
+                );
+                Ok(lease_key)
+            }
+            Ok(RemoteConnectConfirmDecision::Denied) => Err(format!(
+                "Remote SSH connection to '{}' denied by user",
+                target.display_label()
+            )),
+            Err(err) => {
+                Err(format!("Remote connection confirmation failed: {err}"))
+            }
+        }
+    }
+
+    /// Ensure an active [`SshSession`] is attached to an already-authorized
+    /// lease for `profile`, loading credentials from [`LazyCredentialStore`]
+    /// on demand only after confirmation.
+    fn ensure_profile_session(
+        &mut self,
+        lease_key: &RemoteLeaseKey,
+        profile: &SshProfile,
+        endpoint: &SshEndpoint,
+    ) -> Result<(), String> {
+        let needs_session = self
+            .remote_connect_leases
+            .get(lease_key)
+            .and_then(|lease| lease.session.as_ref())
+            .is_none_or(|sess| sess.is_closed() || sess.is_expired());
+        if !needs_session {
+            return Ok(());
+        }
+
+        let creds = self.credentials.as_ref().ok_or_else(|| {
+            format!(
+                "Credential store unavailable for SSH profile '{}'",
+                profile.alias
+            )
+        })?;
+        let material = SshAuthMaterial::from_profile_and_store(profile, creds)?;
+        let duration_minutes = self.resolved_ssh_session_duration_minutes();
+        let session =
+            SshSession::start(endpoint.clone(), material, duration_minutes)?;
+        let lease = self
+            .remote_connect_leases
+            .get_mut(lease_key)
+            .ok_or_else(|| "remote authorization lease missing".to_owned())?;
+        lease.session = Some(session);
+        Ok(())
+    }
+
+    fn tool_list_ssh_profiles(&self) -> Result<Value, String> {
+        let profiles = match &self.storage {
+            Some(db) => db.list_ssh_profiles().map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
+        let list: Vec<Value> = profiles
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "alias": p.alias,
+                    "host": p.host,
+                    "port": p.port,
+                    "username": p.username,
+                    "auth_mode": p.auth_mode.as_str(),
+                    "default_path": p.default_path,
+                })
+            })
+            .collect();
+        Ok(json!({ "profiles": list }))
+    }
+
+    fn tool_list_volumes(&mut self, args: &Value) -> Result<Value, String> {
+        if let Some(target) = self.resolve_optional_remote(args)? {
+            let lease_key =
+                self.ensure_remote_authorized(&target, "list_volumes")?;
+            let roots = match &target {
+                RemoteTarget::Profile {
+                    profile, endpoint, ..
+                } => {
+                    self.ensure_profile_session(&lease_key, profile, endpoint)?;
+                    let session = self
+                        .remote_connect_leases
+                        .get(&lease_key)
+                        .and_then(|l| l.session.as_ref())
+                        .ok_or_else(|| "SSH session missing".to_owned())?;
+                    self.remote_executor
+                        .list_volumes_with_session(session)
+                        .map_err(|err| err.to_string())?
+                }
+                RemoteTarget::RawHost { raw_host, .. } => self
+                    .remote_executor
+                    .list_volumes_raw(raw_host)
+                    .map_err(|err| err.to_string())?,
+            };
             let list: Vec<Value> =
                 roots.volumes.iter().map(format_volume).collect();
             return Ok(json!({
-                "ssh_host": host,
+                "profile": target.profile_alias(),
+                "ssh_host": target.raw_ssh_host(),
                 "platform": roots.platform,
                 "home": roots.home.map(|p| p.display().to_string()),
                 "identity": roots.identity.map(|id| json!({
@@ -372,6 +862,7 @@ impl McpServer {
         }
         let list: Vec<Value> = volumes().iter().map(format_volume).collect();
         Ok(json!({
+            "profile": Value::Null,
             "ssh_host": Value::Null,
             "platform": std::env::consts::OS,
             "home": std::env::home_dir().map(|p| p.display().to_string()),
@@ -380,7 +871,7 @@ impl McpServer {
     }
 
     fn tool_scan_directory(&mut self, args: &Value) -> Result<Value, String> {
-        let ssh_host = optional_host(args);
+        let remote = self.resolve_optional_remote(args)?;
         let path_arg = args.get("path").and_then(Value::as_str);
         let disk = args.get("disk").and_then(Value::as_bool).unwrap_or(false);
         let apparent_size = args
@@ -403,20 +894,26 @@ impl McpServer {
             include_hidden,
             ..ScanOptions::default()
         };
+        if let Some(ref target) = remote {
+            let _ = self.ensure_remote_authorized(target, "scan_directory")?;
+        }
         let (root_path, cached_hit) = self.ensure_scanned(
-            ssh_host.as_deref(),
+            remote.as_ref(),
             path_arg,
             disk,
             &options,
             rescan,
+            "scan_directory",
         )?;
-        let key = (ssh_host.clone(), root_path.clone());
+        let cache_host = remote.as_ref().map(|t| t.cache_key().to_owned());
+        let key = (cache_host, root_path.clone());
         let entry = self
             .cache
             .get(&key)
             .ok_or_else(|| "scan cache missing entry".to_owned())?;
         Ok(format_scan_summary(
-            ssh_host.as_deref(),
+            remote.as_ref().and_then(RemoteTarget::profile_alias),
+            remote.as_ref().and_then(RemoteTarget::raw_ssh_host),
             &root_path,
             entry,
             cached_hit,
@@ -425,7 +922,7 @@ impl McpServer {
     }
 
     fn tool_inspect_subtree(&mut self, args: &Value) -> Result<Value, String> {
-        let ssh_host = optional_host(args);
+        let remote = self.resolve_optional_remote(args)?;
         let root_str = required_str(args, "root")?;
         let subpath = args.get("subpath").and_then(Value::as_str);
         let filter_query = args
@@ -438,9 +935,13 @@ impl McpServer {
             DEFAULT_MAX_ENTRIES,
             MAX_ENTRIES_LIMIT,
         );
-        let (root_path, _) =
-            self.ensure_cached_or_default_scan(ssh_host.as_deref(), root_str)?;
-        let key = (ssh_host, root_path.clone());
+        let (root_path, _) = self.ensure_cached_or_default_scan(
+            remote.as_ref(),
+            root_str,
+            "inspect_subtree",
+        )?;
+        let cache_host = remote.as_ref().map(|t| t.cache_key().to_owned());
+        let key = (cache_host, root_path.clone());
         let entry = self
             .cache
             .get(&key)
@@ -506,16 +1007,20 @@ impl McpServer {
     }
 
     fn tool_find_reclaimable(&mut self, args: &Value) -> Result<Value, String> {
-        let ssh_host = optional_host(args);
+        let remote = self.resolve_optional_remote(args)?;
         let root_str = required_str(args, "root")?;
         let limit = parse_limit(
             args.get("limit"),
             DEFAULT_RECLAIMABLE_LIMIT,
             MAX_RECLAIMABLE_LIMIT,
         );
-        let (root_path, _) =
-            self.ensure_cached_or_default_scan(ssh_host.as_deref(), root_str)?;
-        let key = (ssh_host, root_path.clone());
+        let (root_path, _) = self.ensure_cached_or_default_scan(
+            remote.as_ref(),
+            root_str,
+            "find_reclaimable",
+        )?;
+        let cache_host = remote.as_ref().map(|t| t.cache_key().to_owned());
+        let key = (cache_host, root_path.clone());
         let entry = self
             .cache
             .get(&key)
@@ -551,10 +1056,12 @@ impl McpServer {
     }
 
     fn tool_check_git_safety(args: &Value) -> Result<Value, String> {
-        if args.get("ssh_host").is_some_and(|v| !v.is_null()) {
+        if has_non_null_arg(args, "ssh_host")
+            || has_non_null_arg(args, "profile")
+        {
             return Err(
-                "Git safety inspection is local-only; ssh_host is not \
-                 supported."
+                "Git safety inspection is local-only; ssh_host and profile \
+                 are not supported."
                     .to_owned(),
             );
         }
@@ -583,16 +1090,18 @@ impl McpServer {
     }
 
     fn tool_plan_removal(&self, args: &Value) -> Result<Value, String> {
-        let ssh_host = optional_host(args);
+        let remote = self.resolve_optional_remote(args)?;
         let root_str = required_str(args, "root")?;
         let raw_targets = required_string_array(args, "targets")?;
-        if let Some(host) = ssh_host {
+        if let Some(target) = remote {
             let root_path = normalize_remote_path(Path::new(root_str));
-            let key = (Some(host.clone()), root_path.clone());
+            let cache_host = target.cache_key().to_owned();
+            let key = (Some(cache_host), root_path.clone());
             let cached = self.cache.get(&key).ok_or_else(|| {
                 format!(
-                    "No cached remote scan for {host}:{}; run scan_directory \
+                    "No cached remote scan for {}:{}; run scan_directory \
                      first.",
+                    target.display_label(),
                     root_path.display()
                 )
             })?;
@@ -605,7 +1114,8 @@ impl McpServer {
             let header = cached.to_remote_header(&root_path);
             let remote_plan = plan_remote(&targets, &header);
             return Ok(json!({
-                "ssh_host": host,
+                "profile": target.profile_alias(),
+                "ssh_host": target.raw_ssh_host(),
                 "root": remote_plan.root.display().to_string(),
                 "targets": format_targets(&remote_plan.targets),
                 "covered": format_targets(&remote_plan.covered),
@@ -657,16 +1167,18 @@ impl McpServer {
     }
 
     fn tool_trash_paths(&mut self, args: &Value) -> Result<Value, String> {
-        let ssh_host = optional_host(args);
+        let remote = self.resolve_optional_remote(args)?;
         let root_str = required_str(args, "root")?;
         let raw_targets = required_string_array(args, "targets")?;
-        if let Some(host) = ssh_host {
+        if let Some(target) = remote {
             let root_path = normalize_remote_path(Path::new(root_str));
-            let key = (Some(host.clone()), root_path.clone());
+            let cache_host = target.cache_key().to_owned();
+            let key = (Some(cache_host.clone()), root_path.clone());
             let cached = self.cache.get(&key).ok_or_else(|| {
                 format!(
-                    "No cached remote scan for {host}:{}; run scan_directory \
+                    "No cached remote scan for {}:{}; run scan_directory \
                      first.",
+                    target.display_label(),
                     root_path.display()
                 )
             })?;
@@ -686,6 +1198,12 @@ impl McpServer {
                     &remote_plan.blocked,
                 ));
             }
+
+            // Require an active remote SSH authorization lease (or explicit
+            // user confirmation) before proceeding to item confirmation / trash.
+            let lease_key =
+                self.ensure_remote_authorized(&target, "trash_paths")?;
+
             let confirm_items: Vec<CleanupConfirmItem> = remote_plan
                 .targets
                 .iter()
@@ -699,7 +1217,7 @@ impl McpServer {
                 .collect();
             let req = CleanupConfirmRequest {
                 root: remote_plan.root.clone(),
-                title: format!("Trash items on {host}"),
+                title: format!("Trash items on {}", target.display_label()),
                 summary: Some(format!(
                     "Moving {} items ({}) to Trash",
                     remote_plan.targets.len(),
@@ -728,9 +1246,38 @@ impl McpServer {
                 return Err("cleanup cancelled by user".to_owned());
             }
 
-            execute_remote_trash(&host, &approved_targets, &header)
-                .map_err(|err| err.to_string())?;
-            self.invalidate_overlapping(Some(&host), &root_path);
+            // Re-verify the authorization lease has not expired while the
+            // user was reviewing items.
+            if !self.has_valid_lease(&lease_key) {
+                self.remote_connect_leases.remove(&lease_key);
+                return Err(
+                    "remote SSH authorization lease expired before deletion; \
+                     re-authorize connection before trashing"
+                        .to_owned(),
+                );
+            }
+
+            match &target {
+                RemoteTarget::Profile {
+                    profile, endpoint, ..
+                } => {
+                    self.ensure_profile_session(&lease_key, profile, endpoint)?;
+                    let session = self
+                        .remote_connect_leases
+                        .get(&lease_key)
+                        .and_then(|l| l.session.as_ref())
+                        .ok_or_else(|| "SSH session missing".to_owned())?;
+                    self.remote_executor
+                        .trash_with_session(session, &approved_targets, &header)
+                        .map_err(|err| err.to_string())?;
+                }
+                RemoteTarget::RawHost { raw_host, .. } => {
+                    self.remote_executor
+                        .trash_raw(raw_host, &approved_targets, &header)
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+            self.invalidate_overlapping(Some(&cache_host), &root_path);
             let reclaim: u64 = approved_targets.iter().map(|t| t.bytes).sum();
             let skipped_by_user: Vec<String> = targets
                 .iter()
@@ -739,8 +1286,9 @@ impl McpServer {
                 .collect();
             return Ok(json!({
                 "mode": "trash",
-                "target": host,
-                "ssh_host": host,
+                "target": target.display_label(),
+                "profile": target.profile_alias(),
+                "ssh_host": target.raw_ssh_host(),
                 "root": remote_plan.root.display().to_string(),
                 "removed_count": approved_targets.len(),
                 "reclaim_bytes": reclaim,
@@ -861,7 +1409,9 @@ impl McpServer {
         &mut self,
         args: &Value,
     ) -> Result<Value, String> {
-        if args.get("ssh_host").is_some_and(|v| !v.is_null()) {
+        if has_non_null_arg(args, "ssh_host")
+            || has_non_null_arg(args, "profile")
+        {
             return Err(
                 "Permanent deletion over SSH is forbidden; use trash_paths \
                  instead."
@@ -989,56 +1539,100 @@ impl McpServer {
 
     fn ensure_cached_or_default_scan(
         &mut self,
-        ssh_host: Option<&str>,
+        remote: Option<&RemoteTarget>,
         root_str: &str,
+        tool_name: &str,
     ) -> Result<(PathBuf, bool), String> {
-        let candidate_root = if ssh_host.is_some() {
+        let candidate_root = if remote.is_some() {
             normalize_remote_path(Path::new(root_str))
         } else {
             resolve_local_path(root_str)?
         };
-        let key = (ssh_host.map(str::to_owned), candidate_root.clone());
+        let cache_host = remote.map(|t| t.cache_key().to_owned());
+        let key = (cache_host, candidate_root.clone());
         if self.cache.contains_key(&key) {
             return Ok((candidate_root, true));
         }
         let default_options = ScanOptions::default();
         self.ensure_scanned(
-            ssh_host,
+            remote,
             Some(root_str),
             false,
             &default_options,
             false,
+            tool_name,
         )
     }
 
     fn ensure_scanned(
         &mut self,
-        ssh_host: Option<&str>,
+        remote: Option<&RemoteTarget>,
         path_arg: Option<&str>,
         disk: bool,
         options: &ScanOptions,
         rescan: bool,
+        tool_name: &str,
     ) -> Result<(PathBuf, bool), String> {
-        if let Some(host) = ssh_host {
-            if !rescan && let Some(raw) = path_arg {
+        if let Some(target) = remote {
+            let effective_path = path_arg
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| if disk { None } else { target.default_path() });
+            let cache_host = target.cache_key().to_owned();
+            if !rescan && let Some(raw) = effective_path {
                 let norm = normalize_remote_path(Path::new(raw));
-                let key = (Some(host.to_owned()), norm.clone());
+                let key = (Some(cache_host.clone()), norm.clone());
                 if let Some(existing) = self.cache.get(&key)
                     && same_scan_options(&existing.options, options)
                 {
                     return Ok((norm, true));
                 }
             }
+
+            let lease_key = self.ensure_remote_authorized(target, tool_name)?;
             let request = Request {
-                root: path_arg.map(PathBuf::from),
+                root: effective_path.map(PathBuf::from),
                 disk,
                 options: options.clone(),
             };
-            let snapshot = RemoteScan::spawn(host, &request)
-                .and_then(RemoteScan::wait)
-                .map_err(|err| err.to_string())?;
+            let snapshot = match target {
+                RemoteTarget::Profile {
+                    profile, endpoint, ..
+                } => {
+                    self.ensure_profile_session(&lease_key, profile, endpoint)?;
+                    let session = self
+                        .remote_connect_leases
+                        .get(&lease_key)
+                        .and_then(|l| l.session.as_ref())
+                        .ok_or_else(|| "SSH session missing".to_owned())?;
+                    self.remote_executor
+                        .scan_with_session(session, &request)
+                        .map_err(|err| err.to_string())?
+                }
+                RemoteTarget::RawHost { raw_host, .. } => self
+                    .remote_executor
+                    .scan_raw(raw_host, &request)
+                    .map_err(|err| err.to_string())?,
+            };
+
+            if let RemoteTarget::Profile { profile, .. } = target
+                && let Some(space) = snapshot.header.space
+                && let Some(db) = &self.storage
+            {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = db.update_ssh_profile_scan_summary(
+                    &profile.id,
+                    space.total,
+                    space.available,
+                    now_secs,
+                );
+            }
+
             let root_path = normalize_remote_path(&snapshot.header.root);
-            let key = (Some(host.to_owned()), root_path.clone());
+            let key = (Some(cache_host), root_path.clone());
             let prev_count = self.cache.get(&key).map_or(0, |c| c.scan_count);
             self.cache.insert(
                 key,
@@ -1107,7 +1701,9 @@ pub fn serve_stdio_with_options(read_only: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
-    let mut server = McpServer::default().with_read_only(read_only);
+    let mut server = McpServer::default()
+        .with_default_services()
+        .with_read_only(read_only);
     server.serve(&mut reader, &mut writer)
 }
 
@@ -1158,12 +1754,63 @@ const fn same_scan_options(left: &ScanOptions, right: &ScanOptions) -> bool {
         )
 }
 
-fn optional_host(args: &Value) -> Option<String> {
-    args.get("ssh_host")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+fn has_non_null_arg(args: &Value, field: &str) -> bool {
+    match args.get(field) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn optional_trimmed_str<'a>(
+    args: &'a Value,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            Ok((!trimmed.is_empty()).then_some(trimmed))
+        }
+        Some(_) => Err(format!("Invalid parameter '{field}': expected string")),
+    }
+}
+
+fn parse_raw_ssh_host(raw: &str) -> Result<(String, u16, String), String> {
+    validate_host(raw).map_err(|err| err.to_string())?;
+    let (username, host_part) = match raw.split_once('@') {
+        Some((user, rest)) => (user.to_owned(), rest),
+        None => (String::new(), raw),
+    };
+    let (host, port) = if let Some(rest) = host_part.strip_prefix('[') {
+        if let Some((bracketed, after)) = rest.split_once(']') {
+            if let Some(port_str) = after.strip_prefix(':') {
+                let port = port_str.parse::<u16>().map_err(|_| {
+                    format!("invalid SSH port in destination '{raw}'")
+                })?;
+                (bracketed.to_owned(), port)
+            } else if after.is_empty() {
+                (bracketed.to_owned(), DEFAULT_SSH_PORT)
+            } else {
+                return Err(format!("invalid SSH destination '{raw}'"));
+            }
+        } else {
+            return Err(format!("invalid SSH destination '{raw}'"));
+        }
+    } else if host_part.matches(':').count() == 1
+        && let Some((h, port_str)) = host_part.split_once(':')
+    {
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| format!("invalid SSH port in destination '{raw}'"))?;
+        (h.to_owned(), port)
+    } else {
+        (host_part.to_owned(), DEFAULT_SSH_PORT)
+    };
+    if host.is_empty() || port == 0 {
+        return Err(format!("invalid SSH destination '{raw}'"));
+    }
+    Ok((host, port, username))
 }
 
 fn required_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -1399,6 +2046,7 @@ fn find_relative_node<'a>(root: &'a Node, rel: &Path) -> Option<&'a Node> {
 }
 
 fn format_scan_summary(
+    profile: Option<&str>,
     ssh_host: Option<&str>,
     root_path: &Path,
     entry: &CachedScan,
@@ -1409,6 +2057,7 @@ fn format_scan_summary(
     let categories = summarize_categories(&entry.tree);
     let children = format_top_children(root_path, &entry.tree, max_entries);
     json!({
+        "profile": profile,
         "ssh_host": ssh_host,
         "root": root_path.display().to_string(),
         "platform": entry.platform,
@@ -1676,7 +2325,8 @@ fn format_removal_failure(
 fn is_known_tool(name: &str) -> bool {
     matches!(
         name,
-        "list_volumes"
+        "list_ssh_profiles"
+            | "list_volumes"
             | "scan_directory"
             | "inspect_subtree"
             | "find_reclaimable"
@@ -1690,11 +2340,20 @@ fn is_known_tool(name: &str) -> bool {
 fn tool_definitions(read_only: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({
+            "name": "list_ssh_profiles",
+            "description": "List saved remote SSH server profiles (non-sensitive metadata only; never accesses credentials or opens connections).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
             "name": "list_volumes",
             "description": "List mounted volumes and free space on the local machine or a remote SSH host.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "profile": { "type": "string", "description": "Optional saved SSH profile alias or ID." },
                     "ssh_host": { "type": "string", "description": "Optional SSH destination (e.g. user@host)." }
                 }
             }
@@ -1707,6 +2366,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                 "properties": {
                     "path": { "type": "string", "description": "Directory path to scan (defaults to home directory)." },
                     "disk": { "type": "boolean", "description": "Scan the whole containing volume instead of just path." },
+                    "profile": { "type": "string", "description": "Optional saved SSH profile alias or ID." },
                     "ssh_host": { "type": "string", "description": "Optional SSH destination." },
                     "apparent_size": { "type": "boolean", "description": "Measure apparent file length instead of allocated blocks." },
                     "include_hidden": { "type": "boolean", "description": "Include dotfiles and hidden directories (default true)." },
@@ -1725,6 +2385,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                     "root": { "type": "string", "description": "Scanned root directory path." },
                     "subpath": { "type": "string", "description": "Optional relative or absolute path inside root." },
                     "filter": { "type": "string", "description": "Optional case-insensitive substring filter." },
+                    "profile": { "type": "string", "description": "Optional saved SSH profile alias or ID." },
                     "ssh_host": { "type": "string", "description": "Optional SSH destination." },
                     "max_entries": { "type": "integer", "description": "Maximum entries to return (default 25, max 100)." }
                 }
@@ -1738,6 +2399,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                 "required": ["root"],
                 "properties": {
                     "root": { "type": "string", "description": "Scanned root directory path." },
+                    "profile": { "type": "string", "description": "Optional saved SSH profile alias or ID." },
                     "ssh_host": { "type": "string", "description": "Optional SSH destination." },
                     "limit": { "type": "integer", "description": "Maximum candidates to return (default 20, max 100)." }
                 }
@@ -1755,6 +2417,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Local filesystem paths to inspect."
                     },
+                    "profile": { "type": "string", "description": "Unsupported for git checks; rejected if set." },
                     "ssh_host": { "type": "string", "description": "Unsupported for git checks; rejected if set." }
                 }
             }
@@ -1772,6 +2435,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Target paths under root to evaluate."
                     },
+                    "profile": { "type": "string", "description": "Optional saved SSH profile alias or ID." },
                     "ssh_host": { "type": "string", "description": "Optional SSH destination." }
                 }
             }
@@ -1791,6 +2455,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Target paths under root to move to Trash."
                     },
+                    "profile": { "type": "string", "description": "Optional saved SSH profile alias or ID." },
                     "ssh_host": { "type": "string", "description": "Optional SSH destination." }
                 }
             }
@@ -1809,6 +2474,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
                         "description": "Target paths under root to permanently delete."
                     },
                     "reason": { "type": "string", "description": "Reason for permanent deletion shown in the OS authentication prompt (defaults to '清理回收站')." },
+                    "profile": { "type": "string", "description": "Forbidden for permanent deletion." },
                     "ssh_host": { "type": "string", "description": "Forbidden for permanent deletion." }
                 }
             }
@@ -1949,7 +2615,7 @@ mod tests {
         let tools = responses[2]["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
 
         assert_eq!(responses[3]["id"], 4);
         assert_eq!(responses[3]["error"]["code"], -32601);
@@ -2665,7 +3331,7 @@ mod tests {
         let tools = responses[0]["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
             assert_ne!(name, "trash_paths");
@@ -3005,6 +3671,775 @@ mod tests {
             confirm_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "confirm UI must not open for rejected trash targets"
+        );
+    }
+
+    #[derive(Debug)]
+    struct CountingRootStore {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        secret: [u8; 32],
+    }
+
+    impl crate::credentials::RootSecretStore for CountingRootStore {
+        fn get_or_create_root_secret(
+            &self,
+        ) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(zeroize::Zeroizing::new(self.secret))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingRemoteConfirm {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        requests:
+            std::sync::Arc<std::sync::Mutex<Vec<RemoteConnectConfirmRequest>>>,
+        outcomes: std::sync::Mutex<
+            std::collections::VecDeque<
+                io::Result<RemoteConnectConfirmDecision>,
+            >,
+        >,
+        fallback: RemoteConnectConfirmDecision,
+    }
+
+    impl CountingRemoteConfirm {
+        fn always(decision: RemoteConnectConfirmDecision) -> Self {
+            Self {
+                calls: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+                requests: std::sync::Arc::new(
+                    std::sync::Mutex::new(Vec::new()),
+                ),
+                outcomes: std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                ),
+                fallback: decision,
+            }
+        }
+
+        fn sequence(
+            outcomes: Vec<io::Result<RemoteConnectConfirmDecision>>,
+            fallback: RemoteConnectConfirmDecision,
+        ) -> Self {
+            Self {
+                calls: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+                requests: std::sync::Arc::new(
+                    std::sync::Mutex::new(Vec::new()),
+                ),
+                outcomes: std::sync::Mutex::new(outcomes.into()),
+                fallback,
+            }
+        }
+    }
+
+    impl RemoteConnectConfirmAdapter for CountingRemoteConfirm {
+        fn confirm(
+            &self,
+            request: &RemoteConnectConfirmRequest,
+        ) -> io::Result<RemoteConnectConfirmDecision> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request.clone());
+            let next = self.outcomes.lock().unwrap().pop_front();
+            if let Some(next) = next {
+                next
+            } else {
+                Ok(self.fallback)
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockRemoteExecutor {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        trashed_paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        session_ptrs: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl MockRemoteExecutor {
+        fn sample_roots() -> Roots {
+            let volumes = vec![crate::space::Volume {
+                point: PathBuf::from("/"),
+                device: Some("/dev/vda1".to_owned()),
+                space: Some(SpaceInfo {
+                    total: 100_000_000,
+                    free: 20_000_000,
+                    available: 15_000_000,
+                }),
+            }];
+            serde_json::from_value(json!({
+                "version": 1,
+                "home": "/home/deploy",
+                "platform": "linux",
+                "identity": {
+                    "hostname": "prod-web-01",
+                    "machine_id": "0123456789abcdef0123456789abcdef",
+                },
+                "volumes": volumes,
+            }))
+            .expect("valid sample Roots")
+        }
+
+        fn sample_snapshot(root: &Path) -> Snapshot {
+            let mut tree = Node::directory(
+                root.file_name().and_then(|n| n.to_str()).unwrap_or("root"),
+            );
+            let mut old = Node::directory("old");
+            old.children
+                .push(Node::entry("app.log", NodeKind::File, 4096));
+            tree.children.push(old);
+            aggregate(&mut tree, Metric::Bytes);
+            classify(&mut tree);
+
+            let mut header = Header::new(
+                root.to_path_buf(),
+                Some(PathBuf::from("/home/deploy")),
+                "linux",
+                Some(HostIdentity {
+                    hostname: "prod-web-01".to_owned(),
+                    machine_id: Some(
+                        "0123456789abcdef0123456789abcdef".to_owned(),
+                    ),
+                }),
+            );
+            header.space = Some(SpaceInfo {
+                total: 100_000_000,
+                free: 20_000_000,
+                available: 15_000_000,
+            });
+            Snapshot { header, tree }
+        }
+    }
+
+    impl RemoteExecutor for MockRemoteExecutor {
+        fn list_volumes_with_session(
+            &self,
+            session: &SshSession,
+        ) -> io::Result<Roots> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ops
+                .lock()
+                .unwrap()
+                .push("list_volumes_session".to_owned());
+            self.session_ptrs
+                .lock()
+                .unwrap()
+                .push(std::ptr::from_ref(session) as usize);
+            Ok(Self::sample_roots())
+        }
+
+        fn list_volumes_raw(&self, host: &str) -> io::Result<Roots> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ops
+                .lock()
+                .unwrap()
+                .push(format!("list_volumes_raw:{host}"));
+            Ok(Self::sample_roots())
+        }
+
+        fn scan_with_session(
+            &self,
+            session: &SshSession,
+            request: &Request,
+        ) -> io::Result<Snapshot> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ops.lock().unwrap().push("scan_session".to_owned());
+            self.session_ptrs
+                .lock()
+                .unwrap()
+                .push(std::ptr::from_ref(session) as usize);
+            let root = request
+                .root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/home/deploy"));
+            Ok(Self::sample_snapshot(&root))
+        }
+
+        fn scan_raw(
+            &self,
+            host: &str,
+            request: &Request,
+        ) -> io::Result<Snapshot> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ops.lock().unwrap().push(format!("scan_raw:{host}"));
+            let root = request
+                .root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/home/deploy"));
+            Ok(Self::sample_snapshot(&root))
+        }
+
+        fn trash_with_session(
+            &self,
+            session: &SshSession,
+            targets: &[Target],
+            _header: &Header,
+        ) -> io::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ops.lock().unwrap().push("trash_session".to_owned());
+            self.session_ptrs
+                .lock()
+                .unwrap()
+                .push(std::ptr::from_ref(session) as usize);
+            self.trashed_paths
+                .lock()
+                .unwrap()
+                .extend(targets.iter().map(|t| t.path.clone()));
+            Ok(())
+        }
+
+        fn trash_raw(
+            &self,
+            host: &str,
+            targets: &[Target],
+            _header: &Header,
+        ) -> io::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ops.lock().unwrap().push(format!("trash_raw:{host}"));
+            self.trashed_paths
+                .lock()
+                .unwrap()
+                .extend(targets.iter().map(|t| t.path.clone()));
+            Ok(())
+        }
+    }
+
+    fn seed_profile_and_keychain(
+        temp_dir: &Path,
+    ) -> (StorageDb, SshProfile, PathBuf, [u8; 32]) {
+        use crate::credentials::{
+            CREDENTIALS_FILE_NAME, LazyCredentialStore, SshCredentialSecret,
+        };
+        use crate::storage::AuthMode;
+        use rand_core::OsRng;
+
+        let db = StorageDb::open(temp_dir.join("ruum.db")).unwrap();
+        let mut prod = SshProfile::new(
+            "prod-web",
+            "10.0.1.25",
+            2222,
+            "deploy",
+            AuthMode::PrivateKey,
+        );
+        prod.default_path = Some("/var/log".to_owned());
+        let saved = db.add_ssh_profile(&prod).unwrap();
+
+        let cred_path = temp_dir.join(CREDENTIALS_FILE_NAME);
+        let root_secret = [0x42_u8; 32];
+        let seed_calls =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seed_store = LazyCredentialStore::new(
+            cred_path.clone(),
+            std::sync::Arc::new(CountingRootStore {
+                calls: seed_calls,
+                secret: root_secret,
+            }),
+        );
+        let key = ssh_key::PrivateKey::random(
+            &mut OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        seed_store
+            .set_ssh_secret(
+                &saved.id,
+                &SshCredentialSecret::PrivateKey {
+                    private_key_pem: pem.to_string(),
+                    passphrase: None,
+                },
+            )
+            .unwrap();
+
+        (db, saved, cred_path, root_secret)
+    }
+
+    #[test]
+    fn list_ssh_profiles_returns_metadata_with_zero_secrets_keychain_or_confirm()
+     {
+        use crate::credentials::LazyCredentialStore;
+        use crate::storage::AuthMode;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (db, prod, cred_path, root_secret) =
+            seed_profile_and_keychain(temp.path());
+        let staging = SshProfile::new(
+            "staging-pw",
+            "staging.example.com",
+            22,
+            "ubuntu",
+            AuthMode::Password,
+        );
+        db.add_ssh_profile(&staging).unwrap();
+
+        let kc_calls =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let creds = LazyCredentialStore::new(
+            cred_path,
+            std::sync::Arc::new(CountingRootStore {
+                calls: std::sync::Arc::clone(&kc_calls),
+                secret: root_secret,
+            }),
+        );
+        let remote_confirm =
+            CountingRemoteConfirm::always(RemoteConnectConfirmDecision::Denied);
+        let confirm_calls = std::sync::Arc::clone(&remote_confirm.calls);
+        let exec = MockRemoteExecutor::default();
+        let exec_calls = std::sync::Arc::clone(&exec.calls);
+
+        let mut server = McpServer::new(Box::new(DenyAuth))
+            .with_storage(db)
+            .with_credentials(creds)
+            .with_remote_confirm(Box::new(remote_confirm))
+            .with_remote_executor(Box::new(exec));
+
+        let responses = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "list_ssh_profiles", "arguments": {} }
+            })],
+        )
+        .unwrap();
+
+        let (is_err, payload) = parse_tool_payload(&responses[0]);
+        assert!(!is_err, "list_ssh_profiles failed: {payload}");
+        let profiles = payload["profiles"].as_array().unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0]["id"], prod.id);
+        assert_eq!(profiles[0]["alias"], "prod-web");
+        assert_eq!(profiles[0]["host"], "10.0.1.25");
+        assert_eq!(profiles[0]["port"], 2222);
+        assert_eq!(profiles[0]["username"], "deploy");
+        assert_eq!(profiles[0]["auth_mode"], "private_key");
+        assert_eq!(profiles[0]["default_path"], "/var/log");
+        assert!(profiles[0].get("password").is_none());
+        assert!(profiles[0].get("private_key_pem").is_none());
+        assert!(profiles[0].get("secret").is_none());
+
+        assert_eq!(
+            kc_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "list_ssh_profiles must never access keychain"
+        );
+        assert_eq!(
+            confirm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "list_ssh_profiles must never trigger remote connect confirmation"
+        );
+        assert_eq!(
+            exec_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "list_ssh_profiles must never open SSH connections"
+        );
+    }
+
+    #[test]
+    fn profile_and_ssh_host_conflict_and_disallowed_tools_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, _prod, cred_path, root_secret) =
+            seed_profile_and_keychain(temp.path());
+        let creds = crate::credentials::LazyCredentialStore::new(
+            cred_path,
+            std::sync::Arc::new(CountingRootStore {
+                calls: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+                secret: root_secret,
+            }),
+        );
+        let remote_confirm = CountingRemoteConfirm::always(
+            RemoteConnectConfirmDecision::Approved,
+        );
+        let confirm_calls = std::sync::Arc::clone(&remote_confirm.calls);
+
+        let mut server = McpServer::new(Box::new(DenyAuth))
+            .with_storage(db)
+            .with_credentials(creds)
+            .with_remote_confirm(Box::new(remote_confirm));
+
+        let responses = run_session(
+            &mut server,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_volumes",
+                        "arguments": {
+                            "profile": "prod-web",
+                            "ssh_host": "deploy@10.0.1.25"
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "scan_directory",
+                        "arguments": {
+                            "profile": "prod-web",
+                            "ssh_host": "deploy@10.0.1.25"
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "check_git_safety",
+                        "arguments": {
+                            "paths": ["/tmp"],
+                            "profile": "prod-web"
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "delete_permanently",
+                        "arguments": {
+                            "root": "/var/log",
+                            "targets": ["/var/log/old"],
+                            "profile": "prod-web"
+                        }
+                    }
+                }),
+            ],
+        )
+        .unwrap();
+
+        for (idx, resp) in responses.iter().enumerate() {
+            let (is_err, payload) = parse_tool_payload(resp);
+            assert!(is_err, "call #{idx} must fail: {payload}");
+        }
+        assert!(
+            parse_tool_payload(&responses[0])
+                .1
+                .as_str()
+                .unwrap_or_default()
+                .contains("not both")
+        );
+        assert!(
+            parse_tool_payload(&responses[3])
+                .1
+                .as_str()
+                .unwrap_or_default()
+                .contains("Permanent deletion over SSH is forbidden")
+        );
+        assert_eq!(
+            confirm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid profile/ssh_host combinations must fail before confirm"
+        );
+    }
+
+    #[test]
+    fn remote_tools_fail_closed_on_deny_or_headless_with_zero_keychain_and_ssh()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, prod, cred_path, root_secret) =
+            seed_profile_and_keychain(temp.path());
+        let kc_calls =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let creds = crate::credentials::LazyCredentialStore::new(
+            cred_path,
+            std::sync::Arc::new(CountingRootStore {
+                calls: std::sync::Arc::clone(&kc_calls),
+                secret: root_secret,
+            }),
+        );
+
+        let remote_confirm = CountingRemoteConfirm::sequence(
+            vec![
+                Ok(RemoteConnectConfirmDecision::Denied),
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no active graphical desktop",
+                )),
+                Ok(RemoteConnectConfirmDecision::Denied),
+                Ok(RemoteConnectConfirmDecision::Denied),
+                Ok(RemoteConnectConfirmDecision::Denied),
+                Ok(RemoteConnectConfirmDecision::Denied),
+            ],
+            RemoteConnectConfirmDecision::Denied,
+        );
+        let confirm_calls = std::sync::Arc::clone(&remote_confirm.calls);
+        let exec = MockRemoteExecutor::default();
+        let exec_calls = std::sync::Arc::clone(&exec.calls);
+
+        let mut server = McpServer::with_confirm(
+            Box::new(DenyAuth),
+            Box::new(AutoConfirmAll),
+        )
+        .with_storage(db)
+        .with_credentials(creds)
+        .with_remote_confirm(Box::new(remote_confirm))
+        .with_remote_executor(Box::new(exec));
+
+        // Pre-seed a cached remote scan for `prod.id` WITHOUT granting a lease
+        // to prove `trash_paths` still enforces RemoteConnectConfirmAdapter!
+        let snap = MockRemoteExecutor::sample_snapshot(Path::new("/var/log"));
+        server.insert_cached(
+            Some(format!("profile:{}", prod.id)),
+            PathBuf::from("/var/log"),
+            CachedScan {
+                tree: snap.tree,
+                space: snap.header.space,
+                home: snap.header.home,
+                platform: snap.header.platform,
+                identity: snap.header.identity,
+                options: ScanOptions::default(),
+                scan_count: 1,
+            },
+        );
+
+        let responses = run_session(
+            &mut server,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_volumes",
+                        "arguments": { "profile": "prod-web" }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "scan_directory",
+                        "arguments": { "profile": "prod-web" }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inspect_subtree",
+                        "arguments": {
+                            "profile": "prod-web",
+                            "root": "/tmp/uncached"
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "find_reclaimable",
+                        "arguments": {
+                            "profile": "prod-web",
+                            "root": "/tmp/uncached-2"
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_volumes",
+                        "arguments": { "ssh_host": "ubuntu@10.0.0.99" }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "trash_paths",
+                        "arguments": {
+                            "profile": "prod-web",
+                            "root": "/var/log",
+                            "targets": ["/var/log/old"]
+                        }
+                    }
+                }),
+            ],
+        )
+        .unwrap();
+
+        for (idx, resp) in responses.iter().enumerate() {
+            let (is_err, payload) = parse_tool_payload(resp);
+            assert!(is_err, "denied/headless call #{idx} must fail: {payload}");
+        }
+        assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(
+            kc_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "keychain must never be accessed when connection confirm is denied"
+        );
+        assert_eq!(
+            exec_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "SSH transport must never execute when confirm is denied"
+        );
+        assert_eq!(server.remote_lease_count(), 0);
+    }
+
+    #[test]
+    fn approved_profile_reuses_lease_and_session_and_reprompts_after_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, prod, cred_path, root_secret) =
+            seed_profile_and_keychain(temp.path());
+        let kc_calls =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let creds = crate::credentials::LazyCredentialStore::new(
+            cred_path,
+            std::sync::Arc::new(CountingRootStore {
+                calls: std::sync::Arc::clone(&kc_calls),
+                secret: root_secret,
+            }),
+        );
+
+        let remote_confirm = CountingRemoteConfirm::sequence(
+            vec![
+                Ok(RemoteConnectConfirmDecision::Approved),
+                Ok(RemoteConnectConfirmDecision::Denied),
+            ],
+            RemoteConnectConfirmDecision::Denied,
+        );
+        let confirm_calls = std::sync::Arc::clone(&remote_confirm.calls);
+        let confirm_reqs = std::sync::Arc::clone(&remote_confirm.requests);
+
+        let exec = MockRemoteExecutor::default();
+        let exec_calls = std::sync::Arc::clone(&exec.calls);
+        let session_ptrs = std::sync::Arc::clone(&exec.session_ptrs);
+        let trashed_paths = std::sync::Arc::clone(&exec.trashed_paths);
+
+        let mut server = McpServer::with_confirm(
+            Box::new(DenyAuth),
+            Box::new(AutoConfirmAll),
+        )
+        .with_storage(db)
+        .with_credentials(creds)
+        .with_remote_confirm(Box::new(remote_confirm))
+        .with_remote_executor(Box::new(exec))
+        .with_lease_ttl(Duration::from_mins(10));
+
+        let responses = run_session(
+            &mut server,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_volumes",
+                        "arguments": { "profile": "prod-web" }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "scan_directory",
+                        "arguments": { "profile": "prod-web" }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "plan_removal",
+                        "arguments": {
+                            "profile": prod.id,
+                            "root": "/var/log",
+                            "targets": ["/var/log/old"]
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "trash_paths",
+                        "arguments": {
+                            "profile": "prod-web",
+                            "root": "/var/log",
+                            "targets": ["/var/log/old"]
+                        }
+                    }
+                }),
+            ],
+        )
+        .unwrap();
+
+        for (idx, resp) in responses.iter().enumerate() {
+            let (is_err, payload) = parse_tool_payload(resp);
+            assert!(!is_err, "approved call #{idx} failed: {payload}");
+        }
+        let scan_payload = parse_tool_payload(&responses[1]).1;
+        assert_eq!(scan_payload["profile"], "prod-web");
+        assert_eq!(scan_payload["root"], "/var/log");
+
+        // Confirm prompted only once; keychain loaded only once; SshSession reused.
+        assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(kc_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let reqs = confirm_reqs.lock().unwrap().clone();
+        assert_eq!(reqs[0].alias.as_deref(), Some("prod-web"));
+        assert_eq!(reqs[0].host, "10.0.1.25");
+        assert_eq!(reqs[0].port, 2222);
+        assert_eq!(reqs[0].username, "deploy");
+        assert_eq!(reqs[0].auth_mode, "private_key");
+        assert_eq!(reqs[0].tool_name, "list_volumes");
+        let ptrs = session_ptrs.lock().unwrap().clone();
+        assert_eq!(ptrs.len(), 3);
+        assert_eq!(ptrs[0], ptrs[1]);
+        assert_eq!(ptrs[1], ptrs[2]);
+        assert_eq!(
+            *trashed_paths.lock().unwrap(),
+            vec![PathBuf::from("/var/log/old")]
+        );
+
+        // Expire lease -> next call must re-prompt and fail closed when denied.
+        server.expire_remote_leases_for_test();
+        let after_expiry = run_session(
+            &mut server,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_volumes",
+                    "arguments": { "profile": "prod-web" }
+                }
+            })],
+        )
+        .unwrap();
+        let (is_err, err_payload) = parse_tool_payload(&after_expiry[0]);
+        assert!(is_err, "expired lease denied on re-prompt must fail closed");
+        assert!(
+            err_payload
+                .as_str()
+                .unwrap_or_default()
+                .contains("denied by user")
+        );
+        assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            exec_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "expired and denied session must not run SSH transport"
         );
     }
 }

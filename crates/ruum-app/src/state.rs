@@ -25,7 +25,9 @@ use ruum_core::cli_install::{
 };
 use ruum_core::confirm::{
     CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+    RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
 };
+use ruum_core::credentials::LazyCredentialStore;
 use ruum_core::filter::{Keep, Matches, filter};
 use ruum_core::insights::{Candidate, worth_a_look};
 use ruum_core::removal::{
@@ -34,15 +36,19 @@ use ruum_core::removal::{
 };
 use ruum_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use ruum_core::space::{SpaceInfo, device_for, space_info, volume_root_for};
+use ruum_core::ssh_session::SshSession;
+use ruum_core::storage::{
+    AiConfig, AppSettings, AuthMode, SshProfile, StorageDb, WebhookConfig,
+    WebhookEndpoint,
+};
 use ruum_core::tree::{Metric, Node, path_of};
 use ruum_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
 };
 use ruum_core::watchdog::ServiceStatus;
-use ruum_core::watchdog_config::{
-    MIN_COOLDOWN_SECS, MIN_FREE_GB_FLOOR, WatchdogConfig, WatchdogState,
-};
-use std::collections::BTreeSet;
+use ruum_core::watchdog_config::{AiCliProvider, CleanupProposal};
+use ruum_watchdog::{MIN_COOLDOWN_SECS, WatchdogConfig, WatchdogState};
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::git::GitState;
 
@@ -345,6 +351,7 @@ pub struct CleanupConfirmModal {
     pub checked_paths: BTreeSet<PathBuf>,
     pub responder: Option<std::sync::mpsc::Sender<CleanupConfirmDecision>>,
     pub response_file: Option<PathBuf>,
+    pub remote_profile_id: Option<String>,
     pub decided: bool,
 }
 
@@ -365,8 +372,16 @@ impl CleanupConfirmModal {
             checked_paths,
             responder,
             response_file,
+            remote_profile_id: None,
             decided: false,
         }
+    }
+
+    /// Tag this modal as targeting a remote SSH profile rather than local disk.
+    #[must_use]
+    pub fn with_remote_profile(mut self, profile_id: String) -> Self {
+        self.remote_profile_id = Some(profile_id);
+        self
     }
 
     #[must_use]
@@ -478,6 +493,32 @@ pub fn proposal_confirm_request(
     }
 }
 
+/// Build a standalone confirmation request from a remote SSH AI proposal.
+pub fn remote_proposal_confirm_request(
+    root: PathBuf,
+    alias: &str,
+    proposal: &ruum_core::watchdog_config::CleanupProposal,
+    locale: crate::i18n::Locale,
+) -> CleanupConfirmRequest {
+    let items = proposal
+        .items
+        .iter()
+        .map(|item| CleanupConfirmItem {
+            path: item.path.clone(),
+            bytes: item.bytes,
+            mode: item.mode,
+            reason: item.reason.clone(),
+            git_warning: item.git_warning.clone(),
+        })
+        .collect();
+    CleanupConfirmRequest {
+        root,
+        title: crate::i18n::messages::ai_proposal_remote_title(alias, locale),
+        summary: Some(proposal.summary.clone()),
+        items,
+    }
+}
+
 fn write_decision_file(
     path: &Path,
     decision: &CleanupConfirmDecision,
@@ -487,15 +528,260 @@ fn write_decision_file(
     std::fs::write(path, json)
 }
 
+fn write_remote_connect_decision_file(
+    path: &Path,
+    decision: RemoteConnectConfirmDecision,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(&decision)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+/// Interactive modal state holding an MCP remote SSH connection request.
+#[derive(Debug)]
+pub struct RemoteConnectConfirmModal {
+    pub request: RemoteConnectConfirmRequest,
+    pub responder:
+        Option<std::sync::mpsc::Sender<RemoteConnectConfirmDecision>>,
+    pub response_file: Option<PathBuf>,
+    pub decided: bool,
+}
+
+impl RemoteConnectConfirmModal {
+    /// Create a new modal for an incoming remote SSH connection request.
+    #[must_use]
+    pub const fn new(
+        request: RemoteConnectConfirmRequest,
+        responder: Option<
+            std::sync::mpsc::Sender<RemoteConnectConfirmDecision>,
+        >,
+        response_file: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            request,
+            responder,
+            response_file,
+            decided: false,
+        }
+    }
+
+    pub fn approve(&mut self) -> RemoteConnectConfirmDecision {
+        self.finish(RemoteConnectConfirmDecision::Approved)
+    }
+
+    pub fn deny(&mut self) -> RemoteConnectConfirmDecision {
+        self.finish(RemoteConnectConfirmDecision::Denied)
+    }
+
+    fn finish(
+        &mut self,
+        decision: RemoteConnectConfirmDecision,
+    ) -> RemoteConnectConfirmDecision {
+        self.decided = true;
+        if let Some(resp) = self.responder.take() {
+            let _ = resp.send(decision);
+        }
+        if let Some(ref path) = self.response_file {
+            let _ = write_remote_connect_decision_file(path, decision);
+        }
+        decision
+    }
+}
+
+impl Drop for RemoteConnectConfirmModal {
+    fn drop(&mut self) {
+        if !self.decided {
+            let decision = RemoteConnectConfirmDecision::Denied;
+            if let Some(resp) = self.responder.take() {
+                let _ = resp.send(decision);
+            }
+            if let Some(ref path) = self.response_file {
+                let _ = write_remote_connect_decision_file(path, decision);
+            }
+        }
+    }
+}
+
+/// Category tab shown in the Zed-style left sidebar of `Screen::Settings`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsCategory {
+    #[default]
+    General,
+    Watchdog,
+    Webhook,
+    Ai,
+    Cli,
+}
+
+/// Unique key identifying a host tab in the Explore top bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum HostTabKey {
+    #[default]
+    Local,
+    Ssh(String),
+}
+
+/// Per-tab Explore session snapshot preserved across host tab switches.
+pub struct ExploreSessionSnapshot {
+    pub root_path: PathBuf,
+    pub scan_root: PathBuf,
+    pub tree: Option<Arc<Node>>,
+    pub scan: Option<ScanHandle>,
+    pub remote_scan: Option<ruum_core::remote::RemoteScan>,
+    pub remote_disk: bool,
+    pub remote_progress: ruum_core::remote_progress::Progress,
+    pub scan_preview: Option<Arc<ruum_core::scan_preview::Preview>>,
+    pub preview_updated: Option<Instant>,
+    pub progress: ScanSnapshot,
+    pub scan_error: Option<String>,
+    pub scan_started: Option<Instant>,
+    pub scan_elapsed: Option<Duration>,
+    pub scanned_at: i64,
+    pub scan_epoch: u64,
+    pub crumbs: Vec<usize>,
+    pub selected: Option<Vec<usize>>,
+    pub hovered: Option<Vec<usize>>,
+    pub history: History,
+    pub view: View,
+    pub transition: Option<LayoutTransition>,
+    cache: Option<LayoutCache>,
+    pub marks: Marks,
+    pub space: Option<SpaceInfo>,
+    pub space_baseline: Option<SpaceInfo>,
+    pub disk_root: Option<PathBuf>,
+    pub device: Option<String>,
+    pub home: Option<PathBuf>,
+    pub file_table: bool,
+    pub full_disk_access: Option<bool>,
+    pub remote: Option<String>,
+    pub remote_platform: String,
+    pub remote_identity: Option<ruum_core::identity::HostIdentity>,
+    pub insights: Vec<Candidate>,
+    pub git: FxHashMap<PathBuf, Option<GitState>>,
+    git_pending: FxHashSet<PathBuf>,
+    pub find: String,
+    pub find_open: bool,
+    pub matches: Option<Arc<Matches>>,
+    pub filter_applied: bool,
+    filter_epoch: u64,
+    find_epoch: u64,
+    pub finding: bool,
+    apply_pending: bool,
+    pub crumb_menu: Option<CrumbMenu>,
+    pub awaiting_root: bool,
+    pub active_ssh_profile_id: Option<String>,
+    pub active_ssh_session: Option<Arc<SshSession>>,
+}
+
+impl Default for ExploreSessionSnapshot {
+    fn default() -> Self {
+        Self {
+            root_path: PathBuf::new(),
+            scan_root: PathBuf::new(),
+            tree: None,
+            scan: None,
+            remote_scan: None,
+            remote_disk: false,
+            remote_progress: ruum_core::remote_progress::Progress::default(),
+            scan_preview: None,
+            preview_updated: None,
+            progress: ScanSnapshot::default(),
+            scan_error: None,
+            scan_started: None,
+            scan_elapsed: None,
+            scanned_at: 0,
+            scan_epoch: 0,
+            crumbs: Vec::new(),
+            selected: None,
+            hovered: None,
+            history: History::default(),
+            view: View::default(),
+            transition: None,
+            cache: None,
+            marks: Marks::default(),
+            space: None,
+            space_baseline: None,
+            disk_root: None,
+            device: None,
+            home: None,
+            file_table: false,
+            full_disk_access: None,
+            remote: None,
+            remote_platform: String::new(),
+            remote_identity: None,
+            insights: Vec::new(),
+            git: FxHashMap::default(),
+            git_pending: FxHashSet::default(),
+            find: String::new(),
+            find_open: false,
+            matches: None,
+            filter_applied: false,
+            filter_epoch: 0,
+            find_epoch: 0,
+            finding: false,
+            apply_pending: false,
+            crumb_menu: None,
+            awaiting_root: false,
+            active_ssh_profile_id: None,
+            active_ssh_session: None,
+        }
+    }
+}
+
+/// A host tab entry in the Explore top bar.
+pub struct ExploreHostTab {
+    pub key: HostTabKey,
+    pub label: String,
+    pub session: Option<ExploreSessionSnapshot>,
+}
+
 /// Draft form state for the Settings page, isolated from committed config
 /// until the user explicitly saves.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchdogSettingsDraft {
+    pub power_preset: crate::power::PowerEfficiency,
+    pub apparent_size: bool,
+    pub include_hidden: bool,
+    pub follow_system_appearance: bool,
     pub enabled: bool,
     pub background_service: bool,
     pub ai_auto_analyze: bool,
-    pub ai_provider: ruum_core::watchdog_config::AiCliProvider,
+    pub ai_provider: AiCliProvider,
     pub model: Option<String>,
+}
+
+impl Default for WatchdogSettingsDraft {
+    fn default() -> Self {
+        Self::from_configs(
+            &AppSettings::default(),
+            &WatchdogConfig::default(),
+            &AiConfig::default(),
+        )
+    }
+}
+
+impl WatchdogSettingsDraft {
+    #[must_use]
+    pub fn from_configs(
+        app: &AppSettings,
+        wd: &WatchdogConfig,
+        ai: &AiConfig,
+    ) -> Self {
+        Self {
+            power_preset: crate::power::PowerEfficiency::parse(
+                &app.power_preset,
+            )
+            .unwrap_or_default(),
+            apparent_size: app.apparent_size,
+            include_hidden: app.include_hidden,
+            follow_system_appearance: app.follow_system_appearance,
+            enabled: wd.enabled,
+            background_service: wd.background_service,
+            ai_auto_analyze: ai.auto_analyze_on_alert,
+            ai_provider: ai.provider,
+            model: ai.model.clone(),
+        }
+    }
 }
 
 impl From<&WatchdogConfig> for WatchdogSettingsDraft {
@@ -503,9 +789,7 @@ impl From<&WatchdogConfig> for WatchdogSettingsDraft {
         Self {
             enabled: cfg.enabled,
             background_service: cfg.background_service,
-            ai_auto_analyze: cfg.ai_auto_analyze,
-            ai_provider: cfg.ai_provider,
-            model: cfg.model.clone(),
+            ..Self::default()
         }
     }
 }
@@ -527,7 +811,43 @@ pub struct Ruum {
     pub home: Option<PathBuf>,
     pub options: ScanOptions,
     pub power_choice: Option<crate::power::PowerEfficiency>,
-    pub power_settings_path: Option<PathBuf>,
+    /// Injectable path to unified `SQLite` `ruum.db` (`None` under `cfg!(test)`).
+    pub db_path: Option<PathBuf>,
+    /// Lazy keychain-backed credential store (`None` under `cfg!(test)`).
+    pub cred_store: Option<LazyCredentialStore>,
+    /// Application-wide settings persisted in `app_settings`.
+    pub app_settings: AppSettings,
+    /// Saved SSH server cards loaded from `ssh_profiles` (metadata only).
+    pub ssh_profiles: Vec<SshProfile>,
+    /// Active SSH profile ID when exploring a saved SSH card.
+    pub active_ssh_profile_id: Option<String>,
+    /// Active in-memory SSH session (`SSH_AUTH_SOCK` or `SSH_ASKPASS`).
+    pub active_ssh_session: Option<Arc<SshSession>>,
+    /// Whether the inline SSH Add/Edit form is open on `Screen::Sources`.
+    pub ssh_form_open: bool,
+    /// Profile ID being edited, or `None` when adding a new SSH server.
+    pub ssh_form_editing_id: Option<String>,
+    /// Auth mode selected in the SSH Add/Edit form.
+    pub ssh_form_auth_mode: AuthMode,
+    /// Inline validation or storage error on the SSH Add/Edit form.
+    pub ssh_form_error: Option<String>,
+    /// When true, `views::root` syncs SSH form inputs from the pending state.
+    pub ssh_form_needs_sync: bool,
+    /// SSH form inputs.
+    pub ssh_input_alias: Option<Entity<InputState>>,
+    pub ssh_input_host: Option<Entity<InputState>>,
+    pub ssh_input_port: Option<Entity<InputState>>,
+    pub ssh_input_username: Option<Entity<InputState>>,
+    pub ssh_input_default_path: Option<Entity<InputState>>,
+    pub ssh_input_password: Option<Entity<InputState>>,
+    pub ssh_input_private_key: Option<Entity<InputState>>,
+    pub ssh_input_passphrase: Option<Entity<InputState>>,
+    /// Active MCP remote SSH connection confirmation modal, if any.
+    pub remote_connect_confirm: Option<RemoteConnectConfirmModal>,
+    /// Queued MCP remote SSH connection requests waiting for user approval.
+    pub remote_connect_confirm_queue: VecDeque<RemoteConnectConfirmModal>,
+    /// Focus owner for the remote SSH connection confirmation modal.
+    pub remote_connect_focus: FocusHandle,
     /// The Power Efficiency menu, when open: the row the arrow keys are on,
     /// as an index into [`crate::power::PowerEfficiency::ALL`].
     pub power_menu: Option<usize>,
@@ -647,15 +967,42 @@ pub struct Ruum {
     pub volumes_open: bool,
     pub volumes_loading: bool,
     pub awaiting_root: bool,
-    pub volumes_source: Option<String>,
     pub volumes_error: Option<String>,
     pub picker_error: Option<String>,
-    pub picker_host: Option<Entity<InputState>>,
     pub picker_path: Option<Entity<InputState>>,
-    roots_job: Option<ruum_core::remote::RemoteRoots>,
     volume_epoch: u64,
     pub volumes: Vec<ruum_core::space::Volume>,
     pub volume_highlight: usize,
+    /// Open Explore host tabs (always starts with unclosable `HostTabKey::Local`).
+    pub host_tabs: Vec<ExploreHostTab>,
+    /// Currently active host tab key in Explore.
+    pub active_host_tab: HostTabKey,
+    /// SSH profile IDs currently running a disk-space preflight check.
+    pub ssh_checking_profiles: FxHashSet<String>,
+    /// SSH profile IDs currently running a remote AI analysis.
+    pub ssh_analyzing_profiles: FxHashSet<String>,
+    /// Active left-sidebar category on `Screen::Settings`.
+    pub settings_category: SettingsCategory,
+    /// Configured webhook endpoints loaded from `webhook_endpoints`.
+    pub webhooks: Vec<WebhookEndpoint>,
+    /// Whether the inline Add/Edit webhook form is open on Settings -> Webhooks.
+    pub webhook_form_open: bool,
+    /// Endpoint ID being edited, or `None` when adding a new webhook.
+    pub webhook_form_editing_id: Option<String>,
+    /// Enabled checkbox draft state for the webhook form.
+    pub webhook_form_enabled: bool,
+    /// Validation or persistence error shown inside the webhook form.
+    pub webhook_form_error: Option<String>,
+    /// When true, `views::root` syncs webhook form inputs from state.
+    pub webhook_form_needs_sync: bool,
+    /// Whether the Webhook Setup Tutorial & Payload Guide card is expanded.
+    pub webhook_guide_open: bool,
+    /// Webhook form input: human-readable endpoint name.
+    pub webhook_input_name: Option<Entity<InputState>>,
+    /// Endpoint IDs currently executing a live test POST.
+    pub webhook_testing_ids: FxHashSet<String>,
+    /// True while checking local disk space on the Watchdog page.
+    pub watchdog_checking_space: bool,
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
     pub scan_started: Option<Instant>,
@@ -665,24 +1012,36 @@ pub struct Ruum {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
-    /// Watchdog monitoring configuration.
+    /// Watchdog monitoring configuration (`ruum_watchdog` table).
     pub watchdog_config: WatchdogConfig,
-    /// Injectable path to `watchdog.json` (`None` under `cfg!(test)`).
-    pub watchdog_config_path: Option<PathBuf>,
-    /// Watchdog persistent runtime state.
+    /// Watchdog persistent runtime state (`ruum_watchdog` table).
     pub watchdog_state: WatchdogState,
-    /// Injectable path to `watchdog-state.json` (`None` under `cfg!(test)`).
-    pub watchdog_state_path: Option<PathBuf>,
+    /// Generic HTTP webhook alert configuration (`webhook_config` table).
+    pub webhook_config: WebhookConfig,
+    /// Independent AI analysis configuration (`ai_config` table).
+    pub ai_config: AiConfig,
+    /// Latest AI cleanup proposal (`ai_state` table).
+    pub ai_proposal: Option<CleanupProposal>,
     /// Unsaved toggle/provider/model selections on the Settings page.
     pub watchdog_draft: WatchdogSettingsDraft,
-    /// When true, `views::root` syncs Settings text inputs from `watchdog_config`.
+    /// When true, `views::root` syncs Settings text inputs from committed DB state.
     pub watchdog_inputs_need_sync: bool,
+    /// Settings input: default treemap depth (`1..=6`).
+    pub setting_input_default_depth: Option<Entity<InputState>>,
+    /// Settings input: SSH session / MCP lease duration in minutes.
+    pub setting_input_ssh_duration: Option<Entity<InputState>>,
     /// Settings input: threshold minimum free gigabytes.
     pub watchdog_input_min_free: Option<Entity<InputState>>,
     /// Settings input: watchdog check interval in minutes.
     pub watchdog_input_poll_interval: Option<Entity<InputState>>,
     /// Settings input: watchdog re-alert cooldown in minutes.
     pub watchdog_input_cooldown: Option<Entity<InputState>>,
+    /// Settings input: generic webhook URL.
+    pub setting_input_webhook_url: Option<Entity<InputState>>,
+    /// Settings input: generic webhook timeout in seconds.
+    pub setting_input_webhook_timeout: Option<Entity<InputState>>,
+    /// Settings input: generic webhook headers JSON object.
+    pub setting_input_webhook_headers: Option<Entity<InputState>>,
     /// Settings input: custom AI CLI command.
     pub watchdog_input_custom_cmd: Option<Entity<InputState>>,
     /// Settings input: custom AI CLI extra arguments.
@@ -781,35 +1140,88 @@ impl Ruum {
         };
         let trash_backend = detect_trash_backend();
         let (
-            watchdog_config_path,
-            watchdog_state_path,
+            db_path,
+            cred_store,
+            app_settings,
             watchdog_config,
             watchdog_state,
+            webhook_config,
+            webhooks,
+            ai_config,
+            ai_proposal,
+            ssh_profiles,
             watchdog_home_space,
         ) = if cfg!(test) {
             (
                 None,
                 None,
+                AppSettings::default(),
                 WatchdogConfig::default(),
                 WatchdogState::default(),
+                WebhookConfig::default(),
+                Vec::new(),
+                AiConfig::default(),
+                None,
+                Vec::new(),
                 None,
             )
         } else {
-            let cfg_path = ruum_core::watchdog_config::watchdog_config_path();
-            let state_path = ruum_core::watchdog_config::watchdog_state_path();
-            let cfg = cfg_path
-                .as_deref()
-                .and_then(|p| ruum_core::watchdog_config::load_config(p).ok())
-                .unwrap_or_default();
-            let state = state_path
-                .as_deref()
-                .and_then(|p| ruum_core::watchdog_config::load_state(p).ok())
-                .unwrap_or_default();
+            let db_path = ruum_watchdog::ruum_db_path();
+            let cred_store = LazyCredentialStore::open_default().ok();
+            let (app_s, wd_c, wd_s, wh_c, wh_list, ai_c, ai_p, profiles) =
+                db_path
+                    .as_deref()
+                    .and_then(|p| StorageDb::open(p).ok())
+                    .map_or_else(
+                        || {
+                            (
+                                AppSettings::default(),
+                                WatchdogConfig::default(),
+                                WatchdogState::default(),
+                                WebhookConfig::default(),
+                                Vec::new(),
+                                AiConfig::default(),
+                                None,
+                                Vec::new(),
+                            )
+                        },
+                        |db| {
+                            let wd = db.watchdog().ok();
+                            (
+                                db.load_app_settings().unwrap_or_default(),
+                                wd.as_ref()
+                                    .and_then(|w| w.load_config().ok())
+                                    .unwrap_or_default(),
+                                wd.as_ref()
+                                    .and_then(|w| w.load_state().ok())
+                                    .unwrap_or_default(),
+                                db.load_webhook_config().unwrap_or_default(),
+                                db.list_webhooks().unwrap_or_default(),
+                                db.load_ai_config().unwrap_or_default(),
+                                db.load_ai_state().ok().and_then(|s| {
+                                    s.parse_proposal().ok().flatten()
+                                }),
+                                db.list_ssh_profiles().unwrap_or_default(),
+                            )
+                        },
+                    );
             let home_space = home.as_deref().and_then(|h| space_info(h).ok());
-            (cfg_path, state_path, cfg, state, home_space)
+            (
+                db_path, cred_store, app_s, wd_c, wd_s, wh_c, wh_list, ai_c,
+                ai_p, profiles, home_space,
+            )
+        };
+        let power_choice = if cfg!(test) {
+            None
+        } else {
+            crate::power::PowerEfficiency::parse(&app_settings.power_preset)
         };
         let watchdog_space_checked_at = watchdog_state.last_checked_secs;
-        let watchdog_draft = WatchdogSettingsDraft::from(&watchdog_config);
+        let watchdog_draft = WatchdogSettingsDraft::from_configs(
+            &app_settings,
+            &watchdog_config,
+            &ai_config,
+        );
 
         let mut tree = Self {
             root_path,
@@ -823,8 +1235,29 @@ impl Ruum {
             remote_identity: None,
             home,
             options,
-            power_choice: None,
-            power_settings_path: crate::power::settings_path(),
+            power_choice,
+            db_path,
+            cred_store,
+            app_settings,
+            ssh_profiles,
+            active_ssh_profile_id: None,
+            active_ssh_session: None,
+            ssh_form_open: false,
+            ssh_form_editing_id: None,
+            ssh_form_auth_mode: AuthMode::PrivateKey,
+            ssh_form_error: None,
+            ssh_form_needs_sync: false,
+            ssh_input_alias: None,
+            ssh_input_host: None,
+            ssh_input_port: None,
+            ssh_input_username: None,
+            ssh_input_default_path: None,
+            ssh_input_password: None,
+            ssh_input_private_key: None,
+            ssh_input_passphrase: None,
+            remote_connect_confirm: None,
+            remote_connect_confirm_queue: VecDeque::new(),
+            remote_connect_focus: cx.focus_handle(),
             power_menu: None,
             power_hover: false,
             cpu_threads: crate::power::cpu_threads(),
@@ -900,29 +1333,51 @@ impl Ruum {
             volumes_open: false,
             volumes_loading: false,
             awaiting_root: !start,
-            volumes_source: None,
             volumes_error: None,
             picker_error: None,
-            picker_host: None,
             picker_path: None,
-            roots_job: None,
             volume_epoch: 0,
             volumes: Vec::new(),
             volume_highlight: 0,
+            host_tabs: vec![ExploreHostTab {
+                key: HostTabKey::Local,
+                label: String::new(),
+                session: None,
+            }],
+            active_host_tab: HostTabKey::Local,
+            ssh_checking_profiles: FxHashSet::default(),
+            ssh_analyzing_profiles: FxHashSet::default(),
+            settings_category: SettingsCategory::General,
+            webhooks,
+            webhook_form_open: false,
+            webhook_form_editing_id: None,
+            webhook_form_enabled: true,
+            webhook_form_error: None,
+            webhook_form_needs_sync: false,
+            webhook_guide_open: true,
+            webhook_input_name: None,
+            webhook_testing_ids: FxHashSet::default(),
+            watchdog_checking_space: false,
             panel_rems: PANEL_REMS,
             scan_started: None,
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
             watchdog_config,
-            watchdog_config_path,
             watchdog_state,
-            watchdog_state_path,
+            webhook_config,
+            ai_config,
+            ai_proposal,
             watchdog_draft,
             watchdog_inputs_need_sync: false,
+            setting_input_default_depth: None,
+            setting_input_ssh_duration: None,
             watchdog_input_min_free: None,
             watchdog_input_poll_interval: None,
             watchdog_input_cooldown: None,
+            setting_input_webhook_url: None,
+            setting_input_webhook_timeout: None,
+            setting_input_webhook_headers: None,
             watchdog_input_custom_cmd: None,
             watchdog_input_extra_args: None,
             watchdog_input_model: None,
@@ -1064,6 +1519,91 @@ impl Ruum {
         cx.notify();
     }
 
+    /// Open the configured `ruum.db` database, creating it if needed.
+    pub(crate) fn open_db(&self) -> std::io::Result<StorageDb> {
+        let path = self.db_path.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no database path configured",
+            )
+        })?;
+        StorageDb::open(path)
+    }
+
+    /// Open `ruum.db` only when it already exists on disk (read-only pages).
+    fn open_existing_db(&self) -> Option<StorageDb> {
+        let path = self.db_path.as_deref().filter(|p| p.is_file())?;
+        StorageDb::open(path).ok()
+    }
+
+    fn ensure_cred_store(&self) -> Result<LazyCredentialStore, String> {
+        if let Some(ref store) = self.cred_store {
+            return Ok(store.clone());
+        }
+        if let Some(ref db_path) = self.db_path
+            && let Some(dir) = db_path.parent()
+        {
+            return Ok(LazyCredentialStore::platform(dir));
+        }
+        Err("no credential store configured".to_owned())
+    }
+
+    /// Reload saved SSH server cards from `ruum.db` (metadata only, zero keychain).
+    pub fn reload_ssh_profiles(&mut self) {
+        if let Some(db) = self.open_existing_db()
+            && let Ok(profiles) = db.list_ssh_profiles()
+        {
+            self.ssh_profiles = profiles;
+        }
+    }
+
+    /// Enqueue an MCP remote SSH connection confirmation request.
+    pub fn enqueue_remote_connect_confirm(
+        &mut self,
+        request: RemoteConnectConfirmRequest,
+        responder: Option<
+            std::sync::mpsc::Sender<RemoteConnectConfirmDecision>,
+        >,
+        response_file: Option<PathBuf>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let modal =
+            RemoteConnectConfirmModal::new(request, responder, response_file);
+        if self.remote_connect_confirm.is_none() {
+            self.remote_connect_confirm = Some(modal);
+            self.focus_request = Some(FocusTarget::RemoteConnectDialog);
+        } else {
+            self.remote_connect_confirm_queue.push_back(modal);
+        }
+        cx.notify();
+    }
+
+    /// Approve the active remote SSH connection modal and promote any queued next request.
+    pub fn approve_remote_connect(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(mut modal) = self.remote_connect_confirm.take() {
+            let _ = modal.approve();
+        }
+        self.advance_remote_connect_queue(cx);
+    }
+
+    /// Deny the active remote SSH connection modal and promote any queued next request.
+    pub fn deny_remote_connect(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(mut modal) = self.remote_connect_confirm.take() {
+            let _ = modal.deny();
+        }
+        self.advance_remote_connect_queue(cx);
+    }
+
+    fn advance_remote_connect_queue(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(next) = self.remote_connect_confirm_queue.pop_front() {
+            self.remote_connect_confirm = Some(next);
+            self.focus_request = Some(FocusTarget::RemoteConnectDialog);
+        } else {
+            self.focus_request = Some(FocusTarget::Root);
+        }
+        cx.notify();
+    }
+
     /// Switch primary screen from the icon rail or app menu shortcuts.
     pub fn navigate_rail(
         &mut self,
@@ -1081,17 +1621,18 @@ impl Ruum {
         if target == Screen::Sources {
             self.screen = Screen::Sources;
             self.volumes_open = true;
-            self.picker_host = None;
             self.picker_path = None;
+            self.reload_ssh_profiles();
             self.focus_request = Some(FocusTarget::Dialog);
-            self.load_volume_source(self.remote.clone(), cx);
+            self.load_local_volumes(cx);
             return;
         }
         if self.volumes_open || self.screen == Screen::Sources {
             self.volume_epoch += 1;
-            self.roots_job = None;
             self.volumes_loading = false;
             self.volumes_open = false;
+            self.ssh_form_open = false;
+            self.ssh_form_error = None;
         }
         self.screen = target;
         if target == Screen::Settings {
@@ -1119,89 +1660,35 @@ impl Ruum {
         self.navigate_rail(Screen::Sources, cx);
     }
 
-    pub fn load_volume_source(
-        &mut self,
-        host: Option<String>,
-        cx: &mut Context<'_, Self>,
-    ) {
+    /// Discover local mounts and volumes without probing or depending on any
+    /// active remote SSH session.
+    pub fn load_local_volumes(&mut self, cx: &mut Context<'_, Self>) {
         if !self.volumes_open && self.screen != Screen::Sources {
             return;
         }
         self.volume_epoch += 1;
         let epoch = self.volume_epoch;
-        self.roots_job = None;
-        self.volumes_source.clone_from(&host);
         self.volumes.clear();
         self.volume_highlight = 0;
         self.volumes_error = None;
         self.picker_error = None;
         self.volumes_loading = true;
-        if let Some(host) = host {
-            match ruum_core::remote::RemoteRoots::discover(&host) {
-                Ok(job) => {
-                    self.roots_job = Some(job);
-                    cx.spawn(async move |this, cx| {
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(110))
-                                .await;
-                            let keep = this
-                                .update(cx, |this, cx| {
-                                    this.poll_roots_once(epoch, cx)
-                                })
-                                .unwrap_or(false);
-                            if !keep {
-                                break;
-                            }
-                        }
-                    })
-                    .detach();
+        let task = cx.background_executor().spawn(async {
+            ruum_core::space::volume_roots()
+                .map(|volumes| (volumes, std::env::home_dir()))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if (this.volumes_open || this.screen == Screen::Sources)
+                    && this.volume_epoch == epoch
+                {
+                    this.finish_volume_listing(result, cx);
                 }
-                Err(error) => self.finish_volume_listing(Err(error), cx),
-            }
-        } else {
-            let task = cx.background_executor().spawn(async {
-                ruum_core::space::volume_roots()
-                    .map(|volumes| (volumes, std::env::home_dir()))
             });
-            cx.spawn(async move |this, cx| {
-                let result = task.await;
-                let _ = this.update(cx, |this, cx| {
-                    if (this.volumes_open || this.screen == Screen::Sources)
-                        && this.volume_epoch == epoch
-                    {
-                        this.finish_volume_listing(result, cx);
-                    }
-                });
-            })
-            .detach();
-        }
+        })
+        .detach();
         cx.notify();
-    }
-
-    pub(crate) fn poll_roots_once(
-        &mut self,
-        epoch: u64,
-        cx: &mut Context<'_, Self>,
-    ) -> bool {
-        if (!self.volumes_open && self.screen != Screen::Sources)
-            || self.volume_epoch != epoch
-        {
-            return false;
-        }
-        let Some(result) = self
-            .roots_job
-            .as_ref()
-            .and_then(ruum_core::remote::RemoteJob::poll)
-        else {
-            return self.roots_job.is_some();
-        };
-        self.roots_job = None;
-        self.finish_volume_listing(
-            result.map(|roots| (roots.volumes, roots.home)),
-            cx,
-        );
-        false
     }
 
     pub(crate) fn finish_volume_listing(
@@ -1244,24 +1731,6 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         let locale = self.locale;
-        if self.picker_host.is_none() {
-            let value = self.volumes_source.clone().unwrap_or_default();
-            let host = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(crate::i18n::messages::placeholder_ssh_host(
-                        locale,
-                    ))
-                    .default_value(value)
-            });
-            cx.subscribe(&host, |this, _, event, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.connect_picker(cx);
-                }
-                cx.notify();
-            })
-            .detach();
-            self.picker_host = Some(host);
-        }
         if self.picker_path.is_none() {
             let path = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(
@@ -1281,11 +1750,24 @@ impl Ruum {
     /// Whether any text input currently owns keyboard focus.
     pub fn is_editing(&self, window: &Window, cx: &App) -> bool {
         let inputs = [
-            &self.picker_host,
             &self.picker_path,
+            &self.ssh_input_alias,
+            &self.ssh_input_host,
+            &self.ssh_input_port,
+            &self.ssh_input_username,
+            &self.ssh_input_default_path,
+            &self.ssh_input_password,
+            &self.ssh_input_private_key,
+            &self.ssh_input_passphrase,
+            &self.setting_input_default_depth,
+            &self.setting_input_ssh_duration,
             &self.watchdog_input_min_free,
             &self.watchdog_input_poll_interval,
             &self.watchdog_input_cooldown,
+            &self.webhook_input_name,
+            &self.setting_input_webhook_url,
+            &self.setting_input_webhook_timeout,
+            &self.setting_input_webhook_headers,
             &self.watchdog_input_custom_cmd,
             &self.watchdog_input_extra_args,
             &self.watchdog_input_model,
@@ -1324,35 +1806,414 @@ impl Ruum {
         .detach();
     }
 
-    /// Re-read watchdog persistent state from disk.
+    /// Re-read watchdog persistent state and latest AI proposal from `ruum.db`.
     pub fn reload_watchdog_state(&mut self) {
-        if let Some(path) = self.watchdog_state_path.as_deref()
-            && let Ok(st) = ruum_core::watchdog_config::load_state(path)
-        {
-            self.watchdog_space_checked_at = st.last_checked_secs;
-            self.watchdog_state = st;
+        if let Some(db) = self.open_existing_db() {
+            if let Ok(wd) = db.watchdog()
+                && let Ok(st) = wd.load_state()
+            {
+                self.watchdog_space_checked_at = st.last_checked_secs;
+                self.watchdog_state = st;
+            }
+            if let Ok(ai_st) = db.load_ai_state() {
+                self.ai_proposal = ai_st.parse_proposal().ok().flatten();
+            }
         }
     }
 
-    /// Reload `watchdog.json` (when configured), reset Settings draft, and
+    /// Switch the active left-sidebar category on the Settings page without
+    /// discarding unsaved draft edits.
+    pub fn set_settings_category(
+        &mut self,
+        category: SettingsCategory,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.settings_category = category;
+        cx.notify();
+    }
+
+    /// Toggle the Webhook Setup Tutorial & JSON Payload Guide card.
+    pub fn toggle_webhook_guide(&mut self, cx: &mut Context<'_, Self>) {
+        self.webhook_guide_open = !self.webhook_guide_open;
+        cx.notify();
+    }
+
+    /// Reload saved webhook endpoints from `ruum.db`.
+    pub fn reload_webhooks(&mut self) {
+        if let Some(db) = self.open_existing_db() {
+            if let Ok(list) = db.list_webhooks() {
+                self.webhooks = list;
+            }
+            if let Ok(wh) = db.load_webhook_config() {
+                self.webhook_config = wh;
+            }
+        }
+    }
+
+    /// Open the inline webhook form to add a new endpoint.
+    pub fn open_add_webhook_form(&mut self, cx: &mut Context<'_, Self>) {
+        self.webhook_form_open = true;
+        self.webhook_form_editing_id = None;
+        self.webhook_form_enabled = true;
+        self.webhook_form_error = None;
+        self.webhook_form_needs_sync = true;
+        cx.notify();
+    }
+
+    /// Open the inline webhook form populated from an existing endpoint.
+    pub fn open_edit_webhook_form(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(ep) = self.webhooks.iter().find(|w| w.id == id).cloned()
+        else {
+            return;
+        };
+        self.webhook_form_open = true;
+        self.webhook_form_editing_id = Some(ep.id);
+        self.webhook_form_enabled = ep.enabled;
+        self.webhook_form_error = None;
+        self.webhook_form_needs_sync = true;
+        cx.notify();
+    }
+
+    /// Close the inline webhook form without saving.
+    pub fn close_webhook_form(&mut self, cx: &mut Context<'_, Self>) {
+        self.webhook_form_open = false;
+        self.webhook_form_editing_id = None;
+        self.webhook_form_error = None;
+        self.webhook_form_needs_sync = false;
+        cx.notify();
+    }
+
+    /// Sync inline webhook form text inputs from the editing endpoint or defaults.
+    pub fn sync_webhook_form_inputs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let ep = self
+            .webhook_form_editing_id
+            .as_deref()
+            .and_then(|id| self.webhooks.iter().find(|w| w.id == id));
+        let (name, url, timeout, headers) = if let Some(ep) = ep {
+            (
+                ep.name.clone(),
+                ep.url.clone(),
+                ep.timeout_secs.to_string(),
+                ep.headers_json.clone(),
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                ruum_core::storage::DEFAULT_WEBHOOK_TIMEOUT_SECS.to_string(),
+                "{}".to_owned(),
+            )
+        };
+        let pairs = [
+            (&self.webhook_input_name, name),
+            (&self.setting_input_webhook_url, url),
+            (&self.setting_input_webhook_timeout, timeout),
+            (&self.setting_input_webhook_headers, headers),
+        ];
+        for (slot, val) in pairs {
+            if let Some(input) = slot {
+                input.update(cx, |inp, cx| inp.set_value(val, window, cx));
+            }
+        }
+    }
+
+    /// Validate and save the inline webhook endpoint form to `ruum.db`.
+    pub fn save_webhook_form(&mut self, cx: &mut Context<'_, Self>) {
+        let name = self
+            .webhook_input_name
+            .as_ref()
+            .map_or_else(String::new, |input| {
+                input.read(cx).value().trim().to_owned()
+            });
+        let url = self
+            .setting_input_webhook_url
+            .as_ref()
+            .map_or_else(String::new, |input| {
+                input.read(cx).value().trim().to_owned()
+            });
+        let timeout_raw =
+            self.setting_input_webhook_timeout.as_ref().map_or_else(
+                || ruum_core::storage::DEFAULT_WEBHOOK_TIMEOUT_SECS.to_string(),
+                |input| input.read(cx).value().trim().to_owned(),
+            );
+        let Ok(timeout_secs) = timeout_raw.parse::<u64>() else {
+            self.webhook_form_error =
+                Some(crate::i18n::messages::invalid_webhook_config(
+                    "timeout must be a positive integer",
+                    self.locale,
+                ));
+            cx.notify();
+            return;
+        };
+        if timeout_secs == 0 {
+            self.webhook_form_error =
+                Some(crate::i18n::messages::invalid_webhook_config(
+                    "timeout must be a positive integer",
+                    self.locale,
+                ));
+            cx.notify();
+            return;
+        }
+        let headers_json =
+            self.setting_input_webhook_headers.as_ref().map_or_else(
+                || "{}".to_owned(),
+                |input| {
+                    let text = input.read(cx).value().trim().to_owned();
+                    if text.is_empty() {
+                        "{}".to_owned()
+                    } else {
+                        text
+                    }
+                },
+            );
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        let editing_id = self.webhook_form_editing_id.clone();
+        let existing = editing_id
+            .as_deref()
+            .and_then(|id| self.webhooks.iter().find(|w| w.id == id))
+            .cloned();
+        let candidate = WebhookEndpoint {
+            id: existing.as_ref().map_or_else(String::new, |w| w.id.clone()),
+            name,
+            enabled: self.webhook_form_enabled,
+            url,
+            headers_json,
+            timeout_secs,
+            created_at_secs: existing
+                .as_ref()
+                .map_or(now_secs, |w| w.created_at_secs),
+            updated_at_secs: now_secs,
+        };
+        let validated = match candidate.validated() {
+            Ok(v) => v,
+            Err(err) => {
+                self.webhook_form_error =
+                    Some(crate::i18n::messages::invalid_webhook_config(
+                        &err.to_string(),
+                        self.locale,
+                    ));
+                cx.notify();
+                return;
+            }
+        };
+
+        let saved_name = validated.name.clone();
+        if self.db_path.is_some() {
+            let res = self.open_db().and_then(|db| {
+                if existing.is_some() {
+                    db.update_webhook(&validated)
+                } else {
+                    db.add_webhook(&validated)
+                }
+            });
+            match res {
+                Ok(_) => self.reload_webhooks(),
+                Err(err) => {
+                    self.webhook_form_error =
+                        Some(crate::i18n::messages::webhook_save_failed(
+                            &err.to_string(),
+                            self.locale,
+                        ));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else if let Some(slot) = editing_id
+            .as_deref()
+            .and_then(|id| self.webhooks.iter_mut().find(|w| w.id == id))
+        {
+            *slot = validated;
+        } else {
+            let mut inserted = validated;
+            inserted.id = format!("wh-{}", self.webhooks.len() + 1);
+            self.webhooks.push(inserted);
+        }
+
+        self.webhook_form_open = false;
+        self.webhook_form_editing_id = None;
+        self.webhook_form_error = None;
+        self.webhook_form_needs_sync = false;
+        self.push_toast(
+            crate::i18n::messages::webhook_saved(&saved_name, self.locale),
+            Status::Success,
+            cx,
+        );
+    }
+
+    /// Toggle whether a saved webhook endpoint is enabled.
+    pub fn toggle_webhook_enabled(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(mut ep) = self.webhooks.iter().find(|w| w.id == id).cloned()
+        else {
+            return;
+        };
+        ep.enabled = !ep.enabled;
+        ep.updated_at_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        if self.db_path.is_some() {
+            match self.open_db().and_then(|db| db.update_webhook(&ep)) {
+                Ok(_) => self.reload_webhooks(),
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::webhook_save_failed(
+                            &err.to_string(),
+                            self.locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        } else if let Some(slot) = self.webhooks.iter_mut().find(|w| w.id == id)
+        {
+            *slot = ep;
+        }
+        cx.notify();
+    }
+
+    /// Delete a saved webhook endpoint from `ruum.db`.
+    pub fn delete_webhook_endpoint(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let name = self
+            .webhooks
+            .iter()
+            .find(|w| w.id == id)
+            .map_or_else(|| id.to_owned(), |w| w.name.clone());
+        if self.db_path.is_some() {
+            match self.open_db().and_then(|db| db.delete_webhook(id)) {
+                Ok(_) => self.reload_webhooks(),
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::webhook_save_failed(
+                            &err.to_string(),
+                            self.locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        } else {
+            self.webhooks.retain(|w| w.id != id);
+        }
+        if self.webhook_form_editing_id.as_deref() == Some(id) {
+            self.close_webhook_form(cx);
+        }
+        self.push_toast(
+            crate::i18n::messages::webhook_deleted(&name, self.locale),
+            Status::Success,
+            cx,
+        );
+    }
+
+    /// Send a test POST payload to a configured webhook endpoint off UI thread.
+    pub fn test_webhook_endpoint_now(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(ep) = self.webhooks.iter().find(|w| w.id == id).cloned()
+        else {
+            return;
+        };
+        if self.webhook_testing_ids.contains(&ep.id) {
+            return;
+        }
+        let ep_id = ep.id.clone();
+        let ep_name = ep.name.clone();
+        self.webhook_testing_ids.insert(ep_id.clone());
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            ruum_core::webhook::test_webhook_endpoint(&ep)
+        });
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.webhook_testing_ids.remove(&ep_id);
+                let locale = this.locale;
+                match res {
+                    Ok(()) => {
+                        this.push_toast(
+                            crate::i18n::messages::webhook_test_succeeded(
+                                &ep_name, locale,
+                            ),
+                            Status::Success,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            crate::i18n::messages::webhook_test_failed(
+                                &ep_name,
+                                &err.to_string(),
+                                locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Reload all Settings sections (`app_settings`, `watchdog_config`,
+    /// `webhook_endpoints`, `ai_config`) from `ruum.db`, reset draft, and
     /// schedule text input synchronization.
     pub fn reload_watchdog_config_and_prepare_settings(&mut self) {
-        if let Some(path) = self.watchdog_config_path.as_deref()
-            && let Ok(cfg) = ruum_core::watchdog_config::load_config(path)
-        {
-            self.watchdog_config = cfg;
+        if let Some(db) = self.open_existing_db() {
+            if let Ok(app_s) = db.load_app_settings() {
+                self.app_settings = app_s;
+            }
+            if let Ok(wd) = db.watchdog()
+                && let Ok(cfg) = wd.load_config()
+            {
+                self.watchdog_config = cfg;
+            }
+            if let Ok(wh) = db.load_webhook_config() {
+                self.webhook_config = wh;
+            }
+            if let Ok(list) = db.list_webhooks() {
+                self.webhooks = list;
+            }
+            if let Ok(ai) = db.load_ai_config() {
+                self.ai_config = ai;
+            }
         }
-        self.watchdog_draft =
-            WatchdogSettingsDraft::from(&self.watchdog_config);
+        self.watchdog_draft = WatchdogSettingsDraft::from_configs(
+            &self.app_settings,
+            &self.watchdog_config,
+            &self.ai_config,
+        );
         self.watchdog_inputs_need_sync = true;
     }
 
-    /// Write all 6 Settings text inputs from `self.watchdog_config`.
+    /// Write all Settings text inputs from committed config structs.
     pub fn sync_watchdog_inputs_from_config(
         &self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let default_depth = self.app_settings.default_depth.to_string();
+        let ssh_duration =
+            self.app_settings.ssh_session_duration_minutes.to_string();
         let min_free = self.watchdog_config.min_free_gb.to_string();
         let poll_interval = self
             .watchdog_config
@@ -1367,11 +2228,13 @@ impl Ruum {
             .div_ceil(60)
             .max(min_cooldown_mins)
             .to_string();
-        let custom_cmd = self.watchdog_config.custom_command.clone();
-        let extra_args = self.watchdog_config.extra_args.clone();
-        let model = self.watchdog_config.model.clone().unwrap_or_default();
+        let custom_cmd = self.ai_config.custom_command.clone();
+        let extra_args = self.ai_config.extra_args.clone();
+        let model = self.ai_config.model.clone().unwrap_or_default();
 
         let pairs = [
+            (&self.setting_input_default_depth, default_depth),
+            (&self.setting_input_ssh_duration, ssh_duration),
             (&self.watchdog_input_min_free, min_free),
             (&self.watchdog_input_poll_interval, poll_interval),
             (&self.watchdog_input_cooldown, cooldown),
@@ -1397,6 +2260,25 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         let locale = self.locale;
+        if self.setting_input_default_depth.is_none() {
+            let val = self.app_settings.default_depth.to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("3")
+                    .default_value(val)
+            });
+            self.setting_input_default_depth = Some(input);
+        }
+        if self.setting_input_ssh_duration.is_none() {
+            let val =
+                self.app_settings.ssh_session_duration_minutes.to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("15")
+                    .default_value(val)
+            });
+            self.setting_input_ssh_duration = Some(input);
+        }
         if self.watchdog_input_min_free.is_none() {
             let val = self.watchdog_config.min_free_gb.to_string();
             let input = cx.new(|cx| {
@@ -1435,8 +2317,44 @@ impl Ruum {
             });
             self.watchdog_input_cooldown = Some(input);
         }
+        if self.webhook_input_name.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_webhook_name(locale),
+                )
+            });
+            self.webhook_input_name = Some(input);
+        }
+        if self.setting_input_webhook_url.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_webhook_url(locale),
+                )
+            });
+            self.setting_input_webhook_url = Some(input);
+        }
+        if self.setting_input_webhook_timeout.is_none() {
+            let val =
+                ruum_core::storage::DEFAULT_WEBHOOK_TIMEOUT_SECS.to_string();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("10")
+                    .default_value(val)
+            });
+            self.setting_input_webhook_timeout = Some(input);
+        }
+        if self.setting_input_webhook_headers.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(
+                        crate::i18n::pages::placeholder_webhook_headers(locale),
+                    )
+                    .default_value("{}")
+            });
+            self.setting_input_webhook_headers = Some(input);
+        }
         if self.watchdog_input_custom_cmd.is_none() {
-            let val = self.watchdog_config.custom_command.clone();
+            let val = self.ai_config.custom_command.clone();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(crate::i18n::messages::placeholder_custom_cmd(
@@ -1447,7 +2365,7 @@ impl Ruum {
             self.watchdog_input_custom_cmd = Some(input);
         }
         if self.watchdog_input_extra_args.is_none() {
-            let val = self.watchdog_config.extra_args.clone();
+            let val = self.ai_config.extra_args.clone();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(crate::i18n::messages::placeholder_extra_args(
@@ -1458,7 +2376,7 @@ impl Ruum {
             self.watchdog_input_extra_args = Some(input);
         }
         if self.watchdog_input_model.is_none() {
-            let val = self.watchdog_config.model.clone().unwrap_or_default();
+            let val = self.ai_config.model.clone().unwrap_or_default();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(
@@ -1472,34 +2390,13 @@ impl Ruum {
         }
     }
 
-    /// Read current Watchdog settings including any unsaved draft/input values.
-    fn snapshot_watchdog_config(&self, cx: &App) -> WatchdogConfig {
-        let mut cfg = self.watchdog_config.clone();
-        cfg.enabled = self.watchdog_draft.enabled;
-        cfg.background_service = self.watchdog_draft.background_service;
-        cfg.ai_auto_analyze = self.watchdog_draft.ai_auto_analyze;
-        cfg.ai_provider = self.watchdog_draft.ai_provider;
+    /// Read current AI settings including any unsaved draft/input values.
+    fn snapshot_ai_config(&self, cx: &App) -> AiConfig {
+        let mut cfg = self.ai_config.clone();
+        cfg.auto_analyze_on_alert = self.watchdog_draft.ai_auto_analyze;
+        cfg.provider = self.watchdog_draft.ai_provider;
         cfg.model.clone_from(&self.watchdog_draft.model);
 
-        if let Some(ref input) = self.watchdog_input_min_free {
-            let text = input.read(cx).value();
-            if let Ok(val) = text.trim().parse::<u64>() {
-                cfg.min_free_gb = val.max(MIN_FREE_GB_FLOOR);
-            }
-        }
-        if let Some(ref input) = self.watchdog_input_poll_interval {
-            let text = input.read(cx).value();
-            if let Ok(val) = text.trim().parse::<u64>() {
-                cfg.poll_interval_secs = val.max(1).saturating_mul(60);
-            }
-        }
-        if let Some(ref input) = self.watchdog_input_cooldown {
-            let text = input.read(cx).value();
-            if let Ok(val) = text.trim().parse::<u64>() {
-                let min_mins = MIN_COOLDOWN_SECS / 60;
-                cfg.cooldown_secs = val.max(min_mins).saturating_mul(60);
-            }
-        }
         if let Some(ref input) = self.watchdog_input_custom_cmd {
             cfg.custom_command = input.read(cx).value().trim().to_string();
         }
@@ -1612,13 +2509,38 @@ impl Ruum {
         }
     }
 
-    /// Save watchdog settings from inputs to `watchdog.json`, echo normalized
-    /// values, update runtime cache, and conditionally sync OS service.
+    /// Save all Settings sections (General, Watchdog, Webhook, AI) to `ruum.db`,
+    /// echo normalized values, update runtime cache, and sync OS service.
     pub fn save_watchdog_settings(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(default_depth_raw) = Self::parse_strict_u64_input(
+            self.setting_input_default_depth.as_ref(),
+            u64::from(self.app_settings.default_depth),
+            cx,
+        ) else {
+            self.push_toast(
+                crate::i18n::messages::invalid_general_number(self.locale),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+        let Ok(ssh_duration_mins) = Self::parse_strict_u64_input(
+            self.setting_input_ssh_duration.as_ref(),
+            self.app_settings.ssh_session_duration_minutes,
+            cx,
+        ) else {
+            self.push_toast(
+                crate::i18n::messages::invalid_general_number(self.locale),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+
         let fallback_poll_mins =
             self.watchdog_config.poll_interval_secs.div_ceil(60).max(1);
         let fallback_cool_mins = self
@@ -1664,13 +2586,15 @@ impl Ruum {
             return;
         };
 
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+
         let custom_command =
             self.watchdog_input_custom_cmd.as_ref().map_or_else(
-                || self.watchdog_config.custom_command.clone(),
+                || self.ai_config.custom_command.clone(),
                 |input| input.read(cx).value().trim().to_string(),
             );
         let extra_args = self.watchdog_input_extra_args.as_ref().map_or_else(
-            || self.watchdog_config.extra_args.clone(),
+            || self.ai_config.extra_args.clone(),
             |input| input.read(cx).value().trim().to_string(),
         );
         let model = self.watchdog_input_model.as_ref().map_or_else(
@@ -1681,6 +2605,20 @@ impl Ruum {
             },
         );
 
+        let next_app = AppSettings {
+            power_preset: self.watchdog_draft.power_preset.key().to_owned(),
+            default_depth: u32::try_from(default_depth_raw)
+                .unwrap_or(ruum_core::storage::MAX_DEPTH),
+            apparent_size: self.watchdog_draft.apparent_size,
+            include_hidden: self.watchdog_draft.include_hidden,
+            follow_system_appearance: self
+                .watchdog_draft
+                .follow_system_appearance,
+            ssh_session_duration_minutes: ssh_duration_mins,
+            updated_at_secs: now_secs,
+        }
+        .normalized();
+
         let min_cooldown_mins = MIN_COOLDOWN_SECS / 60;
         let next_cfg = WatchdogConfig {
             enabled: self.watchdog_draft.enabled,
@@ -1690,17 +2628,28 @@ impl Ruum {
             cooldown_secs: cooldown_mins
                 .max(min_cooldown_mins)
                 .saturating_mul(60),
-            ai_auto_analyze: self.watchdog_draft.ai_auto_analyze,
-            ai_provider: self.watchdog_draft.ai_provider,
-            custom_command,
-            extra_args,
-            model,
+            updated_at_secs: now_secs,
         }
         .normalized();
 
-        if let Some(path) = self.watchdog_config_path.as_deref()
-            && let Err(err) =
-                ruum_core::watchdog_config::save_config(path, &next_cfg)
+        let next_ai = AiConfig {
+            auto_analyze_on_alert: self.watchdog_draft.ai_auto_analyze,
+            provider: self.watchdog_draft.ai_provider,
+            custom_command,
+            extra_args,
+            model,
+            updated_at_secs: now_secs,
+        }
+        .normalized();
+
+        if self.db_path.is_some()
+            && let Err(err) = (|| -> std::io::Result<()> {
+                let db = self.open_db()?;
+                db.save_app_settings(&next_app)?;
+                db.watchdog()?.save_config(&next_cfg)?;
+                db.save_ai_config(&next_ai)?;
+                Ok(())
+            })()
         {
             self.push_toast(
                 crate::i18n::messages::failed_save_settings(
@@ -1715,7 +2664,21 @@ impl Ruum {
 
         let prev_cfg =
             std::mem::replace(&mut self.watchdog_config, next_cfg.clone());
-        self.watchdog_draft = WatchdogSettingsDraft::from(&next_cfg);
+        self.app_settings = next_app.clone();
+        self.ai_config = next_ai.clone();
+        if let Some(preset) =
+            crate::power::PowerEfficiency::parse(&next_app.power_preset)
+        {
+            self.power_choice = Some(preset);
+            self.options.threads = preset.policy(self.cpu_threads);
+        }
+        self.options.apparent_size = next_app.apparent_size;
+        self.options.include_hidden = next_app.include_hidden;
+        self.layout_options.max_depth = next_app.default_depth;
+        self.cache = None;
+
+        self.watchdog_draft =
+            WatchdogSettingsDraft::from_configs(&next_app, &next_cfg, &next_ai);
         self.watchdog_inputs_need_sync = false;
         self.sync_watchdog_inputs_from_config(window, cx);
 
@@ -1724,11 +2687,10 @@ impl Ruum {
         if threshold_changed || re_enabled {
             self.watchdog_state.last_triggered_secs = None;
             self.watchdog_state.last_triggered_threshold_gb = None;
-            if let Some(state_path) = self.watchdog_state_path.as_deref() {
-                let _ = ruum_core::watchdog_config::save_state(
-                    state_path,
-                    &self.watchdog_state,
-                );
+            if let Ok(db) = self.open_db()
+                && let Ok(wd) = db.watchdog()
+            {
+                let _ = wd.save_state(&self.watchdog_state);
             }
         }
 
@@ -1766,8 +2728,7 @@ impl Ruum {
             return;
         }
 
-        let current_exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        let cli_exe = crate::resolve_cli_exe();
         self.watchdog_saving = true;
         crate::with_runtime_mut(cx, |rt| rt.service_sync_in_flight = true);
         self.push_toast(
@@ -1781,7 +2742,7 @@ impl Ruum {
                 Duration::from_secs(10),
             );
             let sync_res = if enable_service {
-                ruum_core::watchdog::install_service(&runner, &current_exe)
+                ruum_core::watchdog::install_service(&runner, &cli_exe)
             } else {
                 ruum_core::watchdog::uninstall_service(&runner)
             };
@@ -1984,8 +2945,8 @@ impl Ruum {
         if self.watchdog_testing {
             return;
         }
-        let temp_cfg = self.snapshot_watchdog_config(cx);
-        let provider_label = temp_cfg.ai_provider.label_in(self.locale);
+        let temp_cfg = self.snapshot_ai_config(cx);
+        let provider_label = temp_cfg.provider.label_in(self.locale);
         self.watchdog_testing = true;
         self.watchdog_test_epoch += 1;
         let epoch = self.watchdog_test_epoch;
@@ -2004,7 +2965,7 @@ impl Ruum {
                     ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                 ),
             );
-            ruum_core::ai_cli::test_connection(&temp_cfg, &runner)
+            ruum_core::ai_cli::test_connection_for_config(&temp_cfg, &runner)
         });
 
         cx.spawn(async move |this, cx| {
@@ -2032,8 +2993,8 @@ impl Ruum {
         if self.watchdog_fetching_models {
             return;
         }
-        let temp_cfg = self.snapshot_watchdog_config(cx);
-        let provider_label = temp_cfg.ai_provider.label_in(self.locale);
+        let temp_cfg = self.snapshot_ai_config(cx);
+        let provider_label = temp_cfg.provider.label_in(self.locale);
         self.watchdog_fetching_models = true;
         self.watchdog_fetch_epoch += 1;
         let epoch = self.watchdog_fetch_epoch;
@@ -2049,7 +3010,7 @@ impl Ruum {
                     ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                 ),
             );
-            ruum_core::ai_cli::discover_models(&temp_cfg, &runner)
+            ruum_core::ai_cli::discover_models_for_config(&temp_cfg, &runner)
         });
 
         cx.spawn(async move |this, cx| {
@@ -2123,7 +3084,7 @@ impl Ruum {
         model_override: Option<String>,
         cx: &mut Context<'_, Self>,
     ) {
-        let temp_cfg = self.snapshot_watchdog_config(cx);
+        let temp_cfg = self.snapshot_ai_config(cx);
         let target_key = model_override
             .as_deref()
             .map(str::trim)
@@ -2144,7 +3105,7 @@ impl Ruum {
                     ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                 ),
             );
-            ruum_core::ai_cli::benchmark_model(
+            ruum_core::ai_cli::benchmark_model_for_config(
                 &temp_cfg,
                 model_override.as_deref(),
                 &runner,
@@ -2182,7 +3143,7 @@ impl Ruum {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) {
-        let temp_cfg = self.snapshot_watchdog_config(cx);
+        let temp_cfg = self.snapshot_ai_config(cx);
         let models_to_test: Vec<String> = self
             .watchdog_models
             .iter()
@@ -2222,7 +3183,7 @@ impl Ruum {
                             ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                         ),
                     );
-                    ruum_core::ai_cli::benchmark_model(
+                    ruum_core::ai_cli::benchmark_model_for_config(
                         &cfg_clone,
                         Some(&id_for_task),
                         &runner,
@@ -2288,6 +3249,13 @@ impl Ruum {
                     self.space = Some(info);
                 }
                 self.watchdog_space_checked_at = Some(now_secs);
+                self.watchdog_state.last_checked_secs = Some(now_secs);
+                if self.db_path.is_some()
+                    && let Ok(db) = self.open_db()
+                    && let Ok(svc) = db.watchdog()
+                {
+                    let _ = svc.save_state(&self.watchdog_state);
+                }
                 let thresh_bytes = self
                     .watchdog_config
                     .min_free_gb
@@ -2360,14 +3328,25 @@ impl Ruum {
             );
             return;
         };
-        let cfg = self.snapshot_watchdog_config(cx);
-        let provider_label = cfg.ai_provider.label_in(self.locale);
-        let current_exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        let ai_cfg = self.snapshot_ai_config(cx);
+        let provider_label = ai_cfg.provider.label_in(self.locale);
+        let cli_exe = crate::resolve_cli_exe();
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
-        let existing_tree = (self.remote.is_none() && self.root_path == home)
-            .then(|| self.tree.clone())
-            .flatten();
+        let existing_tree = if self.active_host_tab == HostTabKey::Local {
+            (self.remote.is_none() && self.root_path == home)
+                .then(|| self.tree.clone())
+                .flatten()
+        } else {
+            self.host_tabs
+                .iter()
+                .find(|tab| tab.key == HostTabKey::Local)
+                .and_then(|tab| tab.session.as_ref())
+                .and_then(|snap| {
+                    (snap.remote.is_none() && snap.root_path == home)
+                        .then(|| snap.tree.clone())
+                        .flatten()
+                })
+        };
 
         self.watchdog_analyzing = true;
         self.watchdog_analysis_epoch += 1;
@@ -2383,10 +3362,10 @@ impl Ruum {
 
         let task = cx.background_executor().spawn(async move {
             let runner = ruum_core::ai_cli::DefaultCommandRunner;
-            let res = ruum_core::ai_cli::run_analysis_with_tree(
-                &cfg,
+            let res = ruum_core::ai_cli::run_analysis_with_tree_for_config(
+                &ai_cfg,
                 &home,
-                &current_exe,
+                &cli_exe,
                 now_secs,
                 existing_tree.as_deref(),
                 &runner,
@@ -2404,14 +3383,16 @@ impl Ruum {
                 let locale = this.locale;
                 match res {
                     Ok(proposal) => {
-                        this.watchdog_state.last_proposal =
-                            Some(proposal.clone());
-                        if let Some(path) = this.watchdog_state_path.as_deref()
+                        this.ai_proposal = Some(proposal.clone());
+                        let ai_state =
+                            ruum_core::storage::AiState::from_proposal(
+                                &proposal, now_secs,
+                            )
+                            .unwrap_or_default();
+                        if this.db_path.is_some()
+                            && let Ok(db) = this.open_db()
                         {
-                            let _ = ruum_core::watchdog_config::save_state(
-                                path,
-                                &this.watchdog_state,
-                            );
+                            let _ = db.save_ai_state(&ai_state);
                         }
                         if proposal.items.is_empty() {
                             this.push_toast(
@@ -2426,7 +3407,11 @@ impl Ruum {
                             let request = proposal_confirm_request(
                                 home, &proposal, locale,
                             );
-                            crate::open_confirm_window(request, None, None, cx);
+                            crate::open_local_confirm_window(
+                                request,
+                                this.db_path.clone(),
+                                cx,
+                            );
                             crate::refresh_tray_status(cx);
                             this.push_toast(
                                 crate::i18n::messages::ai_proposed_items(
@@ -2452,44 +3437,1220 @@ impl Ruum {
         .detach();
     }
 
-    /// Open confirmation window for the most recently saved proposal.
+    /// Open confirmation window for the most recently saved local proposal.
     pub fn open_last_proposal(&self, cx: &mut Context<'_, Self>) {
-        let Some(proposal) = &self.watchdog_state.last_proposal else {
+        let Some(proposal) = &self.ai_proposal else {
             return;
         };
         let Some(home) = std::env::home_dir() else {
             return;
         };
         let request = proposal_confirm_request(home, proposal, self.locale);
-        crate::open_confirm_window(request, None, None, cx);
+        crate::open_local_confirm_window(request, self.db_path.clone(), cx);
         cx.notify();
     }
 
-    pub fn picker_source_matches(&self, cx: &Context<'_, Self>) -> bool {
-        self.picker_host.as_ref().is_none_or(|input| {
-            input.read(cx).value().trim()
-                == self.volumes_source.as_deref().unwrap_or_default()
-        })
+    /// Remove confirmed/cleaned paths from the local Watchdog AI proposal.
+    pub fn prune_local_ai_proposal(&mut self, cleaned_paths: &[PathBuf]) {
+        if let Some(proposal) = &mut self.ai_proposal {
+            proposal
+                .items
+                .retain(|item| !cleaned_paths.contains(&item.path));
+            if proposal.items.is_empty() {
+                self.ai_proposal = None;
+            }
+        }
     }
 
-    pub fn choose_local_source(
+    // ── SSH Server Cards & Credentials ────────────────────────────────────
+
+    /// Open the inline SSH server form to add a new profile.
+    pub fn open_add_ssh_form(&mut self, cx: &mut Context<'_, Self>) {
+        self.ssh_form_open = true;
+        self.ssh_form_editing_id = None;
+        self.ssh_form_auth_mode = ruum_core::storage::AuthMode::PrivateKey;
+        self.ssh_form_error = None;
+        self.ssh_form_needs_sync = true;
+        cx.notify();
+    }
+
+    /// Open the inline SSH server form populated with an existing profile.
+    /// Does not read the OS keychain.
+    pub fn open_edit_ssh_form(&mut self, id: &str, cx: &mut Context<'_, Self>) {
+        let Some(profile) =
+            self.ssh_profiles.iter().find(|p| p.id == id).cloned()
+        else {
+            return;
+        };
+        self.ssh_form_open = true;
+        self.ssh_form_editing_id = Some(profile.id);
+        self.ssh_form_auth_mode = profile.auth_mode;
+        self.ssh_form_error = None;
+        self.ssh_form_needs_sync = true;
+        cx.notify();
+    }
+
+    /// Close the inline SSH server form without saving.
+    pub fn close_ssh_form(&mut self, cx: &mut Context<'_, Self>) {
+        self.ssh_form_open = false;
+        self.ssh_form_editing_id = None;
+        self.ssh_form_error = None;
+        self.ssh_form_needs_sync = false;
+        if self.volumes_open || self.screen == Screen::Sources {
+            self.focus_request = Some(FocusTarget::Dialog);
+        }
+        cx.notify();
+    }
+
+    /// Switch authentication mode inside the SSH server form.
+    pub fn set_ssh_form_auth_mode(
+        &mut self,
+        mode: ruum_core::storage::AuthMode,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.ssh_form_auth_mode = mode;
+        self.ssh_form_error = None;
+        cx.notify();
+    }
+
+    /// Ensure the SSH form `InputState` entities exist and sync if dirty.
+    pub fn ensure_ssh_form_inputs(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if let Some(host) = self.picker_host.clone() {
-            host.update(cx, |host, cx| host.set_value("", window, cx));
+        let locale = self.locale;
+        if self.ssh_input_alias.is_none() {
+            self.ssh_input_alias = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_ssh_alias(locale),
+                )
+            }));
         }
-        self.load_volume_source(None, cx);
+        if self.ssh_input_host.is_none() {
+            self.ssh_input_host = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_ssh_host_addr(locale),
+                )
+            }));
+        }
+        if self.ssh_input_port.is_none() {
+            self.ssh_input_port = Some(cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("22")
+                    .default_value("22")
+            }));
+        }
+        if self.ssh_input_username.is_none() {
+            self.ssh_input_username = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_ssh_username(locale),
+                )
+            }));
+        }
+        if self.ssh_input_default_path.is_none() {
+            self.ssh_input_default_path = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_ssh_default_path(locale),
+                )
+            }));
+        }
+        if self.ssh_input_password.is_none() {
+            self.ssh_input_password = Some(cx.new(|cx| {
+                InputState::new(window, cx).masked(true).placeholder(
+                    crate::i18n::pages::placeholder_ssh_password(locale),
+                )
+            }));
+        }
+        if self.ssh_input_private_key.is_none() {
+            self.ssh_input_private_key = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    crate::i18n::pages::placeholder_ssh_private_key(locale),
+                )
+            }));
+        }
+        if self.ssh_input_passphrase.is_none() {
+            self.ssh_input_passphrase = Some(cx.new(|cx| {
+                InputState::new(window, cx).masked(true).placeholder(
+                    crate::i18n::pages::placeholder_ssh_passphrase(locale),
+                )
+            }));
+        }
+        if self.ssh_form_needs_sync {
+            self.sync_ssh_form_inputs(window, cx);
+            self.ssh_form_needs_sync = false;
+        }
     }
 
-    pub fn connect_picker(&mut self, cx: &mut Context<'_, Self>) {
-        let host = self
-            .picker_host
-            .as_ref()
-            .map(|input| input.read(cx).value().trim().to_owned())
-            .unwrap_or_default();
-        self.load_volume_source(Some(host), cx);
+    fn sync_ssh_form_inputs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let profile = self
+            .ssh_form_editing_id
+            .as_deref()
+            .and_then(|id| self.ssh_profiles.iter().find(|p| p.id == id));
+        let mut set_val = |slot: &Option<Entity<InputState>>, val: &str| {
+            if let Some(input) = slot {
+                input.update(cx, |state, cx| state.set_value(val, window, cx));
+            }
+        };
+        if let Some(p) = profile {
+            set_val(&self.ssh_input_alias, &p.alias);
+            set_val(&self.ssh_input_host, &p.host);
+            set_val(&self.ssh_input_port, &p.port.to_string());
+            set_val(&self.ssh_input_username, &p.username);
+            set_val(
+                &self.ssh_input_default_path,
+                p.default_path
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("~"),
+            );
+        } else {
+            set_val(&self.ssh_input_alias, "");
+            set_val(&self.ssh_input_host, "");
+            set_val(&self.ssh_input_port, "22");
+            set_val(&self.ssh_input_username, "");
+            set_val(&self.ssh_input_default_path, "~");
+        }
+        // Secrets stay blank unless the user explicitly enters a new value.
+        set_val(&self.ssh_input_password, "");
+        set_val(&self.ssh_input_private_key, "");
+        set_val(&self.ssh_input_passphrase, "");
+    }
+
+    fn read_ssh_input(
+        slot: Option<&Entity<InputState>>,
+        cx: &Context<'_, Self>,
+    ) -> String {
+        slot.map(|input| input.read(cx).value().trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn resolve_ssh_form_secret(
+        &self,
+        store: &ruum_core::credentials::LazyCredentialStore,
+        existing_id: Option<&str>,
+        cx: &Context<'_, Self>,
+    ) -> Result<Option<ruum_core::credentials::SshCredentialSecret>, String>
+    {
+        let password_raw =
+            Self::read_ssh_input(self.ssh_input_password.as_ref(), cx);
+        let key_raw =
+            Self::read_ssh_input(self.ssh_input_private_key.as_ref(), cx);
+        let passphrase_raw =
+            Self::read_ssh_input(self.ssh_input_passphrase.as_ref(), cx);
+
+        match self.ssh_form_auth_mode {
+            ruum_core::storage::AuthMode::Password => {
+                if password_raw.is_empty() {
+                    if let Some(id) = existing_id
+                        && matches!(
+                            store.get_ssh_secret(id),
+                            Ok(Some(
+                                ruum_core::credentials::SshCredentialSecret::Password {
+                                    ..
+                                }
+                            ))
+                        )
+                    {
+                        return Ok(None);
+                    }
+                    return Err(crate::i18n::messages::ssh_secret_required(
+                        self.locale,
+                    )
+                    .to_owned());
+                }
+                Ok(Some(
+                    ruum_core::credentials::SshCredentialSecret::Password {
+                        password: password_raw,
+                    },
+                ))
+            }
+            ruum_core::storage::AuthMode::PrivateKey => {
+                if key_raw.is_empty() {
+                    if let Some(id) = existing_id
+                        && matches!(
+                            store.get_ssh_secret(id),
+                            Ok(Some(
+                                ruum_core::credentials::SshCredentialSecret::PrivateKey {
+                                    ..
+                                }
+                            ))
+                        )
+                    {
+                        return Ok(None);
+                    }
+                    return Err(crate::i18n::messages::ssh_secret_required(
+                        self.locale,
+                    )
+                    .to_owned());
+                }
+                let private_key_pem = if key_raw.contains("BEGIN ")
+                    && key_raw.contains("PRIVATE KEY")
+                {
+                    key_raw
+                } else {
+                    std::fs::read_to_string(&key_raw).map_err(|err| {
+                        crate::i18n::messages::ssh_invalid_input(
+                            &format!("cannot read private key file: {err}"),
+                            self.locale,
+                        )
+                    })?
+                };
+                Ok(Some(
+                    ruum_core::credentials::SshCredentialSecret::PrivateKey {
+                        private_key_pem,
+                        passphrase: (!passphrase_raw.is_empty())
+                            .then_some(passphrase_raw),
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Validate and save the SSH server profile to `SQLite` + encrypted store.
+    pub fn save_ssh_profile_form(&mut self, cx: &mut Context<'_, Self>) {
+        let alias = Self::read_ssh_input(self.ssh_input_alias.as_ref(), cx);
+        let host = Self::read_ssh_input(self.ssh_input_host.as_ref(), cx);
+        let port_raw = Self::read_ssh_input(self.ssh_input_port.as_ref(), cx);
+        let username =
+            Self::read_ssh_input(self.ssh_input_username.as_ref(), cx);
+        let default_path_raw =
+            Self::read_ssh_input(self.ssh_input_default_path.as_ref(), cx);
+
+        if alias.is_empty() || host.is_empty() || username.is_empty() {
+            self.ssh_form_error =
+                Some(crate::i18n::messages::ssh_invalid_input(
+                    "alias, host, and username are required",
+                    self.locale,
+                ));
+            cx.notify();
+            return;
+        }
+        if let Err(err) = ruum_core::remote::validate_host(&host) {
+            self.ssh_form_error =
+                Some(crate::i18n::messages::ssh_invalid_input(
+                    &err.to_string(),
+                    self.locale,
+                ));
+            cx.notify();
+            return;
+        }
+        let port: u16 = match if port_raw.is_empty() {
+            Ok(22)
+        } else {
+            port_raw.parse::<u16>().map_err(|e| e.to_string())
+        } {
+            Ok(p) if p > 0 => p,
+            Ok(_) | Err(_) => {
+                self.ssh_form_error = Some(
+                    crate::i18n::messages::ssh_invalid_port(self.locale)
+                        .to_owned(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let default_path = if default_path_raw.is_empty() {
+            Some("~".to_owned())
+        } else {
+            Some(default_path_raw)
+        };
+        let db = match self.open_db() {
+            Ok(db) => db,
+            Err(err) => {
+                self.ssh_form_error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let store = match self.ensure_cred_store() {
+            Ok(s) => s,
+            Err(err) => {
+                self.ssh_form_error = Some(err);
+                cx.notify();
+                return;
+            }
+        };
+
+        let editing_id = self.ssh_form_editing_id.clone();
+        let secret_opt = match self.resolve_ssh_form_secret(
+            &store,
+            editing_id.as_deref(),
+            cx,
+        ) {
+            Ok(s) => s,
+            Err(msg) => {
+                self.ssh_form_error = Some(msg);
+                cx.notify();
+                return;
+            }
+        };
+
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        let existing = editing_id
+            .as_deref()
+            .and_then(|id| self.ssh_profiles.iter().find(|p| p.id == id))
+            .cloned();
+        let profile = ruum_core::storage::SshProfile {
+            id: existing.as_ref().map_or_else(String::new, |p| p.id.clone()),
+            alias: alias.clone(),
+            host,
+            port,
+            username,
+            auth_mode: self.ssh_form_auth_mode,
+            default_path,
+            created_at_secs: existing
+                .as_ref()
+                .map_or(now_secs, |p| p.created_at_secs),
+            updated_at_secs: now_secs,
+            last_total_bytes: existing
+                .as_ref()
+                .and_then(|p| p.last_total_bytes),
+            last_available_bytes: existing
+                .as_ref()
+                .and_then(|p| p.last_available_bytes),
+            last_scanned_secs: existing
+                .as_ref()
+                .and_then(|p| p.last_scanned_secs),
+        };
+
+        let saved_profile = match if existing.is_some() {
+            db.update_ssh_profile(&profile)
+        } else {
+            db.add_ssh_profile(&profile)
+        } {
+            Ok(p) => p,
+            Err(err) => {
+                self.ssh_form_error =
+                    Some(crate::i18n::messages::ssh_profile_save_failed(
+                        &err.to_string(),
+                        self.locale,
+                    ));
+                cx.notify();
+                return;
+            }
+        };
+        let profile_id = saved_profile.id;
+        if let Some(secret) = secret_opt
+            && let Err(err) = store.set_ssh_secret(&profile_id, &secret)
+        {
+            if let Some(prev) = existing {
+                let _ = db.update_ssh_profile(&prev);
+            } else {
+                let _ = db.delete_ssh_profile(&profile_id);
+            }
+            self.ssh_form_error =
+                Some(crate::i18n::messages::ssh_profile_save_failed(
+                    &err,
+                    self.locale,
+                ));
+            cx.notify();
+            return;
+        }
+
+        self.reload_ssh_profiles();
+        for tab in &mut self.host_tabs {
+            if tab.key == HostTabKey::Ssh(profile_id.clone()) {
+                tab.label.clone_from(&alias);
+            }
+        }
+        if self.active_ssh_profile_id.as_deref() == Some(profile_id.as_str()) {
+            self.remote = Some(alias.clone());
+        }
+        self.ssh_form_open = false;
+        self.ssh_form_editing_id = None;
+        self.ssh_form_error = None;
+        self.push_toast(
+            crate::i18n::messages::ssh_profile_saved(&alias, self.locale),
+            Status::Success,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Delete an SSH server profile (credential first, then `SQLite` row).
+    pub fn delete_ssh_profile_card(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let alias = self
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map_or_else(|| id.to_owned(), |p| p.alias.clone());
+        let db = match self.open_db() {
+            Ok(db) => db,
+            Err(err) => {
+                self.push_toast(
+                    crate::i18n::messages::ssh_profile_delete_failed(
+                        &err.to_string(),
+                        self.locale,
+                    ),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+        let store = match self.ensure_cred_store() {
+            Ok(s) => s,
+            Err(err) => {
+                self.push_toast(
+                    crate::i18n::messages::ssh_profile_delete_failed(
+                        &err,
+                        self.locale,
+                    ),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+        if let Err(err) =
+            ruum_core::credentials::delete_ssh_profile_with_credentials(
+                &db, &store, id,
+            )
+        {
+            self.push_toast(
+                crate::i18n::messages::ssh_profile_delete_failed(
+                    &err.to_string(),
+                    self.locale,
+                ),
+                Status::Error,
+                cx,
+            );
+            return;
+        }
+        self.close_host_tab(&HostTabKey::Ssh(id.to_owned()), cx);
+        if self.ssh_form_editing_id.as_deref() == Some(id) {
+            self.close_ssh_form(cx);
+        }
+        self.reload_ssh_profiles();
+        self.push_toast(
+            crate::i18n::messages::ssh_profile_deleted(&alias, self.locale),
+            Status::Success,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn snapshot_active_session(&mut self) -> ExploreSessionSnapshot {
+        ExploreSessionSnapshot {
+            root_path: std::mem::take(&mut self.root_path),
+            scan_root: std::mem::take(&mut self.scan_root),
+            tree: self.tree.take(),
+            scan: self.scan.take(),
+            remote_scan: self.remote_scan.take(),
+            remote_disk: std::mem::take(&mut self.remote_disk),
+            remote_progress: std::mem::take(&mut self.remote_progress),
+            scan_preview: self.scan_preview.take(),
+            preview_updated: self.preview_updated.take(),
+            progress: std::mem::take(&mut self.progress),
+            scan_error: self.scan_error.take(),
+            scan_started: self.scan_started.take(),
+            scan_elapsed: self.scan_elapsed.take(),
+            scanned_at: std::mem::replace(&mut self.scanned_at, 0),
+            scan_epoch: self.scan_epoch,
+            crumbs: std::mem::take(&mut self.crumbs),
+            selected: self.selected.take(),
+            hovered: self.hovered.take(),
+            history: std::mem::take(&mut self.history),
+            view: std::mem::take(&mut self.view),
+            transition: self.transition.take(),
+            cache: self.cache.take(),
+            marks: std::mem::take(&mut self.marks),
+            space: self.space.take(),
+            space_baseline: self.space_baseline.take(),
+            disk_root: self.disk_root.take(),
+            device: self.device.take(),
+            home: self.home.take(),
+            file_table: std::mem::take(&mut self.file_table),
+            full_disk_access: self.full_disk_access.take(),
+            remote: self.remote.take(),
+            remote_platform: std::mem::take(&mut self.remote_platform),
+            remote_identity: self.remote_identity.take(),
+            insights: std::mem::take(&mut self.insights),
+            git: std::mem::take(&mut self.git),
+            git_pending: std::mem::take(&mut self.git_pending),
+            find: std::mem::take(&mut self.find),
+            find_open: std::mem::take(&mut self.find_open),
+            matches: self.matches.take(),
+            filter_applied: std::mem::take(&mut self.filter_applied),
+            filter_epoch: self.filter_epoch,
+            find_epoch: self.find_epoch,
+            finding: std::mem::take(&mut self.finding),
+            apply_pending: std::mem::take(&mut self.apply_pending),
+            crumb_menu: self.crumb_menu.take(),
+            awaiting_root: std::mem::take(&mut self.awaiting_root),
+            active_ssh_profile_id: self.active_ssh_profile_id.take(),
+            active_ssh_session: self.active_ssh_session.take(),
+        }
+    }
+
+    fn reset_active_explore_session(&mut self) {
+        self.root_path = PathBuf::new();
+        self.scan_root = PathBuf::new();
+        self.tree = None;
+        self.scan = None;
+        self.remote_scan = None;
+        self.remote_disk = false;
+        self.remote_progress = ruum_core::remote_progress::Progress::default();
+        self.scan_preview = None;
+        self.preview_updated = None;
+        self.progress = ScanSnapshot::default();
+        self.scan_error = None;
+        self.scan_started = None;
+        self.scan_elapsed = None;
+        self.scanned_at = 0;
+        self.crumbs.clear();
+        self.selected = None;
+        self.hovered = None;
+        self.history = History::default();
+        self.view = View::default();
+        self.transition = None;
+        self.cache = None;
+        self.marks.clear();
+        self.space = None;
+        self.space_baseline = None;
+        self.disk_root = None;
+        self.device = None;
+        self.home = None;
+        self.file_table = false;
+        self.full_disk_access = None;
+        self.remote = None;
+        self.remote_platform.clear();
+        self.remote_identity = None;
+        self.insights.clear();
+        self.git.clear();
+        self.git_pending.clear();
+        self.find.clear();
+        self.find_open = false;
+        self.matches = None;
+        self.filter_applied = false;
+        self.finding = false;
+        self.apply_pending = false;
+        self.crumb_menu = None;
+        self.awaiting_root = false;
+        self.active_ssh_profile_id = None;
+        self.active_ssh_session = None;
+        self.scan_epoch += 1;
+    }
+
+    fn restore_session(
+        &mut self,
+        snap: ExploreSessionSnapshot,
+        cx: &Context<'_, Self>,
+    ) {
+        self.root_path = snap.root_path;
+        self.scan_root = snap.scan_root;
+        self.tree = snap.tree;
+        self.scan = snap.scan;
+        self.remote_scan = snap.remote_scan;
+        self.remote_disk = snap.remote_disk;
+        self.remote_progress = snap.remote_progress;
+        self.scan_preview = snap.scan_preview;
+        self.preview_updated = snap.preview_updated;
+        self.progress = snap.progress;
+        self.scan_error = snap.scan_error;
+        self.scan_started = snap.scan_started;
+        self.scan_elapsed = snap.scan_elapsed;
+        self.scanned_at = snap.scanned_at;
+        self.crumbs = snap.crumbs;
+        self.selected = snap.selected;
+        self.hovered = snap.hovered;
+        self.history = snap.history;
+        self.view = snap.view;
+        self.transition = snap.transition;
+        self.cache = snap.cache;
+        self.marks = snap.marks;
+        self.space = snap.space;
+        self.space_baseline = snap.space_baseline;
+        self.disk_root = snap.disk_root;
+        self.device = snap.device;
+        self.home = snap.home;
+        self.file_table = snap.file_table;
+        self.full_disk_access = snap.full_disk_access;
+        self.remote = snap.remote;
+        self.remote_platform = snap.remote_platform;
+        self.remote_identity = snap.remote_identity;
+        self.insights = snap.insights;
+        self.git = snap.git;
+        self.git_pending = snap.git_pending;
+        self.find = snap.find;
+        self.find_open = snap.find_open;
+        self.matches = snap.matches;
+        self.filter_applied = snap.filter_applied;
+        self.filter_epoch = snap.filter_epoch;
+        self.find_epoch = snap.find_epoch;
+        self.finding = snap.finding;
+        self.apply_pending = snap.apply_pending;
+        self.crumb_menu = snap.crumb_menu;
+        self.awaiting_root = snap.awaiting_root;
+        self.active_ssh_profile_id = snap.active_ssh_profile_id;
+        self.active_ssh_session = snap.active_ssh_session;
+
+        self.scan_epoch = self.scan_epoch.max(snap.scan_epoch) + 1;
+        if self.scan.is_some() || self.remote_scan.is_some() {
+            Self::poll_scan(self.scan_epoch, cx);
+        }
+    }
+
+    fn save_active_tab_snapshot(&mut self) {
+        let snap = self.snapshot_active_session();
+        let active_key = self.active_host_tab.clone();
+        if let Some(tab) =
+            self.host_tabs.iter_mut().find(|t| t.key == active_key)
+        {
+            tab.session = Some(snap);
+        }
+    }
+
+    /// Activate an existing Explore host tab (`Local` or `Ssh(id)`), preserving
+    /// every other tab's scanned tree and session state.
+    pub fn switch_host_tab(
+        &mut self,
+        key: HostTabKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(target_idx) = self.host_tabs.iter().position(|t| t.key == key)
+        else {
+            return;
+        };
+        self.screen = Screen::Explore;
+        self.volumes_open = false;
+        self.ssh_form_open = false;
+        self.ssh_form_error = None;
+        if self.active_host_tab != key {
+            let is_local = key == HostTabKey::Local;
+            self.save_active_tab_snapshot();
+            let snap = self.host_tabs[target_idx].session.take();
+            self.active_host_tab = key;
+            if let Some(snap) = snap {
+                self.restore_session(snap, cx);
+            } else {
+                self.reset_active_explore_session();
+                if is_local {
+                    self.home = std::env::home_dir();
+                    self.awaiting_root = true;
+                }
+            }
+        }
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    /// Close a remote SSH host tab, cancelling any in-flight scan and
+    /// dropping its `SshSession`. `HostTabKey::Local` can never be closed.
+    pub fn close_host_tab(
+        &mut self,
+        key: &HostTabKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if *key == HostTabKey::Local {
+            return;
+        }
+        let Some(pos) = self.host_tabs.iter().position(|t| &t.key == key)
+        else {
+            return;
+        };
+        if self.active_host_tab == *key {
+            if let Some(scan) = self.scan.take() {
+                scan.cancel();
+            }
+            self.remote_scan = None;
+            self.active_ssh_session = None;
+            self.active_ssh_profile_id = None;
+            self.host_tabs.remove(pos);
+            let next_idx = pos.min(self.host_tabs.len().saturating_sub(1));
+            let next_key = self.host_tabs[next_idx].key.clone();
+            let snap = self.host_tabs[next_idx].session.take();
+            self.active_host_tab = next_key.clone();
+            if let Some(snap) = snap {
+                self.restore_session(snap, cx);
+            } else {
+                self.reset_active_explore_session();
+                if next_key == HostTabKey::Local {
+                    self.home = std::env::home_dir();
+                    self.awaiting_root = true;
+                }
+            }
+        } else {
+            let mut tab = self.host_tabs.remove(pos);
+            if let Some(mut snap) = tab.session.take() {
+                if let Some(scan) = snap.scan.take() {
+                    scan.cancel();
+                }
+                snap.remote_scan = None;
+                snap.active_ssh_session = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Report whether an SSH profile currently has an active scan in its tab.
+    #[must_use]
+    pub fn is_ssh_profile_scanning(&self, id: &str) -> bool {
+        let key = HostTabKey::Ssh(id.to_owned());
+        if self.active_host_tab == key {
+            return self.remote_scan.is_some();
+        }
+        self.host_tabs
+            .iter()
+            .find(|t| t.key == key)
+            .and_then(|t| t.session.as_ref())
+            .is_some_and(|s| s.remote_scan.is_some())
+    }
+
+    fn find_live_ssh_session(&self, id: &str) -> Option<Arc<SshSession>> {
+        if self.active_ssh_profile_id.as_deref() == Some(id)
+            && let Some(session) = &self.active_ssh_session
+            && !session.is_closed()
+            && !session.is_expired()
+        {
+            return Some(Arc::clone(session));
+        }
+        let key = HostTabKey::Ssh(id.to_owned());
+        self.host_tabs
+            .iter()
+            .find(|t| t.key == key)
+            .and_then(|t| t.session.as_ref())
+            .and_then(|snap| snap.active_ssh_session.as_ref())
+            .filter(|s| !s.is_closed() && !s.is_expired())
+            .map(Arc::clone)
+    }
+
+    fn store_live_ssh_session(&mut self, id: &str, session: &Arc<SshSession>) {
+        if self.active_ssh_profile_id.as_deref() == Some(id) {
+            self.active_ssh_session = Some(Arc::clone(session));
+            return;
+        }
+        let key = HostTabKey::Ssh(id.to_owned());
+        if let Some(tab) = self.host_tabs.iter_mut().find(|t| t.key == key)
+            && let Some(snap) = &mut tab.session
+        {
+            snap.active_ssh_session = Some(Arc::clone(session));
+        }
+    }
+
+    fn cached_ssh_header(&self, id: &str) -> Option<ruum_core::remote::Header> {
+        if self.active_ssh_profile_id.as_deref() == Some(id)
+            && let Some(identity) = &self.remote_identity
+            && !self.root_path.as_os_str().is_empty()
+        {
+            return Some(ruum_core::remote::Header::new(
+                self.root_path.clone(),
+                self.home.clone(),
+                self.remote_platform.clone(),
+                Some(identity.clone()),
+            ));
+        }
+        let key = HostTabKey::Ssh(id.to_owned());
+        self.host_tabs
+            .iter()
+            .find(|t| t.key == key)
+            .and_then(|t| t.session.as_ref())
+            .and_then(|snap| {
+                let identity = snap.remote_identity.as_ref()?;
+                if snap.root_path.as_os_str().is_empty() {
+                    return None;
+                }
+                Some(ruum_core::remote::Header::new(
+                    snap.root_path.clone(),
+                    snap.home.clone(),
+                    snap.remote_platform.clone(),
+                    Some(identity.clone()),
+                ))
+            })
+    }
+
+    fn ensure_active_ssh_session(
+        &mut self,
+        profile_id: &str,
+    ) -> Result<Arc<SshSession>, String> {
+        if let Some(session) = &self.active_ssh_session
+            && !session.is_closed()
+            && !session.is_expired()
+        {
+            return Ok(Arc::clone(session));
+        }
+        let profile = self
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned()
+            .ok_or_else(|| format!("SSH profile `{profile_id}` not found"))?;
+        let session = Arc::new(self.start_profile_ssh_session(&profile)?);
+        self.active_ssh_session = Some(Arc::clone(&session));
+        Ok(session)
+    }
+
+    fn start_profile_ssh_session(
+        &self,
+        profile: &ruum_core::storage::SshProfile,
+    ) -> Result<ruum_core::ssh_session::SshSession, String> {
+        let store = self.ensure_cred_store()?;
+        start_ssh_session_with_store(
+            profile,
+            &store,
+            self.app_settings.ssh_session_duration_minutes,
+        )
+    }
+
+    /// Connect to a saved SSH profile on-demand (or activate its existing tab
+    /// if already connected), preserving other tabs' session state.
+    pub fn connect_ssh_profile(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(profile) =
+            self.ssh_profiles.iter().find(|p| p.id == id).cloned()
+        else {
+            return;
+        };
+        let target_key = HostTabKey::Ssh(profile.id.clone());
+        if let Some(existing_idx) =
+            self.host_tabs.iter().position(|t| t.key == target_key)
+        {
+            let has_live_state =
+                if self.active_host_tab == target_key {
+                    self.tree.is_some() || self.remote_scan.is_some()
+                } else {
+                    self.host_tabs[existing_idx].session.as_ref().is_some_and(
+                        |s| s.tree.is_some() || s.remote_scan.is_some(),
+                    )
+                };
+            if has_live_state {
+                self.switch_host_tab(target_key, cx);
+                return;
+            }
+        }
+
+        let session = if let Some(live) = self.find_live_ssh_session(id) {
+            live
+        } else {
+            match self.start_profile_ssh_session(&profile) {
+                Ok(session) => Arc::new(session),
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::ssh_connect_failed(
+                            &profile.alias,
+                            &err,
+                            self.locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        };
+
+        let root_path = profile
+            .default_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| PathBuf::from("~"), PathBuf::from);
+
+        if self.active_host_tab == target_key {
+            self.marks.clear();
+            self.history = History::default();
+            self.remote_identity = None;
+            self.remote_platform.clear();
+            self.git.clear();
+            self.git_pending.clear();
+            self.space = None;
+            self.space_baseline = None;
+            self.disk_root = None;
+            self.device = None;
+            self.full_disk_access = None;
+            self.file_table = false;
+            self.home = None;
+        } else {
+            self.save_active_tab_snapshot();
+            if let Some(idx) =
+                self.host_tabs.iter().position(|t| t.key == target_key)
+            {
+                let _ = self.host_tabs[idx].session.take();
+                self.host_tabs[idx].label.clone_from(&profile.alias);
+            } else {
+                self.host_tabs.push(ExploreHostTab {
+                    key: target_key.clone(),
+                    label: profile.alias.clone(),
+                    session: None,
+                });
+            }
+            self.active_host_tab = target_key;
+            self.reset_active_explore_session();
+        }
+
+        self.remote = Some(profile.alias);
+        self.active_ssh_profile_id = Some(profile.id);
+        self.active_ssh_session = Some(session);
+        self.options.follow_links = false;
+        self.options.one_filesystem = true;
+        self.awaiting_root = false;
+        self.close_volumes(cx);
+        self.set_root(root_path, cx);
+    }
+
+    /// Pre-flight check remote disk space for a saved SSH profile off the UI
+    /// thread and update its cached summary in `ruum.db`.
+    pub fn check_ssh_profile_space(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.ssh_checking_profiles.contains(id) {
+            return;
+        }
+        let Some(profile) =
+            self.ssh_profiles.iter().find(|p| p.id == id).cloned()
+        else {
+            return;
+        };
+        let store = match self.ensure_cred_store() {
+            Ok(store) => store,
+            Err(err) => {
+                self.push_toast(
+                    crate::i18n::messages::ssh_check_space_failed(
+                        &profile.alias,
+                        &err,
+                        self.locale,
+                    ),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+        let existing_session = self.find_live_ssh_session(id);
+        let duration_minutes = self.app_settings.ssh_session_duration_minutes;
+        let profile_id = profile.id.clone();
+        let alias = profile.alias.clone();
+        self.ssh_checking_profiles.insert(profile_id.clone());
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let session = match existing_session {
+                Some(s) if !s.is_closed() && !s.is_expired() => s,
+                _ => Arc::new(start_ssh_session_with_store(
+                    &profile,
+                    &store,
+                    duration_minutes,
+                )?),
+            };
+            let target_path = profile
+                .default_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let info = ruum_core::remote::check_remote_space_with_session(
+                &session,
+                target_path,
+            )?;
+            Ok::<_, String>((session, info))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.ssh_checking_profiles.remove(&profile_id);
+                let locale = this.locale;
+                match res {
+                    Ok((session, info)) => {
+                        this.store_live_ssh_session(&profile_id, &session);
+                        let now_secs =
+                            u64::try_from(now_seconds()).unwrap_or(0);
+                        if this.db_path.is_some()
+                            && let Ok(db) = this.open_db()
+                        {
+                            let _ = db.update_ssh_profile_scan_summary(
+                                &profile_id,
+                                info.total,
+                                info.available,
+                                now_secs,
+                            );
+                            this.reload_ssh_profiles();
+                        }
+                        let thresh_bytes = this
+                            .watchdog_config
+                            .min_free_gb
+                            .saturating_mul(1024 * 1024 * 1024);
+                        let breached = info.available < thresh_bytes;
+                        let free = ruum_core::size::human_bytes(info.available);
+                        let total = ruum_core::size::human_bytes(info.total);
+                        let msg = if breached {
+                            crate::i18n::messages::ssh_space_checked_below(
+                                &alias,
+                                &free,
+                                &total,
+                                this.watchdog_config.min_free_gb,
+                                locale,
+                            )
+                        } else {
+                            crate::i18n::messages::ssh_space_checked_healthy(
+                                &alias,
+                                &free,
+                                &total,
+                                this.watchdog_config.min_free_gb,
+                                locale,
+                            )
+                        };
+                        let status = if breached {
+                            Status::Warning
+                        } else {
+                            Status::Success
+                        };
+                        this.push_toast(msg, status, cx);
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            crate::i18n::messages::ssh_check_space_failed(
+                                &alias, &err, locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Run remote AI analysis for a saved SSH profile off the UI thread and
+    /// open a remote-targeted cleanup confirmation modal without touching
+    /// local Watchdog `ai_proposal`.
+    pub fn analyze_ssh_profile(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.ssh_analyzing_profiles.contains(id) {
+            return;
+        }
+        let Some(profile) =
+            self.ssh_profiles.iter().find(|p| p.id == id).cloned()
+        else {
+            return;
+        };
+        let store = match self.ensure_cred_store() {
+            Ok(store) => store,
+            Err(err) => {
+                self.push_toast(
+                    crate::i18n::messages::ssh_ai_analyze_failed(
+                        &profile.alias,
+                        &err,
+                        self.locale,
+                    ),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+        let existing_session = self.find_live_ssh_session(id);
+        let cached_header = self.cached_ssh_header(id);
+        let duration_minutes = self.app_settings.ssh_session_duration_minutes;
+        let profile_id = profile.id.clone();
+        let alias = profile.alias.clone();
+        self.ssh_analyzing_profiles.insert(profile_id.clone());
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let session = match existing_session {
+                Some(s) if !s.is_closed() && !s.is_expired() => s,
+                _ => Arc::new(start_ssh_session_with_store(
+                    &profile,
+                    &store,
+                    duration_minutes,
+                )?),
+            };
+            let target_path = profile
+                .default_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let proposal = ruum_core::remote::run_remote_analyze_with_session(
+                &session,
+                target_path.as_deref(),
+            )?;
+            let header = if proposal.items.is_empty() {
+                None
+            } else {
+                Some(resolve_remote_proposal_header(
+                    &session,
+                    cached_header,
+                    target_path.as_deref(),
+                    &proposal.items,
+                )?)
+            };
+            Ok::<_, String>((session, proposal, header))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.ssh_analyzing_profiles.remove(&profile_id);
+                let locale = this.locale;
+                match res {
+                    Ok((session, proposal, header)) => {
+                        this.store_live_ssh_session(&profile_id, &session);
+                        if proposal.items.is_empty() {
+                            this.push_toast(
+                                crate::i18n::messages::ai_found_no_files(
+                                    locale,
+                                ),
+                                Status::Success,
+                                cx,
+                            );
+                        } else if let Some(header) = header {
+                            let count = proposal.items.len();
+                            let request = remote_proposal_confirm_request(
+                                header.root.clone(),
+                                &alias,
+                                &proposal,
+                                locale,
+                            );
+                            crate::open_remote_confirm_window(
+                                request,
+                                profile_id.clone(),
+                                session,
+                                header,
+                                cx,
+                            );
+                            this.push_toast(
+                                crate::i18n::messages::ai_proposed_items(
+                                    count, locale,
+                                ),
+                                Status::Success,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            crate::i18n::messages::ssh_ai_analyze_failed(
+                                &alias, &err, locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn choose_picker_path(&mut self, cx: &mut Context<'_, Self>) {
@@ -2502,6 +4663,7 @@ impl Ruum {
         }
     }
 
+    /// Pick a local directory or mount and activate the Local Explore tab.
     pub fn choose_source_root(
         &mut self,
         mut path: PathBuf,
@@ -2513,42 +4675,29 @@ impl Ruum {
         {
             return;
         }
-        if !self.picker_source_matches(cx) {
-            self.picker_error = Some(
-                crate::i18n::messages::picker_connect_first(self.locale).into(),
-            );
-            cx.notify();
-            return;
-        }
-        let valid_abs = if self.volumes_source.is_some() {
-            ruum_core::remote::is_remote_absolute(&path)
-        } else {
-            path.is_absolute()
-        };
-        if !valid_abs {
+        if !path.is_absolute() {
             self.picker_error = Some(
                 crate::i18n::messages::picker_abs_path(self.locale).into(),
             );
             cx.notify();
             return;
         }
-        if self.volumes_source.is_none() {
-            match dunce::canonicalize(&path) {
-                Ok(root) if root.is_dir() => path = root,
-                _ => {
-                    self.picker_error = Some(
-                        crate::i18n::messages::picker_cannot_open_dir(
-                            self.locale,
-                        )
+        match dunce::canonicalize(&path) {
+            Ok(root) if root.is_dir() => path = root,
+            _ => {
+                self.picker_error = Some(
+                    crate::i18n::messages::picker_cannot_open_dir(self.locale)
                         .into(),
-                    );
-                    cx.notify();
-                    return;
-                }
+                );
+                cx.notify();
+                return;
             }
         }
         self.picker_error = None;
-        if self.remote != self.volumes_source {
+        if self.active_host_tab != HostTabKey::Local {
+            self.switch_host_tab(HostTabKey::Local, cx);
+        }
+        if self.remote.is_some() || self.remote_identity.is_some() {
             // Absolute paths only identify marks within one machine.
             self.marks.clear();
             self.history = History::default();
@@ -2562,17 +4711,11 @@ impl Ruum {
             self.device = None;
             self.full_disk_access = None;
             self.file_table = false;
-            self.home = if self.volumes_source.is_none() {
-                std::env::home_dir()
-            } else {
-                None
-            };
         }
-        self.remote.clone_from(&self.volumes_source);
-        if self.remote.is_some() {
-            self.options.follow_links = false;
-            self.options.one_filesystem = true;
-        }
+        self.remote = None;
+        self.active_ssh_profile_id = None;
+        self.active_ssh_session = None;
+        self.home = std::env::home_dir();
         self.awaiting_root = false;
         self.close_volumes(cx);
         self.set_root(path, cx);
@@ -2581,9 +4724,10 @@ impl Ruum {
     /// Closing cancels discovery, not the scan already on screen.
     pub fn close_volumes(&mut self, cx: &mut Context<'_, Self>) {
         self.volume_epoch += 1;
-        self.roots_job = None;
         self.volumes_loading = false;
         self.volumes_open = false;
+        self.ssh_form_open = false;
+        self.ssh_form_error = None;
         if self.screen == Screen::Sources {
             self.screen = Screen::Explore;
         }
@@ -2730,9 +4874,16 @@ impl Ruum {
         }
         self.options.threads = preset.policy(self.cpu_threads);
         self.power_choice = Some(preset);
+        preset.key().clone_into(&mut self.app_settings.power_preset);
+        self.app_settings.updated_at_secs =
+            u64::try_from(now_seconds()).unwrap_or(0);
+        self.watchdog_draft.power_preset = preset;
         let label = preset.label_in(self.cpu_threads, self.locale);
-        self.notice = Some(match self.power_settings_path.as_deref() {
-            Some(path) => match crate::power::save(path, preset) {
+        self.notice = Some(if self.db_path.is_some() {
+            match self
+                .open_db()
+                .and_then(|db| db.save_app_settings(&self.app_settings))
+            {
                 Ok(()) => (
                     crate::i18n::messages::power_saved(&label, self.locale),
                     Status::Success,
@@ -2745,11 +4896,12 @@ impl Ruum {
                     ),
                     Status::Warning,
                 ),
-            },
-            None => (
+            }
+        } else {
+            (
                 crate::i18n::messages::power_no_dir(&label, self.locale),
                 Status::Warning,
-            ),
+            )
         });
         cx.notify();
     }
@@ -2855,7 +5007,20 @@ impl Ruum {
                 disk: self.remote_disk,
                 options: self.options.clone(),
             };
-            match ruum_core::remote::RemoteScan::spawn(host, &request) {
+            let spawn_res =
+                if let Some(profile_id) = self.active_ssh_profile_id.clone() {
+                    match self.ensure_active_ssh_session(&profile_id) {
+                        Ok(session) => {
+                            ruum_core::remote::RemoteScan::spawn_with_session(
+                                &session, &request,
+                            )
+                        }
+                        Err(err) => Err(std::io::Error::other(err)),
+                    }
+                } else {
+                    ruum_core::remote::RemoteScan::spawn(host, &request)
+                };
+            match spawn_res {
                 Ok(scan) => {
                     self.remote_scan = Some(scan);
                     Self::poll_scan(epoch, cx);
@@ -2944,6 +5109,21 @@ impl Ruum {
                             self.locale,
                         )
                     });
+                    if let (Some(profile_id), Some(space)) =
+                        (self.active_ssh_profile_id.clone(), self.space)
+                        && self.db_path.is_some()
+                        && let Ok(db) = self.open_db()
+                    {
+                        let now_secs =
+                            u64::try_from(now_seconds()).unwrap_or(0);
+                        let _ = db.update_ssh_profile_scan_summary(
+                            &profile_id,
+                            space.total,
+                            space.available,
+                            now_secs,
+                        );
+                        self.reload_ssh_profiles();
+                    }
                     let node = snapshot.tree;
                     self.marks.refresh(
                         &self.root_path,
@@ -4210,6 +6390,9 @@ impl Ruum {
         match self.focus_request.take() {
             Some(FocusTarget::Root) => window.focus(&self.focus, cx),
             Some(FocusTarget::Dialog) => window.focus(&self.confirm_focus, cx),
+            Some(FocusTarget::RemoteConnectDialog) => {
+                window.focus(&self.remote_connect_focus, cx);
+            }
             None => {}
         }
     }
@@ -4709,10 +6892,24 @@ impl Ruum {
         if self.confirm_open {
             return;
         }
+        if self.remote_connect_confirm.is_some() {
+            match key {
+                "enter" => self.approve_remote_connect(cx),
+                "escape" => self.deny_remote_connect(cx),
+                _ => {}
+            }
+            return;
+        }
 
         // The volume picker owns its keys while open: arrows move, Enter
         // picks, Escape closes, and nothing behind it acts.
         if self.volumes_open || self.screen == Screen::Sources {
+            if self.ssh_form_open {
+                if key == "escape" {
+                    self.close_ssh_form(cx);
+                }
+                return;
+            }
             match key {
                 "escape" => self.close_volumes(cx),
                 "enter" => self.choose_volume(cx),
@@ -5265,11 +7462,7 @@ impl Ruum {
         } else {
             &self.root_path
         };
-        let mut args =
-            restart_args(&self.options, self.layout_options.max_depth, root);
-        if let Some(preset) = self.power_choice {
-            args.extend(["--power-efficiency".into(), preset.key().into()]);
-        }
+        let args = restart_args(root);
         // Off the UI thread: the prompt runs its own message loop, which
         // would re-enter this window while it is still being handled.
         let restart = cx.background_executor().spawn(async move {
@@ -5296,51 +7489,9 @@ impl Ruum {
     }
 }
 
-/// The command line that reopens `root` with `options` and `depth`, in the
-/// flags `parse_args` reads.
-pub fn restart_args(
-    options: &ScanOptions,
-    depth: u32,
-    root: &Path,
-) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    for (on, flag) in [
-        (options.apparent_size, "--apparent-size"),
-        (options.follow_links, "--follow-links"),
-        (!options.include_hidden, "--no-hidden"),
-        (!options.one_filesystem, "--cross-filesystems"),
-        (options.metric == Metric::Files, "--metric"),
-    ] {
-        if on {
-            args.push(flag.into());
-        }
-    }
-    if options.metric == Metric::Files {
-        args.push("files".into());
-    }
-    args.push("--scan-threads".into());
-    args.push(options.threads.max_threads.to_string().into());
-    args.push(if options.threads.adaptive {
-        "--adaptive-threads".into()
-    } else {
-        "--fixed-threads".into()
-    });
-    args.push("--thread-throughput-percent".into());
-    args.push(
-        format!("{:.0}", options.threads.retained_throughput * 100.0).into(),
-    );
-    args.push("--thread-system-cpu-percent".into());
-    args.push(
-        format!(
-            "{:.0}",
-            options.threads.system_cpu_limit.unwrap_or(0.0) * 100.0
-        )
-        .into(),
-    );
-    args.push("--depth".into());
-    args.push(depth.to_string().into());
-    args.push(root.as_os_str().to_owned());
-    args
+/// The command line that reopens `root` in `ruum-gui` after elevation.
+pub fn restart_args(root: &Path) -> Vec<std::ffi::OsString> {
+    vec![root.as_os_str().to_owned()]
 }
 
 /// Now, in Unix seconds.
@@ -5384,6 +7535,8 @@ pub enum FocusTarget {
     Root,
     /// The permanent-deletion alert dialog.
     Dialog,
+    /// The remote SSH connect confirmation dialog.
+    RemoteConnectDialog,
 }
 
 impl Render for Ruum {
@@ -5419,6 +7572,79 @@ impl Render for Ruum {
         }
         crate::views::root(self, window, cx)
     }
+}
+
+fn start_ssh_session_with_store(
+    profile: &ruum_core::storage::SshProfile,
+    store: &ruum_core::credentials::LazyCredentialStore,
+    duration_minutes: u64,
+) -> Result<ruum_core::ssh_session::SshSession, String> {
+    let endpoint = ruum_core::ssh_session::SshEndpoint::from_profile(profile)?;
+    let auth = ruum_core::ssh_session::SshAuthMaterial::from_profile_and_store(
+        profile, store,
+    )?;
+    ruum_core::ssh_session::SshSession::start(endpoint, auth, duration_minutes)
+}
+
+fn resolve_remote_proposal_root(
+    target_path: Option<&str>,
+    home: Option<&Path>,
+    items: &[ruum_core::watchdog_config::ProposalItem],
+) -> PathBuf {
+    let raw = target_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("~");
+    let candidate = if raw == "~" {
+        home.map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.map_or_else(|| PathBuf::from("/"), |h| h.join(rest))
+    } else {
+        PathBuf::from(raw)
+    };
+    if items.iter().all(|item| item.path.starts_with(&candidate)) {
+        return candidate;
+    }
+    if let Some(first) = items.first()
+        && let Some(parent) = first.path.parent()
+    {
+        return parent.to_path_buf();
+    }
+    candidate
+}
+
+fn resolve_remote_proposal_header(
+    session: &ruum_core::ssh_session::SshSession,
+    cached: Option<ruum_core::remote::Header>,
+    target_path: Option<&str>,
+    items: &[ruum_core::watchdog_config::ProposalItem],
+) -> Result<ruum_core::remote::Header, String> {
+    if let Some(mut header) = cached
+        && header.identity.is_some()
+    {
+        if !items.iter().all(|item| item.path.starts_with(&header.root)) {
+            header.root = resolve_remote_proposal_root(
+                target_path,
+                header.home.as_deref(),
+                items,
+            );
+        }
+        return Ok(header);
+    }
+    let job = ruum_core::remote::RemoteRoots::discover_with_session(session)
+        .map_err(|err| err.to_string())?;
+    let roots = job.wait().map_err(|err| err.to_string())?;
+    if roots.identity.is_none() {
+        return Err("remote host did not report a host identity".to_owned());
+    }
+    let root =
+        resolve_remote_proposal_root(target_path, roots.home.as_deref(), items);
+    Ok(ruum_core::remote::Header::new(
+        root,
+        roots.home,
+        roots.platform,
+        roots.identity,
+    ))
 }
 
 #[cfg(test)]

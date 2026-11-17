@@ -7,22 +7,39 @@
 //! via [`crate::confirm::CleanupConfirmAdapter`], and executes approved
 //! cleanups without unattended file deletion.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ai_cli::{self, CommandRunner};
+use ruum_watchdog::{
+    SpaceProbe, SpaceSample, WatchdogEvent, WatchdogEventSink,
+};
+
+use crate::ai_cli::{self, CommandRunner, DefaultCommandRunner};
 use crate::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmItem,
-    CleanupConfirmRequest,
+    CleanupConfirmRequest, GuiCleanupConfirm,
 };
 use crate::i18n::{self, Locale};
+use crate::notify::resolve_ipc_target_and_token;
+pub use crate::notify::{
+    NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_CLEANUP_STARTED,
+    NOTIF_TAG_LOW_SPACE, NotificationAdapter, NotificationEnv,
+    NotificationFactory, NotificationOs, OsNotificationAdapter,
+    notify_gui_watchdog_update, notify_gui_watchdog_update_with,
+    send_fallback_os_notification, send_os_notification, try_ipc_notification,
+    try_ipc_notification_with, try_ipc_open_window, try_ipc_open_window_with,
+};
 use crate::removal::{RemovalEvent, RemovalMode, Target};
+use crate::storage::{AiState, StorageDb};
 use crate::watchdog_config::{
     CleanupProposal, ProposalItem, WatchdogConfig, WatchdogState, load_config,
     load_state, save_state,
+};
+use crate::webhook::{
+    LowSpaceWebhookPayload, send_low_space_webhook, send_low_space_webhooks,
 };
 
 /// Result of evaluating disk space for a single polling tick.
@@ -46,157 +63,349 @@ pub enum TickResult {
     },
 }
 
-/// Notification tag for low disk space alerts.
-pub const NOTIF_TAG_LOW_SPACE: &str = "ruum.low_disk_space";
-/// Notification tag for completed cleanup summaries.
-pub const NOTIF_TAG_CLEANUP_DONE: &str = "ruum.cleanup_complete";
-/// Notification tag for AI analysis completion / proposals.
-pub const NOTIF_TAG_AI_ANALYSIS: &str = "ruum.ai_analysis";
+/// [`SpaceProbe`] adapter backed by [`crate::space::space_info`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoreSpaceProbe;
 
-/// Abstract adapter for sending temporary OS notifications.
-pub trait NotificationAdapter: Send + Sync {
-    fn notify_tagged(
-        &self,
-        tag: &str,
-        title: &str,
-        body: &str,
-    ) -> io::Result<()>;
-
-    fn notify(&self, title: &str, body: &str) -> io::Result<()> {
-        self.notify_tagged(NOTIF_TAG_LOW_SPACE, title, body)
+impl SpaceProbe for CoreSpaceProbe {
+    fn probe(&self, path: &Path) -> io::Result<SpaceSample> {
+        let space = crate::space::space_info(path)?;
+        Ok(SpaceSample {
+            available_bytes: space.available,
+            total_bytes: space.total,
+        })
     }
 }
 
-/// Default system notification adapter sending non-persistent alerts.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OsNotificationAdapter;
+/// Core event sink handling [`WatchdogEvent::LowDiskSpace`] alerts:
+///
+/// 1. Sends a core OS/IPC notification (`notify`).
+/// 2. Delivers a generic JSON webhook if configured and enabled (`webhook`).
+/// 3. Reads `ai_config` from `ruum.db`; if `auto_analyze_on_alert` is true,
+///    runs `ai_cli`, persists `ai_state.last_proposal_json`, notifies GUI via
+///    IPC, and executes user-confirmed items via [`CleanupConfirmAdapter`].
+pub struct CoreWatchdogEventHandler<'a> {
+    db: &'a StorageDb,
+    current_exe: PathBuf,
+    cmd_runner: &'a dyn CommandRunner,
+    confirm_adapter: &'a dyn CleanupConfirmAdapter,
+    notifier: &'a dyn NotificationAdapter,
+    locale: Locale,
+    ipc_notify_target: Option<(PathBuf, String)>,
+}
 
-impl NotificationAdapter for OsNotificationAdapter {
-    fn notify_tagged(
-        &self,
-        tag: &str,
-        title: &str,
-        body: &str,
-    ) -> io::Result<()> {
-        if try_ipc_notification(tag, title, body) {
+impl fmt::Debug for CoreWatchdogEventHandler<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreWatchdogEventHandler")
+            .field("db", &self.db)
+            .field("current_exe", &self.current_exe)
+            .field("locale", &self.locale)
+            .field(
+                "has_ipc_target",
+                &self.ipc_notify_target.as_ref().map(|(p, _)| p.clone()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> CoreWatchdogEventHandler<'a> {
+    /// Construct a new [`CoreWatchdogEventHandler`] wired to `db` and adapters.
+    #[must_use]
+    pub fn new(
+        db: &'a StorageDb,
+        current_exe: PathBuf,
+        cmd_runner: &'a dyn CommandRunner,
+        confirm_adapter: &'a dyn CleanupConfirmAdapter,
+        notifier: &'a dyn NotificationAdapter,
+    ) -> Self {
+        Self {
+            db,
+            current_exe,
+            cmd_runner,
+            confirm_adapter,
+            notifier,
+            locale: Locale::current(),
+            ipc_notify_target: resolve_ipc_target_and_token(),
+        }
+    }
+
+    /// Override localization used for notification titles/bodies.
+    #[must_use]
+    pub const fn with_locale(mut self, locale: Locale) -> Self {
+        self.locale = locale;
+        self
+    }
+
+    /// Override (or disable with `None`) the GUI IPC notification endpoint.
+    #[must_use]
+    pub fn with_ipc_target(
+        mut self,
+        target: Option<(PathBuf, String)>,
+    ) -> Self {
+        self.ipc_notify_target = target;
+        self
+    }
+
+    fn send_ipc_watchdog_update(&self) {
+        if let Some((ref target, ref token)) = self.ipc_notify_target {
+            let _ = notify_gui_watchdog_update_with(target, token);
+        }
+    }
+}
+
+impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
+    fn on_event(&self, event: &WatchdogEvent) -> io::Result<()> {
+        let WatchdogEvent::LowDiskSpace {
+            timestamp_secs,
+            mount_path,
+            available_bytes,
+            total_bytes,
+            threshold_bytes,
+        } = event;
+
+        let min_gb = threshold_bytes / (1024 * 1024 * 1024);
+        if let Err(err) = self.notifier.notify_tagged(
+            NOTIF_TAG_LOW_SPACE,
+            i18n::low_disk_space_title(self.locale),
+            &i18n::low_disk_space_body(*available_bytes, min_gb, self.locale),
+        ) {
+            eprintln!("ruum watchdog: notification error: {err}");
+        }
+
+        let endpoints = self.db.list_webhooks()?;
+        let webhook_payload = LowSpaceWebhookPayload::from_low_space_event(
+            *timestamp_secs,
+            mount_path,
+            *available_bytes,
+            *total_bytes,
+            *threshold_bytes,
+        );
+        if endpoints.is_empty() {
+            let webhook_cfg = self.db.load_webhook_config()?;
+            if let Err(err) =
+                send_low_space_webhook(&webhook_cfg, &webhook_payload)
+            {
+                eprintln!("ruum watchdog: webhook delivery error: {err}");
+            }
+        } else {
+            for (endpoint_id, res) in
+                send_low_space_webhooks(&endpoints, &webhook_payload)
+            {
+                if let Err(err) = res {
+                    eprintln!(
+                        "ruum watchdog: webhook `{endpoint_id}` delivery \
+                         error: {err}"
+                    );
+                }
+            }
+        }
+
+        let ai_cfg = self.db.load_ai_config()?;
+        if !ai_cfg.auto_analyze_on_alert {
+            self.send_ipc_watchdog_update();
             return Ok(());
         }
-        send_fallback_os_notification(title, body)
+
+        let proposal = match ai_cli::run_analysis_for_config(
+            &ai_cfg,
+            mount_path,
+            &self.current_exe,
+            *timestamp_secs,
+            self.cmd_runner,
+        ) {
+            Ok(prop) => {
+                let ai_state = AiState::from_proposal(&prop, *timestamp_secs)?;
+                self.db.save_ai_state(&ai_state)?;
+                self.send_ipc_watchdog_update();
+                Some(prop)
+            }
+            Err(err) => {
+                eprintln!("ruum watchdog: AI analysis error: {err}");
+                self.send_ipc_watchdog_update();
+                None
+            }
+        };
+
+        if let Some(prop) = proposal.as_ref().filter(|p| !p.items.is_empty()) {
+            let confirm_items = prop
+                .items
+                .iter()
+                .map(|i| CleanupConfirmItem {
+                    path: i.path.clone(),
+                    bytes: i.bytes,
+                    mode: i.mode,
+                    reason: i.reason.clone(),
+                    git_warning: i.git_warning.clone(),
+                })
+                .collect();
+
+            let request = CleanupConfirmRequest {
+                root: mount_path.clone(),
+                title: i18n::recommended_cleanup_title(self.locale).to_string(),
+                summary: Some(prop.summary.clone()),
+                items: confirm_items,
+            };
+
+            if let Ok(CleanupConfirmDecision::Confirmed { selected_paths }) =
+                self.confirm_adapter.confirm(&request)
+            {
+                let approved_items: Vec<ProposalItem> = prop
+                    .items
+                    .iter()
+                    .filter(|item| selected_paths.contains(&item.path))
+                    .cloned()
+                    .collect();
+
+                if !approved_items.is_empty() {
+                    let (reclaimed_bytes, removed_items, cleaned_paths) =
+                        execute_confirmed_cleanup_tracked(
+                            &approved_items,
+                            mount_path,
+                        );
+                    if !cleaned_paths.is_empty() {
+                        if let Err(err) = self.db.prune_ai_state_paths(
+                            &cleaned_paths,
+                            *timestamp_secs,
+                        ) {
+                            eprintln!(
+                                "ruum watchdog: failed to prune ai_state: {err}"
+                            );
+                        }
+                        self.send_ipc_watchdog_update();
+                    }
+                    if removed_items > 0 {
+                        let _ = self.notifier.notify_tagged(
+                            NOTIF_TAG_CLEANUP_DONE,
+                            i18n::cleanup_complete_title(self.locale),
+                            &i18n::cleanup_complete_body(
+                                removed_items,
+                                reclaimed_bytes,
+                                self.locale,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
-fn resolve_ipc_target_and_token() -> Option<(PathBuf, String)> {
-    let token_path = crate::watchdog_config::ipc_token_path()?;
-    let token = crate::confirm::load_or_create_ipc_token(&token_path).ok()?;
-    #[cfg(unix)]
-    let target = crate::confirm::resolve_socket_path();
-    #[cfg(windows)]
-    let target = crate::confirm::ipc_port_path()?;
-    Some((target, token))
-}
-
-fn send_ipc_ok(
-    socket_or_port: &Path,
-    request: &crate::confirm::IpcRequest,
-) -> bool {
-    matches!(
-        crate::confirm::send_ipc_message(socket_or_port, request),
-        Ok(crate::confirm::IpcResponse::Ok)
+/// Run a single `SQLite`-backed watchdog evaluation tick via `ruum-watchdog`
+/// and [`CoreWatchdogEventHandler`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit adapter injection for deterministic tests"
+)]
+pub fn run_once_with_db(
+    db: &StorageDb,
+    mount_path: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    cmd_runner: &dyn CommandRunner,
+    confirm_adapter: &dyn CleanupConfirmAdapter,
+    notifier: &dyn NotificationAdapter,
+) -> io::Result<ruum_watchdog::TickResult> {
+    let wd_service = db.watchdog()?;
+    let handler = CoreWatchdogEventHandler::new(
+        db,
+        current_exe.to_path_buf(),
+        cmd_runner,
+        confirm_adapter,
+        notifier,
+    );
+    ruum_watchdog::run_once(
+        &wd_service,
+        mount_path,
+        now_secs,
+        &CoreSpaceProbe,
+        &handler,
     )
 }
 
-/// Try delivering a tagged notification through an active GUI instance.
-pub fn try_ipc_notification_with(
-    socket_or_port: &Path,
-    token: &str,
-    tag: &str,
-    title: &str,
-    body: &str,
-) -> bool {
-    send_ipc_ok(
-        socket_or_port,
-        &crate::confirm::IpcRequest::ShowNotification {
-            token: token.to_string(),
-            tag: tag.to_string(),
-            title: title.to_string(),
-            body: body.to_string(),
-        },
-    )
-}
-
-/// Try delivering a tagged notification through the default local IPC channel.
-#[must_use]
-pub fn try_ipc_notification(tag: &str, title: &str, body: &str) -> bool {
-    let Some((target, token)) = resolve_ipc_target_and_token() else {
-        return false;
-    };
-    try_ipc_notification_with(&target, &token, tag, title, body)
-}
-
-/// Try opening/focusing an active GUI window via an explicit IPC socket/port.
-pub fn try_ipc_open_window_with(
-    socket_or_port: &Path,
-    token: &str,
-    tag: &str,
-) -> bool {
-    send_ipc_ok(
-        socket_or_port,
-        &crate::confirm::IpcRequest::OpenWindow {
-            token: token.to_string(),
-            tag: tag.to_string(),
-        },
-    )
-}
-
-/// Try opening/focusing an active GUI window through the default local IPC.
-#[must_use]
-pub fn try_ipc_open_window(tag: &str) -> bool {
-    let Some((target, token)) = resolve_ipc_target_and_token() else {
-        return false;
-    };
-    try_ipc_open_window_with(&target, &token, tag)
-}
-
-/// Send a fallback OS desktop notification directly via CLI utilities
-/// (`osascript` on macOS, `notify-send` on Linux) without touching IPC.
-pub fn send_fallback_os_notification(
-    title: &str,
-    body: &str,
+/// Run the `SQLite`-backed watchdog polling loop via `ruum-watchdog` and
+/// [`CoreWatchdogEventHandler`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit adapter injection for deterministic tests"
+)]
+pub fn run_loop_with_db(
+    db: &StorageDb,
+    mount_path: &Path,
+    pid_path: Option<&Path>,
+    current_exe: &Path,
+    cancel: &AtomicBool,
+    cmd_runner: &dyn CommandRunner,
+    confirm_adapter: &dyn CleanupConfirmAdapter,
+    notifier: &dyn NotificationAdapter,
 ) -> io::Result<()> {
-    if cfg!(target_os = "macos") {
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            body.replace('\"', "\\\""),
-            title.replace('\"', "\\\""),
-        );
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    } else if cfg!(target_os = "linux") {
-        let _ = Command::new("notify-send")
-            .arg("-t")
-            .arg("5000")
-            .arg(title)
-            .arg(body)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    Ok(())
+    let wd_service = db.watchdog()?;
+    let handler = CoreWatchdogEventHandler::new(
+        db,
+        current_exe.to_path_buf(),
+        cmd_runner,
+        confirm_adapter,
+        notifier,
+    );
+    ruum_watchdog::run_loop(
+        &wd_service,
+        mount_path,
+        pid_path,
+        cancel,
+        &CoreSpaceProbe,
+        &handler,
+    )
 }
 
-/// Send a temporary OS desktop notification, preferring an active GUI via IPC
-/// and falling back to platform CLI utilities.
-pub fn send_os_notification(title: &str, body: &str) -> io::Result<()> {
-    if try_ipc_notification(NOTIF_TAG_LOW_SPACE, title, body) {
-        return Ok(());
-    }
-    send_fallback_os_notification(title, body)
+fn default_db_paths()
+-> io::Result<(StorageDb, PathBuf, PathBuf, Option<PathBuf>)> {
+    let db = StorageDb::open_default()?;
+    let home_dir = std::env::home_dir().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no home directory")
+    })?;
+    let current_exe = std::env::current_exe()?;
+    let pid_path = ruum_watchdog::watchdog_pid_path();
+    Ok((db, home_dir, current_exe, pid_path))
+}
+
+/// Run a single evaluation tick against the default `ruum.db` and adapters.
+pub fn run_default_once_with_db() -> io::Result<ruum_watchdog::TickResult> {
+    let (db, home_dir, current_exe, _) = default_db_paths()?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let runner = DefaultCommandRunner;
+    let confirm = GuiCleanupConfirm::new();
+    let notifier = NotificationFactory::create();
+    run_once_with_db(
+        &db,
+        &home_dir,
+        &current_exe,
+        now_secs,
+        &runner,
+        &confirm,
+        notifier.as_ref(),
+    )
+}
+
+/// Run the background polling loop against the default `ruum.db` and adapters.
+pub fn run_default_loop_with_db(cancel: &AtomicBool) -> io::Result<()> {
+    let (db, home_dir, current_exe, pid_path) = default_db_paths()?;
+    let runner = DefaultCommandRunner;
+    let confirm = GuiCleanupConfirm::new();
+    let notifier = NotificationFactory::create();
+    run_loop_with_db(
+        &db,
+        &home_dir,
+        pid_path.as_deref(),
+        &current_exe,
+        cancel,
+        &runner,
+        &confirm,
+        notifier.as_ref(),
+    )
 }
 
 /// Evaluate volume free space against threshold and cooldown in $O(1)$.
@@ -255,17 +464,6 @@ pub use crate::watchdog_service::{
     macos_launchd_plist_path, service_status, uninstall_service,
 };
 
-/// Notify an active GUI instance over IPC of a watchdog state change.
-pub fn notify_gui_watchdog_update() {
-    let Some((target, token)) = resolve_ipc_target_and_token() else {
-        return;
-    };
-    let _ = send_ipc_ok(
-        &target,
-        &crate::confirm::IpcRequest::NotifyWatchdogUpdate { token },
-    );
-}
-
 /// Summary outcome of a single watchdog check execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchdogRunOutcome {
@@ -281,6 +479,17 @@ pub fn execute_confirmed_cleanup(
     items: &[ProposalItem],
     home_dir: &Path,
 ) -> (u64, usize) {
+    let (bytes, count, _) = execute_confirmed_cleanup_tracked(items, home_dir);
+    (bytes, count)
+}
+
+/// Execute synchronous removal of items confirmed by the user, returning
+/// `(reclaimed_bytes, removed_count, succeeded_paths)`.
+#[must_use]
+pub fn execute_confirmed_cleanup_tracked(
+    items: &[ProposalItem],
+    home_dir: &Path,
+) -> (u64, usize, Vec<PathBuf>) {
     execute_confirmed_cleanup_with(items, home_dir, &mut |path, err| {
         eprintln!("ruum watchdog: failed to remove {}: {err}", path.display());
     })
@@ -290,9 +499,10 @@ fn execute_confirmed_cleanup_with(
     items: &[ProposalItem],
     home_dir: &Path,
     log_error: &mut dyn FnMut(&Path, &str),
-) -> (u64, usize) {
+) -> (u64, usize, Vec<PathBuf>) {
     let mut total_bytes = 0_u64;
     let mut total_count = 0_usize;
+    let mut cleaned_paths = Vec::new();
 
     for mode in [RemovalMode::Trash, RemovalMode::Permanent] {
         let mode_items: Vec<&ProposalItem> =
@@ -343,9 +553,11 @@ fn execute_confirmed_cleanup_with(
                         ..
                     } => log_error(&path, &err),
                     RemovalEvent::Item {
-                        outcome: Ok(()), ..
-                    }
-                    | RemovalEvent::Start { .. } => {}
+                        path,
+                        outcome: Ok(()),
+                        ..
+                    } => cleaned_paths.push(path),
+                    RemovalEvent::Start { .. } => {}
                 }
             }
             if !progressed && !done {
@@ -354,7 +566,7 @@ fn execute_confirmed_cleanup_with(
         }
     }
 
-    (total_bytes, total_count)
+    (total_bytes, total_count, cleaned_paths)
 }
 
 /// Run a single watchdog evaluation, AI analysis, confirmation and cleanup.
@@ -858,11 +1070,12 @@ mod tests {
         assert!(plist.contains("<string>com.ruum.watchdog</string>"));
         assert!(plist.contains("<string>/usr/local/bin/ruum</string>"));
         assert!(plist.contains("<string>watchdog</string>"));
+        assert!(plist.contains("<string>run</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
 
         let unit = linux_systemd_unit_content(exe);
         assert!(unit.contains("Description=Ruum Disk Space Watchdog"));
-        assert!(unit.contains("ExecStart=/usr/local/bin/ruum watchdog"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/ruum watchdog run"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
@@ -1477,7 +1690,7 @@ mod tests {
             None,
         )];
         let mut logged = Vec::new();
-        let (bytes, count) = execute_confirmed_cleanup_with(
+        let (bytes, count, cleaned) = execute_confirmed_cleanup_with(
             &blocked_items,
             home,
             &mut |path, err| {
@@ -1485,6 +1698,7 @@ mod tests {
             },
         );
         assert_eq!((bytes, count), (0, 0));
+        assert!(cleaned.is_empty());
         assert!(outside_file.exists());
         assert!(logged.is_empty());
 
@@ -1507,22 +1721,393 @@ mod tests {
                 None,
                 None,
             )];
-            let (perm_bytes, perm_count) = execute_confirmed_cleanup_with(
-                &perm_items,
-                home,
-                &mut |path, err| {
-                    logged.push((path.to_path_buf(), err.to_owned()));
-                },
-            );
+            let (perm_bytes, perm_count, perm_cleaned) =
+                execute_confirmed_cleanup_with(
+                    &perm_items,
+                    home,
+                    &mut |path, err| {
+                        logged.push((path.to_path_buf(), err.to_owned()));
+                    },
+                );
 
             fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755))
                 .unwrap();
 
             assert_eq!((perm_bytes, perm_count), (0, 0));
+            assert!(perm_cleaned.is_empty());
             assert!(locked_file.exists());
             assert_eq!(logged.len(), 1);
             assert_eq!(logged[0].0, locked_file);
             assert!(!logged[0].1.is_empty());
         }
+    }
+
+    #[test]
+    fn core_space_probe_reads_live_volume_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let sample = CoreSpaceProbe.probe(temp.path()).unwrap();
+        assert!(sample.total_bytes > 0);
+        assert!(sample.available_bytes <= sample.total_bytes);
+    }
+
+    #[test]
+    fn core_event_handler_skips_ai_when_disabled_and_posts_webhook() {
+        use crate::storage::{AiConfig, WebhookConfig};
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = StorageDb::open(temp.path().join("ruum.db")).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "unexpected EOF reading webhook headers");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    break pos;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let total_len = header_end + 4 + content_len;
+            while buf.len() < total_len {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let raw = String::from_utf8_lossy(&buf).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            raw
+        });
+
+        db.save_webhook_config(&WebhookConfig {
+            enabled: true,
+            url: format!("http://{addr}/alert"),
+            headers_json: r#"{"X-Test":"yes"}"#.to_owned(),
+            timeout_secs: 5,
+            updated_at_secs: 1,
+        })
+        .unwrap();
+        db.save_ai_config(&AiConfig {
+            auto_analyze_on_alert: false,
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let ai_runner = MockRunner::default();
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db,
+            PathBuf::from("/bin/ruum"),
+            &ai_runner,
+            &confirm,
+            &notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None);
+
+        let event = WatchdogEvent::LowDiskSpace {
+            timestamp_secs: 1_794_895_200,
+            mount_path: temp.path().to_path_buf(),
+            available_bytes: 1_000_000_000,
+            total_bytes: 100_000_000_000,
+            threshold_bytes: 20_000_000_000,
+        };
+        handler.on_event(&event).unwrap();
+
+        let raw_http = server.join().unwrap();
+        assert!(raw_http.contains("ruum.disk.low_space"));
+        assert!(raw_http.contains("2026-11-17T06:00:00Z"));
+        assert_eq!(notifier.tagged.lock().unwrap().len(), 1);
+        assert_eq!(notifier.tagged.lock().unwrap()[0].0, NOTIF_TAG_LOW_SPACE);
+        assert!(
+            ai_runner.runs.lock().unwrap().is_empty(),
+            "AI CLI must never run when auto_analyze_on_alert is false"
+        );
+        assert_eq!(db.load_ai_state().unwrap().last_proposal_json, None);
+    }
+
+    #[test]
+    fn core_event_handler_runs_ai_saves_state_and_honors_confirm_cancel() {
+        use crate::storage::AiConfig;
+        use crate::watchdog_config::AiCliProvider;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+
+        let keep_file = home.join("keep.dat");
+        fs::write(&keep_file, b"keep-me").unwrap();
+        let fake_ai = home.join("fake-ai");
+        fs::write(&fake_ai, b"").unwrap();
+
+        db.save_ai_config(&AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: fake_ai.to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let ai_json = serde_json::json!({
+            "summary": "Proposed 1 file",
+            "items": [{
+                "path": keep_file.to_string_lossy(),
+                "mode": "trash",
+                "reason": "test file",
+            }],
+        })
+        .to_string();
+        let ai_runner = AiMock(ai_json);
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db, fake_ai, &ai_runner, &confirm, &notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None);
+
+        let event = WatchdogEvent::LowDiskSpace {
+            timestamp_secs: 1_700_000_000,
+            mount_path: home.to_path_buf(),
+            available_bytes: 512,
+            total_bytes: 1024,
+            threshold_bytes: 1024 * 1024 * 1024,
+        };
+        handler.on_event(&event).unwrap();
+
+        assert!(
+            keep_file.exists(),
+            "cancelled confirmation must not remove file"
+        );
+        let ai_state = db.load_ai_state().unwrap();
+        assert_eq!(ai_state.updated_at_secs, 1_700_000_000);
+        let parsed =
+            ai_state.parse_proposal().unwrap().expect("proposal saved");
+        assert_eq!(parsed.summary, "Proposed 1 file");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(notifier.tagged.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_once_with_db_evaluates_sqlite_config_and_executes_confirmed_items() {
+        use crate::storage::AiConfig;
+        use crate::watchdog_config::AiCliProvider;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+
+        let target_dir = home.join("cache").join("artifacts");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("tmp.dat"), b"123456").unwrap();
+
+        let fake_ai = home.join("fake-ai");
+        fs::write(&fake_ai, b"").unwrap();
+
+        db.watchdog()
+            .unwrap()
+            .save_config(&ruum_watchdog::WatchdogConfig {
+                enabled: true,
+                min_free_gb: 1_000_000,
+                ..ruum_watchdog::WatchdogConfig::default()
+            })
+            .unwrap();
+        db.save_ai_config(&AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: fake_ai.to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let ai_json = serde_json::json!({
+            "summary": "Clean test cache",
+            "items": [{
+                "path": target_dir.to_string_lossy(),
+                "mode": "permanent",
+                "reason": "test cache",
+            }],
+        })
+        .to_string();
+        let ai_runner = AiMock(ai_json);
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Confirmed {
+                selected_paths: vec![target_dir.clone()],
+            },
+        };
+        let notifier = MockNotification::default();
+
+        let tick = run_once_with_db(
+            &db,
+            home,
+            &fake_ai,
+            1_700_000_500,
+            &ai_runner,
+            &confirm,
+            &notifier,
+        )
+        .unwrap();
+
+        assert!(matches!(tick, ruum_watchdog::TickResult::Breached { .. }));
+        assert!(!target_dir.exists(), "confirmed item should be removed");
+        assert_eq!(notifier.tagged.lock().unwrap().len(), 2);
+        assert_eq!(notifier.tagged.lock().unwrap()[0].0, NOTIF_TAG_LOW_SPACE);
+        assert_eq!(
+            notifier.tagged.lock().unwrap()[1].0,
+            NOTIF_TAG_CLEANUP_DONE
+        );
+        let wd_state = db.watchdog().unwrap().load_state().unwrap();
+        assert_eq!(wd_state.last_triggered_secs, Some(1_700_000_500));
+        assert_eq!(
+            db.load_ai_state().unwrap().last_proposal_json,
+            None,
+            "fully cleaned proposal must be cleared from ai_state"
+        );
+    }
+
+    #[test]
+    fn core_event_handler_delivers_multiple_webhooks_and_prunes_partial_cleanup()
+     {
+        use crate::storage::{AiConfig, WebhookEndpoint};
+        use crate::watchdog_config::AiCliProvider;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+
+        let item_clean = home.join("clean_me.dat");
+        let item_keep = home.join("keep_me.dat");
+        fs::write(&item_clean, b"12345").unwrap();
+        fs::write(&item_keep, b"67890").unwrap();
+        let fake_ai = home.join("fake-ai");
+        fs::write(&fake_ai, b"").unwrap();
+
+        let ok_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ok_addr = ok_listener.local_addr().unwrap();
+        let ok_server = std::thread::spawn(move || {
+            let (mut stream, _) = ok_listener.accept().unwrap();
+            let _ = stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        });
+
+        let fail_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fail_addr = fail_listener.local_addr().unwrap();
+        let fail_server = std::thread::spawn(move || {
+            let (mut stream, _) = fail_listener.accept().unwrap();
+            let _ = stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nerr",
+                )
+                .unwrap();
+        });
+
+        db.add_webhook(&WebhookEndpoint::new(
+            "failing-hook",
+            format!("http://{fail_addr}/fail"),
+        ))
+        .unwrap();
+        db.add_webhook(&WebhookEndpoint::new(
+            "healthy-hook",
+            format!("http://{ok_addr}/ok"),
+        ))
+        .unwrap();
+        db.save_ai_config(&AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: fake_ai.to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let ai_json = serde_json::json!({
+            "summary": "Partial cleanup proposal",
+            "items": [
+                {
+                    "path": item_clean.to_string_lossy(),
+                    "mode": "permanent",
+                    "reason": "clean",
+                },
+                {
+                    "path": item_keep.to_string_lossy(),
+                    "mode": "permanent",
+                    "reason": "keep",
+                }
+            ],
+        })
+        .to_string();
+        let ai_runner = AiMock(ai_json);
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Confirmed {
+                selected_paths: vec![item_clean.clone()],
+            },
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db, fake_ai, &ai_runner, &confirm, &notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None);
+
+        handler
+            .on_event(&WatchdogEvent::LowDiskSpace {
+                timestamp_secs: 1_794_895_200,
+                mount_path: home.to_path_buf(),
+                available_bytes: 512,
+                total_bytes: 1024,
+                threshold_bytes: 1024 * 1024 * 1024,
+            })
+            .unwrap();
+
+        ok_server.join().unwrap();
+        fail_server.join().unwrap();
+        assert!(!item_clean.exists());
+        assert!(item_keep.exists());
+
+        let remaining = db
+            .load_ai_state()
+            .unwrap()
+            .parse_proposal()
+            .unwrap()
+            .expect("unconfirmed item remains in ai_state");
+        assert_eq!(remaining.items.len(), 1);
+        assert_eq!(remaining.items[0].path, item_keep);
     }
 }

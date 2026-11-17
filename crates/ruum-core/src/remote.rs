@@ -262,6 +262,39 @@ pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
     serve_request_with_progress(request, out, false, false, false)
 }
 
+fn expand_remote_tilde_with(
+    path: PathBuf,
+    home: Option<&Path>,
+    allow_backslash: bool,
+) -> io::Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::other("no remote home directory"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        let base =
+            home.ok_or_else(|| io::Error::other("no remote home directory"))?;
+        return Ok(if rest.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(rest)
+        });
+    }
+    if allow_backslash && let Some(rest) = trimmed.strip_prefix("~\\") {
+        let base =
+            home.ok_or_else(|| io::Error::other("no remote home directory"))?;
+        return Ok(if rest.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(rest)
+        });
+    }
+    Ok(path)
+}
+
 fn serve_request_with_progress(
     request: Request,
     out: &mut impl Write,
@@ -271,10 +304,14 @@ fn serve_request_with_progress(
 ) -> io::Result<()> {
     let _ = (live_progress, client_dedup, live_tree); // Only Unix has the streaming walker.
     let home = std::env::home_dir();
-    let root = request
-        .root
-        .or_else(|| home.clone())
-        .ok_or_else(|| io::Error::other("no remote home directory"))?;
+    let root = match request.root.filter(|p| !p.as_os_str().is_empty()) {
+        Some(path) => {
+            expand_remote_tilde_with(path, home.as_deref(), cfg!(windows))?
+        }
+        None => home
+            .clone()
+            .ok_or_else(|| io::Error::other("no remote home directory"))?,
+    };
     let root = if request.disk {
         volume_root_for(&root).unwrap_or_else(|| PathBuf::from("/"))
     } else {
@@ -611,10 +648,57 @@ fn ssh_command(
     Ok((command, archive))
 }
 
+#[cfg(feature = "service")]
+fn ssh_command_for_session(
+    session: &crate::ssh_session::SshSession,
+) -> io::Result<(Command, Option<crate::payload::Archive>)> {
+    let archive = crate::payload::Archive::current()?;
+    let remote = if archive.is_some() {
+        crate::deployment::COMMAND
+    } else {
+        REMOTE_COMMAND
+    };
+    let command = session.build_ssh_command(&["-C"], remote)?;
+    Ok((command, archive))
+}
+
+#[cfg(feature = "service")]
+fn ssh_command_for_endpoint(
+    endpoint: &crate::ssh_session::SshEndpoint,
+) -> io::Result<(Command, Option<crate::payload::Archive>)> {
+    let archive = crate::payload::Archive::current()?;
+    let remote = if archive.is_some() {
+        crate::deployment::COMMAND
+    } else {
+        REMOTE_COMMAND
+    };
+    let command = endpoint.build_ssh_command(&["-C"], remote);
+    Ok((command, archive))
+}
+
 impl RemoteScan {
     pub fn spawn(host: &str, request: &Request) -> io::Result<Self> {
         let (command, archive) = ssh_command(host)?;
         Self::spawn_with_archive(command, host, request, archive)
+    }
+
+    #[cfg(feature = "service")]
+    pub fn spawn_with_session(
+        session: &crate::ssh_session::SshSession,
+        request: &Request,
+    ) -> io::Result<Self> {
+        let (command, archive) = ssh_command_for_session(session)?;
+        let label = session.endpoint().label();
+        Self::spawn_with_archive(command, label, request, archive)
+    }
+
+    #[cfg(feature = "service")]
+    pub fn spawn_with_endpoint(
+        endpoint: &crate::ssh_session::SshEndpoint,
+        request: &Request,
+    ) -> io::Result<Self> {
+        let (command, archive) = ssh_command_for_endpoint(endpoint)?;
+        Self::spawn_with_archive(command, endpoint.label(), request, archive)
     }
 
     #[cfg(all(test, unix))]
@@ -656,6 +740,38 @@ impl RemoteRoots {
         Self::start(
             command,
             host,
+            Operation::Discover {
+                discover_version: VERSION,
+            },
+            archive,
+            |input, _| read_roots(input),
+        )
+    }
+
+    #[cfg(feature = "service")]
+    pub fn discover_with_session(
+        session: &crate::ssh_session::SshSession,
+    ) -> io::Result<Self> {
+        let (command, archive) = ssh_command_for_session(session)?;
+        Self::start(
+            command,
+            session.endpoint().label(),
+            Operation::Discover {
+                discover_version: VERSION,
+            },
+            archive,
+            |input, _| read_roots(input),
+        )
+    }
+
+    #[cfg(feature = "service")]
+    pub fn discover_with_endpoint(
+        endpoint: &crate::ssh_session::SshEndpoint,
+    ) -> io::Result<Self> {
+        let (command, archive) = ssh_command_for_endpoint(endpoint)?;
+        Self::start(
+            command,
+            endpoint.label(),
             Operation::Discover {
                 discover_version: VERSION,
             },
@@ -776,6 +892,509 @@ impl<T> Drop for RemoteJob<T> {
             let _ = child.kill();
         }
     }
+}
+
+/// Typed pre-flight and remote execution diagnostics for SSH capability checks.
+#[cfg(feature = "service")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemotePreflightError {
+    /// The remote host does not have `ruum` (`ruum-core` CLI) installed.
+    RuumCoreNotInstalled { host: String, detail: String },
+    /// The SSH account lacks read/traverse permissions on `target` (root
+    /// privileges may be required).
+    PermissionDenied {
+        host: String,
+        target: String,
+        detail: String,
+    },
+    /// The target path does not exist or is not a directory on the remote host.
+    PathNotFound {
+        host: String,
+        target: String,
+        detail: String,
+    },
+    /// SSH connection, host key verification, or authentication failed.
+    SshFailed { host: String, detail: String },
+    /// Remote command execution failed for another reason.
+    CommandFailed { host: String, detail: String },
+}
+
+#[cfg(feature = "service")]
+impl std::fmt::Display for RemotePreflightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuumCoreNotInstalled { host, detail } => write!(
+                f,
+                "ruum-core (`ruum`) is not installed on {host} ({detail}). \
+                 Install `ruum` on the remote host (e.g. `make install` or \
+                 place `ruum` in `~/.local/bin/ruum`)."
+            ),
+            Self::PermissionDenied {
+                host,
+                target,
+                detail,
+            } => write!(
+                f,
+                "Permission denied accessing `{target}` on {host} ({detail}). \
+                 Root privileges may be required, or choose a directory \
+                 readable by this SSH user."
+            ),
+            Self::PathNotFound {
+                host,
+                target,
+                detail,
+            } => write!(
+                f,
+                "Target path `{target}` does not exist or is not a directory \
+                 on {host} ({detail})."
+            ),
+            Self::SshFailed { host, detail } => {
+                write!(f, "SSH connection to {host} failed: {detail}")
+            }
+            Self::CommandFailed { host, detail } => {
+                write!(f, "Remote command failed on {host}: {detail}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "service")]
+impl std::error::Error for RemotePreflightError {}
+
+#[cfg(feature = "service")]
+fn sanitize_remote_text(bytes: &[u8]) -> String {
+    let tail = if bytes.len() > MAX_DIAGNOSTICS {
+        &bytes[bytes.len() - MAX_DIAGNOSTICS..]
+    } else {
+        bytes
+    };
+    String::from_utf8_lossy(tail)
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+#[cfg(feature = "service")]
+fn remote_target_shell_expr(target_path: Option<&str>) -> String {
+    let raw = target_path.map_or("", str::trim);
+    if raw.is_empty() || raw == "~" {
+        return "\"$HOME\"".to_owned();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if rest.is_empty() {
+            return "\"$HOME\"".to_owned();
+        }
+        return format!("\"$HOME\"/{}", crate::export::shell_quote(rest));
+    }
+    if let Some(rest) = raw.strip_prefix("~\\") {
+        let unix_rest = rest.replace('\\', "/");
+        if unix_rest.is_empty() {
+            return "\"$HOME\"".to_owned();
+        }
+        return format!("\"$HOME\"/{}", crate::export::shell_quote(&unix_rest));
+    }
+    crate::export::shell_quote(raw)
+}
+
+#[cfg(feature = "service")]
+fn build_remote_preflight_command(target_path: Option<&str>) -> String {
+    let target_expr = remote_target_shell_expr(target_path);
+    let inner = format!(
+        "if command -v ruum >/dev/null 2>&1; then \
+           ruum_bin=$(command -v ruum); \
+         elif [ -x \"$HOME/.local/bin/ruum\" ]; then \
+           ruum_bin=\"$HOME/.local/bin/ruum\"; \
+         else \
+           printf 'RUUM_PREFLIGHT_ERR:NOT_INSTALLED:ruum binary not found \
+in PATH or ~/.local/bin\\n' >&2; \
+           exit 127; \
+         fi; \
+         target={target_expr}; \
+         if [ ! -e \"$target\" ]; then \
+           printf 'RUUM_PREFLIGHT_ERR:NOT_FOUND:%s\\n' \"$target\" >&2; \
+           exit 2; \
+         fi; \
+         if [ ! -d \"$target\" ]; then \
+           printf 'RUUM_PREFLIGHT_ERR:NOT_DIR:%s\\n' \"$target\" >&2; \
+           exit 2; \
+         fi; \
+         if [ ! -r \"$target\" ] || [ ! -x \"$target\" ]; then \
+           printf 'RUUM_PREFLIGHT_ERR:PERMISSION_DENIED:%s\\n' \"$target\" >&2; \
+           exit 13; \
+         fi; \
+         printf 'RUUM_PREFLIGHT_OK:%s\\n' \"$ruum_bin\""
+    );
+    format!("sh -c {}", crate::export::shell_quote(&inner))
+}
+
+#[cfg(feature = "service")]
+fn run_ssh_capture(
+    session: &crate::ssh_session::SshSession,
+    remote_cmd: &str,
+) -> Result<std::process::Output, RemotePreflightError> {
+    let host = session.endpoint().label().to_owned();
+    let mut cmd =
+        session.build_ssh_command(&[], remote_cmd).map_err(|err| {
+            RemotePreflightError::SshFailed {
+                host: host.clone(),
+                detail: err.to_string(),
+            }
+        })?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| RemotePreflightError::SshFailed {
+            host,
+            detail: err.to_string(),
+        })
+}
+
+#[cfg(feature = "service")]
+fn looks_like_ssh_transport_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("permission denied (")
+        || lower.contains("authentication failed")
+        || lower.contains("host key verification failed")
+        || lower.contains("connection refused")
+        || lower.contains("connection timed out")
+        || lower.contains("operation timed out")
+        || lower.contains("could not resolve hostname")
+        || lower.contains("no route to host")
+}
+
+#[cfg(feature = "service")]
+fn classify_preflight_failure(
+    host: &str,
+    target_display: &str,
+    status_code: Option<i32>,
+    stderr: &str,
+) -> RemotePreflightError {
+    for line in stderr.lines() {
+        if let Some(rest) = line.trim().strip_prefix("RUUM_PREFLIGHT_ERR:") {
+            if let Some(detail) = rest.strip_prefix("NOT_INSTALLED:") {
+                return RemotePreflightError::RuumCoreNotInstalled {
+                    host: host.to_owned(),
+                    detail: detail.trim().to_owned(),
+                };
+            }
+            if let Some(path) = rest.strip_prefix("PERMISSION_DENIED:") {
+                return RemotePreflightError::PermissionDenied {
+                    host: host.to_owned(),
+                    target: path.trim().to_owned(),
+                    detail: "root or read/execute permission required"
+                        .to_owned(),
+                };
+            }
+            if let Some(path) = rest
+                .strip_prefix("NOT_FOUND:")
+                .or_else(|| rest.strip_prefix("NOT_DIR:"))
+            {
+                return RemotePreflightError::PathNotFound {
+                    host: host.to_owned(),
+                    target: path.trim().to_owned(),
+                    detail: "missing or not a directory".to_owned(),
+                };
+            }
+        }
+    }
+
+    if looks_like_ssh_transport_error(stderr) || status_code == Some(255) {
+        let detail = if stderr.is_empty() {
+            "SSH exited with status 255".to_owned()
+        } else {
+            stderr.to_owned()
+        };
+        return RemotePreflightError::SshFailed {
+            host: host.to_owned(),
+            detail,
+        };
+    }
+
+    let lower = stderr.to_ascii_lowercase();
+    if status_code == Some(127)
+        || lower.contains("ruum: command not found")
+        || lower.contains("ruum: not found")
+    {
+        return RemotePreflightError::RuumCoreNotInstalled {
+            host: host.to_owned(),
+            detail: if stderr.is_empty() {
+                "exit status 127".to_owned()
+            } else {
+                stderr.to_owned()
+            },
+        };
+    }
+    if status_code == Some(13)
+        || lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+    {
+        return RemotePreflightError::PermissionDenied {
+            host: host.to_owned(),
+            target: target_display.to_owned(),
+            detail: if stderr.is_empty() {
+                "exit status 13".to_owned()
+            } else {
+                stderr.to_owned()
+            },
+        };
+    }
+
+    let detail = if stderr.is_empty() {
+        format!(
+            "exit status {}",
+            status_code.map_or_else(|| "unknown".to_owned(), |c| c.to_string())
+        )
+    } else {
+        stderr.to_owned()
+    };
+    RemotePreflightError::CommandFailed {
+        host: host.to_owned(),
+        detail,
+    }
+}
+
+#[cfg(feature = "service")]
+fn extract_json_object(stdout: &str) -> Option<&str> {
+    let start = stdout.find('{')?;
+    let end = stdout.rfind('}')?;
+    (end >= start).then(|| &stdout[start..=end])
+}
+
+#[cfg(feature = "service")]
+fn probe_remote_ruum_with_runner(
+    host: &str,
+    target_path: Option<&str>,
+    runner: &dyn Fn(&str) -> Result<std::process::Output, RemotePreflightError>,
+) -> Result<String, RemotePreflightError> {
+    let target_display = target_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("~");
+    let remote_cmd = build_remote_preflight_command(target_path);
+    let output = runner(&remote_cmd)?;
+    let stdout = sanitize_remote_text(&output.stdout);
+    let stderr = sanitize_remote_text(&output.stderr);
+
+    if !output.status.success() {
+        return Err(classify_preflight_failure(
+            host,
+            target_display,
+            output.status.code(),
+            &stderr,
+        ));
+    }
+
+    for line in stdout.lines() {
+        if let Some(bin) = line.trim().strip_prefix("RUUM_PREFLIGHT_OK:") {
+            let trimmed = bin.trim();
+            if !trimmed.is_empty() && !trimmed.chars().any(char::is_control) {
+                return Ok(trimmed.to_owned());
+            }
+        }
+    }
+
+    Err(RemotePreflightError::RuumCoreNotInstalled {
+        host: host.to_owned(),
+        detail: "remote pre-flight did not report a `ruum` executable path"
+            .to_owned(),
+    })
+}
+
+/// Run a lightweight, non-destructive SSH pre-flight check verifying:
+/// 1. SSH connectivity and authentication via `session`,
+/// 2. `ruum` (`ruum-core` CLI) availability in `PATH`, `~/.local/bin`, or
+///    `/usr/local/bin`,
+/// 3. existence and readability (`test -d` & `test -r`) of `target_path`
+///    (defaulting to `~`).
+///
+/// Returns the resolved remote `ruum` executable path or a typed
+/// [`RemotePreflightError`].
+#[cfg(feature = "service")]
+pub fn probe_remote_ruum_typed_with_session(
+    session: &crate::ssh_session::SshSession,
+    target_path: Option<&str>,
+) -> Result<String, RemotePreflightError> {
+    let host = session.endpoint().label().to_owned();
+    probe_remote_ruum_with_runner(&host, target_path, &|cmd| {
+        run_ssh_capture(session, cmd)
+    })
+}
+
+/// Run [`probe_remote_ruum_typed_with_session`] and format any diagnostic as a
+/// user-facing error string.
+#[cfg(feature = "service")]
+pub fn probe_remote_ruum_with_session(
+    session: &crate::ssh_session::SshSession,
+    target_path: Option<&str>,
+) -> Result<String, String> {
+    probe_remote_ruum_typed_with_session(session, target_path)
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(feature = "service")]
+#[derive(Deserialize)]
+struct RemoteSpacePayload {
+    total: u64,
+    free: u64,
+    available: u64,
+    #[serde(default)]
+    readable: Option<bool>,
+}
+
+#[cfg(feature = "service")]
+fn check_remote_space_with_runner(
+    host: &str,
+    target_path: Option<&str>,
+    runner: &dyn Fn(&str) -> Result<std::process::Output, RemotePreflightError>,
+) -> Result<SpaceInfo, String> {
+    let target_display = target_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("~");
+    let ruum_bin = probe_remote_ruum_with_runner(host, target_path, runner)
+        .map_err(|err| err.to_string())?;
+    let inner = format!(
+        "{} space {} --json",
+        crate::export::shell_quote(&ruum_bin),
+        remote_target_shell_expr(target_path),
+    );
+    let remote_cmd = format!("sh -c {}", crate::export::shell_quote(&inner));
+    let output = runner(&remote_cmd).map_err(|err| err.to_string())?;
+    let stdout = sanitize_remote_text(&output.stdout);
+    let stderr = sanitize_remote_text(&output.stderr);
+
+    if !output.status.success() {
+        return Err(classify_preflight_failure(
+            host,
+            target_display,
+            output.status.code(),
+            &stderr,
+        )
+        .to_string());
+    }
+
+    let json_slice = extract_json_object(&stdout).ok_or_else(|| {
+        format!("Invalid JSON output from remote `ruum space` on {host}")
+    })?;
+    let parsed: RemoteSpacePayload =
+        serde_json::from_str(json_slice).map_err(|err| {
+            format!("Failed to parse remote `ruum space` JSON on {host}: {err}")
+        })?;
+    if parsed.readable == Some(false) {
+        return Err(RemotePreflightError::PermissionDenied {
+            host: host.to_owned(),
+            target: target_display.to_owned(),
+            detail: "directory is not readable by SSH user".to_owned(),
+        }
+        .to_string());
+    }
+    Ok(SpaceInfo {
+        total: parsed.total,
+        free: parsed.free,
+        available: parsed.available,
+    })
+}
+
+/// Pre-flight check and execute remote `ruum space [TARGET] --json` over
+/// an active [`crate::ssh_session::SshSession`].
+#[cfg(feature = "service")]
+pub fn check_remote_space_with_session(
+    session: &crate::ssh_session::SshSession,
+    target_path: Option<&str>,
+) -> Result<SpaceInfo, String> {
+    let host = session.endpoint().label().to_owned();
+    check_remote_space_with_runner(&host, target_path, &|cmd| {
+        run_ssh_capture(session, cmd)
+    })
+}
+
+#[cfg(feature = "service")]
+fn run_remote_analyze_with_runner(
+    host: &str,
+    target_path: Option<&str>,
+    runner: &dyn Fn(&str) -> Result<std::process::Output, RemotePreflightError>,
+) -> Result<crate::watchdog_config::CleanupProposal, String> {
+    let target_display = target_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("~");
+    let ruum_bin = probe_remote_ruum_with_runner(host, target_path, runner)
+        .map_err(|err| err.to_string())?;
+    let inner = format!(
+        "{} analyze {} --json",
+        crate::export::shell_quote(&ruum_bin),
+        remote_target_shell_expr(target_path),
+    );
+    let remote_cmd = format!("sh -c {}", crate::export::shell_quote(&inner));
+    let output = runner(&remote_cmd).map_err(|err| err.to_string())?;
+    let stdout = sanitize_remote_text(&output.stdout);
+    let stderr = sanitize_remote_text(&output.stderr);
+
+    if !output.status.success() {
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("permission denied")
+            || lower.contains("operation not permitted")
+            || lower.contains("eacces")
+        {
+            return Err(RemotePreflightError::PermissionDenied {
+                host: host.to_owned(),
+                target: target_display.to_owned(),
+                detail: stderr,
+            }
+            .to_string());
+        }
+        if looks_like_ssh_transport_error(&stderr)
+            || output.status.code() == Some(255)
+        {
+            return Err(RemotePreflightError::SshFailed {
+                host: host.to_owned(),
+                detail: if stderr.is_empty() {
+                    "SSH exited with status 255".to_owned()
+                } else {
+                    stderr
+                },
+            }
+            .to_string());
+        }
+        return Err(RemotePreflightError::CommandFailed {
+            host: host.to_owned(),
+            detail: if stderr.is_empty() {
+                format!(
+                    "`ruum analyze` exited with status {}",
+                    output.status.code().map_or_else(
+                        || "unknown".to_owned(),
+                        |c| c.to_string()
+                    )
+                )
+            } else {
+                stderr
+            },
+        }
+        .to_string());
+    }
+
+    let json_slice = extract_json_object(&stdout).ok_or_else(|| {
+        format!("Invalid JSON output from remote `ruum analyze` on {host}")
+    })?;
+    serde_json::from_str(json_slice).map_err(|err| {
+        format!("Failed to parse remote `ruum analyze` JSON on {host}: {err}")
+    })
+}
+
+/// Pre-flight check and execute remote `ruum analyze [TARGET] --json` over an
+/// active [`crate::ssh_session::SshSession`].
+#[cfg(feature = "service")]
+pub fn run_remote_analyze_with_session(
+    session: &crate::ssh_session::SshSession,
+    target_path: Option<&str>,
+) -> Result<crate::watchdog_config::CleanupProposal, String> {
+    let host = session.endpoint().label().to_owned();
+    run_remote_analyze_with_runner(&host, target_path, &|cmd| {
+        run_ssh_capture(session, cmd)
+    })
 }
 
 #[cfg(test)]
@@ -1155,6 +1774,43 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "service")]
+    #[test]
+    fn session_and_endpoint_commands_avoid_ssh_config_and_pass_session_env() {
+        use crate::ssh_session::{SshAuthMaterial, SshEndpoint, SshSession};
+        use zeroize::Zeroizing;
+
+        let endpoint = SshEndpoint::new("10.1.2.3", 2222, "ops").unwrap();
+        let (ep_cmd, _) = ssh_command_for_endpoint(&endpoint).unwrap();
+        let ep_args: Vec<String> = ep_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(ep_args.windows(2).any(|w| w == ["-F", "none"]));
+        assert!(ep_args.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(ep_args.contains(&"-C".to_owned()));
+        assert!(ep_args.contains(&"ops@10.1.2.3".to_owned()));
+
+        let mut session = SshSession::start(
+            endpoint,
+            SshAuthMaterial::Password {
+                password: Zeroizing::new("pw".to_owned()),
+            },
+            15,
+        )
+        .unwrap();
+        let (sess_cmd, _) = ssh_command_for_session(&session).unwrap();
+        let sess_args: Vec<String> = sess_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(sess_args.windows(2).any(|w| w == ["-F", "none"]));
+        assert!(sess_args.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(sess_args.contains(&"-C".to_owned()));
+        session.close();
+        assert!(ssh_command_for_session(&session).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_backslashes_in_names_roundtrip_without_becoming_separators() {
@@ -1407,5 +2063,233 @@ mod tests {
             let snapshot = read_snapshot(&mut snap_wire.as_slice()).unwrap();
             assert_eq!(snapshot.header.root, PathBuf::from(remote_root));
         }
+    }
+
+    #[test]
+    fn expand_remote_tilde_handles_home_subpaths_and_absolute_paths() {
+        let home = Path::new("/home/remote");
+        assert_eq!(
+            expand_remote_tilde_with(PathBuf::from("~"), Some(home), false)
+                .unwrap(),
+            PathBuf::from("/home/remote")
+        );
+        assert_eq!(
+            expand_remote_tilde_with(
+                PathBuf::from("~/projects/ruum"),
+                Some(home),
+                false,
+            )
+            .unwrap(),
+            PathBuf::from("/home/remote/projects/ruum")
+        );
+        assert_eq!(
+            expand_remote_tilde_with(PathBuf::from("~/"), Some(home), false)
+                .unwrap(),
+            PathBuf::from("/home/remote")
+        );
+        assert_eq!(
+            expand_remote_tilde_with(
+                PathBuf::from("~\\Downloads"),
+                Some(home),
+                true,
+            )
+            .unwrap(),
+            PathBuf::from("/home/remote/Downloads")
+        );
+        assert_eq!(
+            expand_remote_tilde_with(
+                PathBuf::from("/var/log"),
+                Some(home),
+                false,
+            )
+            .unwrap(),
+            PathBuf::from("/var/log")
+        );
+        assert!(
+            expand_remote_tilde_with(PathBuf::from("~"), None, false).is_err()
+        );
+    }
+
+    #[test]
+    fn serve_request_expands_tilde_against_home_dir() {
+        let Some(real_home) = std::env::home_dir() else {
+            return;
+        };
+        if !real_home.is_dir() {
+            return;
+        }
+        // Only test `~` expansion on the Header without walking a large real
+        // home directory: pass max_depth = 0!
+        let request = Request {
+            root: Some(PathBuf::from("~")),
+            disk: false,
+            options: ScanOptions {
+                max_depth: Some(0),
+                ..ScanOptions::default()
+            },
+        };
+        let mut out = Vec::new();
+        serve_request(request, &mut out).unwrap();
+        let snapshot = read_snapshot(&mut out.as_slice()).unwrap();
+        assert_eq!(
+            snapshot.header.root,
+            real_home.canonicalize().unwrap_or(real_home)
+        );
+    }
+
+    #[cfg(feature = "service")]
+    #[test]
+    fn preflight_diagnostics_classify_missing_ruum_and_permissions() {
+        let missing = classify_preflight_failure(
+            "prod",
+            "~",
+            Some(127),
+            "RUUM_PREFLIGHT_ERR:NOT_INSTALLED:ruum binary not found",
+        );
+        assert!(matches!(
+            missing,
+            RemotePreflightError::RuumCoreNotInstalled { .. }
+        ));
+        assert!(missing.to_string().contains("ruum-core"));
+
+        let perm = classify_preflight_failure(
+            "prod",
+            "/root",
+            Some(13),
+            "RUUM_PREFLIGHT_ERR:PERMISSION_DENIED:/root",
+        );
+        assert!(matches!(
+            perm,
+            RemotePreflightError::PermissionDenied { .. }
+        ));
+        assert!(perm.to_string().contains("Permission denied"));
+        assert!(perm.to_string().contains("Root"));
+
+        let ssh_auth = classify_preflight_failure(
+            "prod",
+            "~",
+            Some(255),
+            "Permission denied (publickey,password).",
+        );
+        assert!(matches!(ssh_auth, RemotePreflightError::SshFailed { .. }));
+    }
+
+    #[cfg(all(feature = "service", unix))]
+    #[test]
+    fn preflight_space_and_analyze_runners_exercise_real_shell_and_json() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let local_bin = home.join(".local/bin");
+        let empty_bin = dir.path().join("empty_bin");
+        let project = home.join("project");
+        let locked = dir.path().join("locked_root");
+        fs::create_dir_all(&local_bin).unwrap();
+        fs::create_dir_all(&empty_bin).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&locked).unwrap();
+
+        let run_local = |cmd: &str, path_env: &Path| {
+            let scoped_path = format!("{}:/bin", path_env.display());
+            Command::new("/bin/sh")
+                .args(["-c", cmd])
+                .env("HOME", &home)
+                .env("PATH", scoped_path)
+                .output()
+                .map_err(|e| RemotePreflightError::SshFailed {
+                    host: "test-host".to_owned(),
+                    detail: e.to_string(),
+                })
+        };
+
+        // 1. Missing `ruum` binary -> RuumCoreNotInstalled
+        let err_missing =
+            probe_remote_ruum_with_runner("test-host", Some("~"), &|cmd| {
+                run_local(cmd, &empty_bin)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err_missing,
+            RemotePreflightError::RuumCoreNotInstalled { .. }
+        ));
+
+        // Install a stub `ruum` in ~/.local/bin/ruum (outside PATH) to also
+        // verify ~/.local/bin fallback discovery!
+        let stub_ruum = local_bin.join("ruum");
+        fs::write(
+            &stub_ruum,
+            r#"#!/bin/sh
+cmd="$1"
+shift
+if [ "$cmd" = "space" ]; then
+  printf '{"root":"%s","available":42000,"free":45000,"total":100000,"readable":true,"platform":"linux"}\n' "$1"
+  exit 0
+elif [ "$cmd" = "analyze" ]; then
+  printf '{\n  "timestamp_secs": 1700000000,\n  "summary": "Remote cleanup ok",\n  "items": [{"path":"/tmp/old.log","bytes":2048,"mode":"trash","reason":"old log","git_warning":null}]\n}\n'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&stub_ruum, fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        // 2. Unreadable directory -> PermissionDenied (if not running as uid 0)
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let locked_str = locked.to_string_lossy().into_owned();
+        if std::fs::read_dir(&locked).is_err() {
+            let err_perm = probe_remote_ruum_with_runner(
+                "test-host",
+                Some(&locked_str),
+                &|cmd| run_local(cmd, &empty_bin),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err_perm,
+                    RemotePreflightError::PermissionDenied { .. }
+                ),
+                "expected PermissionDenied, got {err_perm:?}"
+            );
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        // 3. `~` and `~/project` preflight + check_remote_space + run_remote_analyze
+        let probed = probe_remote_ruum_with_runner(
+            "test-host",
+            Some("~/project"),
+            &|cmd| run_local(cmd, &empty_bin),
+        )
+        .unwrap();
+        assert_eq!(probed, stub_ruum.to_string_lossy());
+
+        let space = check_remote_space_with_runner(
+            "test-host",
+            Some("~/project"),
+            &|cmd| run_local(cmd, &empty_bin),
+        )
+        .unwrap();
+        assert_eq!(
+            space,
+            SpaceInfo {
+                total: 100_000,
+                free: 45_000,
+                available: 42_000,
+            }
+        );
+
+        let proposal =
+            run_remote_analyze_with_runner("test-host", Some("~"), &|cmd| {
+                run_local(cmd, &empty_bin)
+            })
+            .unwrap();
+        assert_eq!(proposal.summary, "Remote cleanup ok");
+        assert_eq!(proposal.items.len(), 1);
+        assert_eq!(proposal.items[0].path, PathBuf::from("/tmp/old.log"));
     }
 }

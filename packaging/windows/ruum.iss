@@ -15,7 +15,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=@INNO_ARCH_ALLOWED@
 ArchitecturesInstallIn64BitMode=@INNO_ARCH_INSTALL64@
 SetupIconFile=@ICON_PATH@
-UninstallDisplayIcon={app}\ruum.exe
+UninstallDisplayIcon={app}\ruum-gui.exe
 OutputDir=@OUTPUT_DIR@
 OutputBaseFilename=ruum-@VERSION@-@ARCH@-windows-setup
 Compression=lzma2
@@ -32,13 +32,14 @@ Name: "addtopath"; Description: "Add ruum to user PATH"; GroupDescription: "Othe
 
 [Files]
 Source: "@EXE_PATH@"; DestDir: "{app}"; Flags: ignoreversion
+Source: "@GUI_EXE_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@README_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@LICENSE_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@NOTICES_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\ruum"; Filename: "{app}\ruum.exe"
-Name: "{autodesktop}\ruum"; Filename: "{app}\ruum.exe"; Tasks: desktopicon
+Name: "{autoprograms}\ruum"; Filename: "{app}\ruum-gui.exe"
+Name: "{autodesktop}\ruum"; Filename: "{app}\ruum-gui.exe"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))

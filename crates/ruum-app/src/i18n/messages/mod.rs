@@ -1,10 +1,8 @@
 //! Localized messages, window titles, placeholders, picker errors,
 //! OS notifications, and CLI help strings.
 
-mod cli;
 mod notices;
 
-pub use cli::*;
 pub use notices::*;
 use ruum_core::size::human_bytes;
 
@@ -73,11 +71,28 @@ pub const fn title_confirm_cleanup(locale: Locale) -> &'static str {
 pub const fn ai_proposal_title(locale: Locale) -> &'static str {
     pick(
         locale,
-        "AI Cleanup Proposal",
-        "AI \u{6e05}\u{7406}\u{5efa}\u{8bae}",
-        "AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848}",
-        "AI \u{c815}\u{b9ac} \u{c81c}\u{c548}",
+        "Local AI Cleanup Proposal",
+        "\u{672c}\u{673a} AI \u{6e05}\u{7406}\u{5efa}\u{8bae}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb} AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848}",
+        "\u{b85c}\u{ceec} AI \u{c815}\u{b9ac} \u{c81c}\u{c548}",
     )
+}
+
+/// Title for a remote SSH AI cleanup proposal modal.
+#[must_use]
+pub fn ai_proposal_remote_title(alias: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Remote AI Cleanup Proposal \u{00b7} {alias}"),
+        Locale::Zh => format!(
+            "\u{8fdc}\u{7a0b} AI \u{6e05}\u{7406}\u{5efa}\u{8bae} \u{00b7} {alias}"
+        ),
+        Locale::Ja => format!(
+            "\u{30ea}\u{30e2}\u{30fc}\u{30c8} AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848} \u{00b7} {alias}"
+        ),
+        Locale::Ko => format!(
+            "\u{c6d0}\u{aca9} AI \u{c815}\u{b9ac} \u{c81c}\u{c548} \u{00b7} {alias}"
+        ),
+    }
 }
 
 /// Merged small-items tile label (`"+N more"`).
@@ -100,18 +115,6 @@ pub const fn home_directory(locale: Locale) -> &'static str {
         "\u{4e3b}\u{76ee}\u{5f55}",
         "\u{30db}\u{30fc}\u{30e0}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}",
         "\u{d648} \u{b514}\u{b809}\u{d130}\u{b9ac}",
-    )
-}
-
-/// Placeholder for the SSH host input in Sources & Drives.
-#[must_use]
-pub const fn placeholder_ssh_host(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "SSH alias or user@host",
-        "SSH \u{522b}\u{540d}\u{6216} user@host",
-        "SSH \u{30a8}\u{30a4}\u{30ea}\u{30a2}\u{30b9}\u{307e}\u{305f}\u{306f} user@host",
-        "SSH \u{bcc4}\u{ce6d} \u{b610}\u{b294} user@host",
     )
 }
 
@@ -163,18 +166,6 @@ pub const fn placeholder_model_override(locale: Locale) -> &'static str {
     )
 }
 
-/// Picker error shown when SSH input does not match the connected source.
-#[must_use]
-pub const fn picker_connect_first(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Connect SSH or choose This computer before scanning.",
-        "\u{8bf7}\u{5148}\u{8fde}\u{63a5} SSH \u{6216}\u{9009}\u{62e9}\u{201c}\u{672c}\u{673a}\u{201d}\u{518d}\u{626b}\u{63cf}\u{3002}",
-        "\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{524d}\u{306b} SSH \u{63a5}\u{7d9a}\u{307e}\u{305f}\u{306f}\u{300c}\u{3053}\u{306e}\u{30b3}\u{30f3}\u{30d4}\u{30e5}\u{30fc}\u{30bf}\u{300d}\u{3092}\u{9078}\u{629e}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
-        "\u{c2a4}\u{ce94} \u{c804}\u{c5d0} SSH\u{c5d0} \u{c5f0}\u{acb0}\u{d558}\u{ac70}\u{b098} \u{c774} \u{cef4}\u{d4e8}\u{d130}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{c138}\u{c694}.",
-    )
-}
-
 /// Picker error shown when a relative path is submitted.
 #[must_use]
 pub const fn picker_abs_path(locale: Locale) -> &'static str {
@@ -218,6 +209,43 @@ pub fn cleaned_items_summary(
         ),
         Locale::Ko => format!(
             "{items} \u{c815}\u{b9ac} \u{c644}\u{b8cc}, {freed} \u{d655}\u{bcf4}"
+        ),
+    }
+}
+
+/// OS notification title when background cleanup begins after confirmation.
+#[must_use]
+pub const fn cleanup_started_notif_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "ruum Cleaning in Background",
+        "ruum \u{6b63}\u{5728}\u{540e}\u{53f0}\u{6e05}\u{7406}",
+        "ruum \u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{3067}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{4e2d}",
+        "ruum \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c815}\u{b9ac} \u{c911}",
+    )
+}
+
+/// OS notification and toast body when background cleanup begins.
+#[must_use]
+pub fn cleanup_started_notif_body(
+    count: usize,
+    bytes: u64,
+    locale: Locale,
+) -> String {
+    let items = item_count(count, locale);
+    let size = human_bytes(bytes);
+    match locale {
+        Locale::En => format!(
+            "Cleaning {items} ({size}) in background, please wait\u{2026}"
+        ),
+        Locale::Zh => format!(
+            "\u{6b63}\u{5728}\u{540e}\u{53f0}\u{6e05}\u{7406} {items}\u{ff08}{size}\u{ff09}\u{ff0c}\u{8bf7}\u{7a0d}\u{7b49}\u{2026}"
+        ),
+        Locale::Ja => format!(
+            "{items}\u{ff08}{size}\u{ff09}\u{3092}\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{3067}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{4e2d}\u{3067}\u{3059}\u{3002}\u{3057}\u{3070}\u{3089}\u{304f}\u{304a}\u{5f85}\u{3061}\u{304f}\u{3060}\u{3055}\u{3044}\u{2026}"
+        ),
+        Locale::Ko => format!(
+            "{items} ({size}) \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc}\u{c5d0}\u{c11c} \u{c815}\u{b9ac} \u{c911}\u{c785}\u{b2c8}\u{b2e4}. \u{c7a0}\u{c2dc}\u{b9cc} \u{ae30}\u{b2e4}\u{b824} \u{c8fc}\u{c138}\u{c694}\u{2026}"
         ),
     }
 }

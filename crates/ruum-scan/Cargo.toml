@@ -10,7 +10,7 @@ description = "Read-only headless scanner for ruum SSH sessions"
 workspace = true
 
 [dependencies]
-ruum-core.workspace = true
+ruum-core = { path = "../ruum-core", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", features = ["process"] }

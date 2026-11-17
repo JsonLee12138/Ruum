@@ -15,10 +15,22 @@ use std::time::{Duration, Instant};
 use crate::insights::{self, Finding};
 use crate::removal::RemovalMode;
 use crate::size::human_bytes;
+use crate::storage::AiConfig;
 use crate::tree::{Node, path_of};
 use crate::watchdog_config::{
     AiCliProvider, CleanupProposal, ProposalItem, WatchdogConfig,
 };
+
+fn ai_config_from_legacy(config: &WatchdogConfig) -> AiConfig {
+    AiConfig {
+        auto_analyze_on_alert: config.ai_auto_analyze,
+        provider: config.ai_provider,
+        custom_command: config.custom_command.clone(),
+        extra_args: config.extra_args.clone(),
+        model: config.model.clone(),
+        updated_at_secs: 0,
+    }
+}
 
 /// Default timeout for full AI analysis CLI runs (seconds).
 pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
@@ -583,16 +595,16 @@ pub fn build_analysis_prompt(home_dir: &Path, current_exe: &Path) -> String {
     build_analysis_prompt_with_candidates(home_dir, current_exe, &[])
 }
 
-/// Build the concrete invocation for the configured AI provider.
-pub fn build_invocation(
-    config: &WatchdogConfig,
+/// Build the concrete invocation for an [`AiConfig`].
+pub fn build_invocation_for_config(
+    config: &AiConfig,
     prompt: &str,
 ) -> Result<CliInvocation, String> {
     let has_custom = !config.custom_command.trim().is_empty();
     let (base_cmd, provider) = if has_custom {
-        (config.custom_command.trim(), config.ai_provider)
+        (config.custom_command.trim(), config.provider)
     } else {
-        match config.ai_provider {
+        match config.provider {
             AiCliProvider::Pi => ("pi", AiCliProvider::Pi),
             AiCliProvider::Agy => ("agy", AiCliProvider::Agy),
             AiCliProvider::Codex => ("codex", AiCliProvider::Codex),
@@ -662,6 +674,14 @@ pub fn build_invocation(
     Ok(CliInvocation::new(program, args))
 }
 
+/// Build the concrete invocation for the configured AI provider.
+pub fn build_invocation(
+    config: &WatchdogConfig,
+    prompt: &str,
+) -> Result<CliInvocation, String> {
+    build_invocation_for_config(&ai_config_from_legacy(config), prompt)
+}
+
 /// Probe whether an AI CLI executable can be located.
 pub fn probe_cli(
     provider: AiCliProvider,
@@ -685,12 +705,12 @@ pub fn probe_cli(
         .ok_or_else(|| format!("executable `{name}` could not be found"))
 }
 
-/// Run a short non-destructive connection test against the CLI assistant.
-pub fn test_connection(
-    config: &WatchdogConfig,
+/// Run a short non-destructive connection test against an [`AiConfig`].
+pub fn test_connection_for_config(
+    config: &AiConfig,
     runner: &dyn CommandRunner,
 ) -> Result<String, String> {
-    let probe_path = probe_cli(config.ai_provider, &config.custom_command)?;
+    let probe_path = probe_cli(config.provider, &config.custom_command)?;
     let path_env = enriched_path_var();
     let envs = [("PATH", path_env.as_str())];
 
@@ -719,6 +739,14 @@ pub fn test_connection(
             output.stderr.trim()
         ))
     }
+}
+
+/// Run a short non-destructive connection test against the CLI assistant.
+pub fn test_connection(
+    config: &WatchdogConfig,
+    runner: &dyn CommandRunner,
+) -> Result<String, String> {
+    test_connection_for_config(&ai_config_from_legacy(config), runner)
 }
 
 /// An AI model discovered from a CLI assistant or its local configuration.
@@ -1073,13 +1101,13 @@ pub fn discover_codex_models_in_dir(codex_dir: &Path) -> Vec<DiscoveredModel> {
     result
 }
 
-/// Discover selectable models for the configured AI CLI provider.
-pub fn discover_models(
-    config: &WatchdogConfig,
+/// Discover selectable models for an [`AiConfig`].
+pub fn discover_models_for_config(
+    config: &AiConfig,
     runner: &dyn CommandRunner,
 ) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
     let custom = config.custom_command.trim();
-    match config.ai_provider {
+    match config.provider {
         AiCliProvider::Agy => {
             let program = if custom.is_empty() {
                 probe_cli(AiCliProvider::Agy, "")?
@@ -1168,13 +1196,21 @@ pub fn discover_models(
     }
 }
 
-/// Probe CLI connectivity and fetch available models in one step.
-pub fn test_connection_and_discover(
+/// Discover selectable models for the configured AI CLI provider.
+pub fn discover_models(
     config: &WatchdogConfig,
     runner: &dyn CommandRunner,
+) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+    discover_models_for_config(&ai_config_from_legacy(config), runner)
+}
+
+/// Probe CLI connectivity and fetch available models for an [`AiConfig`].
+pub fn test_connection_and_discover_for_config(
+    config: &AiConfig,
+    runner: &dyn CommandRunner,
 ) -> Result<ConnectionTestResult, String> {
-    let version_message = test_connection(config, runner)?;
-    match discover_models(config, runner) {
+    let version_message = test_connection_for_config(config, runner)?;
+    match discover_models_for_config(config, runner) {
         Ok((models, model_note)) => Ok(ConnectionTestResult {
             version_message,
             models,
@@ -1186,6 +1222,17 @@ pub fn test_connection_and_discover(
             model_note: Some(format!("Model discovery note: {err}")),
         }),
     }
+}
+
+/// Probe CLI connectivity and fetch available models in one step.
+pub fn test_connection_and_discover(
+    config: &WatchdogConfig,
+    runner: &dyn CommandRunner,
+) -> Result<ConnectionTestResult, String> {
+    test_connection_and_discover_for_config(
+        &ai_config_from_legacy(config),
+        runner,
+    )
 }
 
 fn first_line_snippet(text: &str, max_chars: usize) -> String {
@@ -1203,9 +1250,10 @@ fn first_line_snippet(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Run a lightweight round-trip latency test for a specific AI model.
-pub fn benchmark_model(
-    config: &WatchdogConfig,
+/// Run a lightweight round-trip latency test for a specific AI model using
+/// [`AiConfig`].
+pub fn benchmark_model_for_config(
+    config: &AiConfig,
     model_override: Option<&str>,
     runner: &dyn CommandRunner,
 ) -> ModelSpeedResult {
@@ -1220,17 +1268,18 @@ pub fn benchmark_model(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| "(default)".to_string());
 
-    let invocation = match build_invocation(&cfg, "Reply with only OK.") {
-        Ok(inv) => inv,
-        Err(err) => {
-            return ModelSpeedResult {
-                model: model_name,
-                elapsed_ms: 0,
-                ok: false,
-                detail: err,
-            };
-        }
-    };
+    let invocation =
+        match build_invocation_for_config(&cfg, "Reply with only OK.") {
+            Ok(inv) => inv,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: model_name,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: err,
+                };
+            }
+        };
 
     let path_env = enriched_path_var();
     let envs = [("PATH", path_env.as_str())];
@@ -1277,6 +1326,19 @@ pub fn benchmark_model(
             detail: err.to_string(),
         },
     }
+}
+
+/// Run a lightweight round-trip latency test for a specific AI model.
+pub fn benchmark_model(
+    config: &WatchdogConfig,
+    model_override: Option<&str>,
+    runner: &dyn CommandRunner,
+) -> ModelSpeedResult {
+    benchmark_model_for_config(
+        &ai_config_from_legacy(config),
+        model_override,
+        runner,
+    )
 }
 
 /// Check whether a candidate JSON slice is an AI cleanup proposal object.
@@ -1557,9 +1619,10 @@ fn parse_and_validate_proposal_with(
     })
 }
 
-/// Run an AI diagnostic analysis, optionally reusing a scanned tree.
-pub fn run_analysis_with_tree(
-    config: &WatchdogConfig,
+/// Run an AI diagnostic analysis for an [`AiConfig`], optionally reusing a
+/// scanned tree.
+pub fn run_analysis_with_tree_for_config(
+    config: &AiConfig,
     home_dir: &Path,
     current_exe: &Path,
     now_secs: u64,
@@ -1573,7 +1636,7 @@ pub fn run_analysis_with_tree(
         current_exe,
         &candidates,
     );
-    let invocation = build_invocation(config, &prompt)?;
+    let invocation = build_invocation_for_config(config, &prompt)?;
     let path_env = enriched_path_var();
     let envs = [("PATH", path_env.as_str())];
 
@@ -1610,6 +1673,43 @@ pub fn run_analysis_with_tree(
     parse_and_validate_proposal(raw, home_dir, now_secs)
 }
 
+/// Run an AI diagnostic analysis directly from an [`AiConfig`].
+pub fn run_analysis_for_config(
+    config: &AiConfig,
+    home_dir: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    runner: &dyn CommandRunner,
+) -> Result<CleanupProposal, String> {
+    run_analysis_with_tree_for_config(
+        config,
+        home_dir,
+        current_exe,
+        now_secs,
+        None,
+        runner,
+    )
+}
+
+/// Run an AI diagnostic analysis, optionally reusing a scanned tree.
+pub fn run_analysis_with_tree(
+    config: &WatchdogConfig,
+    home_dir: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    existing_tree: Option<&Node>,
+    runner: &dyn CommandRunner,
+) -> Result<CleanupProposal, String> {
+    run_analysis_with_tree_for_config(
+        &ai_config_from_legacy(config),
+        home_dir,
+        current_exe,
+        now_secs,
+        existing_tree,
+        runner,
+    )
+}
+
 /// Run an AI diagnostic analysis using the injected command runner.
 pub fn run_analysis(
     config: &WatchdogConfig,
@@ -1618,12 +1718,11 @@ pub fn run_analysis(
     now_secs: u64,
     runner: &dyn CommandRunner,
 ) -> Result<CleanupProposal, String> {
-    run_analysis_with_tree(
-        config,
+    run_analysis_for_config(
+        &ai_config_from_legacy(config),
         home_dir,
         current_exe,
         now_secs,
-        None,
         runner,
     )
 }
@@ -2216,5 +2315,77 @@ mod tests {
             .find(|item| item.path == cache_dir)
             .expect("cache item kept");
         assert_eq!(cache_prop.mode, RemovalMode::Trash);
+    }
+
+    #[test]
+    fn ai_config_entrypoints_work_without_watchdog_config() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let fake_bin = temp_home.path().join("fake-ai");
+        fs::write(&fake_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        let target_dir = temp_home.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("out.bin"), b"12345").unwrap();
+
+        let cfg = AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: fake_bin.to_string_lossy().into_owned(),
+            extra_args: "--strict".to_owned(),
+            model: Some("model-x".to_owned()),
+            updated_at_secs: 1,
+        };
+
+        let inv = build_invocation_for_config(&cfg, "check disk").unwrap();
+        assert_eq!(inv.program, fake_bin);
+        assert_eq!(
+            inv.args,
+            vec!["check disk", "--model", "model-x", "--strict"]
+        );
+
+        let conn_runner = MockCommandRunner::with_output(CommandOutput {
+            status_code: 0,
+            stdout: "fake-ai 2.0".to_owned(),
+            stderr: String::new(),
+        });
+        assert!(
+            test_connection_for_config(&cfg, &conn_runner)
+                .unwrap()
+                .contains("fake-ai 2.0")
+        );
+
+        let speed_runner = MockCommandRunner::with_output(CommandOutput {
+            status_code: 0,
+            stdout: "OK".to_owned(),
+            stderr: String::new(),
+        });
+        let speed = benchmark_model_for_config(&cfg, None, &speed_runner);
+        assert!(speed.ok);
+        assert_eq!(speed.model, "model-x");
+
+        let prop_json = serde_json::json!({
+            "summary": "Found target",
+            "items": [{
+                "path": target_dir.to_string_lossy(),
+                "mode": "trash",
+                "reason": "build dir",
+            }],
+        })
+        .to_string();
+        let analysis_runner = MockCommandRunner::with_output(CommandOutput {
+            status_code: 0,
+            stdout: prop_json,
+            stderr: String::new(),
+        });
+        let prop = run_analysis_for_config(
+            &cfg,
+            temp_home.path(),
+            Path::new("/usr/local/bin/ruum"),
+            1_700_000_000,
+            &analysis_runner,
+        )
+        .unwrap();
+        assert_eq!(prop.summary, "Found target");
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.items[0].path, target_dir);
     }
 }

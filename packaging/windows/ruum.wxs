@@ -26,6 +26,10 @@
       <File Id="RuumExe" Source="@EXE_PATH@" KeyPath="yes" />
     </Component>
 
+    <Component Id="GuiExecutable" Directory="INSTALLFOLDER" Guid="B7F4E102-1C94-4A6D-9B28-3D71E5A4C005">
+      <File Id="RuumGuiExe" Source="@GUI_EXE_PATH@" KeyPath="yes" />
+    </Component>
+
     <Component Id="ReadmeFile" Directory="INSTALLFOLDER" Guid="B7F4E102-1C94-4A6D-9B28-3D71E5A4C002">
       <File Id="ReadmeMd" Source="@README_PATH@" KeyPath="yes" />
     </Component>
@@ -43,7 +47,7 @@
         Id="ApplicationStartMenuShortcut"
         Name="ruum"
         Description="GPUI treemap explorer for disk usage"
-        Target="[INSTALLFOLDER]ruum.exe"
+        Target="[INSTALLFOLDER]ruum-gui.exe"
         WorkingDirectory="INSTALLFOLDER"
         Icon="RuumIcon" />
       <RemoveFolder Id="CleanUpShortcutFolder" On="uninstall" />
@@ -76,6 +80,7 @@
 
     <Feature Id="ProductFeature" Title="ruum" Level="1">
       <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="GuiExecutable" />
       <ComponentRef Id="ReadmeFile" />
       <ComponentRef Id="LicenseFile" />
       <ComponentRef Id="NoticesFile" />

@@ -69,20 +69,21 @@ pub fn format_checked_age(
 pub const fn watchdog_title(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Disk Space Watchdog",
-        "\u{78c1}\u{76d8}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}",
-        "\u{30c7}\u{30a3}\u{30b9}\u{30af}\u{5bb9}\u{91cf}\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}",
-        "\u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04} \u{c6cc}\u{ce58}\u{b3c5}",
+        "Local Disk Space Watchdog",
+        "\u{672c}\u{673a}\u{78c1}\u{76d8}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{30c7}\u{30a3}\u{30b9}\u{30af}\u{5bb9}\u{91cf}\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}",
+        "\u{b85c}\u{ceec} \u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04} \u{c6cc}\u{ce58}\u{b3c5}",
     )
 }
 
 pub const fn watchdog_subtitle(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Low-overhead disk monitoring with proactive AI cleanup suggestions.",
-        "\u{4f4e}\u{5f00}\u{9500}\u{78c1}\u{76d8}\u{7a7a}\u{95f4}\u{76d1}\u{63a7}\u{ff0c}\u{4e3b}\u{52a8}\u{63d0}\u{4f9b} AI \u{6e05}\u{7406}\u{5efa}\u{8bae}\u{3002}",
-        "\u{4f4e}\u{30aa}\u{30fc}\u{30d0}\u{30fc}\u{30d8}\u{30c3}\u{30c9}\u{306e}\u{30c7}\u{30a3}\u{30b9}\u{30af}\u{76e3}\u{8996}\u{3068} AI \u{306b}\u{3088}\u{308b}\u{7a4d}\u{6975}\u{7684}\u{306a}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848}\u{3002}",
-        "\u{b0ae}\u{c740} \u{c624}\u{bc84}\u{d5e4}\u{b4dc}\u{c758} \u{b514}\u{c2a4}\u{d06c} \u{baa8}\u{b2c8}\u{d130}\u{b9c1}\u{acfc} \u{c120}\u{c81c}\u{c801} AI \u{c815}\u{b9ac} \u{c81c}\u{c548}.",
+        "Monitors this computer only with low-overhead checks and local AI \
+         cleanup suggestions.",
+        "\u{4ec5}\u{76d1}\u{63a7}\u{672c}\u{673a}\u{78c1}\u{76d8}\u{7a7a}\u{95f4}\u{ff0c}\u{63d0}\u{4f9b}\u{4f4e}\u{5f00}\u{9500}\u{68c0}\u{67e5}\u{4e0e}\u{672c}\u{673a} AI \u{6e05}\u{7406}\u{5efa}\u{8bae}\u{3002}",
+        "\u{3053}\u{306e}\u{30b3}\u{30f3}\u{30d4}\u{30e5}\u{30fc}\u{30bf}\u{306e}\u{307f}\u{3092}\u{4f4e}\u{30aa}\u{30fc}\u{30d0}\u{30fc}\u{30d8}\u{30c3}\u{30c9}\u{3067}\u{76e3}\u{8996}\u{3057}\u{3001}\u{30ed}\u{30fc}\u{30ab}\u{30eb} AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848}\u{3092}\u{884c}\u{3044}\u{307e}\u{3059}\u{3002}",
+        "\u{c774} \u{cef4}\u{d4e8}\u{d130}\u{b9cc} \u{b0ae}\u{c740} \u{c624}\u{bc84}\u{d5e4}\u{b4dc}\u{b85c} \u{baa8}\u{b2c8}\u{d130}\u{b9c1}\u{d558}\u{ba70} \u{b85c}\u{ceec} AI \u{c815}\u{b9ac} \u{c81c}\u{c548}\u{c744} \u{c81c}\u{acf5}\u{d569}\u{b2c8}\u{b2e4}.",
     )
 }
 
@@ -135,20 +136,20 @@ pub const fn service_status(
 pub const fn volume_status_title(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Volume Status",
-        "\u{5377}\u{72b6}\u{6001}",
-        "\u{30dc}\u{30ea}\u{30e5}\u{30fc}\u{30e0}\u{72b6}\u{614b}",
-        "\u{bcfc}\u{b968} \u{c0c1}\u{d0dc}",
+        "Local Volume Status",
+        "\u{672c}\u{673a}\u{5377}\u{72b6}\u{6001}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{30dc}\u{30ea}\u{30e5}\u{30fc}\u{30e0}\u{72b6}\u{614b}",
+        "\u{b85c}\u{ceec} \u{bcfc}\u{b968} \u{c0c1}\u{d0dc}",
     )
 }
 
 pub const fn monitored_root(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Monitored Root:",
-        "\u{76d1}\u{63a7}\u{6839}\u{76ee}\u{5f55}\u{ff1a}",
-        "\u{76e3}\u{8996}\u{30eb}\u{30fc}\u{30c8}:",
-        "\u{baa8}\u{b2c8}\u{d130}\u{b9c1} \u{b8e8}\u{d2b8}:",
+        "Local Monitored Root:",
+        "\u{672c}\u{673a}\u{76d1}\u{63a7}\u{6839}\u{76ee}\u{5f55}\u{ff1a}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{76e3}\u{8996}\u{30eb}\u{30fc}\u{30c8}:",
+        "\u{b85c}\u{ceec} \u{baa8}\u{b2c8}\u{d130}\u{b9c1} \u{b8e8}\u{d2b8}:",
     )
 }
 
@@ -243,40 +244,30 @@ pub const fn actions_title(locale: Locale) -> &'static str {
 pub const fn check_disk_space_now(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Check Disk Space Now",
-        "\u{7acb}\u{5373}\u{68c0}\u{67e5}\u{78c1}\u{76d8}\u{7a7a}\u{95f4}",
-        "\u{4eca}\u{3059}\u{3050}\u{30c7}\u{30a3}\u{30b9}\u{30af}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{3092}\u{78ba}\u{8a8d}",
-        "\u{c9c0}\u{ae08} \u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04} \u{d655}\u{c778}",
-    )
-}
-
-pub const fn analyzing(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Analyzing\u{2026}",
-        "\u{5206}\u{6790}\u{4e2d}\u{2026}",
-        "\u{5206}\u{6790}\u{4e2d}\u{2026}",
-        "\u{bd84}\u{c11d} \u{c911}\u{2026}",
+        "Check Local Disk Space",
+        "\u{68c0}\u{67e5}\u{672c}\u{673a}\u{78c1}\u{76d8}\u{7a7a}\u{95f4}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{3092}\u{78ba}\u{8a8d}",
+        "\u{b85c}\u{ceec} \u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04} \u{d655}\u{c778}",
     )
 }
 
 pub const fn run_ai_analysis_now(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Run AI Analysis Now",
-        "\u{7acb}\u{5373}\u{8fd0}\u{884c} AI \u{5206}\u{6790}",
-        "\u{4eca}\u{3059}\u{3050} AI \u{5206}\u{6790}\u{3092}\u{5b9f}\u{884c}",
-        "\u{c9c0}\u{ae08} AI \u{bd84}\u{c11d} \u{c2e4}\u{d589}",
+        "Run Local AI Analysis",
+        "\u{8fd0}\u{884c}\u{672c}\u{673a} AI \u{5206}\u{6790}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb} AI \u{5206}\u{6790}\u{3092}\u{5b9f}\u{884c}",
+        "\u{b85c}\u{ceec} AI \u{bd84}\u{c11d} \u{c2e4}\u{d589}",
     )
 }
 
 pub const fn latest_proposal_title(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Latest AI Cleanup Proposal",
-        "\u{6700}\u{65b0} AI \u{6e05}\u{7406}\u{5efa}\u{8bae}",
-        "\u{6700}\u{65b0}\u{306e} AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848}",
-        "\u{cd5c}\u{c2e0} AI \u{c815}\u{b9ac} \u{c81c}\u{c548}",
+        "Latest Local AI Cleanup Proposal",
+        "\u{6700}\u{65b0}\u{672c}\u{673a} AI \u{6e05}\u{7406}\u{5efa}\u{8bae}",
+        "\u{6700}\u{65b0}\u{306e}\u{30ed}\u{30fc}\u{30ab}\u{30eb} AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{63d0}\u{6848}",
+        "\u{cd5c}\u{c2e0} \u{b85c}\u{ceec} AI \u{c815}\u{b9ac} \u{c81c}\u{c548}",
     )
 }
 

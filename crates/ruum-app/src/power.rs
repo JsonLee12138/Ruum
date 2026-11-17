@@ -1,7 +1,4 @@
-//! Saved fixed worker presets. Read before the first scan starts.
-
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+//! Fixed worker presets and CPU budget calculation.
 
 use crate::i18n::{Locale, common};
 use ruum_core::scan_threads::ScanThreads;
@@ -38,7 +35,9 @@ impl PowerEfficiency {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|preset| preset.key() == value)
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.key() == value.trim())
     }
 
     pub fn threads(self, cpus: usize) -> usize {
@@ -100,48 +99,6 @@ pub fn cpu_threads() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 
-/// Follow each desktop's user configuration location; never write beside
-/// the executable or scanned root. No home/config location means session-only.
-pub fn settings_path() -> Option<PathBuf> {
-    let home = std::env::home_dir();
-    let base = if cfg!(target_os = "macos") {
-        home.map(|home| home.join("Library/Application Support"))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| home.map(|home| home.join(".config")))
-    };
-    base.map(|base| base.join("ruum/power-efficiency"))
-}
-
-pub fn load(path: &Path) -> io::Result<PowerEfficiency> {
-    match std::fs::read_to_string(path) {
-        Ok(value) => PowerEfficiency::parse(value.trim()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "unknown power preset")
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok(PowerEfficiency::default())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub fn save(path: &Path, preset: PowerEfficiency) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "no settings directory")
-    })?;
-    std::fs::create_dir_all(parent)?;
-    // Atomic replacement leaves the previous choice intact after a failed
-    // write, and readers never see a half-written setting.
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    writeln!(file, "{}", preset.key())?;
-    file.persist(path).map_err(|error| error.error)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +113,13 @@ mod tests {
             assert!(!policy.adaptive);
             assert_eq!(policy.system_cpu_limit, None);
             assert_eq!(preset.threads(1), 1);
+            assert_eq!(PowerEfficiency::parse(preset.key()), Some(preset));
         }
+        assert_eq!(
+            PowerEfficiency::parse("balanced\n"),
+            Some(PowerEfficiency::Balanced)
+        );
+        assert_eq!(PowerEfficiency::parse("unknown"), None);
         assert_eq!(PowerEfficiency::Balanced.threads(3), 3);
         assert_eq!(
             PowerEfficiency::DrainMyBattery.label_in(18, Locale::En),
@@ -188,23 +151,6 @@ mod tests {
         assert_eq!(P::signal(4, 4), 2);
         assert_eq!(P::signal(1, 18), 1);
         assert_eq!(P::signal(12, 18), 3);
-    }
-
-    #[test]
-    fn saved_choice_survives_replacement_and_bad_data_is_reported() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config/power-efficiency");
-        assert_eq!(load(&path).expect("missing"), PowerEfficiency::Balanced);
-        for preset in PowerEfficiency::ALL {
-            save(&path, preset).expect("save");
-            assert_eq!(load(&path).expect("load"), preset);
-        }
-        std::fs::write(&path, "not-a-preset").expect("corrupt");
-        assert_eq!(
-            load(&path).expect_err("invalid").kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(save(dir.path(), PowerEfficiency::Miser).is_err());
     }
 
     #[test]

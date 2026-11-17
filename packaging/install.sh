@@ -17,6 +17,7 @@ VERSION=$(cat "$here/VERSION")
 
 install -d "$BINDIR" "$APPDIR" "$ICONDIR"
 install -m755 "$here/ruum" "$BINDIR/ruum"
+install -m755 "$here/ruum-gui" "$BINDIR/ruum-gui"
 install -m644 "$here/ruum.svg" "$ICONDIR/ruum.svg"
 sed -e "s|@BINDIR@|$BINDIR|" -e "s|@VERSION@|$VERSION|" \
     "$here/ruum.desktop.in" > "$APPDIR/ruum.desktop"
@@ -27,6 +28,7 @@ fi
 
 echo "installed ruum $VERSION:"
 echo "  $BINDIR/ruum"
+echo "  $BINDIR/ruum-gui"
 echo "  $APPDIR/ruum.desktop"
 echo "  $ICONDIR/ruum.svg"
 resolved=$(command -v ruum 2>/dev/null || true)

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/ruum-app", "crates/ruum-core", "crates/ruum-scan", "xtask"]
+members = [
+    "crates/ruum-app",
+    "crates/ruum-core",
+    "crates/ruum-scan",
+    "crates/ruum-watchdog",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,10 +17,38 @@ repository = "https://github.com/JsonLee12138/Ruum.git"
 
 [workspace.dependencies]
 ruum-core = { path = "crates/ruum-core" }
+ruum-watchdog = { path = "crates/ruum-watchdog" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
 anyhow = "1"
+base64 = "0.22"
+dunce = "1.0.5"
+hmac = "0.12"
+interprocess = "2"
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1"
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 rustc-hash = "2"
+ssh-key = { version = "0.6", features = [
+    "ed25519",
+    "encryption",
+    "getrandom",
+    "p256",
+    "p384",
+    "p521",
+    "rsa",
+] }
 sys-locale = "0.3.2"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1", features = ["derive"] }
 
 # Lint gates follow omatrack's policy: the checks that catch real defects are
 # errors, and every deliberate omission is written down instead of silently

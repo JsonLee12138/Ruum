@@ -222,6 +222,7 @@ mod tests {
         use crate::remote_progress::Stage;
         use crate::removal::{RemovalMode, TrashBackend};
         use crate::tree::Metric;
+        #[cfg(feature = "service")]
         use crate::watchdog_config::AiCliProvider;
 
         let locales = [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko];
@@ -299,16 +300,19 @@ mod tests {
             }
         }
 
-        for provider in AiCliProvider::ALL {
-            assert_eq!(provider.label_in(Locale::En), provider.label());
-            for locale in locales {
-                assert!(!provider.label_in(locale).is_empty());
+        #[cfg(feature = "service")]
+        {
+            for provider in AiCliProvider::ALL {
+                assert_eq!(provider.label_in(Locale::En), provider.label());
+                for locale in locales {
+                    assert!(!provider.label_in(locale).is_empty());
+                }
             }
+            assert_ne!(
+                AiCliProvider::Custom.label_in(Locale::Zh),
+                AiCliProvider::Custom.label_in(Locale::En)
+            );
         }
-        assert_ne!(
-            AiCliProvider::Custom.label_in(Locale::Zh),
-            AiCliProvider::Custom.label_in(Locale::En)
-        );
 
         let clean = GitState {
             changed: Some(0),

@@ -172,8 +172,12 @@ impl CliInstallAdapter for MacOsCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<CliInstallStatus> {
+        let Ok(cli_exe) = resolve_cli_binary_for(self.os_kind(), current_exe)
+        else {
+            return Ok(CliInstallStatus::NotInstalled);
+        };
         let usr_local_target = env.usr_local_bin.join("ruum");
-        if path_matches_exe(&usr_local_target, current_exe) {
+        if path_matches_exe(&usr_local_target, &cli_exe) {
             return Ok(CliInstallStatus::Installed {
                 path: usr_local_target,
                 in_path: true,
@@ -182,7 +186,7 @@ impl CliInstallAdapter for MacOsCliInstaller {
 
         if let Some(local_bin) = Self::local_bin_in(env) {
             let local_target = local_bin.join("ruum");
-            if path_matches_exe(&local_target, current_exe) {
+            if path_matches_exe(&local_target, &cli_exe) {
                 let in_path =
                     dir_in_path_unix(env.path_var.as_deref(), &local_bin);
                 return Ok(CliInstallStatus::Installed {
@@ -201,11 +205,12 @@ impl CliInstallAdapter for MacOsCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<PathBuf> {
+        let cli_exe = resolve_cli_binary_for(self.os_kind(), current_exe)?;
         let dst = env.usr_local_bin.join("ruum");
-        match atomic_symlink(current_exe, &dst) {
+        match atomic_symlink(&cli_exe, &dst) {
             Ok(()) => Ok(dst),
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                let src_str = current_exe.to_string_lossy();
+                let src_str = cli_exe.to_string_lossy();
                 let dst_str = dst.to_string_lossy();
                 let dir_str = env.usr_local_bin.to_string_lossy();
                 let out = runner.run(
@@ -236,6 +241,8 @@ impl CliInstallAdapter for MacOsCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<()> {
+        let cli_exe = resolve_cli_binary_for(self.os_kind(), current_exe)
+            .unwrap_or_else(|_| current_exe.to_path_buf());
         let usr_dst = env.usr_local_bin.join("ruum");
         if fs::symlink_metadata(&usr_dst).is_ok() {
             match fs::remove_file(&usr_dst) {
@@ -263,7 +270,7 @@ impl CliInstallAdapter for MacOsCliInstaller {
             let local_dst = local_bin.join("ruum");
             if let Ok(meta) = fs::symlink_metadata(&local_dst)
                 && meta.file_type().is_symlink()
-                && path_matches_exe(&local_dst, current_exe)
+                && path_matches_exe(&local_dst, &cli_exe)
             {
                 fs::remove_file(&local_dst)?;
             }
@@ -294,18 +301,22 @@ impl CliInstallAdapter for LinuxCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<CliInstallStatus> {
-        if current_exe == Path::new("/usr/bin/ruum")
-            || current_exe == Path::new("/usr/local/bin/ruum")
+        let Ok(cli_exe) = resolve_cli_binary_for(self.os_kind(), current_exe)
+        else {
+            return Ok(CliInstallStatus::NotInstalled);
+        };
+        if cli_exe == Path::new("/usr/bin/ruum")
+            || cli_exe == Path::new("/usr/local/bin/ruum")
         {
             return Ok(CliInstallStatus::Installed {
-                path: current_exe.to_path_buf(),
+                path: cli_exe,
                 in_path: true,
             });
         }
 
         if let Some(local_bin) = Self::local_bin_in(env) {
             let target = local_bin.join("ruum");
-            if path_matches_exe(&target, current_exe) {
+            if path_matches_exe(&target, &cli_exe) {
                 let in_path =
                     dir_in_path_unix(env.path_var.as_deref(), &local_bin);
                 return Ok(CliInstallStatus::Installed {
@@ -324,6 +335,7 @@ impl CliInstallAdapter for LinuxCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<PathBuf> {
+        let cli_exe = resolve_cli_binary_for(self.os_kind(), current_exe)?;
         let local_bin = Self::local_bin_in(env).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -333,11 +345,11 @@ impl CliInstallAdapter for LinuxCliInstaller {
         let target = local_bin.join("ruum");
 
         // Do not overwrite the running binary with a self-referential symlink.
-        if is_same_non_symlink_binary(&target, current_exe) {
+        if is_same_non_symlink_binary(&target, &cli_exe) {
             return Ok(target);
         }
 
-        atomic_symlink(current_exe, &target)?;
+        atomic_symlink(&cli_exe, &target)?;
         Ok(target)
     }
 
@@ -347,6 +359,8 @@ impl CliInstallAdapter for LinuxCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<()> {
+        let cli_exe = resolve_cli_binary_for(self.os_kind(), current_exe)
+            .unwrap_or_else(|_| current_exe.to_path_buf());
         let local_bin = Self::local_bin_in(env).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -360,7 +374,7 @@ impl CliInstallAdapter for LinuxCliInstaller {
             Err(err) => Err(err),
             Ok(meta) => {
                 if !meta.file_type().is_symlink()
-                    && paths_match_file_or_lexical(&target, current_exe)
+                    && paths_match_file_or_lexical(&target, &cli_exe)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -440,6 +454,7 @@ impl CliInstallAdapter for WindowsCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<PathBuf> {
+        let cli_exe = resolve_cli_binary_for(self.os_kind(), current_exe)?;
         let bin_dir = Self::bin_dir_in(env).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -449,8 +464,17 @@ impl CliInstallAdapter for WindowsCliInstaller {
         let target_exe = bin_dir.join("ruum.exe");
 
         fs::create_dir_all(&bin_dir)?;
-        if !paths_equal_windows(current_exe, &target_exe) {
-            fs::copy(current_exe, &target_exe)?;
+        if !paths_equal_windows(&cli_exe, &target_exe) {
+            fs::copy(&cli_exe, &target_exe)?;
+        }
+        // Keep sibling `ruum-gui.exe` co-located so `ruum` launched via PATH
+        // can still find and launch the desktop GUI.
+        if let Some(src_dir) = cli_exe.parent() {
+            let gui_src = src_dir.join("ruum-gui.exe");
+            let gui_dst = bin_dir.join("ruum-gui.exe");
+            if gui_src.is_file() && !paths_equal_windows(&gui_src, &gui_dst) {
+                fs::copy(&gui_src, &gui_dst)?;
+            }
         }
 
         let bin_dir_str = bin_dir.to_string_lossy();
@@ -480,6 +504,8 @@ impl CliInstallAdapter for WindowsCliInstaller {
         env: &CliInstallEnv,
         current_exe: &Path,
     ) -> io::Result<()> {
+        let cli_exe = resolve_cli_binary_for(self.os_kind(), current_exe)
+            .unwrap_or_else(|_| current_exe.to_path_buf());
         let bin_dir = Self::bin_dir_in(env).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -505,10 +531,12 @@ impl CliInstallAdapter for WindowsCliInstaller {
         }
 
         let target_exe = bin_dir.join("ruum.exe");
-        if !paths_equal_windows(current_exe, &target_exe)
-            && target_exe.is_file()
-        {
+        if !paths_equal_windows(&cli_exe, &target_exe) && target_exe.is_file() {
             let _ = fs::remove_file(&target_exe);
+        }
+        let gui_dst = bin_dir.join("ruum-gui.exe");
+        if !paths_equal_windows(current_exe, &gui_dst) && gui_dst.is_file() {
+            let _ = fs::remove_file(&gui_dst);
         }
 
         Ok(())
@@ -548,6 +576,53 @@ impl CliInstallFactory {
     pub fn create() -> Box<dyn CliInstallAdapter> {
         Self::create_for(Self::current_os())
     }
+}
+
+/// Resolve the `ruum` CLI executable from `current_exe`.
+///
+/// When invoked from `ruum-gui` (or `ruum-gui.exe`), resolves the co-located
+/// sibling `ruum` (`ruum.exe`) after canonicalizing symlinks so `ruum-gui` is
+/// never symlinked or copied under the `ruum` CLI name.
+pub fn resolve_cli_binary_for(
+    os: CliInstallOs,
+    current_exe: &Path,
+) -> io::Result<PathBuf> {
+    let canonical = dunce::canonicalize(current_exe)
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+    let is_gui = [current_exe, &canonical].iter().any(|path| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("ruum-gui")
+                    || name.eq_ignore_ascii_case("ruum-gui.exe")
+            })
+    });
+    if !is_gui {
+        return Ok(current_exe.to_path_buf());
+    }
+
+    let sibling_name = match os {
+        CliInstallOs::Windows => "ruum.exe",
+        CliInstallOs::MacOs | CliInstallOs::Linux => "ruum",
+    };
+    if let Some(parent) = canonical.parent() {
+        let sibling = parent.join(sibling_name);
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "sibling `{sibling_name}` CLI binary not found next to {}",
+            canonical.display()
+        ),
+    ))
+}
+
+/// Resolve the `ruum` CLI executable for the current host OS.
+pub fn resolve_cli_binary(current_exe: &Path) -> io::Result<PathBuf> {
+    resolve_cli_binary_for(CliInstallFactory::current_os(), current_exe)
 }
 
 /// Query the CLI installation status for the current host OS.
@@ -1384,5 +1459,84 @@ mod tests {
         assert!(!dir_in_path_unix(Some("/usr/bin:/bin"), win_dir));
         assert!(dir_in_path_unix(Some("c:/usr/bin"), Path::new("/usr/bin")));
         assert!(dir_in_path_unix(Some("C:\\\\:/usr/bin"), Path::new("C:\\")));
+    }
+
+    #[test]
+    fn gui_executable_resolves_sibling_cli_across_all_platforms() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("bin_dir");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let gui_unix = app_dir.join("ruum-gui");
+        fs::write(&gui_unix, b"gui").unwrap();
+
+        // Missing sibling `ruum` fails closed instead of symlinking `ruum-gui`.
+        for os in [CliInstallOs::MacOs, CliInstallOs::Linux] {
+            let err = resolve_cli_binary_for(os, &gui_unix).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        }
+
+        let cli_unix = app_dir.join("ruum");
+        fs::write(&cli_unix, b"cli").unwrap();
+
+        for os in [CliInstallOs::MacOs, CliInstallOs::Linux] {
+            let resolved = resolve_cli_binary_for(os, &gui_unix).unwrap();
+            assert_eq!(
+                fs::canonicalize(&resolved).unwrap(),
+                fs::canonicalize(&cli_unix).unwrap()
+            );
+        }
+
+        // Linux install called with `ruum-gui` links `ruum`, never `ruum-gui`.
+        let home = temp.path().join("linux_home");
+        fs::create_dir_all(&home).unwrap();
+        let linux_env = CliInstallEnv {
+            home: Some(home),
+            local_appdata: None,
+            path_var: None,
+            usr_local_bin: temp.path().join("usr_local"),
+        };
+        let linux_adapter = CliInstallFactory::create_for(CliInstallOs::Linux);
+        let runner = ScriptedRunner::with_default(ok_out(""));
+        let installed = linux_adapter
+            .install(&runner, &linux_env, &gui_unix)
+            .unwrap();
+        let target_target = fs::read_link(&installed).unwrap();
+        assert_eq!(
+            fs::canonicalize(target_target).unwrap(),
+            fs::canonicalize(&cli_unix).unwrap()
+        );
+        assert!(matches!(
+            linux_adapter
+                .status(&runner, &linux_env, &gui_unix)
+                .unwrap(),
+            CliInstallStatus::Installed { .. }
+        ));
+
+        // Windows install from `ruum-gui.exe` copies `ruum.exe` and keeps
+        // sibling `ruum-gui.exe` co-located in `%LOCALAPPDATA%\Programs\ruum\bin`.
+        let win_src = temp.path().join("win_src");
+        let local_appdata = temp.path().join("win_local");
+        fs::create_dir_all(&win_src).unwrap();
+        let gui_win = win_src.join("ruum-gui.exe");
+        let cli_win = win_src.join("ruum.exe");
+        fs::write(&gui_win, b"MZ-gui").unwrap();
+        fs::write(&cli_win, b"MZ-cli").unwrap();
+
+        let win_env = CliInstallEnv {
+            home: Some(temp.path().join("win_home")),
+            local_appdata: Some(local_appdata.clone()),
+            path_var: None,
+            usr_local_bin: PathBuf::from("/usr/local/bin"),
+        };
+        let win_adapter = CliInstallFactory::create_for(CliInstallOs::Windows);
+        let win_dst = win_adapter.install(&runner, &win_env, &gui_win).unwrap();
+        let expected_dir = local_appdata.join("Programs/ruum/bin");
+        assert_eq!(win_dst, expected_dir.join("ruum.exe"));
+        assert_eq!(fs::read(&win_dst).unwrap(), b"MZ-cli");
+        assert_eq!(
+            fs::read(expected_dir.join("ruum-gui.exe")).unwrap(),
+            b"MZ-gui"
+        );
     }
 }

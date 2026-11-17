@@ -20,8 +20,8 @@ const USAGE: &str = "\
 usage: cargo xtask package <subcommand> [options]
 
 subcommands:
-  linux-stage    --arch <x86_64|aarch64> --out <dir> [--binary <path>] [--version <V>]
-  windows-stage  --arch <x86_64|aarch64> --out <dir> [--exe <path>] [--version <V>]
+  linux-stage    --arch <x86_64|aarch64> --out <dir> [--binary <path>] [--gui-binary <path>] [--version <V>]
+  windows-stage  --arch <x86_64|aarch64> --out <dir> [--exe <path>] [--gui-exe <path>] [--version <V>]
   homebrew-cask  --version <V> --arm64-sha256 <H1> --x64-sha256 <H2> --repo <owner/repo> --out <path> [--signed]
   checksums      --dir <dist_dir>
 ";
@@ -78,6 +78,7 @@ pub struct LinuxStageOptions {
     pub arch: Arch,
     pub out: PathBuf,
     pub binary: Option<PathBuf>,
+    pub gui_binary: Option<PathBuf>,
     pub version: String,
 }
 
@@ -86,6 +87,7 @@ pub struct WindowsStageOptions {
     pub arch: Arch,
     pub out: PathBuf,
     pub exe: Option<PathBuf>,
+    pub gui_exe: Option<PathBuf>,
     pub version: String,
 }
 
@@ -176,6 +178,7 @@ fn parse_linux_stage(args: &[String]) -> Result<LinuxStageOptions, String> {
     let mut arch = None;
     let mut out = None;
     let mut binary = None;
+    let mut gui_binary = None;
     let mut version = env!("CARGO_PKG_VERSION").to_string();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -186,6 +189,10 @@ fn parse_linux_stage(args: &[String]) -> Result<LinuxStageOptions, String> {
             "--out" => out = Some(PathBuf::from(next_arg(&mut iter, "--out")?)),
             "--binary" => {
                 binary = Some(PathBuf::from(next_arg(&mut iter, "--binary")?));
+            }
+            "--gui-binary" => {
+                gui_binary =
+                    Some(PathBuf::from(next_arg(&mut iter, "--gui-binary")?));
             }
             "--version" => {
                 version = next_arg(&mut iter, "--version")?.to_string();
@@ -199,6 +206,7 @@ fn parse_linux_stage(args: &[String]) -> Result<LinuxStageOptions, String> {
         arch: arch.ok_or("--arch is required")?,
         out: out.ok_or("--out is required")?,
         binary,
+        gui_binary,
         version,
     })
 }
@@ -207,6 +215,7 @@ fn parse_windows_stage(args: &[String]) -> Result<WindowsStageOptions, String> {
     let mut arch = None;
     let mut out = None;
     let mut exe = None;
+    let mut gui_exe = None;
     let mut version = env!("CARGO_PKG_VERSION").to_string();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -216,6 +225,10 @@ fn parse_windows_stage(args: &[String]) -> Result<WindowsStageOptions, String> {
             }
             "--out" => out = Some(PathBuf::from(next_arg(&mut iter, "--out")?)),
             "--exe" => exe = Some(PathBuf::from(next_arg(&mut iter, "--exe")?)),
+            "--gui-exe" => {
+                gui_exe =
+                    Some(PathBuf::from(next_arg(&mut iter, "--gui-exe")?));
+            }
             "--version" => {
                 version = next_arg(&mut iter, "--version")?.to_string();
             }
@@ -228,6 +241,7 @@ fn parse_windows_stage(args: &[String]) -> Result<WindowsStageOptions, String> {
         arch: arch.ok_or("--arch is required")?,
         out: out.ok_or("--out is required")?,
         exe,
+        gui_exe,
         version,
     })
 }
@@ -345,8 +359,20 @@ pub fn stage_linux(opts: &LinuxStageOptions) -> Result<(), String> {
         .unwrap_or_else(|| root.join("target/portable/ruum"));
     if !binary.is_file() {
         return Err(format!(
-            "portable Linux binary not found at {}; run `cargo xtask portable` first",
+            "portable Linux binary not found at {}; run `cargo xtask portable` \
+             first",
             binary.display()
+        ));
+    }
+    let gui_binary = opts
+        .gui_binary
+        .clone()
+        .unwrap_or_else(|| binary.with_file_name("ruum-gui"));
+    if !gui_binary.is_file() {
+        return Err(format!(
+            "portable Linux GUI binary not found at {}; run `cargo xtask \
+             portable` first",
+            gui_binary.display()
         ));
     }
     let nfpm_version = normalize_nfpm_version(&opts.version)?;
@@ -358,14 +384,12 @@ pub fn stage_linux(opts: &LinuxStageOptions) -> Result<(), String> {
     })?;
 
     let staged_bin = appdir_bin.join("ruum");
-    fs::copy(&binary, &staged_bin).map_err(|err| {
-        format!(
-            "cannot copy {} to {}: {err}",
-            binary.display(),
-            staged_bin.display()
-        )
-    })?;
+    copy_file(&binary, &staged_bin)?;
     set_executable(&staged_bin)?;
+
+    let staged_gui_bin = appdir_bin.join("ruum-gui");
+    copy_file(&gui_binary, &staged_gui_bin)?;
+    set_executable(&staged_gui_bin)?;
 
     let desktop_system = DESKTOP_TEMPLATE
         .replace("@BINDIR@", "/usr/bin")
@@ -393,6 +417,7 @@ pub fn stage_linux(opts: &LinuxStageOptions) -> Result<(), String> {
         .replace("@NFPM_ARCH@", opts.arch.nfpm_arch())
         .replace("@NFPM_VERSION@", &nfpm_version)
         .replace("@BIN_PATH@", &slash_path(&staged_bin))
+        .replace("@GUI_BIN_PATH@", &slash_path(&staged_gui_bin))
         .replace("@DESKTOP_PATH@", &slash_path(&desktop_path))
         .replace("@ICON_PATH@", &slash_path(&staged_icon))
         .replace("@LICENSE_PATH@", &slash_path(&root.join("LICENSE")))
@@ -416,6 +441,10 @@ pub fn stage_windows(opts: &WindowsStageOptions) -> Result<(), String> {
         .exe
         .clone()
         .unwrap_or_else(|| root.join("target/release/ruum.exe"));
+    let gui_exe_path = opts
+        .gui_exe
+        .clone()
+        .unwrap_or_else(|| exe_path.with_file_name("ruum-gui.exe"));
     let icon_path = root.join("assets/ruum.ico");
     let readme_path = root.join("README.md");
     let license_path = root.join("LICENSE");
@@ -424,6 +453,7 @@ pub fn stage_windows(opts: &WindowsStageOptions) -> Result<(), String> {
     let wxs = WXS_TEMPLATE
         .replace("@MSI_VERSION@", &xml_escape(&msi_version))
         .replace("@EXE_PATH@", &xml_escape(&native_path(&exe_path)))
+        .replace("@GUI_EXE_PATH@", &xml_escape(&native_path(&gui_exe_path)))
         .replace("@ICON_PATH@", &xml_escape(&native_path(&icon_path)))
         .replace("@README_PATH@", &xml_escape(&native_path(&readme_path)))
         .replace("@LICENSE_PATH@", &xml_escape(&native_path(&license_path)))
@@ -438,6 +468,7 @@ pub fn stage_windows(opts: &WindowsStageOptions) -> Result<(), String> {
         .replace("@INNO_ARCH_INSTALL64@", opts.arch.inno_arch())
         .replace("@OUTPUT_DIR@", &native_path(&opts.out))
         .replace("@EXE_PATH@", &native_path(&exe_path))
+        .replace("@GUI_EXE_PATH@", &native_path(&gui_exe_path))
         .replace("@ICON_PATH@", &native_path(&icon_path))
         .replace("@README_PATH@", &native_path(&readme_path))
         .replace("@LICENSE_PATH@", &native_path(&license_path))
@@ -712,33 +743,40 @@ mod tests {
     fn stages_linux_nfpm_and_appdir_without_bindir_in_appdir_desktop() {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("ruum");
+        let gui_bin = tmp.path().join("ruum-gui");
         fs::write(&bin, b"ELF_WITH_TRAILER").unwrap();
+        fs::write(&gui_bin, b"ELF_GUI").unwrap();
         let out = tmp.path().join("stage");
         stage_linux(&LinuxStageOptions {
             arch: Arch::Aarch64,
             out: out.clone(),
             binary: Some(bin),
+            gui_binary: None,
             version: "0.1.1".into(),
         })
         .unwrap();
 
         let desktop = fs::read_to_string(out.join("ruum.desktop")).unwrap();
-        assert!(desktop.contains("Exec=/usr/bin/ruum %f"));
-        assert!(desktop.contains("Exec=/usr/bin/ruum --disk"));
+        assert!(desktop.contains("Exec=/usr/bin/ruum-gui %f"));
+        assert!(
+            desktop.contains("Exec=/usr/bin/ruum-gui --open-screen sources")
+        );
         assert!(desktop.contains("X-AppVersion=0.1.1"));
 
         let appdir_desktop =
             fs::read_to_string(out.join("AppDir/ruum.desktop")).unwrap();
-        assert!(appdir_desktop.contains("Exec=ruum %f"));
-        assert!(appdir_desktop.contains("Exec=ruum --disk"));
+        assert!(appdir_desktop.contains("Exec=ruum-gui %f"));
+        assert!(appdir_desktop.contains("Exec=ruum-gui --open-screen sources"));
         assert!(!appdir_desktop.contains("@BINDIR@"));
 
         let nfpm = fs::read_to_string(out.join("nfpm.yaml")).unwrap();
         assert!(nfpm.contains("arch: \"arm64\""));
         assert!(nfpm.contains("overrides:"));
+        assert!(nfpm.contains("/usr/bin/ruum-gui"));
         assert!(!nfpm.contains('@'));
 
         assert!(out.join("AppDir/usr/bin/ruum").is_file());
+        assert!(out.join("AppDir/usr/bin/ruum-gui").is_file());
         assert!(out.join("AppDir/ruum.svg").is_file());
         assert!(out.join("AppDir/.DirIcon").is_file());
         assert!(out.join("AppDir/AppRun").is_file());
@@ -751,11 +789,16 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
+            let gui_mode = fs::metadata(out.join("AppDir/usr/bin/ruum-gui"))
+                .unwrap()
+                .permissions()
+                .mode();
             let apprun_mode = fs::metadata(out.join("AppDir/AppRun"))
                 .unwrap()
                 .permissions()
                 .mode();
             assert_ne!(bin_mode & 0o111, 0);
+            assert_ne!(gui_mode & 0o111, 0);
             assert_ne!(apprun_mode & 0o111, 0);
         }
     }
@@ -768,12 +811,14 @@ mod tests {
             arch: Arch::X86_64,
             out: out_x64.clone(),
             exe: Some(tmp.path().join("ruum.exe")),
+            gui_exe: None,
             version: "0.1.1-beta.1".into(),
         })
         .unwrap();
         let wxs_x64 = fs::read_to_string(out_x64.join("ruum.wxs")).unwrap();
         assert!(wxs_x64.contains("Version=\"0.1.1\""));
         assert!(wxs_x64.contains("Scope=\"perMachine\""));
+        assert!(wxs_x64.contains("ruum-gui.exe"));
         assert!(!wxs_x64.contains('@'));
         let iss_x64 = fs::read_to_string(out_x64.join("ruum.iss")).unwrap();
         assert!(
@@ -784,6 +829,7 @@ mod tests {
         assert!(iss_x64.contains(
             "OutputBaseFilename=ruum-0.1.1-beta.1-x86_64-windows-setup"
         ));
+        assert!(iss_x64.contains("ruum-gui.exe"));
         assert!(!iss_x64.contains('@'));
 
         let out_arm = tmp.path().join("arm64");
@@ -791,6 +837,7 @@ mod tests {
             arch: Arch::Aarch64,
             out: out_arm.clone(),
             exe: None,
+            gui_exe: None,
             version: "0.1.1".into(),
         })
         .unwrap();
@@ -873,6 +920,7 @@ mod tests {
                 arch: Arch::X86_64,
                 out: tmp.path().join("out"),
                 binary: Some(tmp.path().join("missing-ruum")),
+                gui_binary: None,
                 version: "0.1.1".into(),
             })
             .is_err()
@@ -905,6 +953,7 @@ mod tests {
             arch: Arch::X86_64,
             out: tricky.clone(),
             exe: Some(tricky.join("ruum.exe")),
+            gui_exe: None,
             version: "0.1.1".into(),
         })
         .unwrap();

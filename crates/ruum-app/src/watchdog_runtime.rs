@@ -11,7 +11,8 @@ use std::thread::{self, JoinHandle};
 
 use ruum_core::confirm::{
     CleanupConfirmDecision, CleanupConfirmRequest, IpcListenerGuard,
-    IpcRequest, IpcResponse, load_or_create_ipc_token,
+    IpcRequest, IpcResponse, RemoteConnectConfirmDecision,
+    RemoteConnectConfirmRequest, load_or_create_ipc_token,
 };
 use ruum_core::watchdog_config::ipc_token_path;
 
@@ -33,6 +34,11 @@ pub enum WatchdogIpcEvent {
     },
     /// External notification click handler requests opening/focusing Ruum.
     OpenWindow { tag: String },
+    /// External MCP server requests user approval for a remote SSH connection.
+    ConfirmRemoteConnect {
+        request: RemoteConnectConfirmRequest,
+        responder: Sender<RemoteConnectConfirmDecision>,
+    },
 }
 
 /// Handle to the background IPC server thread.
@@ -127,6 +133,24 @@ fn run_listener_loop(
                 let decision =
                     resp_rx.recv().unwrap_or(CleanupConfirmDecision::Cancelled);
                 Ok(IpcResponse::ConfirmDecision { decision })
+            }
+            IpcRequest::ConfirmRemoteConnect { request, .. } => {
+                let (resp_tx, resp_rx) = channel();
+                if event_tx
+                    .send(WatchdogIpcEvent::ConfirmRemoteConnect {
+                        request,
+                        responder: resp_tx,
+                    })
+                    .is_err()
+                {
+                    return Ok(IpcResponse::RemoteConnectDecision {
+                        decision: RemoteConnectConfirmDecision::Denied,
+                    });
+                }
+                let decision = resp_rx
+                    .recv()
+                    .unwrap_or(RemoteConnectConfirmDecision::Denied);
+                Ok(IpcResponse::RemoteConnectDecision { decision })
             }
             IpcRequest::NotifyWatchdogUpdate { .. } => {
                 let _ = event_tx.send(WatchdogIpcEvent::WatchdogUpdated);
@@ -233,7 +257,8 @@ mod tests {
             }
             WatchdogIpcEvent::WatchdogUpdated
             | WatchdogIpcEvent::ShowNotification { .. }
-            | WatchdogIpcEvent::OpenWindow { .. } => {
+            | WatchdogIpcEvent::OpenWindow { .. }
+            | WatchdogIpcEvent::ConfirmRemoteConnect { .. } => {
                 panic!("unexpected watchdog notification event");
             }
         }

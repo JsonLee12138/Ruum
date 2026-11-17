@@ -26,7 +26,9 @@ use ruum_core::tree::Metric;
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
-use crate::state::{ColorMode, Crumb, PANEL_REMS, Ruum, Screen, panel_width};
+use crate::state::{
+    ColorMode, Crumb, HostTabKey, PANEL_REMS, Ruum, Screen, panel_width,
+};
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
 use crate::widgets;
@@ -46,12 +48,17 @@ pub fn root(
     }
     if app.screen == Screen::Sources {
         app.prepare_picker_inputs(window, cx);
+        app.ensure_ssh_form_inputs(window, cx);
     }
     if app.screen == Screen::Settings {
         app.ensure_watchdog_inputs(window, cx);
         if app.watchdog_inputs_need_sync {
             app.watchdog_inputs_need_sync = false;
             app.sync_watchdog_inputs_from_config(window, cx);
+        }
+        if app.webhook_form_needs_sync {
+            app.webhook_form_needs_sync = false;
+            app.sync_webhook_form_inputs(window, cx);
         }
     }
     app.apply_focus(window, cx);
@@ -175,6 +182,9 @@ pub fn root(
     }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
+    }
+    if let Some(dialog) = remote_connect_dialog(app, cx) {
+        root = root.child(dialog);
     }
     if let Some(toast) = toast_overlay(app, cx) {
         root = root.child(toast);
@@ -300,6 +310,56 @@ fn delete_dialog(app: &Ruum, cx: &mut Context<'_, Ruum>) -> impl IntoElement {
             false
         })
         .popup(centred)
+}
+
+fn remote_connect_dialog(
+    app: &Ruum,
+    cx: &mut Context<'_, Ruum>,
+) -> Option<impl IntoElement> {
+    let modal = app.remote_connect_confirm.as_ref()?;
+    let approve = cx.entity().downgrade();
+    let deny = approve.clone();
+    let popup = crate::rail_pages::remote_connect_confirm_card(
+        modal,
+        app.locale,
+        |this, window, cx| {
+            this.approve_remote_connect(cx);
+            this.apply_focus(window, cx);
+        },
+        |this, window, cx| {
+            this.deny_remote_connect(cx);
+            this.apply_focus(window, cx);
+        },
+        cx,
+    );
+    let centred = centred_popup(popup, {
+        let close = deny.clone();
+        move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.deny_remote_connect(cx);
+                this.apply_focus(window, cx);
+            });
+        }
+    });
+    Some(
+        alert_dialog(&app.remote_connect_focus, cx)
+            .open(true)
+            .on_ok(move |_, window, cx| {
+                let _ = approve.update(cx, |this, cx| {
+                    this.approve_remote_connect(cx);
+                    this.apply_focus(window, cx);
+                });
+                false
+            })
+            .on_cancel(move |_, window, cx| {
+                let _ = deny.update(cx, |this, cx| {
+                    this.deny_remote_connect(cx);
+                    this.apply_focus(window, cx);
+                });
+                false
+            })
+            .popup(centred),
+    )
 }
 
 // ── explore ─────────────────────────────────────────────────────────────
@@ -472,10 +532,124 @@ fn top_bar(
                 })),
             crate::i18n::explore::logo_tooltip(app.locale),
         ))
+        .child(host_tabs_strip(app, theme, cx))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
         .child(div().flex_1())
         .child(view_settings(app, window, cx))
+}
+
+/// Horizontally scrollable host tag strip (`Local` unclosable + connected SSH
+/// server tabs with close buttons).
+fn host_tabs_strip(
+    app: &Ruum,
+    theme: &Theme,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let mut strip = div()
+        .id("host-tabs")
+        .debug_selector(|| "host-tabs".into())
+        .max_w(size::HOST_TABS_MAX)
+        .overflow_x_scroll()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::XS);
+
+    let mut ssh_idx = 0usize;
+    for tab in &app.host_tabs {
+        let active = app.active_host_tab == tab.key;
+        let is_local = tab.key == HostTabKey::Local;
+        let tab_label: SharedString = if is_local {
+            crate::i18n::explore::host_tab_local(app.locale).into()
+        } else {
+            tab.label.clone().into()
+        };
+        let selector_name = if is_local {
+            "host-tab-local".to_owned()
+        } else {
+            let name = format!("host-tab-{ssh_idx}");
+            name
+        };
+        let sel_clone = selector_name.clone();
+        let click_key = tab.key.clone();
+        let tab_icon = if is_local {
+            IconName::HardDrive
+        } else {
+            IconName::Network
+        };
+
+        let mut pill = div()
+            .id(SharedString::from(selector_name))
+            .debug_selector(move || sel_clone)
+            .cursor_pointer()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::XS)
+            .px(space::SM)
+            .py(space::XXS)
+            .border_1()
+            .border_color(if active {
+                theme.accent
+            } else {
+                theme.divider()
+            })
+            .bg(if active {
+                theme.selected_fill()
+            } else {
+                theme.normal_fill()
+            })
+            .text_size(text::CAPTION)
+            .text_color(if active {
+                theme.bright
+            } else {
+                theme.secondary
+            })
+            .hover(|s| s.bg(theme.hover_fill()).text_color(theme.bright))
+            .child(gpui_omarchy::icon(tab_icon).size(icon::SM).text_color(
+                if active {
+                    theme.accent
+                } else {
+                    theme.secondary
+                },
+            ))
+            .child(tab_label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.switch_host_tab(click_key.clone(), cx);
+            }));
+
+        if !is_local {
+            let close_id = format!("host-tab-close-{ssh_idx}");
+            let close_sel = close_id.clone();
+            let close_key = tab.key.clone();
+            let close_btn = with_tooltip(
+                div()
+                    .id(SharedString::from(close_id))
+                    .debug_selector(move || close_sel)
+                    .cursor_pointer()
+                    .p(space::XXS)
+                    .hover(|s| s.bg(theme.danger.opacity(0.18)))
+                    .child(
+                        gpui_omarchy::icon(IconName::Close)
+                            .size(icon::SM)
+                            .text_color(theme.secondary),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_host_tab(&close_key, cx);
+                    })),
+                crate::i18n::explore::close_host_tab_tooltip(app.locale),
+            );
+            pill = pill.child(close_btn);
+            ssh_idx += 1;
+        }
+
+        strip = strip.child(pill);
+    }
+
+    strip
 }
 
 /// The trail, from `/`. Above the scanned root, a crumb widens the scan;

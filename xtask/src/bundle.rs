@@ -16,7 +16,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const APP: &str = "ruum.app";
-const EXECUTABLE: &str = "ruum";
+const GUI_EXECUTABLE: &str = "ruum-gui";
+const CLI_EXECUTABLE: &str = "ruum";
 const BUNDLE_ID: &str = "io.github.tobi.ruum";
 /// What the binary is built for at least; `LSMinimumSystemVersion` in
 /// `packaging/macos/Info.plist.in` says the same, and GPUI needs 10.15.7.
@@ -134,7 +135,19 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     tool(
         Command::new(cargo)
             .current_dir(&root)
-            .args(["build", "--release", "--locked", "-p", "ruum-app"])
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "ruum-app",
+                "-p",
+                "ruum-core",
+                "--bin",
+                GUI_EXECUTABLE,
+                "--bin",
+                CLI_EXECUTABLE,
+            ])
             .arg("--target-dir")
             .arg(&target)
             .env("MACOSX_DEPLOYMENT_TARGET", DEPLOYMENT_TARGET),
@@ -153,10 +166,12 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
             .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
     }
 
-    let binary = macos.join(EXECUTABLE);
-    copy(&target.join("release").join(EXECUTABLE), &binary)?;
-    // Local symbols only: the backtrace of a panic still names functions.
-    tool(Command::new("strip").arg("-x").arg(&binary))?;
+    for exe in [GUI_EXECUTABLE, CLI_EXECUTABLE] {
+        let binary = macos.join(exe);
+        copy(&target.join("release").join(exe), &binary)?;
+        // Local symbols only: the backtrace of a panic still names functions.
+        tool(Command::new("strip").arg("-x").arg(&binary))?;
+    }
 
     let plist = fs::read_to_string(root.join("packaging/macos/Info.plist.in"))
         .map_err(|err| format!("cannot read the Info.plist template: {err}"))?;
@@ -274,19 +289,22 @@ fn icon(svg: &Path, scratch: &Path, icns: &Path) -> Result<(), String> {
 /// the hardened runtime withholds, and the Trash is reached through
 /// `NSFileManager`, which asks for no permission.
 fn sign(app: &Path, identity: Option<&str>) -> Result<(), String> {
-    let mut command = Command::new("codesign");
-    command.arg("--force");
-    match identity {
-        Some(identity) => {
-            command
-                .args(["--timestamp", "--options", "runtime", "--sign"])
-                .arg(identity);
+    let cli_helper = app.join("Contents/MacOS").join(CLI_EXECUTABLE);
+    for target in [cli_helper.as_path(), app] {
+        let mut command = Command::new("codesign");
+        command.arg("--force");
+        match identity {
+            Some(identity) => {
+                command
+                    .args(["--timestamp", "--options", "runtime", "--sign"])
+                    .arg(identity);
+            }
+            None => {
+                command.args(["--sign", "-"]);
+            }
         }
-        None => {
-            command.args(["--sign", "-"]);
-        }
+        tool(command.arg(target))?;
     }
-    tool(command.arg(app))?;
     tool(
         Command::new("codesign")
             .args(["--verify", "--strict", "--verbose=2"])
@@ -667,7 +685,7 @@ mod tests {
     #[test]
     fn the_plist_template_names_the_executable_and_takes_the_version() {
         let plist = include_str!("../../packaging/macos/Info.plist.in");
-        assert!(plist.contains(&format!("<string>{EXECUTABLE}</string>")));
+        assert!(plist.contains(&format!("<string>{GUI_EXECUTABLE}</string>")));
         assert!(plist.contains("@VERSION@"));
         assert!(
             plist.contains(&format!("<string>{DEPLOYMENT_TARGET}</string>"))

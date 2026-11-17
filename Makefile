@@ -23,8 +23,10 @@ UNAME := $(shell uname -s)
 MANIFEST = Cargo.toml
 CARGO ?= cargo
 TARGET = target/release/ruum
+GUI_TARGET = target/release/ruum-gui
 ifeq ($(UNAME),Linux)
 TARGET = target/portable/ruum
+GUI_TARGET = target/portable/ruum-gui
 endif
 ICON = assets/ruum.svg
 DESKTOP = packaging/ruum.desktop.in
@@ -74,7 +76,7 @@ build:
 ifeq ($(UNAME),Linux)
 	$(CARGO) xtask portable
 else
-	$(CARGO) build --release
+	$(CARGO) build --release -p ruum-app -p ruum-core --bin ruum-gui --bin ruum
 endif
 
 # For servers: no desktop, GPU, GPUI build, or elevated permissions needed.
@@ -125,6 +127,7 @@ else
 install: build
 	install -d $(BINDIR) $(APPDIR) $(ICONDIR)
 	install -m755 $(TARGET) $(BINDIR)/ruum
+	install -m755 $(GUI_TARGET) $(BINDIR)/ruum-gui
 	install -m644 $(ICON) $(ICONDIR)/ruum.svg
 	VERSION=$$(sed -n 's/^version = "\(.*\)"/\1/p' $(MANIFEST) | head -1) && \
 	sed -e 's|@BINDIR@|$(BINDIR)|' -e "s|@VERSION@|$$VERSION|" \
@@ -136,6 +139,7 @@ install: build
 	@echo
 	@echo "installed:"
 	@echo "  $(BINDIR)/ruum"
+	@echo "  $(BINDIR)/ruum-gui"
 	@echo "  $(APPDIR)/ruum.desktop"
 	@echo "  $(ICONDIR)/ruum.svg"
 	@if command -v desktop-file-validate >/dev/null 2>&1; then \
@@ -144,7 +148,7 @@ install: build
 	$(call check_install_path,ruum)
 
 uninstall:
-	rm -f $(BINDIR)/ruum $(APPDIR)/ruum.desktop $(ICONDIR)/ruum.svg
+	rm -f $(BINDIR)/ruum $(BINDIR)/ruum-gui $(APPDIR)/ruum.desktop $(ICONDIR)/ruum.svg
 	@if command -v update-desktop-database >/dev/null 2>&1; then \
 	    update-desktop-database $(APPDIR) 2>/dev/null || true; \
 	fi

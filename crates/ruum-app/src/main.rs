@@ -51,18 +51,25 @@ use gpui_kit::{
 };
 use ruum_core::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmRequest,
+    RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
 };
 use ruum_core::scan::ScanOptions;
-use state::{CleanupConfirmModal, Ruum, Screen};
+use ruum_core::storage::StorageDb;
+use state::{CleanupConfirmModal, RemoteConnectConfirmModal, Ruum, Screen};
 
-/// What the command line asked for.
+/// Resolve the sibling `ruum` CLI binary so prompts and MCP commands point to
+/// `ruum` rather than `ruum-gui`.
+pub(crate) fn resolve_cli_exe() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| ruum_core::cli_install::resolve_cli_binary(&exe).ok())
+        .unwrap_or_else(|| PathBuf::from("ruum"))
+}
+
+/// What the GUI command line asked for.
 #[derive(Debug)]
-struct Args {
-    root: PathBuf,
-    remote: Option<String>,
-    remote_disk: bool,
-    check: bool,
-    choose_root: bool,
+pub(crate) struct GuiArgs {
+    pub(crate) root: PathBuf,
     options: ScanOptions,
     depth: u32,
     power: Option<power::PowerEfficiency>,
@@ -79,72 +86,37 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    if extract_scanner()? || run_mcp()? || run_watchdog()? {
-        return Ok(());
-    }
-    if let Some(notify_args) =
-        notifications::parse_notify_wait_args(std::env::args_os().skip(1))
+    if let Some(internal) =
+        parse_internal_gui_command(std::env::args_os().skip(1))?
     {
-        notifications::run_notify_wait_command(&notify_args)?;
-        return Ok(());
-    }
-    if let Some(dialog_args) =
-        parse_confirm_dialog_args(std::env::args_os().skip(1))
-    {
-        return run_confirm_dialog(dialog_args);
-    }
-    let saved = power::settings_path()
-        .map_or_else(
-            || Ok(power::PowerEfficiency::default()),
-            |path| power::load(&path),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "{}",
-                i18n::messages::cannot_load_power(
-                    &error.to_string(),
-                    i18n::Locale::current(),
-                )
-            );
-            power::PowerEfficiency::default()
-        });
-    let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
-
-    if args.check {
-        let host = args
-            .remote
-            .as_deref()
-            .context("--check requires ruum ssh HOST")?;
-        let scan = ruum_core::remote::RemoteScan::spawn(
-            host,
-            &ruum_core::remote::Request {
-                root: (!args.root.as_os_str().is_empty())
-                    .then(|| args.root.clone()),
-                disk: args.remote_disk,
-                options: args.options,
-            },
-        )?;
-        loop {
-            if let Some(result) = scan.poll() {
-                let snapshot = result?;
-                println!(
-                    "{}",
-                    i18n::messages::check_summary(
-                        host,
-                        &snapshot.header.root.display().to_string(),
-                        snapshot.tree.bytes,
-                        snapshot.tree.files,
-                        snapshot.tree.dirs,
-                        i18n::Locale::current(),
-                    )
-                );
-                return Ok(());
+        return match internal {
+            InternalGuiCommand::ConfirmCleanup(dialog_args) => {
+                run_confirm_dialog(dialog_args)
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+            InternalGuiCommand::ConfirmRemoteConnect(dialog_args) => {
+                run_remote_connect_confirm_dialog(dialog_args)
+            }
+            InternalGuiCommand::ShowNotification(notif_args) => {
+                run_show_notification(notif_args);
+                Ok(())
+            }
+        };
     }
 
-    // When the app executable is reached through the command-line symlink,
+    let db_opt = StorageDb::open_default().ok();
+    let app_settings = db_opt
+        .as_ref()
+        .and_then(|db| db.load_app_settings().ok())
+        .unwrap_or_default();
+    let saved = power::PowerEfficiency::parse(&app_settings.power_preset)
+        .unwrap_or_default();
+    let mut args =
+        parse_gui_args_with_power(std::env::args_os().skip(1), saved)?;
+    args.depth = app_settings.default_depth.clamp(1, 6);
+    args.options.apparent_size = app_settings.apparent_size;
+    args.options.include_hidden = app_settings.include_hidden;
+
+    // When the app executable is reached through a terminal launcher,
     // cmux sends SIGTERM to its foreground process group as AppKit takes
     // focus. Spawn once into a separate group before AppKit starts. Restrict
     // this to interactive cmux sessions so scripts retain normal foreground
@@ -154,7 +126,7 @@ fn run() -> Result<()> {
         && std::env::var_os("CMUX_SURFACE_ID").is_some()
         && std::env::var_os("RUUM_CMUX_DETACHED").is_none()
     {
-        Command::new(std::env::current_exe().context("find ruum")?)
+        Command::new(std::env::current_exe().context("find ruum-gui")?)
             .args(std::env::args_os().skip(1))
             .env("RUUM_CMUX_DETACHED", "1")
             .stdin(Stdio::null())
@@ -163,21 +135,25 @@ fn run() -> Result<()> {
             // Zero makes the child the leader of a new process group.
             .process_group(0)
             .spawn()
-            .context("start ruum")?;
+            .context("start ruum-gui")?;
         return Ok(());
     }
 
     let depth = args.depth;
     let title_root = args.root.clone();
     let home_at_boot = std::env::home_dir();
-    let native_look = appearance::follows_system(home_at_boot.as_deref());
+    let native_look = if db_opt.is_some() {
+        app_settings.follow_system_appearance
+    } else {
+        appearance::follows_system(home_at_boot.as_deref())
+    };
     let launch = LaunchConfig {
         root: args.root,
         options: args.options.clone(),
         depth,
-        remote: args.remote.clone(),
-        remote_disk: args.remote_disk,
-        choose_root: args.choose_root,
+        remote: None,
+        remote_disk: false,
+        choose_root: false,
         power: args.power,
         native_look,
         initial_screen: args.initial_screen,
@@ -205,14 +181,16 @@ fn run() -> Result<()> {
             };
         let (in_proc_tx, in_proc_rx) = channel();
         let (in_proc_notif_tx, in_proc_notif_rx) = channel();
-        let initial_watchdog_config =
-            ruum_core::watchdog_config::watchdog_config_path()
-                .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
-                .unwrap_or_default();
+        let initial_watchdog_config = StorageDb::open_default()
+            .ok()
+            .and_then(|db| db.watchdog().ok())
+            .and_then(|svc| svc.load_config().ok())
+            .unwrap_or_default();
         cx.set_global(AppRuntime {
             launch,
             main_window: None,
             confirm_window: None,
+            remote_connect_window: None,
             tray: None,
             ipc_rx,
             ipc_server,
@@ -318,6 +296,9 @@ pub struct CleanupConfirmWindow {
     pub confirm_only: bool,
     pub handled: bool,
     pub locale: i18n::Locale,
+    pub db_path: Option<PathBuf>,
+    pub remote_session: Option<Arc<ruum_core::ssh_session::SshSession>>,
+    pub remote_header: Option<ruum_core::remote::Header>,
 }
 
 impl CleanupConfirmWindow {
@@ -334,7 +315,23 @@ impl CleanupConfirmWindow {
             confirm_only,
             handled: false,
             locale: i18n::Locale::current(),
+            db_path: None,
+            remote_session: None,
+            remote_header: None,
         }
+    }
+
+    pub fn set_target_context(
+        &mut self,
+        db_path: Option<PathBuf>,
+        remote_profile_id: Option<String>,
+        remote_session: Option<Arc<ruum_core::ssh_session::SshSession>>,
+        remote_header: Option<ruum_core::remote::Header>,
+    ) {
+        self.db_path = db_path;
+        self.modal.remote_profile_id = remote_profile_id;
+        self.remote_session = remote_session;
+        self.remote_header = remote_header;
     }
 
     #[cfg(test)]
@@ -353,6 +350,9 @@ impl CleanupConfirmWindow {
         self.modal =
             CleanupConfirmModal::new(request, responder, response_file);
         self.handled = false;
+        self.db_path = None;
+        self.remote_session = None;
+        self.remote_header = None;
         cx.notify();
     }
 
@@ -388,14 +388,49 @@ impl CleanupConfirmWindow {
         // Read before calling `modal.confirm()`, which consumes `responder`.
         let is_in_app = self.modal.responder.is_none()
             && self.modal.response_file.is_none();
+        let selected_bytes = self.modal.selected_bytes();
         let decision = self.modal.confirm();
         let confirm_only = self.confirm_only;
-        if is_in_app
-            && let CleanupConfirmDecision::Confirmed { selected_paths } =
-                decision
+        let locale = self.locale;
+        let mut sync_fallback_notif: Option<(String, String)> = None;
+        if let CleanupConfirmDecision::Confirmed { selected_paths } = decision
+            && !selected_paths.is_empty()
         {
-            let approved_items: Vec<ruum_core::watchdog_config::ProposalItem> =
-                self.modal
+            let selected_count = selected_paths.len();
+            let started_title =
+                i18n::messages::cleanup_started_notif_title(locale);
+            let started_body = i18n::messages::cleanup_started_notif_body(
+                selected_count,
+                selected_bytes,
+                locale,
+            );
+            if confirm_only
+                && !cfg!(test)
+                && !notifications::has_native_notification_identity()
+            {
+                sync_fallback_notif =
+                    Some((started_title.to_owned(), started_body));
+            } else {
+                post_app_notification(
+                    ruum_core::watchdog::NOTIF_TAG_CLEANUP_STARTED,
+                    started_title,
+                    &started_body,
+                    cx,
+                );
+            }
+            if is_in_app {
+                update_open_main_window(cx, |app, cx| {
+                    let msg = i18n::messages::cleanup_started_notif_body(
+                        selected_count,
+                        selected_bytes,
+                        app.locale,
+                    );
+                    app.push_toast(msg, gpui_omarchy::Status::Neutral, cx);
+                });
+                let approved_items: Vec<
+                    ruum_core::watchdog_config::ProposalItem,
+                > = self
+                    .modal
                     .request
                     .items
                     .iter()
@@ -410,48 +445,149 @@ impl CleanupConfirmWindow {
                         )
                     })
                     .collect();
-            if !approved_items.is_empty() {
-                let root = self.modal.request.root.clone();
-                let locale = self.locale;
-                let task = cx.background_executor().spawn(async move {
-                    ruum_core::watchdog::execute_confirmed_cleanup(
-                        &approved_items,
-                        &root,
-                    )
-                });
-                cx.spawn(async move |_, cx| {
-                    let (bytes, count) = task.await;
-                    let summary = i18n::messages::cleaned_items_summary(
-                        count, bytes, locale,
-                    );
-                    cx.update(|cx| {
-                        if !cfg!(test) && count > 0 {
-                            post_app_notification(
-                                ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
-                                i18n::messages::cleanup_complete_notif_title(
-                                    locale,
-                                ),
-                                &summary,
-                                cx,
-                            );
-                        }
-                        refresh_tray_status(cx);
-                        update_open_main_window(cx, |app, cx| {
-                            app.reload_watchdog_state();
-                            app.notice = Some((
-                                i18n::messages::cleaned_items_summary(
-                                    count, bytes, app.locale,
-                                ),
-                                gpui_omarchy::Status::Success,
-                            ));
-                            cx.notify();
+                if !approved_items.is_empty() {
+                    if self.modal.remote_profile_id.is_some()
+                        && let (Some(session), Some(header)) = (
+                            self.remote_session.clone(),
+                            self.remote_header.clone(),
+                        )
+                    {
+                        let targets: Vec<ruum_core::removal::Target> =
+                            approved_items
+                                .iter()
+                                .map(|item| ruum_core::removal::Target {
+                                    path: item.path.clone(),
+                                    bytes: item.bytes,
+                                    is_dir: false,
+                                    hidden: item.path.file_name().is_some_and(
+                                        |n| {
+                                            n.to_string_lossy().starts_with('.')
+                                        },
+                                    ),
+                                })
+                                .collect();
+                        let count = targets.len();
+                        let bytes: u64 = targets.iter().map(|t| t.bytes).sum();
+                        let task = cx.background_executor().spawn(async move {
+                            ruum_core::remote_trash::execute_remote_trash_with_session(
+                                &session, &targets, &header,
+                            )
+                            .map_err(|err| err.to_string())
                         });
-                    });
-                })
-                .detach();
+                        cx.spawn(async move |_, cx| {
+                            let res = task.await;
+                            cx.update(|cx| match res {
+                                Ok(()) => {
+                                    let summary =
+                                        i18n::messages::cleaned_items_summary(
+                                            count, bytes, locale,
+                                        );
+                                    if count > 0 {
+                                        post_app_notification(
+                                            ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
+                                            i18n::messages::cleanup_complete_notif_title(
+                                                locale,
+                                            ),
+                                            &summary,
+                                            cx,
+                                        );
+                                    }
+                                    update_open_main_window(cx, |app, cx| {
+                                        app.push_toast(
+                                            i18n::messages::cleaned_items_summary(
+                                                count, bytes, app.locale,
+                                            ),
+                                            gpui_omarchy::Status::Success,
+                                            cx,
+                                        );
+                                    });
+                                }
+                                Err(err) => {
+                                    update_open_main_window(cx, |app, cx| {
+                                        app.push_toast(
+                                            i18n::messages::ssh_remote_cleanup_failed(
+                                                &err, app.locale,
+                                            ),
+                                            gpui_omarchy::Status::Error,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            });
+                        })
+                        .detach();
+                    } else {
+                        let root = self.modal.request.root.clone();
+                        let db_path = self.db_path.clone();
+                        let task = cx.background_executor().spawn(async move {
+                            let (bytes, count, cleaned_paths) =
+                                ruum_core::watchdog::execute_confirmed_cleanup_tracked(
+                                    &approved_items,
+                                    &root,
+                                );
+                            let mut pruned_paths = cleaned_paths;
+                            for item in &approved_items {
+                                if !item.path.exists()
+                                    && !pruned_paths.contains(&item.path)
+                                {
+                                    pruned_paths.push(item.path.clone());
+                                }
+                            }
+                            if !pruned_paths.is_empty()
+                                && let Some(path) = db_path.as_deref()
+                                && let Ok(db) =
+                                    ruum_core::storage::StorageDb::open(path)
+                            {
+                                let now_secs = now_unix_secs();
+                                let _ = db.prune_ai_state_paths(
+                                    &pruned_paths,
+                                    now_secs,
+                                );
+                            }
+                            (bytes, count, pruned_paths)
+                        });
+                        cx.spawn(async move |_, cx| {
+                            let (bytes, count, pruned_paths) = task.await;
+                            let summary =
+                                i18n::messages::cleaned_items_summary(
+                                    count, bytes, locale,
+                                );
+                            cx.update(|cx| {
+                                if count > 0 {
+                                    post_app_notification(
+                                        ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
+                                        i18n::messages::cleanup_complete_notif_title(
+                                            locale,
+                                        ),
+                                        &summary,
+                                        cx,
+                                    );
+                                }
+                                refresh_tray_status(cx);
+                                update_open_main_window(cx, |app, cx| {
+                                    app.prune_local_ai_proposal(&pruned_paths);
+                                    app.reload_watchdog_state();
+                                    app.notice = Some((
+                                        i18n::messages::cleaned_items_summary(
+                                            count, bytes, app.locale,
+                                        ),
+                                        gpui_omarchy::Status::Success,
+                                    ));
+                                    cx.notify();
+                                });
+                            });
+                        })
+                        .detach();
+                    }
+                }
             }
         }
         window.remove_window();
+        if let Some((title, body)) = sync_fallback_notif {
+            let _ = ruum_core::watchdog::send_fallback_os_notification(
+                &title, &body,
+            );
+        }
         if confirm_only {
             app_menu::request_quit(cx);
         }
@@ -481,6 +617,41 @@ pub fn open_confirm_window(
     cx: &mut App,
 ) -> Option<WindowHandle<CleanupConfirmWindow>> {
     open_confirm_window_with_mode(request, responder, response_file, false, cx)
+}
+
+/// Open (or update) a local Watchdog/AI cleanup confirmation window with
+/// `ruum.db` pruning wired on completion.
+pub fn open_local_confirm_window(
+    request: CleanupConfirmRequest,
+    db_path: Option<PathBuf>,
+    cx: &mut App,
+) -> Option<WindowHandle<CleanupConfirmWindow>> {
+    let handle = open_confirm_window(request, None, None, cx)?;
+    let _ = handle.update(cx, |win, _, _| {
+        win.set_target_context(db_path, None, None, None);
+    });
+    Some(handle)
+}
+
+/// Open (or update) a remote SSH AI cleanup confirmation window scoped to a
+/// specific `SshSession` and `Header` (never pruning local Watchdog state).
+pub fn open_remote_confirm_window(
+    request: CleanupConfirmRequest,
+    remote_profile_id: String,
+    session: Arc<ruum_core::ssh_session::SshSession>,
+    header: ruum_core::remote::Header,
+    cx: &mut App,
+) -> Option<WindowHandle<CleanupConfirmWindow>> {
+    let handle = open_confirm_window(request, None, None, cx)?;
+    let _ = handle.update(cx, |win, _, _| {
+        win.set_target_context(
+            None,
+            Some(remote_profile_id),
+            Some(session),
+            Some(header),
+        );
+    });
+    Some(handle)
 }
 
 fn open_confirm_window_with_mode(
@@ -589,6 +760,211 @@ fn open_confirm_window_with_mode(
     Some(window)
 }
 
+/// Standalone window confirming an MCP tool's request to connect over SSH.
+#[derive(Debug)]
+pub struct RemoteConnectConfirmWindow {
+    pub modal: RemoteConnectConfirmModal,
+    pub focus: FocusHandle,
+    pub confirm_only: bool,
+    pub handled: bool,
+    pub locale: i18n::Locale,
+}
+
+impl RemoteConnectConfirmWindow {
+    pub fn new(
+        request: RemoteConnectConfirmRequest,
+        responder: Option<Sender<RemoteConnectConfirmDecision>>,
+        response_file: Option<PathBuf>,
+        confirm_only: bool,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> Self {
+        Self {
+            modal: RemoteConnectConfirmModal::new(
+                request,
+                responder,
+                response_file,
+            ),
+            focus: cx.focus_handle(),
+            confirm_only,
+            handled: false,
+            locale: i18n::Locale::current(),
+        }
+    }
+
+    pub fn replace_request(
+        &mut self,
+        request: RemoteConnectConfirmRequest,
+        responder: Option<Sender<RemoteConnectConfirmDecision>>,
+        response_file: Option<PathBuf>,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        self.ensure_denied();
+        self.modal =
+            RemoteConnectConfirmModal::new(request, responder, response_file);
+        self.handled = false;
+        cx.notify();
+    }
+
+    /// Fail closed: if no explicit approval happened yet, emit `Denied`.
+    pub fn ensure_denied(&mut self) {
+        if !self.handled {
+            self.handled = true;
+            self.modal.deny();
+        }
+    }
+
+    pub fn deny(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        self.ensure_denied();
+        let confirm_only = self.confirm_only;
+        window.remove_window();
+        if confirm_only {
+            app_menu::request_quit(cx);
+        }
+    }
+
+    pub fn approve(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        if self.handled {
+            return;
+        }
+        self.handled = true;
+        self.modal.approve();
+        let confirm_only = self.confirm_only;
+        window.remove_window();
+        if confirm_only {
+            app_menu::request_quit(cx);
+        }
+    }
+}
+
+impl Render for RemoteConnectConfirmWindow {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> impl IntoElement {
+        rail_pages::remote_connect_confirm_view(
+            &self.modal,
+            &self.focus,
+            self.locale,
+            cx,
+        )
+    }
+}
+
+pub(crate) fn open_remote_connect_confirm_window_with_mode(
+    request: RemoteConnectConfirmRequest,
+    responder: Option<Sender<RemoteConnectConfirmDecision>>,
+    response_file: Option<PathBuf>,
+    confirm_only: bool,
+    cx: &mut App,
+) -> Option<WindowHandle<RemoteConnectConfirmWindow>> {
+    let windows = cx.windows();
+    let existing = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.remote_connect_window)
+        .filter(|h| windows.contains(&(*h).into()));
+
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(Some((
+        request,
+        responder,
+        response_file,
+    ))));
+
+    if let Some(handle) = existing {
+        let slot = std::rc::Rc::clone(&pending);
+        let updated = handle.update(cx, move |win, window, cx| {
+            if let Some((req, resp, file)) = slot.borrow_mut().take() {
+                win.replace_request(req, resp, file, cx);
+            }
+            let focus = win.focus.clone();
+            window.focus(&focus, cx);
+            window.activate_window();
+        });
+        if updated.is_ok() {
+            cx.activate(true);
+            return Some(handle);
+        }
+    }
+
+    let (request, responder, response_file) = pending.borrow_mut().take()?;
+
+    let native_look = cx.try_global::<AppRuntime>().map_or_else(
+        || {
+            let home = std::env::home_dir();
+            appearance::follows_system(home.as_deref())
+        },
+        |rt| rt.launch.native_look,
+    );
+
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(
+                    gpui_kit::Bounds::new(
+                        gpui_kit::point(px(240.), px(180.)),
+                        size(px(560.), px(380.)),
+                    ),
+                )),
+                titlebar: Some(gpui_kit::TitlebarOptions {
+                    title: Some(
+                        i18n::messages::title_confirm_remote_connect(
+                            i18n::Locale::current(),
+                        )
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                app_id: Some("ruum".to_owned()),
+                window_min_size: Some(size(px(460.), px(320.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                if native_look {
+                    appearance::follow(window);
+                }
+                let entity = cx.new(|cx| {
+                    RemoteConnectConfirmWindow::new(
+                        request,
+                        responder,
+                        response_file,
+                        confirm_only,
+                        cx,
+                    )
+                });
+                let close_entity = entity.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    let _ = close_entity.update(cx, |win, _| {
+                        win.ensure_denied();
+                    });
+                    if confirm_only {
+                        app_menu::request_quit(cx);
+                    }
+                    true
+                });
+                entity
+            },
+        )
+        .ok()?;
+
+    let _ = window.update(cx, |win, window, cx| {
+        let focus = win.focus.clone();
+        window.focus(&focus, cx);
+        window.activate_window();
+    });
+    cx.activate(true);
+
+    with_runtime_mut(cx, |rt| rt.remote_connect_window = Some(window));
+    Some(window)
+}
+
 pub(crate) fn with_runtime_mut(cx: &mut App, f: impl FnOnce(&mut AppRuntime)) {
     if cx.has_global::<AppRuntime>() {
         f(cx.global_mut::<AppRuntime>());
@@ -609,9 +985,10 @@ pub fn refresh_tray_status(cx: &mut App) {
         .as_deref()
         .and_then(|h| ruum_core::space::space_info(h).ok())
         .map(|s| s.available);
-    let has_proposal = ruum_core::watchdog_config::watchdog_state_path()
-        .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
-        .and_then(|s| s.last_proposal)
+    let has_proposal = StorageDb::open_default()
+        .ok()
+        .and_then(|db| db.load_ai_state().ok())
+        .and_then(|s| s.parse_proposal().ok().flatten())
         .is_some_and(|p| !p.items.is_empty());
 
     if let Some(rt) = cx.try_global::<AppRuntime>()
@@ -623,7 +1000,7 @@ pub fn refresh_tray_status(cx: &mut App) {
 
 /// Update cached runtime Watchdog config and optionally reset poll timer.
 pub(crate) fn notify_watchdog_config_saved(
-    new_cfg: &ruum_core::watchdog_config::WatchdogConfig,
+    new_cfg: &ruum_watchdog::WatchdogConfig,
     reset_poll: bool,
     cx: &mut App,
 ) {
@@ -658,6 +1035,7 @@ pub(crate) struct AppRuntime {
     launch: LaunchConfig,
     pub(crate) main_window: Option<WindowHandle<Ruum>>,
     confirm_window: Option<WindowHandle<CleanupConfirmWindow>>,
+    remote_connect_window: Option<WindowHandle<RemoteConnectConfirmWindow>>,
     tray: Option<tray_menu::TrayMenu>,
     ipc_rx: Option<Receiver<watchdog_runtime::WatchdogIpcEvent>>,
     #[allow(
@@ -672,7 +1050,7 @@ pub(crate) struct AppRuntime {
     last_watchdog_poll: Option<Instant>,
     background_analysis_in_flight: bool,
     pub(crate) service_sync_in_flight: bool,
-    watchdog_config: ruum_core::watchdog_config::WatchdogConfig,
+    watchdog_config: ruum_watchdog::WatchdogConfig,
 }
 
 impl Global for AppRuntime {}
@@ -700,6 +1078,7 @@ pub(crate) fn install_test_runtime(
         },
         main_window,
         confirm_window: None,
+        remote_connect_window: None,
         tray: None,
         ipc_rx: None,
         ipc_server: None,
@@ -710,7 +1089,7 @@ pub(crate) fn install_test_runtime(
         last_watchdog_poll: None,
         background_analysis_in_flight: false,
         service_sync_in_flight: false,
-        watchdog_config: ruum_core::watchdog_config::WatchdogConfig::default(),
+        watchdog_config: ruum_watchdog::WatchdogConfig::default(),
     });
 }
 
@@ -1007,7 +1386,8 @@ where
     let existing = cx
         .try_global::<AppRuntime>()
         .and_then(|rt| rt.main_window)
-        .filter(|h| windows.contains(&(*h).into()));
+        .filter(|h| windows.contains(&(*h).into()))
+        .or_else(|| windows.into_iter().find_map(|win| win.downcast::<Ruum>()));
     if let Some(handle) = existing {
         let _ = handle.update(cx, |app, _, cx| f(app, cx));
     }
@@ -1097,6 +1477,20 @@ fn poll_app_runtime(cx: &mut App) {
             watchdog_runtime::WatchdogIpcEvent::OpenWindow { tag } => {
                 activate_window_for_notification_tag(&tag, cx);
             }
+            watchdog_runtime::WatchdogIpcEvent::ConfirmRemoteConnect {
+                request,
+                responder,
+            } => {
+                open_or_navigate_main_window(None, cx);
+                update_open_main_window(cx, |app, cx| {
+                    app.enqueue_remote_connect_confirm(
+                        request,
+                        Some(responder),
+                        None,
+                        cx,
+                    );
+                });
+            }
         }
     }
 
@@ -1130,6 +1524,7 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
     }
     let confirm_tx = rt.in_proc_confirm_tx.clone();
     let notif_tx = rt.in_proc_notif_tx.clone();
+    let exe = resolve_cli_exe();
     with_runtime_mut(cx, |rt| {
         rt.last_watchdog_poll = Some(Instant::now());
         rt.background_analysis_in_flight = true;
@@ -1143,32 +1538,17 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         ) {
             return;
         }
-        let Some(cfg_path) = ruum_core::watchdog_config::watchdog_config_path()
-        else {
-            return;
-        };
-        let Some(state_path) =
-            ruum_core::watchdog_config::watchdog_state_path()
-        else {
+        let Ok(db) = StorageDb::open_default() else {
             return;
         };
         let Some(home) = std::env::home_dir() else {
             return;
         };
-        let exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
         let now_secs = now_unix_secs();
         let adapter = InProcessConfirmAdapter { tx: confirm_tx };
         let notifier = InProcessNotificationAdapter { tx: notif_tx };
-        let _ = ruum_core::watchdog::run_once(
-            &cfg_path,
-            &state_path,
-            &home,
-            &exe,
-            now_secs,
-            &runner,
-            &adapter,
-            &notifier,
+        let _ = ruum_core::watchdog::run_once_with_db(
+            &db, &home, &exe, now_secs, &runner, &adapter, &notifier,
         );
     });
 
@@ -1193,11 +1573,12 @@ fn trigger_tray_space_check(cx: &App) {
         let home = std::env::home_dir()?;
         let info = ruum_core::space::space_info(&home).ok()?;
         let now_secs = now_unix_secs();
-        if let Some(path) = ruum_core::watchdog_config::watchdog_state_path() {
-            let mut st = ruum_core::watchdog_config::load_state(&path)
-                .unwrap_or_default();
+        if let Ok(db) = StorageDb::open_default()
+            && let Ok(svc) = db.watchdog()
+        {
+            let mut st = svc.load_state().unwrap_or_default();
             st.last_checked_secs = Some(now_secs);
-            let _ = ruum_core::watchdog_config::save_state(&path, &st);
+            let _ = svc.save_state(&st);
         }
         Some((info, now_secs))
     });
@@ -1240,34 +1621,28 @@ fn trigger_background_ai_analysis(cx: &mut App) {
     {
         return;
     }
+    let exe = resolve_cli_exe();
     with_runtime_mut(cx, |rt| rt.background_analysis_in_flight = true);
 
-    let task = cx.background_executor().spawn(async {
+    let task = cx.background_executor().spawn(async move {
         let home = std::env::home_dir().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "cannot find home directory",
             )
         })?;
-        let cfg = ruum_core::watchdog_config::watchdog_config_path()
-            .and_then(|p| ruum_core::watchdog_config::load_config(&p).ok())
-            .unwrap_or_default();
-        let exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ruum"));
+        let db = StorageDb::open_default().map_err(std::io::Error::other)?;
+        let ai_cfg = db.load_ai_config().unwrap_or_default();
         let now_secs = now_unix_secs();
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
-        let proposal = ruum_core::ai_cli::run_analysis(
-            &cfg, &home, &exe, now_secs, &runner,
+        let proposal = ruum_core::ai_cli::run_analysis_for_config(
+            &ai_cfg, &home, &exe, now_secs, &runner,
         )
         .map_err(std::io::Error::other)?;
-        if let Some(state_path) =
-            ruum_core::watchdog_config::watchdog_state_path()
-        {
-            let mut st = ruum_core::watchdog_config::load_state(&state_path)
+        let ai_state =
+            ruum_core::storage::AiState::from_proposal(&proposal, now_secs)
                 .unwrap_or_default();
-            st.last_proposal = Some(proposal.clone());
-            let _ = ruum_core::watchdog_config::save_state(&state_path, &st);
-        }
+        let _ = db.save_ai_state(&ai_state);
         Ok::<_, std::io::Error>((home, proposal))
     });
 
@@ -1296,7 +1671,10 @@ fn trigger_background_ai_analysis(cx: &mut App) {
                         let request = state::proposal_confirm_request(
                             home, &proposal, locale,
                         );
-                        open_confirm_window(request, None, None, cx);
+                        let db_path = StorageDb::open_default()
+                            .ok()
+                            .map(|db| db.db_path().to_path_buf());
+                        open_local_confirm_window(request, db_path, cx);
                     }
                 }
                 Err(err) => {
@@ -1314,9 +1692,11 @@ fn trigger_background_ai_analysis(cx: &mut App) {
 }
 
 fn review_latest_proposal_from_tray(cx: &mut App) {
-    let proposal = ruum_core::watchdog_config::watchdog_state_path()
-        .and_then(|p| ruum_core::watchdog_config::load_state(&p).ok())
-        .and_then(|s| s.last_proposal);
+    let db = StorageDb::open_default().ok();
+    let db_path = db.as_ref().map(|d| d.db_path().to_path_buf());
+    let proposal = db
+        .and_then(|db| db.load_ai_state().ok())
+        .and_then(|s| s.parse_proposal().ok().flatten());
     let Some(prop) = proposal.filter(|p| !p.items.is_empty()) else {
         open_or_navigate_main_window(Some(Screen::Watchdog), cx);
         return;
@@ -1329,7 +1709,7 @@ fn review_latest_proposal_from_tray(cx: &mut App) {
     };
     let request =
         state::proposal_confirm_request(home, &prop, i18n::Locale::current());
-    open_confirm_window(request, None, None, cx);
+    open_local_confirm_window(request, db_path, cx);
 }
 
 fn now_unix_secs() -> u64 {
@@ -1338,190 +1718,139 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Extraction works without a display or GPUI initialization.
-fn extract_scanner() -> Result<bool> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.first().is_none_or(|arg| arg != "extract-scanner") {
-        return Ok(false);
-    }
-    anyhow::ensure!(args.len() == 3, "usage: ruum extract-scanner ARCH OUTPUT");
-    let archive = ruum_core::payload::Archive::current()?
-        .context("no embedded scanners; build with cargo xtask portable")?;
-    let arch = args[1].to_str().context("ARCH must be x86_64 or aarch64")?;
-    let (_, bytes) = archive.load(arch)?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args[2])?;
-    std::io::Write::write_all(&mut output, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        output.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    }
-    println!(
-        "{}",
-        i18n::messages::extracted_scanner(
-            arch,
-            &PathBuf::from(&args[2]).display().to_string(),
-            i18n::Locale::current(),
-        )
-    );
-    Ok(true)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum McpCommand {
-    NotMcp,
-    Serve { read_only: bool },
-    Help,
-}
-
-fn parse_mcp_command<I, S>(args: I) -> Result<McpCommand>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<std::ffi::OsString>,
-{
-    let mut iter = args.into_iter().map(Into::into);
-    let Some(first) = iter.next() else {
-        return Ok(McpCommand::NotMcp);
-    };
-    if first != "mcp" {
-        return Ok(McpCommand::NotMcp);
-    }
-    let mut read_only = false;
-    for arg in iter {
-        if arg == "-h" || arg == "--help" {
-            return Ok(McpCommand::Help);
-        } else if arg == "--read-only" {
-            read_only = true;
-        } else {
-            anyhow::bail!(
-                "unknown option for `ruum mcp`; try `ruum mcp --help`"
-            );
-        }
-    }
-    Ok(McpCommand::Serve { read_only })
-}
-
-/// Serve the Model Context Protocol over stdio without initializing GPUI.
-fn run_mcp() -> Result<bool> {
-    match parse_mcp_command(std::env::args_os().skip(1))? {
-        McpCommand::NotMcp => Ok(false),
-        McpCommand::Help => {
-            println!("{}", i18n::messages::mcp_help(i18n::Locale::current()));
-            Ok(true)
-        }
-        McpCommand::Serve { read_only } => {
-            if read_only {
-                ruum_core::mcp::serve_stdio_read_only()?;
-            } else {
-                ruum_core::mcp::serve_stdio()?;
-            }
-            Ok(true)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WatchdogCommand {
-    NotWatchdog,
-    RunLoop,
-    RunOnce,
-    Help,
-}
-
-fn parse_watchdog_command<I, S>(args: I) -> Result<WatchdogCommand>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<std::ffi::OsString>,
-{
-    let mut iter = args.into_iter().map(Into::into);
-    let Some(first) = iter.next() else {
-        return Ok(WatchdogCommand::NotWatchdog);
-    };
-    if first != "watchdog" {
-        return Ok(WatchdogCommand::NotWatchdog);
-    }
-    let mut once = false;
-    for arg in iter {
-        if arg == "-h" || arg == "--help" {
-            return Ok(WatchdogCommand::Help);
-        } else if arg == "--once" {
-            once = true;
-        } else {
-            anyhow::bail!(
-                "unknown option for `ruum watchdog`; try `ruum watchdog --help`"
-            );
-        }
-    }
-    if once {
-        Ok(WatchdogCommand::RunOnce)
-    } else {
-        Ok(WatchdogCommand::RunLoop)
-    }
-}
-
-/// Run volume monitoring and AI cleanup poller without initializing GPUI.
-fn run_watchdog() -> Result<bool> {
-    match parse_watchdog_command(std::env::args_os().skip(1))? {
-        WatchdogCommand::NotWatchdog => Ok(false),
-        WatchdogCommand::Help => {
-            println!(
-                "{}",
-                i18n::messages::watchdog_help(i18n::Locale::current())
-            );
-            Ok(true)
-        }
-        WatchdogCommand::RunOnce => {
-            let _ = ruum_core::watchdog::run_default_once_with_notifier(
-                &notifications::DesktopNotificationAdapter {
-                    detached_once: true,
-                },
-            )?;
-            Ok(true)
-        }
-        WatchdogCommand::RunLoop => {
-            let cancel = std::sync::atomic::AtomicBool::new(false);
-            ruum_core::watchdog::run_default_loop_with_notifier(
-                &cancel,
-                &notifications::DesktopNotificationAdapter {
-                    detached_once: false,
-                },
-            )?;
-            Ok(true)
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct ConfirmDialogArgs {
     req_path: PathBuf,
     resp_path: PathBuf,
 }
 
-fn parse_confirm_dialog_args<I, S>(args: I) -> Option<ConfirmDialogArgs>
+#[derive(Debug, PartialEq, Eq)]
+struct ShowNotificationArgs {
+    tag: String,
+    title: String,
+    body: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InternalGuiCommand {
+    ConfirmCleanup(ConfirmDialogArgs),
+    ConfirmRemoteConnect(ConfirmDialogArgs),
+    ShowNotification(ShowNotificationArgs),
+}
+
+fn parse_internal_gui_command<I, S>(
+    args: I,
+) -> Result<Option<InternalGuiCommand>>
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
 {
-    let mut iter = args.into_iter().map(Into::into);
-    let mut req_path = None;
-    let mut resp_path = None;
+    let items: Vec<std::ffi::OsString> =
+        args.into_iter().map(Into::into).collect();
+    if items.is_empty() {
+        return Ok(None);
+    }
+
+    let mut confirm_cleanup = false;
+    let mut confirm_remote = false;
+    let mut show_notif = false;
+    let mut req_path: Option<PathBuf> = None;
+    let mut resp_path: Option<PathBuf> = None;
+    let mut tag: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut body: Option<String> = None;
+
+    let mut iter = items.into_iter();
     while let Some(arg) = iter.next() {
-        if arg == "--confirm-cleanup" {
-            req_path = iter.next().map(PathBuf::from);
-        } else if arg == "--response" {
-            resp_path = iter.next().map(PathBuf::from);
+        match arg.to_str() {
+            Some("--confirm-cleanup") => {
+                confirm_cleanup = true;
+                req_path = iter.next().map(PathBuf::from);
+            }
+            Some("--confirm-remote-connect") => {
+                confirm_remote = true;
+                req_path = iter.next().map(PathBuf::from);
+            }
+            Some("--response") => {
+                resp_path = iter.next().map(PathBuf::from);
+            }
+            Some("--show-notification") => {
+                show_notif = true;
+            }
+            Some("--tag") if show_notif => {
+                tag = iter.next().and_then(|v| v.into_string().ok());
+            }
+            Some("--title") if show_notif => {
+                title = iter.next().and_then(|v| v.into_string().ok());
+            }
+            Some("--body") if show_notif => {
+                body = iter.next().and_then(|v| v.into_string().ok());
+            }
+            _ => {}
         }
     }
-    match (req_path, resp_path) {
-        (Some(r), Some(s)) => Some(ConfirmDialogArgs {
-            req_path: r,
-            resp_path: s,
-        }),
-        _ => None,
+
+    if confirm_cleanup && confirm_remote {
+        anyhow::bail!(
+            "cannot combine --confirm-cleanup and --confirm-remote-connect"
+        );
     }
+    if confirm_cleanup {
+        let Some((req, resp)) = req_path.zip(resp_path) else {
+            anyhow::bail!(
+                "--confirm-cleanup requires both request and --response paths"
+            );
+        };
+        return Ok(Some(InternalGuiCommand::ConfirmCleanup(
+            ConfirmDialogArgs {
+                req_path: req,
+                resp_path: resp,
+            },
+        )));
+    }
+    if confirm_remote {
+        let Some((req, resp)) = req_path.zip(resp_path) else {
+            anyhow::bail!(
+                "--confirm-remote-connect requires both request and \
+                 --response paths"
+            );
+        };
+        return Ok(Some(InternalGuiCommand::ConfirmRemoteConnect(
+            ConfirmDialogArgs {
+                req_path: req,
+                resp_path: resp,
+            },
+        )));
+    }
+    if show_notif {
+        let Some(title) = title.filter(|s| !s.is_empty()) else {
+            anyhow::bail!("--show-notification requires --title");
+        };
+        return Ok(Some(InternalGuiCommand::ShowNotification(
+            ShowNotificationArgs {
+                tag: tag
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "ruum.notification".to_owned()),
+                title,
+                body: body.unwrap_or_default(),
+            },
+        )));
+    }
+
+    Ok(None)
+}
+
+fn resolve_native_look_from_db() -> bool {
+    StorageDb::open_default()
+        .ok()
+        .and_then(|db| db.load_app_settings().ok())
+        .map_or_else(
+            || {
+                let home = std::env::home_dir();
+                appearance::follows_system(home.as_deref())
+            },
+            |s| s.follow_system_appearance,
+        )
 }
 
 fn run_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
@@ -1534,11 +1863,10 @@ fn run_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
+            install_notification_handler(cx);
             app_menu::install_for(i18n::Locale::current(), cx);
             app_menu::set_confirm_only(cx, true);
-            let home = std::env::home_dir();
-            let native_look = appearance::follows_system(home.as_deref());
-            if native_look {
+            if resolve_native_look_from_db() {
                 appearance::apply(cx.window_appearance(), cx);
             }
             let _ = open_confirm_window_with_mode(
@@ -1552,10 +1880,59 @@ fn run_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read the command line, program name already skipped.
+fn run_remote_connect_confirm_dialog(args: ConfirmDialogArgs) -> Result<()> {
+    let req_content = std::fs::read_to_string(&args.req_path)
+        .context("read remote connect confirm request file")?;
+    let request: RemoteConnectConfirmRequest =
+        serde_json::from_str(&req_content)
+            .context("parse remote connect confirm request JSON")?;
+
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_omarchy::init(cx);
+            app_menu::install_for(i18n::Locale::current(), cx);
+            app_menu::set_confirm_only(cx, true);
+            if resolve_native_look_from_db() {
+                appearance::apply(cx.window_appearance(), cx);
+            }
+            let _ = open_remote_connect_confirm_window_with_mode(
+                request,
+                None,
+                Some(args.resp_path),
+                true,
+                cx,
+            );
+        });
+    Ok(())
+}
+
+fn run_show_notification(args: ShowNotificationArgs) {
+    if notifications::has_native_notification_identity() {
+        let tag = args.tag;
+        let title = args.title;
+        let body = args.body;
+        gpui_kit::application()
+            .with_assets(gpui_kit::assets::Assets)
+            .run(move |cx| {
+                install_notification_handler(cx);
+                post_app_notification(&tag, &title, &body, cx);
+                cx.quit();
+            });
+    } else {
+        let _ = ruum_core::watchdog::send_fallback_os_notification(
+            &args.title,
+            &args.body,
+        );
+    }
+}
+
+/// Read GUI launch arguments, program name already skipped.
 #[cfg(test)]
-fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
-    parse_args_with_power(args, power::PowerEfficiency::default())
+pub(crate) fn parse_gui_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<GuiArgs> {
+    parse_gui_args_with_power(args, power::PowerEfficiency::default())
 }
 
 fn parse_open_screen(value: &str) -> Result<Screen> {
@@ -1570,140 +1947,38 @@ fn parse_open_screen(value: &str) -> Result<Screen> {
     }
 }
 
-fn parse_args_with_power(
+fn parse_gui_args_with_power(
     args: impl Iterator<Item = std::ffi::OsString>,
     preset: power::PowerEfficiency,
-) -> Result<Args> {
+) -> Result<GuiArgs> {
     let mut root: Option<PathBuf> = None;
-    let mut options = ScanOptions {
+    let options = ScanOptions {
         threads: preset.policy(power::cpu_threads()),
         ..ScanOptions::default()
     };
-    let mut power = Some(preset);
-    let mut depth = 3_u32;
-    let mut disk = false;
     let mut initial_screen = None;
-    // `std::env::args` panics on a name that is not Unicode, and a path is
-    // any name: a restart as administrator hands the root back exactly as
-    // it was, so the caller passes `args_os`.
     let text = |value: Option<std::ffi::OsString>, need: &str| {
         value
             .and_then(|value| value.into_string().ok())
             .with_context(|| need.to_owned())
     };
-    let mut check = false;
-    let mut choose_root = false;
-    let mut args = args.peekable();
-    let remote = if args.peek().is_some_and(|arg| arg == "ssh") {
-        args.next();
-        let host = text(args.next(), "ssh needs a host, e.g. ruum ssh dev")?;
-        ruum_core::remote::validate_host(&host)?;
-        Some(host)
-    } else {
-        None
-    };
 
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.to_str().unwrap_or_default() {
-            "-h" | "--help" => {
-                println!("{}", i18n::messages::usage(i18n::Locale::current()));
-                std::process::exit(0);
-            }
-            "-a" | "--apparent-size" => options.apparent_size = true,
-            "-l" | "--follow-links" => options.follow_links = true,
-            "-H" | "--no-hidden" => options.include_hidden = false,
-            // Staying on one volume is the default; the flag is kept so
-            // old invocations still work.
-            "-x" | "--one-filesystem" => options.one_filesystem = true,
-            "-X" | "--cross-filesystems" => options.one_filesystem = false,
-            "-D" | "--disk" => disk = true,
-            "--check" => check = true,
-            "--choose" => choose_root = true,
             "--open-screen" => {
                 let value = text(
                     args.next(),
-                    "--open-screen needs a screen (explore, sources, watchdog, settings)",
+                    "--open-screen needs a screen (explore, sources, \
+                     watchdog, settings)",
                 )?;
                 initial_screen = Some(parse_open_screen(&value)?);
-            }
-            "-d" | "--depth" => {
-                let value = text(args.next(), "--depth needs a number")?;
-                depth = value.parse().context("--depth needs a number")?;
-                anyhow::ensure!(
-                    (1..=6).contains(&depth),
-                    "--depth must be 1 to 6"
-                );
-            }
-            "--power-efficiency" => {
-                let value =
-                    text(args.next(), "--power-efficiency needs a preset")?;
-                let preset = power::PowerEfficiency::parse(&value)
-                    .context("unknown Power Efficiency preset")?;
-                options.threads = preset.policy(power::cpu_threads());
-                power = Some(preset);
-            }
-            "--scan-threads" => {
-                power = None;
-                let value = text(args.next(), "--scan-threads needs a number")?;
-                options.threads.max_threads = value
-                    .parse()
-                    .context("--scan-threads needs a positive integer")?;
-                anyhow::ensure!(
-                    options.threads.max_threads > 0,
-                    "--scan-threads must be positive"
-                );
-            }
-            "--fixed-threads" => {
-                options.threads.adaptive = false;
-                power = None;
-            }
-            "--adaptive-threads" => {
-                options.threads.adaptive = true;
-                options.threads.system_cpu_limit = Some(0.80);
-                power = None;
-            }
-            "--thread-throughput-percent" => {
-                let value = text(
-                    args.next(),
-                    "--thread-throughput-percent needs a number",
-                )?;
-                let percent: u8 = value
-                    .parse()
-                    .context("throughput percent must be 1 to 100")?;
-                anyhow::ensure!(
-                    (1..=100).contains(&percent),
-                    "throughput percent must be 1 to 100"
-                );
-                options.threads.retained_throughput =
-                    f64::from(percent) / 100.0;
-            }
-            "--thread-system-cpu-percent" => {
-                let value = text(
-                    args.next(),
-                    "--thread-system-cpu-percent needs a number",
-                )?;
-                let percent: u8 =
-                    value.parse().context("CPU percent must be 0 to 100")?;
-                anyhow::ensure!(percent <= 100, "CPU percent must be 0 to 100");
-                options.threads.system_cpu_limit =
-                    (percent > 0).then(|| f64::from(percent) / 100.0);
-            }
-            "--metric" => {
-                let value = text(args.next(), "--metric needs a value")?;
-                options.metric = match value.as_str() {
-                    "files" => ruum_core::tree::Metric::Files,
-                    "bytes" | "size" => ruum_core::tree::Metric::Bytes,
-                    other => anyhow::bail!(
-                        "unknown metric {other}; try bytes or files"
-                    ),
-                };
             }
             // Launch Services added a process serial number when opening an
             // app from Finder until OS X 10.9, and some launchers still do.
             other if other.starts_with("-psn_") => {}
             other if other.starts_with('-') => {
-                let usage = i18n::messages::usage(i18n::Locale::current());
-                anyhow::bail!("unknown option {other}\n\n{usage}");
+                anyhow::bail!("unknown option {other} for ruum-gui");
             }
             _ => {
                 anyhow::ensure!(root.is_none(), "only one path can be scanned");
@@ -1712,65 +1987,21 @@ fn parse_args_with_power(
         }
     }
 
-    anyhow::ensure!(
-        !(disk && root.is_some()),
-        "--disk and a PATH cannot be combined"
-    );
-    let choose_root = if remote.is_some() {
-        choose_root || (root.is_none() && !disk && !check)
-    } else {
-        choose_root && root.is_none() && !disk && !check
-    };
-    if remote.is_some() {
-        return Ok(Args {
-            root: root.unwrap_or_default(),
-            remote,
-            remote_disk: disk,
-            check,
-            choose_root,
-            power,
-            options,
-            depth,
-            initial_screen,
-        });
-    }
     let home = std::env::home_dir();
     let root = match root {
-        _ if disk => home
-            .as_deref()
-            .and_then(ruum_core::space::volume_root_for)
-            .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
         None => home.context("no path given and no home directory")?,
     };
-    // Store the depth as the initial view setting rather than a scan option: it
-    // is a display choice the run-time `[` and `]` keys also change.
-    // Canonical, so a later widening recognises this tree in the wider walk;
-    // through dunce, so Windows gets `C:\Users\…` rather than the `\\?\C:\…`
-    // form nothing else is written in.
-    let root = if choose_root {
-        root
-    } else {
-        let root = dunce::canonicalize(&root).unwrap_or(root);
-        let metadata = std::fs::metadata(&root)
-            .with_context(|| format!("cannot read {}", root.display()))?;
-        anyhow::ensure!(
-            metadata.is_dir(),
-            "{} is not a directory",
-            root.display()
-        );
-        root
-    };
+    let root = dunce::canonicalize(&root).unwrap_or(root);
+    let metadata = std::fs::metadata(&root)
+        .with_context(|| format!("cannot read {}", root.display()))?;
+    anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
 
-    Ok(Args {
+    Ok(GuiArgs {
         root,
-        remote: None,
-        remote_disk: false,
-        check,
-        choose_root,
         options,
-        depth: depth.clamp(1, 6),
-        power,
+        depth: 3,
+        power: Some(preset),
         initial_screen,
     })
 }
@@ -1820,116 +2051,36 @@ mod argument_tests {
     }
 
     #[test]
-    fn adaptive_budget_and_fixed_override_are_explicit() {
-        let args = parse_args(arguments(&[])).expect("defaults");
-        assert_eq!(
-            args.options.threads.max_threads,
-            4.min(power::cpu_threads())
-        );
-        assert!(!args.options.threads.adaptive);
-        let args = parse_args(arguments(&[
-            "--scan-threads",
-            "4",
-            "--fixed-threads",
-            "--thread-throughput-percent",
-            "85",
-            "--thread-system-cpu-percent",
-            "0",
-        ]))
-        .expect("custom");
-        assert_eq!(args.options.threads.max_threads, 4);
-        assert!(!args.options.threads.adaptive);
-        assert!(
-            (args.options.threads.retained_throughput - 0.85).abs()
-                < f64::EPSILON
-        );
-        assert_eq!(args.options.threads.system_cpu_limit, None);
+    fn default_gui_args_resolve_home_and_ignore_macos_psn() {
+        let parsed = parse_gui_args(
+            std::iter::once("-psn_0_12345").map(std::ffi::OsString::from),
+        )
+        .expect("defaults with psn");
+        let expected_home = dunce::canonicalize(std::env::home_dir().unwrap())
+            .unwrap_or_else(|_| std::env::home_dir().unwrap());
+        assert_eq!(parsed.root, expected_home);
+        assert_eq!(parsed.depth, 3);
+        assert_eq!(parsed.initial_screen, None);
     }
 
     #[test]
-    fn default_scans_home_and_choose_requires_selection() {
-        let parse = |args: &[&str]| {
-            parse_args(args.iter().map(std::ffi::OsString::from)).unwrap()
-        };
-        assert!(!parse(&[]).choose_root);
-        assert!(parse(&["--choose"]).choose_root);
-        assert!(parse(&["ssh", "dev"]).choose_root);
-        assert!(!parse(&["."]).choose_root);
-        assert!(!parse(&["--disk"]).choose_root);
-        assert!(!parse(&["ssh", "dev", "/only-on-server"]).choose_root);
-        assert!(!parse(&["ssh", "dev", "--check"]).choose_root);
+    fn gui_args_reject_business_cli_flags_and_multiple_paths() {
+        for bad in [
+            vec!["--unknown-flag"],
+            vec!["--scan-threads", "4", "."],
+            vec!["--power-efficiency", "miser", "."],
+            vec![".", ".."],
+        ] {
+            assert!(
+                parse_gui_args(bad.into_iter().map(std::ffi::OsString::from))
+                    .is_err()
+            );
+        }
     }
 
-    #[test]
-    fn ssh_keeps_worker_options_without_inspecting_the_remote_root() {
-        let args = parse_args(
-            [
-                "ssh",
-                "dev",
-                "--check",
-                "--scan-threads",
-                "4",
-                "/only-on-the-remote-machine",
-            ]
-            .into_iter()
-            .map(std::ffi::OsString::from),
-        )
-        .expect("remote arguments");
-        assert_eq!(args.remote.as_deref(), Some("dev"));
-        assert!(args.check);
-        assert_eq!(args.options.threads.max_threads, 4);
-        assert_eq!(args.root, PathBuf::from("/only-on-the-remote-machine"));
-        assert!(args.power.is_none());
-
-        let args = parse_args(
-            ["ssh", "dev", "--disk"]
-                .into_iter()
-                .map(std::ffi::OsString::from),
-        )
-        .expect("remote volume");
-        assert!(args.remote_disk);
-        assert!(args.root.as_os_str().is_empty());
-        assert!(args.power.is_some());
-    }
-
-    #[test]
-    fn saved_power_is_loaded_before_cli_overrides() {
-        use power::PowerEfficiency as Power;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("power-efficiency");
-        power::save(&path, Power::Miser).expect("save");
-        let saved = power::load(&path).expect("load");
-        let args = parse_args_with_power(arguments(&[]), saved).expect("saved");
-        assert_eq!(args.power, Some(Power::Miser));
-        assert_eq!(
-            args.options.threads.max_threads,
-            2.min(power::cpu_threads())
-        );
-        let args = parse_args_with_power(
-            arguments(&["--power-efficiency", "drain-my-battery"]),
-            saved,
-        )
-        .expect("override");
-        assert_eq!(args.power, Some(Power::DrainMyBattery));
-        assert_eq!(args.options.threads.max_threads, power::cpu_threads());
-        let args = parse_args_with_power(
-            arguments(&["--scan-threads", "8", "--adaptive-threads"]),
-            saved,
-        )
-        .expect("experiment");
-        assert!(args.power.is_none());
-        assert!(args.options.threads.adaptive);
-        assert_eq!(args.options.threads.max_threads, 8);
-        assert_eq!(power::load(&path).expect("unchanged"), saved);
-        assert!(
-            parse_args(arguments(&["--power-efficiency", "invalid"])).is_err()
-        );
-    }
-
-    // APFS rejects these filename bytes; Linux filesystems permit them.
     #[cfg(target_os = "linux")]
     #[test]
-    fn worker_options_preserve_a_non_unicode_root() {
+    fn gui_args_preserve_non_unicode_root() {
         use std::os::unix::ffi::OsStringExt as _;
 
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1937,159 +2088,120 @@ mod argument_tests {
             .path()
             .join(std::ffi::OsString::from_vec(vec![b'r', 0xff]));
         std::fs::create_dir(&root).expect("directory");
-        let args = parse_args(
-            [
-                std::ffi::OsString::from("--scan-threads"),
-                std::ffi::OsString::from("4"),
-                root.clone().into_os_string(),
-            ]
-            .into_iter(),
-        )
-        .expect("native path");
+        let args =
+            parse_gui_args(std::iter::once(root.clone().into_os_string()))
+                .expect("native path");
         assert_eq!(args.root, dunce::canonicalize(root).expect("root"));
-        assert_eq!(args.options.threads.max_threads, 4);
     }
 
     #[test]
-    fn invalid_worker_budgets_are_rejected() {
-        for extra in [
-            vec!["--scan-threads", "0"],
-            vec!["--scan-threads", "-1"],
-            vec!["--thread-throughput-percent", "0"],
-            vec!["--thread-throughput-percent", "101"],
-            vec!["--thread-system-cpu-percent", "101"],
-        ] {
-            assert!(parse_args(arguments(&extra)).is_err());
-        }
-    }
-
-    #[test]
-    fn mcp_subcommand_dispatches_and_rejects_unknown_flags() {
+    fn internal_gui_commands_parse_confirm_and_notification_flags() {
         assert_eq!(
-            parse_mcp_command(Vec::<&str>::new()).expect("empty"),
-            McpCommand::NotMcp
-        );
-        assert_eq!(
-            parse_mcp_command(["ssh", "dev"]).expect("ssh"),
-            McpCommand::NotMcp
-        );
-        assert_eq!(
-            parse_mcp_command(["mcp"]).expect("mcp serve"),
-            McpCommand::Serve { read_only: false }
-        );
-        assert_eq!(
-            parse_mcp_command(["mcp", "--read-only"]).expect("mcp read-only"),
-            McpCommand::Serve { read_only: true }
-        );
-        assert_eq!(
-            parse_mcp_command(["mcp", "--help"]).expect("mcp --help"),
-            McpCommand::Help
-        );
-        assert_eq!(
-            parse_mcp_command(["mcp", "-h"]).expect("mcp -h"),
-            McpCommand::Help
-        );
-        assert!(parse_mcp_command(["mcp", "--unknown"]).is_err());
-        for locale in i18n::ALL_LOCALES {
-            assert!(i18n::messages::usage(locale).contains("ruum mcp"));
-        }
-    }
-
-    #[test]
-    fn watchdog_subcommand_dispatches_and_rejects_unknown_flags() {
-        assert_eq!(
-            parse_watchdog_command(Vec::<&str>::new()).expect("empty"),
-            WatchdogCommand::NotWatchdog
-        );
-        assert_eq!(
-            parse_watchdog_command(["watchdog"]).expect("watchdog loop"),
-            WatchdogCommand::RunLoop
-        );
-        assert_eq!(
-            parse_watchdog_command(["watchdog", "--once"])
-                .expect("watchdog once"),
-            WatchdogCommand::RunOnce
-        );
-        assert_eq!(
-            parse_watchdog_command(["watchdog", "--help"])
-                .expect("watchdog help"),
-            WatchdogCommand::Help
-        );
-        assert_eq!(
-            parse_watchdog_command(["watchdog", "-h"]).expect("watchdog -h"),
-            WatchdogCommand::Help
-        );
-        assert!(parse_watchdog_command(["watchdog", "--invalid"]).is_err());
-        for locale in i18n::ALL_LOCALES {
-            assert!(i18n::messages::usage(locale).contains("ruum watchdog"));
-        }
-    }
-
-    #[test]
-    fn confirm_cleanup_arguments_parse_and_require_both_paths() {
-        assert_eq!(parse_confirm_dialog_args(Vec::<&str>::new()), None);
-        assert_eq!(
-            parse_confirm_dialog_args(["--confirm-cleanup", "req.json"]),
+            parse_internal_gui_command(Vec::<&str>::new()).unwrap(),
             None
         );
-        assert_eq!(
-            parse_confirm_dialog_args(["--response", "resp.json"]),
-            None
+        assert_eq!(parse_internal_gui_command(["."]).unwrap(), None);
+        assert!(
+            parse_internal_gui_command(["--confirm-cleanup", "req.json"])
+                .is_err()
         );
+        assert!(
+            parse_internal_gui_command([
+                "--confirm-remote-connect",
+                "req.json"
+            ])
+            .is_err()
+        );
+        assert!(parse_internal_gui_command(["--show-notification"]).is_err());
+
         assert_eq!(
-            parse_confirm_dialog_args([
+            parse_internal_gui_command([
                 "--confirm-cleanup",
                 "req.json",
                 "--response",
                 "resp.json",
-            ]),
-            Some(ConfirmDialogArgs {
+            ])
+            .unwrap(),
+            Some(InternalGuiCommand::ConfirmCleanup(ConfirmDialogArgs {
                 req_path: PathBuf::from("req.json"),
                 resp_path: PathBuf::from("resp.json"),
-            })
+            }))
         );
-        for locale in i18n::ALL_LOCALES {
-            assert!(
-                i18n::messages::usage(locale).contains("--confirm-cleanup")
-            );
-        }
+        assert_eq!(
+            parse_internal_gui_command([
+                "--confirm-remote-connect",
+                "rc_req.json",
+                "--response",
+                "rc_resp.json",
+            ])
+            .unwrap(),
+            Some(InternalGuiCommand::ConfirmRemoteConnect(
+                ConfirmDialogArgs {
+                    req_path: PathBuf::from("rc_req.json"),
+                    resp_path: PathBuf::from("rc_resp.json"),
+                }
+            ))
+        );
+        assert_eq!(
+            parse_internal_gui_command([
+                "--show-notification",
+                "--tag",
+                "ruum.low_disk_space",
+                "--title",
+                "Low Disk",
+                "--body",
+                "Only 1 GB left",
+            ])
+            .unwrap(),
+            Some(InternalGuiCommand::ShowNotification(ShowNotificationArgs {
+                tag: "ruum.low_disk_space".to_owned(),
+                title: "Low Disk".to_owned(),
+                body: "Only 1 GB left".to_owned(),
+            }))
+        );
     }
 
     #[test]
     fn open_screen_parses_valid_screens_and_rejects_invalid() {
-        assert_eq!(parse_args(arguments(&[])).unwrap().initial_screen, None);
         assert_eq!(
-            parse_args(arguments(&["--open-screen", "explore"]))
+            parse_gui_args(arguments(&[])).unwrap().initial_screen,
+            None
+        );
+        assert_eq!(
+            parse_gui_args(arguments(&["--open-screen", "explore"]))
                 .unwrap()
                 .initial_screen,
             Some(Screen::Explore)
         );
         assert_eq!(
-            parse_args(arguments(&["--open-screen", "sources"]))
+            parse_gui_args(arguments(&["--open-screen", "sources"]))
                 .unwrap()
                 .initial_screen,
             Some(Screen::Sources)
         );
         assert_eq!(
-            parse_args(arguments(&["--open-screen", "watchdog"]))
+            parse_gui_args(arguments(&["--open-screen", "watchdog"]))
                 .unwrap()
                 .initial_screen,
             Some(Screen::Watchdog)
         );
         assert_eq!(
-            parse_args(arguments(&["--open-screen", "settings"]))
+            parse_gui_args(arguments(&["--open-screen", "settings"]))
                 .unwrap()
                 .initial_screen,
             Some(Screen::Settings)
         );
-        assert!(parse_args(arguments(&["--open-screen", "unknown"])).is_err());
-        assert!(parse_args(arguments(&["--open-screen"])).is_err());
+        assert!(
+            parse_gui_args(arguments(&["--open-screen", "unknown"])).is_err()
+        );
+        assert!(parse_gui_args(arguments(&["--open-screen"])).is_err());
     }
 
     #[test]
     fn notification_tag_maps_to_expected_target_screen() {
         use ruum_core::watchdog::{
-            NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_LOW_SPACE,
+            NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_CLEANUP_DONE,
+            NOTIF_TAG_CLEANUP_STARTED, NOTIF_TAG_LOW_SPACE,
         };
 
         assert_eq!(
@@ -2099,6 +2211,10 @@ mod argument_tests {
         assert_eq!(
             target_screen_for_notification_tag(NOTIF_TAG_AI_ANALYSIS),
             Some(Screen::Watchdog)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(NOTIF_TAG_CLEANUP_STARTED),
+            None
         );
         assert_eq!(
             target_screen_for_notification_tag(NOTIF_TAG_CLEANUP_DONE),

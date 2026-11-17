@@ -4,7 +4,7 @@ Version=1.0
 Name=ruum
 GenericName=Disk space treemap
 Comment=Find what is using a volume, mark what should go, remove it
-Exec=@BINDIR@/ruum %f
+Exec=@BINDIR@/ruum-gui %f
 Icon=ruum
 Terminal=false
 Categories=System;Filesystem;
@@ -14,9 +14,9 @@ StartupWMClass=ruum
 # Registered for directories, so a file manager can offer "Open with ruum".
 # This adds a handler; it does not become the default.
 MimeType=inode/directory;
-Actions=disk;
+Actions=sources;
 X-AppVersion=@VERSION@
 
-[Desktop Action disk]
-Name=Scan the whole disk
-Exec=@BINDIR@/ruum --disk
+[Desktop Action sources]
+Name=Choose a source or disk
+Exec=@BINDIR@/ruum-gui --open-screen sources

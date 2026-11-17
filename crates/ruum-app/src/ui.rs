@@ -106,6 +106,10 @@ pub mod size {
     pub const ICON_RAIL: Rems = Rems(3.25);
     /// Floating toast notification max width.
     pub const TOAST: Rems = Rems(26.0);
+    /// Bounded width of the horizontally scrollable host tag strip in top bar.
+    pub const HOST_TABS_MAX: Rems = Rems(18.0);
+    /// Left category sidebar width on the Zed-style Settings page.
+    pub const SETTINGS_NAV: Rems = Rems(12.5);
 }
 
 /// Interface zoom steps, as a factor of the 16 px default rem.

@@ -104,6 +104,35 @@ pub trait CleanupConfirmAdapter: Send + Sync + std::fmt::Debug {
     ) -> io::Result<CleanupConfirmDecision>;
 }
 
+/// A request presented to the user before opening an MCP remote SSH session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConnectConfirmRequest {
+    pub target_label: String,
+    pub alias: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_mode: String,
+    pub tool_name: String,
+}
+
+/// The user's decision from a remote SSH connection confirmation prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RemoteConnectConfirmDecision {
+    Approved,
+    Denied,
+}
+
+/// Adapter interface for requesting explicit user approval before MCP connects
+/// to a remote SSH server.
+pub trait RemoteConnectConfirmAdapter: Send + Sync + std::fmt::Debug {
+    fn confirm(
+        &self,
+        request: &RemoteConnectConfirmRequest,
+    ) -> io::Result<RemoteConnectConfirmDecision>;
+}
+
 /// Protocol request frame sent to the IPC listener.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -111,6 +140,10 @@ pub enum IpcRequest {
     ConfirmCleanup {
         token: String,
         request: CleanupConfirmRequest,
+    },
+    ConfirmRemoteConnect {
+        token: String,
+        request: RemoteConnectConfirmRequest,
     },
     NotifyWatchdogUpdate {
         token: String,
@@ -131,9 +164,16 @@ pub enum IpcRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcResponse {
-    ConfirmDecision { decision: CleanupConfirmDecision },
+    ConfirmDecision {
+        decision: CleanupConfirmDecision,
+    },
+    RemoteConnectDecision {
+        decision: RemoteConnectConfirmDecision,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Generate a cryptographically secure 256-bit hexadecimal token.
@@ -272,14 +312,19 @@ where
     if cfg!(target_os = "macos") {
         // macOS local user sessions reach WindowServer. If running inside
         // a remote SSH session with no forwarded DISPLAY, windows cannot open.
-        if get_env("SSH_CONNECTION").is_some() && get_env("DISPLAY").is_none() {
+        if get_env("SSH_CONNECTION").is_some_and(|s| !s.is_empty())
+            && get_env("DISPLAY").is_none_or(|s| s.is_empty())
+        {
             return false;
         }
         true
     } else if cfg!(target_os = "linux") {
-        get_env("WAYLAND_DISPLAY").is_some() || get_env("DISPLAY").is_some()
+        get_env("WAYLAND_DISPLAY").is_some_and(|s| !s.is_empty())
+            || get_env("DISPLAY").is_some_and(|s| !s.is_empty())
+    } else if cfg!(windows) {
+        get_env("SSH_CONNECTION").is_none_or(|s| s.is_empty())
     } else {
-        cfg!(windows)
+        false
     }
 }
 
@@ -319,6 +364,7 @@ where
 
     let token = match &request {
         IpcRequest::ConfirmCleanup { token, .. }
+        | IpcRequest::ConfirmRemoteConnect { token, .. }
         | IpcRequest::NotifyWatchdogUpdate { token }
         | IpcRequest::ShowNotification { token, .. }
         | IpcRequest::OpenWindow { token, .. } => token.as_str(),
@@ -463,7 +509,8 @@ pub const IPC_NOTIFY_READ_TIMEOUT: std::time::Duration =
 #[must_use]
 pub const fn ipc_read_timeout(request: &IpcRequest) -> std::time::Duration {
     match request {
-        IpcRequest::ConfirmCleanup { .. } => IPC_CONFIRM_READ_TIMEOUT,
+        IpcRequest::ConfirmCleanup { .. }
+        | IpcRequest::ConfirmRemoteConnect { .. } => IPC_CONFIRM_READ_TIMEOUT,
         IpcRequest::NotifyWatchdogUpdate { .. }
         | IpcRequest::ShowNotification { .. }
         | IpcRequest::OpenWindow { .. } => IPC_NOTIFY_READ_TIMEOUT,
@@ -537,11 +584,31 @@ pub fn send_ipc_message(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Spawn `ruum --confirm-cleanup` as an interactive confirmation dialog.
-fn spawn_dialog(
-    request: &CleanupConfirmRequest,
-) -> io::Result<CleanupConfirmDecision> {
-    let current_exe = std::env::current_exe()?;
+fn resolve_confirm_gui_binary_with(
+    env: &crate::desktop_launch::DesktopLaunchEnv,
+) -> io::Result<PathBuf> {
+    crate::desktop_launch::DesktopLaunchFactory::create()
+        .resolve_gui_binary(env)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "ruum-gui executable not found for confirmation dialog",
+            )
+        })
+}
+
+fn spawn_json_dialog<Req, Resp>(
+    flag: &str,
+    request: &Req,
+    fallback: Resp,
+) -> io::Result<Resp>
+where
+    Req: Serialize,
+    Resp: serde::de::DeserializeOwned,
+{
+    let gui_exe = resolve_confirm_gui_binary_with(
+        &crate::desktop_launch::DesktopLaunchEnv::current(),
+    )?;
     let temp_dir = tempfile::tempdir()?;
     let req_path = temp_dir.path().join("confirm_request.json");
     let resp_path = temp_dir.path().join("confirm_response.json");
@@ -550,29 +617,99 @@ fn spawn_dialog(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(&req_path, req_json)?;
 
-    let status = Command::new(current_exe)
-        .arg("--confirm-cleanup")
+    let mut cmd = Command::new(gui_exe);
+    cmd.arg(flag)
         .arg(&req_path)
         .arg("--response")
-        .arg(&resp_path)
-        .status()?;
-
-    if !status.success() {
-        return Ok(CleanupConfirmDecision::Cancelled);
+        .arg(&resp_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    let status = cmd.status()?;
 
-    if !resp_path.exists() {
-        return Ok(CleanupConfirmDecision::Cancelled);
+    if !status.success() || !resp_path.exists() {
+        return Ok(fallback);
     }
 
     let resp_content = fs::read_to_string(&resp_path)?;
     if resp_content.trim().is_empty() {
-        return Ok(CleanupConfirmDecision::Cancelled);
+        return Ok(fallback);
     }
 
-    let decision: CleanupConfirmDecision = serde_json::from_str(&resp_content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(decision)
+    serde_json::from_str(&resp_content)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Spawn `ruum --confirm-cleanup` as an interactive confirmation dialog.
+fn spawn_dialog(
+    request: &CleanupConfirmRequest,
+) -> io::Result<CleanupConfirmDecision> {
+    spawn_json_dialog(
+        "--confirm-cleanup",
+        request,
+        CleanupConfirmDecision::Cancelled,
+    )
+}
+
+/// Spawn `ruum --confirm-remote-connect` as an interactive confirmation dialog.
+fn spawn_remote_connect_dialog(
+    request: &RemoteConnectConfirmRequest,
+) -> io::Result<RemoteConnectConfirmDecision> {
+    spawn_json_dialog(
+        "--confirm-remote-connect",
+        request,
+        RemoteConnectConfirmDecision::Denied,
+    )
+}
+
+fn resolve_ipc_token(override_token: Option<&str>) -> io::Result<String> {
+    if let Some(t) = override_token {
+        return Ok(t.to_owned());
+    }
+    let token_path = ipc_token_path().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no ipc.token path")
+    })?;
+    load_or_create_ipc_token(&token_path)
+}
+
+fn send_ipc_with_override(
+    socket_override: Option<&Path>,
+    request: &IpcRequest,
+) -> Result<IpcResponse, IpcUnavailableOrError> {
+    #[cfg(unix)]
+    let send_res = {
+        let target =
+            socket_override.map_or_else(resolve_socket_path, Path::to_path_buf);
+        send_ipc_message(&target, request)
+    };
+
+    #[cfg(windows)]
+    let send_res = {
+        let target = match socket_override {
+            Some(p) => p.to_path_buf(),
+            None => match ipc_port_path() {
+                Some(p) => p,
+                None => return Err(IpcUnavailableOrError::Unavailable),
+            },
+        };
+        send_ipc_message(&target, request)
+    };
+
+    match send_res {
+        Ok(resp) => Ok(resp),
+        Err(err) if is_socket_unavailable(&err) => {
+            Err(IpcUnavailableOrError::Unavailable)
+        }
+        Err(err) => Err(IpcUnavailableOrError::Error(err)),
+    }
+}
+
+enum IpcUnavailableOrError {
+    Unavailable,
+    Error(io::Error),
 }
 
 /// Cleanup confirmation adapter that delegates to Ruum GUI.
@@ -615,34 +752,8 @@ impl GuiCleanupConfirm {
         }
     }
 
-    fn resolved_token(&self) -> io::Result<String> {
-        if let Some(ref t) = self.token {
-            return Ok(t.clone());
-        }
-        let token_path = ipc_token_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no ipc.token path")
-        })?;
-        load_or_create_ipc_token(&token_path)
-    }
-
-    #[cfg(unix)]
-    fn resolved_socket(&self) -> PathBuf {
-        self.socket_path.clone().unwrap_or_else(resolve_socket_path)
-    }
-
-    #[cfg(windows)]
-    fn resolved_port_path(&self) -> io::Result<PathBuf> {
-        if let Some(ref p) = self.socket_path {
-            return Ok(p.clone());
-        }
-        ipc_port_path().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no ipc.port path")
-        })
-    }
-
-    /// Try communicating with an existing Ruum instance over IPC.
     fn try_ipc(&self, request: &CleanupConfirmRequest) -> IpcOutcome {
-        let Ok(token) = self.resolved_token() else {
+        let Ok(token) = resolve_ipc_token(self.token.as_deref()) else {
             return IpcOutcome::Unavailable;
         };
         let frame = IpcRequest::ConfirmCleanup {
@@ -650,28 +761,21 @@ impl GuiCleanupConfirm {
             request: request.clone(),
         };
 
-        #[cfg(unix)]
-        let send_res = send_ipc_message(&self.resolved_socket(), &frame);
-
-        #[cfg(windows)]
-        let send_res = match self.resolved_port_path() {
-            Ok(p) => send_ipc_message(&p, &frame),
-            Err(_) => return IpcOutcome::Unavailable,
-        };
-
-        match send_res {
+        match send_ipc_with_override(self.socket_path.as_deref(), &frame) {
             Ok(IpcResponse::ConfirmDecision { decision }) => {
                 IpcOutcome::Decision(decision)
             }
             Ok(IpcResponse::Error { message }) => IpcOutcome::Error(
                 io::Error::new(io::ErrorKind::PermissionDenied, message),
             ),
-            Ok(IpcResponse::Ok) => IpcOutcome::Error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected ok response for confirm",
-            )),
-            Err(err) if is_socket_unavailable(&err) => IpcOutcome::Unavailable,
-            Err(err) => IpcOutcome::Error(err),
+            Ok(IpcResponse::Ok | IpcResponse::RemoteConnectDecision { .. }) => {
+                IpcOutcome::Error(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected IPC response for cleanup confirm",
+                ))
+            }
+            Err(IpcUnavailableOrError::Unavailable) => IpcOutcome::Unavailable,
+            Err(IpcUnavailableOrError::Error(err)) => IpcOutcome::Error(err),
         }
     }
 
@@ -745,6 +849,148 @@ impl CleanupConfirmAdapter for GuiCleanupConfirm {
         request: &CleanupConfirmRequest,
     ) -> io::Result<CleanupConfirmDecision> {
         self.confirm_with_spawner(request, spawn_dialog)
+    }
+}
+
+/// Remote SSH connection confirmation adapter that delegates to Ruum GUI.
+///
+/// Tries local IPC first (`IpcRequest::ConfirmRemoteConnect`); if Ruum GUI is
+/// not running and a graphical desktop is reachable, spawns
+/// `ruum-gui --confirm-remote-connect <req.json> --response <resp.json>`, and
+/// fails closed otherwise.
+#[derive(Default)]
+pub struct GuiRemoteConnectConfirm {
+    socket_path: Option<PathBuf>,
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for GuiRemoteConnectConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuiRemoteConnectConfirm")
+            .field("socket_path", &self.socket_path)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+enum RemoteConnectIpcOutcome {
+    Decision(RemoteConnectConfirmDecision),
+    Unavailable,
+    Error(io::Error),
+}
+
+impl GuiRemoteConnectConfirm {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            socket_path: None,
+            token: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_socket_and_token(
+        socket_path: PathBuf,
+        token: String,
+    ) -> Self {
+        Self {
+            socket_path: Some(socket_path),
+            token: Some(token),
+        }
+    }
+
+    fn try_ipc(
+        &self,
+        request: &RemoteConnectConfirmRequest,
+    ) -> RemoteConnectIpcOutcome {
+        let Ok(token) = resolve_ipc_token(self.token.as_deref()) else {
+            return RemoteConnectIpcOutcome::Unavailable;
+        };
+        let frame = IpcRequest::ConfirmRemoteConnect {
+            token,
+            request: request.clone(),
+        };
+
+        match send_ipc_with_override(self.socket_path.as_deref(), &frame) {
+            Ok(IpcResponse::RemoteConnectDecision { decision }) => {
+                RemoteConnectIpcOutcome::Decision(decision)
+            }
+            Ok(IpcResponse::Error { message }) => {
+                RemoteConnectIpcOutcome::Error(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    message,
+                ))
+            }
+            Ok(IpcResponse::Ok | IpcResponse::ConfirmDecision { .. }) => {
+                RemoteConnectIpcOutcome::Error(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected IPC response for remote connect confirm",
+                ))
+            }
+            Err(IpcUnavailableOrError::Unavailable) => {
+                RemoteConnectIpcOutcome::Unavailable
+            }
+            Err(IpcUnavailableOrError::Error(err)) => {
+                RemoteConnectIpcOutcome::Error(err)
+            }
+        }
+    }
+
+    /// Internal confirm implementation allowing an injected spawner.
+    pub fn confirm_with_spawner<S>(
+        &self,
+        request: &RemoteConnectConfirmRequest,
+        spawner: S,
+    ) -> io::Result<RemoteConnectConfirmDecision>
+    where
+        S: FnOnce(
+            &RemoteConnectConfirmRequest,
+        ) -> io::Result<RemoteConnectConfirmDecision>,
+    {
+        self.confirm_with_spawner_and_reachability(
+            request,
+            spawner,
+            is_desktop_reachable,
+        )
+    }
+
+    /// Internal confirm allowing injected spawner and desktop reachability.
+    pub fn confirm_with_spawner_and_reachability<S, R>(
+        &self,
+        request: &RemoteConnectConfirmRequest,
+        spawner: S,
+        desktop_reachable: R,
+    ) -> io::Result<RemoteConnectConfirmDecision>
+    where
+        S: FnOnce(
+            &RemoteConnectConfirmRequest,
+        ) -> io::Result<RemoteConnectConfirmDecision>,
+        R: FnOnce() -> bool,
+    {
+        match self.try_ipc(request) {
+            RemoteConnectIpcOutcome::Decision(decision) => return Ok(decision),
+            RemoteConnectIpcOutcome::Error(err) => return Err(err),
+            RemoteConnectIpcOutcome::Unavailable => {}
+        }
+
+        if !desktop_reachable() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "remote connection confirmation requires an active graphical \
+                 desktop",
+            ));
+        }
+
+        spawner(request)
+    }
+}
+
+impl RemoteConnectConfirmAdapter for GuiRemoteConnectConfirm {
+    fn confirm(
+        &self,
+        request: &RemoteConnectConfirmRequest,
+    ) -> io::Result<RemoteConnectConfirmDecision> {
+        self.confirm_with_spawner(request, spawn_remote_connect_dialog)
     }
 }
 
@@ -930,6 +1176,11 @@ mod tests {
                             decision: CleanupConfirmDecision::Confirmed {
                                 selected_paths: selected,
                             },
+                        })
+                    }
+                    IpcRequest::ConfirmRemoteConnect { .. } => {
+                        Ok(IpcResponse::RemoteConnectDecision {
+                            decision: RemoteConnectConfirmDecision::Denied,
                         })
                     }
                     IpcRequest::NotifyWatchdogUpdate { .. }
@@ -1147,5 +1398,158 @@ mod tests {
         assert!(matches!(bad_auth, IpcResponse::Error { .. }));
 
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn remote_connect_confirm_serde_and_timeout() {
+        let req = RemoteConnectConfirmRequest {
+            target_label: "prod-web".to_owned(),
+            alias: Some("prod-web".to_owned()),
+            host: "10.0.1.25".to_owned(),
+            port: 2222,
+            username: "deploy".to_owned(),
+            auth_mode: "private_key".to_owned(),
+            tool_name: "scan_directory".to_owned(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RemoteConnectConfirmRequest =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, req);
+
+        for decision in [
+            RemoteConnectConfirmDecision::Approved,
+            RemoteConnectConfirmDecision::Denied,
+        ] {
+            let d_json = serde_json::to_string(&decision).unwrap();
+            let d_parsed: RemoteConnectConfirmDecision =
+                serde_json::from_str(&d_json).unwrap();
+            assert_eq!(d_parsed, decision);
+        }
+
+        let ipc_req = IpcRequest::ConfirmRemoteConnect {
+            token: "tok".to_owned(),
+            request: req,
+        };
+        assert_eq!(ipc_read_timeout(&ipc_req), IPC_CONFIRM_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn gui_remote_connect_confirm_ipc_spawner_and_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = "remote_connect_token_12345678901234567890".to_owned();
+
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("remote-confirm.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("remote-confirm.port");
+
+        let req = RemoteConnectConfirmRequest {
+            target_label: "prod".to_owned(),
+            alias: Some("prod".to_owned()),
+            host: "10.0.0.5".to_owned(),
+            port: 22,
+            username: "ubuntu".to_owned(),
+            auth_mode: "password".to_owned(),
+            tool_name: "list_volumes".to_owned(),
+        };
+
+        // 1. Live IPC server returns Approved.
+        let listener = IpcListenerGuard::bind(&socket_or_port).unwrap();
+        let server_token = token.clone();
+        let handle = std::thread::spawn(move || {
+            listener
+                .accept_and_handle(&server_token, |frame| match frame {
+                    IpcRequest::ConfirmRemoteConnect { request, .. } => {
+                        assert_eq!(request.host, "10.0.0.5");
+                        Ok(IpcResponse::RemoteConnectDecision {
+                            decision: RemoteConnectConfirmDecision::Approved,
+                        })
+                    }
+                    _ => panic!("unexpected IPC request"),
+                })
+                .unwrap();
+        });
+
+        let client = GuiRemoteConnectConfirm::with_socket_and_token(
+            socket_or_port,
+            token.clone(),
+        );
+        let decision = client
+            .confirm_with_spawner(&req, |_| {
+                panic!("spawner must not run when IPC answers");
+            })
+            .unwrap();
+        assert_eq!(decision, RemoteConnectConfirmDecision::Approved);
+        handle.join().unwrap();
+
+        // 2. Unreachable socket + headless desktop -> Fail-Closed (NotConnected).
+        let missing_sock = temp.path().join("missing.sock");
+        let headless_client =
+            GuiRemoteConnectConfirm::with_socket_and_token(missing_sock, token);
+        let err = headless_client
+            .confirm_with_spawner_and_reachability(
+                &req,
+                |_| panic!("spawner must not run when display unreachable"),
+                || false,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+
+        // 3. Unreachable socket + reachable desktop -> delegates to spawner.
+        let denied = headless_client
+            .confirm_with_spawner_and_reachability(
+                &req,
+                |_| Ok(RemoteConnectConfirmDecision::Denied),
+                || true,
+            )
+            .unwrap();
+        assert_eq!(denied, RemoteConnectConfirmDecision::Denied);
+    }
+
+    #[test]
+    fn resolve_confirm_gui_binary_prefers_override_and_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli_name = if cfg!(windows) { "ruum.exe" } else { "ruum" };
+        let gui_name = if cfg!(windows) {
+            "ruum-gui.exe"
+        } else {
+            "ruum-gui"
+        };
+        let cli_bin = dir.path().join(cli_name);
+        let gui_bin = dir.path().join(gui_name);
+        let custom_gui = dir.path().join("custom-gui");
+        fs::write(&cli_bin, b"cli").unwrap();
+        fs::write(&gui_bin, b"gui").unwrap();
+        fs::write(&custom_gui, b"custom").unwrap();
+
+        let sibling_env = crate::desktop_launch::DesktopLaunchEnv {
+            current_exe: cli_bin.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_confirm_gui_binary_with(&sibling_env).unwrap(),
+            dunce::canonicalize(&gui_bin).unwrap()
+        );
+
+        let override_env = crate::desktop_launch::DesktopLaunchEnv {
+            current_exe: cli_bin,
+            ruum_gui_bin: Some(custom_gui.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_confirm_gui_binary_with(&override_env).unwrap(),
+            custom_gui
+        );
+
+        let missing_env = crate::desktop_launch::DesktopLaunchEnv {
+            ruum_gui_bin: Some(dir.path().join("nonexistent-gui")),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_confirm_gui_binary_with(&missing_env)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

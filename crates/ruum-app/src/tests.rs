@@ -126,12 +126,16 @@ fn startup_chooser_never_scans_before_explicit_acceptance(
     cx.run_until_parked();
     draw(cx);
     assert!(cx.debug_bounds("choose-root-idle").is_some());
-    assert!(cx.debug_bounds("source-host").is_some());
+    assert!(cx.debug_bounds("source-host").is_none());
+    assert!(cx.debug_bounds("source-path").is_some());
+    assert!(cx.debug_bounds("ssh-profiles-card").is_some());
     read(&view, cx, |app| {
         assert!(app.awaiting_root);
         assert_eq!(app.scan_epoch, 0);
         assert!(app.scan.is_none() && app.remote_scan.is_none());
     });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.ssh_form_open));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
     press(cx, "r");
@@ -187,17 +191,34 @@ fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
     cx.run_until_parked();
+    update(&view, cx, Ruum::open_add_ssh_form);
     draw(cx);
-    let input = cx.debug_bounds("source-host").expect("host editor");
-    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
-    cx.simulate_input("invalid host");
-    press(cx, "enter");
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.ssh_input_alias
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("prod", window, cx));
+            app.ssh_input_host
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("invalid host", window, cx));
+            app.ssh_input_username
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("alice", window, cx));
+            app.save_ssh_profile_form(cx);
+        });
+    });
     read(&view, cx, |app| {
-        assert!(app.volumes_error.is_some());
+        assert!(app.ssh_form_error.is_some());
+        assert!(app.ssh_profiles.is_empty());
         assert!(app.remote.is_none());
         assert!(app.scan.is_none() && app.remote_scan.is_none());
         assert_eq!(app.scan_epoch, 0);
     });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.ssh_form_open));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
 }
@@ -221,11 +242,11 @@ fn switching_from_remote_to_local_clears_machine_specific_marks(
         app.toggle_mark_selected(cx);
         assert!(!app.marks.is_empty());
         app.volumes_open = true;
-        app.volumes_source = None;
         app.choose_source_root(target.path().to_path_buf(), cx);
         assert!(app.remote.is_none() && app.remote_identity.is_none());
         assert!(app.marks.is_empty());
         assert!(app.tree.is_none());
+        assert_eq!(app.active_host_tab, crate::state::HostTabKey::Local);
     });
     finish_scan(&view, cx);
 }
@@ -264,18 +285,20 @@ fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, Ruum::open_volumes);
     cx.run_until_parked();
+    update(&view, cx, Ruum::open_add_ssh_form);
     draw(cx);
     let before = read(&view, cx, |app| app.scan_epoch);
-    let input = cx.debug_bounds("source-host").unwrap();
+    let input = cx.debug_bounds("ssh-form-host").unwrap();
     cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
     cx.simulate_input("new-host-not-connected");
-    update(&view, cx, |app, cx| {
-        app.choose_source_root(temp.path().into(), cx);
-        assert!(app.picker_error.is_some());
+    read(&view, cx, |app| {
         assert!(app.remote.is_none());
         assert_eq!(app.scan_epoch, before);
         assert!(app.tree.is_some());
     });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.ssh_form_open));
+    draw(cx);
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
 }
@@ -301,46 +324,39 @@ fn a_directory_error_can_be_corrected_without_reconnecting(
 }
 
 #[gpui_kit::test]
-fn stale_local_discovery_cannot_overwrite_a_new_source_error(
+fn stale_local_discovery_cannot_overwrite_closed_sources_state(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_omarchy::init);
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
-    // The old discovery is still queued. The new host fails validation
-    // without any network connection; only its error may remain.
-    update(&view, cx, |app, cx| {
-        app.load_volume_source(Some("-invalid".into()), cx);
-    });
+    update(&view, cx, Ruum::load_local_volumes);
+    update(&view, cx, Ruum::close_volumes);
     cx.run_until_parked();
     draw(cx);
     read(&view, cx, |app| {
-        assert_eq!(app.volumes_source.as_deref(), Some("-invalid"));
-        assert!(app.volumes_error.is_some());
-        assert!(app.volumes.is_empty());
+        assert!(!app.volumes_open);
+        assert!(!app.volumes_loading);
         assert!(app.remote.is_none());
-    });
-    update(&view, cx, |app, cx| {
-        app.close_volumes(cx);
-        assert!(!app.poll_roots_once(1, cx));
     });
 }
 
 #[gpui_kit::test]
-fn remote_root_acceptance_never_stats_the_path_locally(
+fn local_mounts_never_scan_nonexistent_remote_only_paths(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
-        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
-        app.select(Some(crumbs), cx);
-        app.toggle_mark_selected(cx);
+        app.host_tabs.push(crate::state::ExploreHostTab {
+            key: crate::state::HostTabKey::Ssh("srv-1".into()),
+            label: "srv-1".into(),
+            session: None,
+        });
+        app.switch_host_tab(crate::state::HostTabKey::Ssh("srv-1".into()), cx);
         app.volumes_open = true;
-        // An intentionally invalid SSH destination ensures acceptance cannot
-        // contact any machine. The listing is a decoded fixture, not a walk.
-        app.volumes_source = Some("-test-fixture".into());
+        app.screen = Screen::Sources;
         app.finish_volume_listing(
             Ok((
                 vec![Volume {
@@ -355,19 +371,13 @@ fn remote_root_acceptance_never_stats_the_path_locally(
     });
     draw(cx);
     update(&view, cx, |app, cx| {
+        let before_epoch = app.scan_epoch;
         app.choose_volume(cx);
-        assert_eq!(app.remote.as_deref(), Some("-test-fixture"));
-        assert_eq!(app.root_path, PathBuf::from("/only-on-the-remote-host"));
-        assert!(app.marks.is_empty() && app.remote_identity.is_none());
-        assert!(
-            app.tree.is_none()
-                && app.scan.is_none()
-                && app.remote_scan.is_none()
-        );
-        assert!(
-            app.scan_error
-                .as_ref()
-                .is_some_and(|error| error.contains("invalid SSH"))
+        assert!(app.picker_error.is_some());
+        assert_eq!(app.scan_epoch, before_epoch);
+        assert_eq!(
+            app.active_host_tab,
+            crate::state::HostTabKey::Ssh("srv-1".into())
         );
     });
 }
@@ -903,6 +913,8 @@ fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     let before = read(&view, cx, |app| app.root_path.clone());
     press(cx, "down");
     press(cx, "up");
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.ssh_form_open));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
@@ -2117,78 +2129,32 @@ fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
 /// The restart as administrator reopens the same root and options: every
 /// flag it writes is one the command line reads back.
 #[test]
-fn restart_arguments_parse_back_to_the_same_scan() {
-    use ruum_core::tree::Metric;
+fn restart_arguments_parse_back_to_the_same_root() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let root = temp.path().join("a folder");
     std::fs::create_dir(&root).expect("mkdir");
     let root = dunce::canonicalize(&root).expect("canonical root");
-    let changed = ScanOptions {
-        apparent_size: true,
-        follow_links: true,
-        include_hidden: false,
-        one_filesystem: false,
-        metric: Metric::Files,
-        threads: ruum_core::scan_threads::ScanThreads {
-            max_threads: 8,
-            adaptive: true,
-            retained_throughput: 0.85,
-            system_cpu_limit: Some(0.70),
-        },
-        ..ScanOptions::default()
-    };
-    for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
-        let args = crate::state::restart_args(&options, depth, &root);
-        let parsed = crate::parse_args(args.into_iter()).expect("parses");
-        assert_eq!(parsed.root, root);
-        assert_eq!(parsed.depth, depth);
-        let got = &parsed.options;
-        assert_eq!(got.threads.max_threads, options.threads.max_threads);
-        assert_eq!(got.threads.adaptive, options.threads.adaptive);
-        assert!(
-            (got.threads.retained_throughput
-                - options.threads.retained_throughput)
-                .abs()
-                < f64::EPSILON
-        );
-        assert_eq!(
-            got.threads.system_cpu_limit,
-            options.threads.system_cpu_limit
-        );
-        assert_eq!(
-            (
-                got.apparent_size,
-                got.follow_links,
-                got.include_hidden,
-                got.one_filesystem,
-                got.metric,
-            ),
-            (
-                options.apparent_size,
-                options.follow_links,
-                options.include_hidden,
-                options.one_filesystem,
-                options.metric,
-            )
-        );
-    }
+    let args = crate::state::restart_args(&root);
+    let parsed = crate::parse_gui_args(args.into_iter()).expect("parses");
+    assert_eq!(parsed.root, root);
 }
 
 #[gpui_kit::test]
 fn power_efficiency_menu_saves_without_discarding_the_tree(
     cx: &mut TestAppContext,
 ) {
-    use crate::power::{self, PowerEfficiency as Power};
+    use crate::power::PowerEfficiency as Power;
     use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
 
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let config = tempfile::tempdir().expect("config");
-    let path = config.path().join("power-efficiency");
+    let path = config.path().join("ruum.db");
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
     update(&view, cx, |app, _| {
-        app.power_settings_path = Some(path.clone());
+        app.db_path = Some(path.clone());
         // Enough CPUs that every preset is offered, whatever runs the test.
         app.cpu_threads = 18;
     });
@@ -2201,7 +2167,11 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
         let choice = cx.debug_bounds(preset.key()).expect("preset");
         cx.simulate_click(choice.center(), Modifiers::none());
         draw(cx);
-        assert_eq!(power::load(&path).expect("saved"), preset);
+        let saved = StorageDb::open(&path)
+            .expect("open db")
+            .load_app_settings()
+            .expect("saved");
+        assert_eq!(saved.power_preset, preset.key());
         read(&view, cx, |app| {
             assert_eq!(app.power_choice, Some(preset));
             assert_eq!(
@@ -2216,7 +2186,7 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
     }
     // Persistence failure must not masquerade as a saved preference.
     update(&view, cx, |app, cx| {
-        app.power_settings_path = Some(config.path().to_owned());
+        app.db_path = Some(config.path().to_owned());
         app.set_power_efficiency(Power::Miser, cx);
     });
     assert!(read(&view, cx, |app| {
@@ -2246,7 +2216,7 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
     update(&view, cx, |app, _| {
-        app.power_settings_path = Some(config.path().join("power"));
+        app.db_path = Some(config.path().join("ruum.db"));
         // Aggressive and Drain My Battery would both run four workers.
         app.cpu_threads = 4;
         app.power_choice = Some(Power::Balanced);
@@ -2506,8 +2476,11 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
-    // 1. Navigate to Settings page
-    update(&view, cx, |app, _| app.screen = Screen::Settings);
+    // 1. Navigate to Settings page (Watchdog category)
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Settings;
+        app.set_settings_category(crate::state::SettingsCategory::Watchdog, cx);
+    });
     draw(cx);
     assert!(cx.debug_bounds("settings-page").is_some());
     assert!(cx.debug_bounds("setting-enable-watchdog").is_some());
@@ -2632,18 +2605,17 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     // 3. Inject mock proposal into watchdog state and open standalone window
     let target_file = temp.path().join("junk/blob.bin");
     update(&view, cx, |app, cx| {
-        app.watchdog_state.last_proposal =
-            Some(ruum_core::watchdog_config::CleanupProposal {
-                timestamp_secs: 1000,
-                summary: "AI recommends removing junk blobs".into(),
-                items: vec![ProposalItem::new(
-                    target_file.clone(),
-                    200_000,
-                    RemovalMode::Trash,
-                    Some("junk test file".into()),
-                    None,
-                )],
-            });
+        app.ai_proposal = Some(ruum_core::watchdog_config::CleanupProposal {
+            timestamp_secs: 1000,
+            summary: "AI recommends removing junk blobs".into(),
+            items: vec![ProposalItem::new(
+                target_file.clone(),
+                200_000,
+                RemovalMode::Trash,
+                Some("junk test file".into()),
+                None,
+            )],
+        });
         app.open_last_proposal(cx);
     });
     draw(cx);
@@ -2827,15 +2799,15 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
     let (view, cx) = view_over(temp.path(), cx);
 
     // 1. Settings page: save feedback shows floating Toast (no inline notice).
-    update(&view, cx, |app, _| {
+    update(&view, cx, |app, cx| {
         app.notice = None;
         app.screen = Screen::Settings;
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
     });
     draw(cx);
     assert!(cx.debug_bounds("toast-notification").is_none());
     assert!(cx.debug_bounds("setting-test-cli").is_some());
     assert!(cx.debug_bounds("setting-fetch-models").is_some());
-    assert!(cx.debug_bounds("setting-cli-btn").is_some());
     assert!(cx.debug_bounds("setting-ai-auto-analyze").is_some());
     assert!(cx.debug_bounds("setting-extra-args-input").is_some());
     assert!(cx.debug_bounds("setting-save-status").is_none());
@@ -2925,17 +2897,14 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
         Some("claude-sonnet-4-6".to_string())
     );
     // Committed config only updates after Save Settings.
-    assert_eq!(
-        read(&view, cx, |app| app.watchdog_config.model.clone()),
-        None
-    );
+    assert_eq!(read(&view, cx, |app| app.ai_config.model.clone()), None);
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
             app.save_watchdog_settings(window, cx);
         });
     });
     assert_eq!(
-        read(&view, cx, |app| app.watchdog_config.model.clone()),
+        read(&view, cx, |app| app.ai_config.model.clone()),
         Some("claude-sonnet-4-6".to_string())
     );
 
@@ -3003,12 +2972,12 @@ esac
 
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
-    update(&view, cx, |app, _| {
+    update(&view, cx, |app, cx| {
         app.screen = Screen::Settings;
-        app.watchdog_config.ai_provider = AiCliProvider::Agy;
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.ai_config.provider = AiCliProvider::Agy;
         app.watchdog_draft.ai_provider = AiCliProvider::Agy;
-        app.watchdog_config.custom_command =
-            fake_cli.to_string_lossy().to_string();
+        app.ai_config.custom_command = fake_cli.to_string_lossy().to_string();
     });
 
     // 1. Test connection only (without auto-fetching models).
@@ -3541,33 +3510,30 @@ fn review_auto_switches_to_permanent_for_trash_and_localizes_trash_block(
 fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
     cx: &mut TestAppContext,
 ) {
-    use ruum_core::watchdog_config::{
-        AiCliProvider, DEFAULT_COOLDOWN_SECS, WatchdogConfig, WatchdogState,
-        load_config, load_state,
-    };
+    use ruum_core::storage::{AiConfig, StorageDb};
+    use ruum_core::watchdog_config::AiCliProvider;
+    use ruum_watchdog::{DEFAULT_COOLDOWN_SECS, WatchdogConfig, WatchdogState};
 
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let cfg_path = temp.path().join("watchdog.json");
-    let state_path = temp.path().join("watchdog-state.json");
+    let db_path = temp.path().join("ruum.db");
     let (view, cx) = view_over(temp.path(), cx);
 
-    // Under cfg!(test), paths are None so host config is never touched.
+    // Under cfg!(test), db_path is None so host config is never touched.
     read(&view, cx, |app| {
-        assert!(app.watchdog_config_path.is_none());
-        assert!(app.watchdog_state_path.is_none());
+        assert!(app.db_path.is_none());
         assert_eq!(app.watchdog_config.cooldown_secs, DEFAULT_COOLDOWN_SECS);
     });
 
     update(&view, cx, |app, cx| {
         app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
     });
     draw(cx);
 
     // Defaults echo "20", "5", "360", and extra_args/auto-analyze are visible.
     assert!(cx.debug_bounds("setting-ai-auto-analyze").is_some());
     assert!(cx.debug_bounds("setting-extra-args-input").is_some());
-    assert!(cx.debug_bounds("setting-cli-btn").is_some());
     assert!(cx.debug_bounds("setting-custom-cmd-input").is_none());
 
     let val_of = |cx: &mut Window,
@@ -3583,17 +3549,22 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
     assert_eq!(val_of(cx, |a| &a.watchdog_input_poll_interval), "5");
     assert_eq!(val_of(cx, |a| &a.watchdog_input_cooldown), "360");
 
-    // Inject temp config/state paths and pre-seed cooldown state to verify reset.
+    // Pre-seed cooldown state in temp SQLite DB to verify threshold reset.
+    {
+        let db = StorageDb::open(&db_path).expect("open temp db");
+        let svc = db.watchdog().expect("watchdog service");
+        svc.save_state(&WatchdogState {
+            last_checked_secs: Some(500),
+            last_triggered_secs: Some(400),
+            last_triggered_threshold_gb: Some(20),
+        })
+        .expect("seed state");
+    }
+
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
-            app.watchdog_config_path = Some(cfg_path.clone());
-            app.watchdog_state_path = Some(state_path.clone());
-            app.watchdog_state = WatchdogState {
-                last_checked_secs: Some(500),
-                last_triggered_secs: Some(400),
-                last_triggered_threshold_gb: Some(20),
-                last_proposal: None,
-            };
+            app.db_path = Some(db_path.clone());
+            app.reload_watchdog_state();
             app.watchdog_draft.enabled = true;
             app.watchdog_draft.background_service = true;
             app.watchdog_draft.ai_auto_analyze = false;
@@ -3634,34 +3605,49 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
         });
     });
 
-    let expected = WatchdogConfig {
+    let db = StorageDb::open(&db_path).expect("reopen temp db");
+    let svc = db.watchdog().expect("watchdog service");
+    let saved_wd = svc.load_config().expect("saved wd cfg");
+    assert!(saved_wd.updated_at_secs > 0);
+    let expected_wd = WatchdogConfig {
         enabled: true,
         background_service: true,
         min_free_gb: 42,
         poll_interval_secs: 900,
         cooldown_secs: 7200,
-        ai_auto_analyze: false,
-        ai_provider: AiCliProvider::Custom,
+        updated_at_secs: saved_wd.updated_at_secs,
+    };
+    assert_eq!(saved_wd, expected_wd);
+    let saved_state = svc.load_state().expect("saved state");
+    assert_eq!(saved_state.last_triggered_secs, None);
+    assert_eq!(saved_state.last_triggered_threshold_gb, None);
+    let saved_ai = db.load_ai_config().expect("saved ai cfg");
+    assert!(saved_ai.updated_at_secs > 0);
+    let expected_ai = AiConfig {
+        provider: AiCliProvider::Custom,
         custom_command: "/opt/bin/custom-ai".into(),
         extra_args: "--fast --json".into(),
         model: Some("gpt-5-codex".into()),
+        auto_analyze_on_alert: false,
+        updated_at_secs: saved_ai.updated_at_secs,
     };
-    assert_eq!(load_config(&cfg_path).expect("saved cfg"), expected);
-    let saved_state = load_state(&state_path).expect("saved state");
-    assert_eq!(saved_state.last_triggered_secs, None);
-    assert_eq!(saved_state.last_triggered_threshold_gb, None);
+    assert_eq!(saved_ai, expected_ai);
 
-    // Reload into a fresh Ruum instance and confirm all 10 fields echo back.
+    // Reload into a fresh Ruum instance and confirm all fields echo back.
     let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
     update(&fresh_view, fresh_cx, |app, cx| {
-        app.watchdog_config_path = Some(cfg_path.clone());
-        app.watchdog_state_path = Some(state_path.clone());
+        app.db_path = Some(db_path.clone());
+        app.reload_watchdog_config_and_prepare_settings();
         app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
     });
     draw(fresh_cx);
     assert!(fresh_cx.debug_bounds("setting-custom-cmd-input").is_some());
     read(&fresh_view, fresh_cx, |app| {
-        assert_eq!(app.watchdog_config, expected);
+        assert!(app.watchdog_config.updated_at_secs > 0);
+        assert!(app.ai_config.updated_at_secs > 0);
+        assert_eq!(app.watchdog_config, expected_wd);
+        assert_eq!(app.ai_config, expected_ai);
         assert!(app.watchdog_draft.enabled);
         assert!(app.watchdog_draft.background_service);
         assert!(!app.watchdog_draft.ai_auto_analyze);
@@ -3701,14 +3687,15 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
 fn settings_draft_isolation_validation_and_clamped_echo(
     cx: &mut TestAppContext,
 ) {
-    use ruum_core::watchdog_config::{AiCliProvider, load_config};
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
 
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let cfg_path = temp.path().join("watchdog.json");
+    let db_path = temp.path().join("ruum.db");
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
-        app.watchdog_config_path = Some(cfg_path.clone());
+        app.db_path = Some(db_path.clone());
         app.navigate_rail(Screen::Settings, cx);
     });
     draw(cx);
@@ -3727,8 +3714,8 @@ fn settings_draft_isolation_validation_and_clamped_echo(
     });
     read(&view, cx, |app| {
         assert!(!app.watchdog_config.enabled);
-        assert!(app.watchdog_config.ai_auto_analyze);
-        assert_eq!(app.watchdog_config.ai_provider, AiCliProvider::Agy);
+        assert!(app.ai_config.auto_analyze_on_alert);
+        assert_eq!(app.ai_config.provider, AiCliProvider::Agy);
     });
 
     // Re-entering Settings resets unsaved draft and input edits from config.
@@ -3762,7 +3749,7 @@ fn settings_draft_isolation_validation_and_clamped_echo(
             });
         });
         assert!(!read(&view, cx, |a| a.watchdog_config.enabled));
-        assert!(!cfg_path.exists());
+        assert!(!db_path.exists());
         assert_eq!(
             read(&view, cx, |a| a.notice.as_ref().map(|(_, s)| *s)),
             Some(gpui_omarchy::Status::Error)
@@ -3787,7 +3774,12 @@ fn settings_draft_isolation_validation_and_clamped_echo(
             app.save_watchdog_settings(window, cx);
         });
     });
-    let saved = load_config(&cfg_path).expect("saved clamped");
+    let saved = StorageDb::open(&db_path)
+        .expect("open temp db")
+        .watchdog()
+        .expect("watchdog svc")
+        .load_config()
+        .expect("saved clamped");
     assert_eq!(saved.min_free_gb, 1);
     assert_eq!(saved.poll_interval_secs, 60);
     assert_eq!(saved.cooldown_secs, 300);
@@ -3840,6 +3832,7 @@ fn settings_cli_install_card_and_menu_action_work_without_host_mutation(
         app.cli_install_os = Some(CliInstallOs::Linux);
         app.cli_install_exe = Some(fake_exe.clone());
         app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Cli, cx);
     });
     draw(cx);
 
@@ -3890,25 +3883,27 @@ fn settings_cli_install_card_and_menu_action_work_without_host_mutation(
 fn watchdog_page_handles_none_space_saturating_mul_and_syncs_checked_at(
     cx: &mut TestAppContext,
 ) {
-    use ruum_core::watchdog_config::{WatchdogState, save_state};
+    use ruum_core::storage::StorageDb;
+    use ruum_watchdog::WatchdogState;
 
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let state_path = temp.path().join("watchdog-state.json");
-    save_state(
-        &state_path,
-        &WatchdogState {
-            last_checked_secs: Some(1_234_567),
-            last_triggered_secs: None,
-            last_triggered_threshold_gb: None,
-            last_proposal: None,
-        },
-    )
-    .expect("save state");
+    let db_path = temp.path().join("ruum.db");
+    {
+        let db = StorageDb::open(&db_path).expect("open temp db");
+        db.watchdog()
+            .expect("watchdog svc")
+            .save_state(&WatchdogState {
+                last_checked_secs: Some(1_234_567),
+                last_triggered_secs: None,
+                last_triggered_threshold_gb: None,
+            })
+            .expect("save state");
+    }
 
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
-        app.watchdog_state_path = Some(state_path);
+        app.db_path = Some(db_path);
         app.watchdog_home_space = None;
         app.space = None;
         app.watchdog_config.min_free_gb = u64::MAX;
@@ -3938,10 +3933,11 @@ fn settings_model_list_scroll_is_isolated_from_outer_page(
     let (view, cx) = view_over(temp.path(), cx);
 
     // Resize to a height where `setting-model-list` is visible in the
-    // viewport while the outer `settings-page` still overflows vertically.
-    cx.simulate_resize(gpui_kit::size(px(1000.), px(1050.)));
-    update(&view, cx, |app, _| {
+    // viewport while `settings-content` still overflows vertically.
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(660.)));
+    update(&view, cx, |app, cx| {
         app.screen = Screen::Settings;
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
         app.watchdog_models = (0..20)
             .map(|i| DiscoveredModel {
                 id: format!("model-{i:02}"),
@@ -3965,12 +3961,14 @@ fn settings_model_list_scroll_is_isolated_from_outer_page(
         .debug_bounds("setting-save-btn")
         .expect("setting-save-btn bounds");
     assert!(
-        list_before.center().y < px(1050.),
-        "expected setting-model-list center inside viewport: {list_before:?}"
+        list_before.center().y < save_btn_before.origin.y,
+        "expected setting-model-list center above pinned save bar: \
+         list={list_before:?}, save={save_btn_before:?}"
     );
     assert!(
-        save_btn_before.bottom() > px(1050.),
-        "expected settings-page to overflow viewport: {save_btn_before:?}"
+        list_before.bottom() > save_btn_before.origin.y,
+        "expected settings-content to overflow above pinned save bar: \
+         list={list_before:?}, save={save_btn_before:?}"
     );
     let initial_rel_y = row0_before.origin.y - list_before.origin.y;
 
@@ -4044,12 +4042,9 @@ fn settings_model_list_scroll_is_isolated_from_outer_page(
         test_cli_after_inner.origin.y,
         test_cli_after_outer.origin.y
     );
-    assert!(
-        save_btn_after_outer.origin.y < save_btn_after_inner.origin.y,
-        "expected outer setting-save-btn to shift upward: before={:?}, \
-         after={:?}",
-        save_btn_after_inner.origin.y,
-        save_btn_after_outer.origin.y
+    assert_eq!(
+        save_btn_after_outer.origin.y, save_btn_after_inner.origin.y,
+        "expected bottom setting-save-btn bar to remain pinned"
     );
     let rel_after_outer = row0_after_outer.origin.y - list_after_outer.origin.y;
     assert_eq!(
@@ -4057,4 +4052,1352 @@ fn settings_model_list_scroll_is_isolated_from_outer_page(
         "inner model list scroll offset should stay unchanged when scrolling \
          outer settings-page"
     );
+}
+
+#[derive(Debug, Default)]
+struct CountingRootSecret {
+    loads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    secret: std::sync::Mutex<Option<[u8; 32]>>,
+}
+
+impl CountingRootSecret {
+    fn new(seed: [u8; 32]) -> Self {
+        Self {
+            loads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            secret: std::sync::Mutex::new(Some(seed)),
+        }
+    }
+
+    fn load_count(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct CountingRootSecretHandle {
+    loads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    seed: [u8; 32],
+}
+
+impl ruum_core::credentials::RootSecretStore for CountingRootSecretHandle {
+    fn get_or_create_root_secret(
+        &self,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(zeroize::Zeroizing::new(self.seed))
+    }
+}
+
+impl CountingRootSecret {
+    fn store_for(
+        &self,
+        enc_path: &Path,
+    ) -> ruum_core::credentials::LazyCredentialStore {
+        let seed = self.secret.lock().expect("lock").unwrap_or([0x42; 32]);
+        let handle = CountingRootSecretHandle {
+            loads: std::sync::Arc::clone(&self.loads),
+            seed,
+        };
+        ruum_core::credentials::LazyCredentialStore::new(
+            enc_path.to_path_buf(),
+            std::sync::Arc::new(handle),
+        )
+    }
+}
+
+#[gpui_kit::test]
+fn default_explore_startup_does_not_touch_keychain_or_legacy_text_files(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("device-credentials.enc");
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.add_ssh_profile(&SshProfile {
+            id: "prof-1".into(),
+            alias: "prod-box".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_mode: AuthMode::PrivateKey,
+            default_path: Some("/var/log".into()),
+            created_at_secs: 100,
+            updated_at_secs: 100,
+            last_total_bytes: Some(1_000_000_000),
+            last_available_bytes: Some(250_000_000),
+            last_scanned_secs: Some(900),
+        })
+        .expect("seed ssh profile");
+    }
+
+    let counter = CountingRootSecret::new([0x11; 32]);
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.reload_ssh_profiles();
+        app.reload_watchdog_config_and_prepare_settings();
+    });
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+        assert!(app.tree.is_some());
+        assert_eq!(app.ssh_profiles.len(), 1);
+    });
+    assert_eq!(counter.load_count(), 0);
+    assert!(!cfg_dir.path().join("watchdog.json").exists());
+    assert!(!cfg_dir.path().join("watchdog-state.json").exists());
+    assert!(!cfg_dir.path().join("power-efficiency").exists());
+
+    // Rendering Sources SSH cards from SQLite also must not touch the keychain.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Sources, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-profiles-card").is_some());
+    assert!(cx.debug_bounds("ssh-card-0").is_some());
+    assert_eq!(counter.load_count(), 0);
+}
+
+#[gpui_kit::test]
+fn sources_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("device-credentials.enc");
+
+    let counter = CountingRootSecret::new([0x2A; 32]);
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(900.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.navigate_rail(Screen::Sources, cx);
+    });
+    draw(cx);
+    assert_eq!(counter.load_count(), 0);
+
+    // 1. Open Add Server form and fill Password-authenticated SSH server.
+    let add_btn = cx.debug_bounds("ssh-add-btn").expect("ssh-add-btn");
+    cx.simulate_click(add_btn.center(), Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-form").is_some());
+
+    let auth_pw_btn = cx
+        .debug_bounds("ssh-form-auth-password")
+        .expect("auth password btn");
+    cx.simulate_click(auth_pw_btn.center(), Modifiers::none());
+    draw(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.ssh_input_alias
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("lab-server", window, cx));
+            app.ssh_input_host
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("127.0.0.1", window, cx));
+            app.ssh_input_port
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("2222", window, cx));
+            app.ssh_input_username
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("tester", window, cx));
+            app.ssh_input_default_path
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("/tmp", window, cx));
+            app.ssh_input_password
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("s3cr3t", window, cx));
+            app.save_ssh_profile_form(cx);
+        });
+    });
+    draw(cx);
+
+    assert!(cx.debug_bounds("ssh-form").is_none());
+    assert!(cx.debug_bounds("ssh-card-0").is_some());
+    assert!(enc_path.exists());
+    // Saving encrypted credentials called RootSecretStore once.
+    assert_eq!(counter.load_count(), 1);
+
+    let profiles = StorageDb::open(&db_path)
+        .expect("open db")
+        .list_ssh_profiles()
+        .expect("list profiles");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].alias, "lab-server");
+    assert_eq!(profiles[0].port, 2222);
+    assert_eq!(profiles[0].auth_mode, AuthMode::Password);
+    assert_eq!(profiles[0].default_path.as_deref(), Some("/tmp"));
+
+    // 2. Edit alias without touching secret field -> keeps saved secret.
+    let edit_btn = cx.debug_bounds("ssh-edit-0").expect("ssh-edit-0");
+    cx.simulate_click(edit_btn.center(), Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-form").is_some());
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.ssh_input_alias
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("lab-renamed", window, cx));
+            app.save_ssh_profile_form(cx);
+        });
+    });
+    draw(cx);
+
+    let updated = StorageDb::open(&db_path)
+        .expect("open db")
+        .list_ssh_profiles()
+        .expect("list profiles");
+    assert_eq!(updated[0].alias, "lab-renamed");
+    assert_eq!(updated[0].auth_mode, AuthMode::Password);
+
+    // 2b. Switching auth_mode without entering a matching secret is rejected
+    //     so SQLite auth_mode never diverges from encrypted store variant.
+    let edit_btn2 = cx.debug_bounds("ssh-edit-0").expect("ssh-edit-0");
+    cx.simulate_click(edit_btn2.center(), Modifiers::none());
+    draw(cx);
+    let key_mode_btn = cx
+        .debug_bounds("ssh-form-auth-key")
+        .expect("ssh-form-auth-key");
+    cx.simulate_click(key_mode_btn.center(), Modifiers::none());
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.save_ssh_profile_form(cx);
+    });
+    draw(cx);
+    assert!(read(&view, cx, |app| {
+        app.ssh_form_open && app.ssh_form_error.is_some()
+    }));
+    let still_pw = StorageDb::open(&db_path)
+        .expect("open db")
+        .list_ssh_profiles()
+        .expect("list profiles");
+    assert_eq!(still_pw[0].auth_mode, AuthMode::Password);
+    update(&view, cx, Ruum::close_ssh_form);
+
+    // 3. Fresh Ruum reloads SQLite profiles with 0 keychain calls until Connect.
+    let counter2 = CountingRootSecret::new([0x2A; 32]);
+    let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
+    update(&fresh_view, fresh_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(counter2.store_for(&enc_path));
+        app.reload_ssh_profiles();
+        app.navigate_rail(Screen::Sources, cx);
+    });
+    draw(fresh_cx);
+    assert_eq!(counter2.load_count(), 0);
+
+    // 4. Clicking Connect & Scan triggers on-demand secret decryption even if
+    //    no network/ssh endpoint responds (returns structured error toast).
+    let connect_btn = fresh_cx
+        .debug_bounds("ssh-connect-0")
+        .expect("ssh-connect-0");
+    fresh_cx.simulate_click(connect_btn.center(), Modifiers::none());
+    draw(fresh_cx);
+    assert_eq!(counter2.load_count(), 1);
+    let connected_or_errored = read(&fresh_view, fresh_cx, |app| {
+        app.screen == Screen::Explore
+            || app
+                .notice
+                .as_ref()
+                .is_some_and(|(_, s)| *s == gpui_omarchy::Status::Error)
+    });
+    assert!(connected_or_errored);
+
+    // 4b. Re-opening Sources while an SSH card is active loads local mounts
+    //     only and performs 0 keychain reads (lazy keychain guarantee).
+    let counter_session = CountingRootSecret::new([0x2A; 32]);
+    update(&fresh_view, fresh_cx, |app, cx| {
+        app.cred_store = Some(counter_session.store_for(&enc_path));
+        app.active_ssh_session = None;
+        app.active_ssh_profile_id = Some(updated[0].id.clone());
+        app.remote = Some(updated[0].alias.clone());
+        app.navigate_rail(Screen::Sources, cx);
+    });
+    draw(fresh_cx);
+    assert_eq!(counter_session.load_count(), 0);
+    assert!(read(&fresh_view, fresh_cx, |app| {
+        app.active_ssh_session.is_none()
+    }));
+
+    // 5. Delete SSH card deletes credential first, then SQLite row.
+    fresh_cx.simulate_resize(gpui_kit::size(px(1100.), px(900.)));
+    draw(fresh_cx);
+    let delete_btn =
+        fresh_cx.debug_bounds("ssh-delete-0").expect("ssh-delete-0");
+    fresh_cx.simulate_click(delete_btn.center(), Modifiers::none());
+    draw(fresh_cx);
+    assert!(
+        StorageDb::open(&db_path)
+            .expect("open db")
+            .list_ssh_profiles()
+            .expect("list profiles")
+            .is_empty()
+    );
+    assert_eq!(
+        counter2.store_for(&enc_path).get_ssh_secret(&updated[0].id),
+        Ok(None)
+    );
+    assert!(fresh_cx.debug_bounds("ssh-card-0").is_none());
+
+    // 6. Deleting a profile when device-credentials.enc does NOT exist never
+    //    touches keychain and deletes SQLite cleanly (headless Linux safe).
+    let missing_enc = cfg_dir.path().join("missing-credentials.enc");
+    let counter3 = CountingRootSecret::new([0x33; 32]);
+    StorageDb::open(&db_path)
+        .expect("open db")
+        .add_ssh_profile(&SshProfile {
+            id: "no-enc-prof".into(),
+            alias: "headless".into(),
+            host: "10.0.0.9".into(),
+            port: 22,
+            username: "ops".into(),
+            auth_mode: AuthMode::PrivateKey,
+            default_path: None,
+            created_at_secs: 1,
+            updated_at_secs: 1,
+            last_total_bytes: None,
+            last_available_bytes: None,
+            last_scanned_secs: None,
+        })
+        .expect("add profile");
+    update(&fresh_view, fresh_cx, |app, cx| {
+        app.cred_store = Some(counter3.store_for(&missing_enc));
+        app.reload_ssh_profiles();
+        app.delete_ssh_profile_card("no-enc-prof", cx);
+    });
+    assert_eq!(counter3.load_count(), 0);
+    assert!(
+        StorageDb::open(&db_path)
+            .expect("open db")
+            .list_ssh_profiles()
+            .expect("list")
+            .is_empty()
+    );
+}
+
+#[gpui_kit::test]
+fn remote_connect_confirm_modal_approve_deny_queue_and_fail_closed(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::{
+        RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(700.)));
+
+    let make_req = |alias: &str| RemoteConnectConfirmRequest {
+        target_label: alias.into(),
+        alias: Some(alias.into()),
+        host: "10.0.0.10".into(),
+        port: 22,
+        username: "ops".into(),
+        auth_mode: "private_key".into(),
+        tool_name: "scan_directory".into(),
+    };
+
+    let (tx1, rx1) = std::sync::mpsc::channel();
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    let (tx3, rx3) = std::sync::mpsc::channel();
+
+    update(&view, cx, |app, cx| {
+        app.enqueue_remote_connect_confirm(
+            make_req("prod-1"),
+            Some(tx1),
+            None,
+            cx,
+        );
+        app.enqueue_remote_connect_confirm(
+            make_req("prod-2"),
+            Some(tx2),
+            None,
+            cx,
+        );
+        app.enqueue_remote_connect_confirm(
+            make_req("prod-3"),
+            Some(tx3),
+            None,
+            cx,
+        );
+    });
+    draw(cx);
+
+    assert!(cx.debug_bounds("remote-connect-confirm-popup").is_some());
+    assert!(cx.debug_bounds("remote-connect-approve").is_some());
+    assert!(cx.debug_bounds("remote-connect-deny").is_some());
+
+    // Enter approves first request and promotes second request from queue.
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert_eq!(rx1.try_recv(), Ok(RemoteConnectConfirmDecision::Approved));
+    assert_eq!(
+        read(&view, cx, |a| {
+            a.remote_connect_confirm
+                .as_ref()
+                .map(|m| m.request.target_label.clone())
+        }),
+        Some("prod-2".into())
+    );
+
+    // Escape denies second request and promotes third.
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert_eq!(rx2.try_recv(), Ok(RemoteConnectConfirmDecision::Denied));
+    assert_eq!(
+        read(&view, cx, |a| {
+            a.remote_connect_confirm
+                .as_ref()
+                .map(|m| m.request.target_label.clone())
+        }),
+        Some("prod-3".into())
+    );
+
+    // Dropping/clearing undecided modal fails closed with Denied.
+    update(&view, cx, |app, _| {
+        app.remote_connect_confirm = None;
+    });
+    assert_eq!(rx3.try_recv(), Ok(RemoteConnectConfirmDecision::Denied));
+
+    // Standalone window writes Approved on click, and Denied on close.
+    let resp_dir = tempfile::tempdir().expect("resp dir");
+    let resp_approve = resp_dir.path().join("approve.json");
+    let resp_close = resp_dir.path().join("close.json");
+    let req_standalone = make_req("standalone-box");
+    cx.update(|_, cx| {
+        crate::open_remote_connect_confirm_window_with_mode(
+            req_standalone.clone(),
+            None,
+            Some(resp_approve.clone()),
+            false,
+            cx,
+        )
+        .expect("open standalone approve window");
+    });
+    let windows = cx.windows();
+    assert_eq!(windows.len(), 2);
+    let mut win_cx = VisualTestContext::from_window(windows[1], &cx.cx);
+    draw(&mut win_cx);
+    let approve_btn = win_cx
+        .debug_bounds("remote-connect-approve")
+        .expect("approve btn");
+    win_cx.simulate_click(approve_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    let approved_json =
+        std::fs::read_to_string(&resp_approve).expect("approve resp file");
+    let parsed_approve: RemoteConnectConfirmDecision =
+        serde_json::from_str(&approved_json).expect("parse approved");
+    assert_eq!(parsed_approve, RemoteConnectConfirmDecision::Approved);
+
+    // Second standalone window closed without clicking fails closed -> Denied.
+    cx.update(|_, cx| {
+        crate::open_remote_connect_confirm_window_with_mode(
+            req_standalone,
+            None,
+            Some(resp_close.clone()),
+            false,
+            cx,
+        )
+        .expect("open standalone close window");
+    });
+    let windows = cx.windows();
+    assert_eq!(windows.len(), 2);
+    let mut close_cx = VisualTestContext::from_window(windows[1], &cx.cx);
+    draw(&mut close_cx);
+    close_cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let closed_json =
+        std::fs::read_to_string(&resp_close).expect("close resp file");
+    let parsed_close: RemoteConnectConfirmDecision =
+        serde_json::from_str(&closed_json).expect("parse denied");
+    assert_eq!(parsed_close, RemoteConnectConfirmDecision::Denied);
+}
+
+#[gpui_kit::test]
+fn settings_general_watchdog_webhook_and_ai_round_trip_in_sqlite(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{AiConfig, AppSettings, StorageDb};
+    use ruum_core::watchdog_config::AiCliProvider;
+    use ruum_watchdog::WatchdogConfig;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(1400.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    assert!(cx.debug_bounds("setting-general-section").is_some());
+    assert!(cx.debug_bounds("setting-tab-general").is_some());
+    assert!(cx.debug_bounds("setting-tab-watchdog").is_some());
+    assert!(cx.debug_bounds("setting-tab-webhook").is_some());
+    assert!(cx.debug_bounds("setting-tab-ai").is_some());
+    assert!(cx.debug_bounds("setting-tab-cli").is_some());
+
+    // Switch to Webhook category and verify multi-webhook validation + CRUD.
+    let wh_tab = cx.debug_bounds("setting-tab-webhook").expect("webhook tab");
+    cx.simulate_click(wh_tab.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("setting-webhook-section").is_some());
+    update(&view, cx, Ruum::open_add_webhook_form);
+    draw(cx);
+    assert!(cx.debug_bounds("setting-webhook-form").is_some());
+
+    // Invalid webhook URL & invalid headers JSON abort Save cleanly.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.webhook_input_name
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("ops", window, cx));
+            app.setting_input_webhook_url
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("ftp://invalid", window, cx));
+            app.save_webhook_form(cx);
+        });
+    });
+    assert!(read(&view, cx, |a| a.webhook_form_error.is_some()));
+    assert!(read(&view, cx, |a| a.webhooks.is_empty()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.setting_input_webhook_url.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("https://hooks.example.com/ruum", window, cx);
+                },
+            );
+            app.setting_input_webhook_headers
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("[1,2]", window, cx));
+            app.save_webhook_form(cx);
+        });
+    });
+    assert!(read(&view, cx, |a| a.webhook_form_error.is_some()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.webhook_form_enabled = true;
+            app.setting_input_webhook_timeout
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("15", window, cx));
+            app.setting_input_webhook_headers.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("{\"X-Token\":\"abc\"}", window, cx);
+                },
+            );
+            app.save_webhook_form(cx);
+        });
+    });
+    assert_eq!(read(&view, cx, |a| a.webhooks.len()), 1);
+
+    // Save valid settings across General + Watchdog + AI without clobbering
+    // saved multi-webhook endpoints.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.set_settings_category(
+                crate::state::SettingsCategory::General,
+                cx,
+            );
+            app.watchdog_draft.power_preset =
+                crate::power::PowerEfficiency::Miser;
+            app.watchdog_draft.apparent_size = true;
+            app.watchdog_draft.include_hidden = true;
+            app.watchdog_draft.follow_system_appearance = false;
+            app.setting_input_default_depth
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("5", window, cx));
+            app.setting_input_ssh_duration
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("30", window, cx));
+
+            app.set_settings_category(
+                crate::state::SettingsCategory::Watchdog,
+                cx,
+            );
+            app.watchdog_draft.enabled = true;
+            app.watchdog_input_min_free
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("35", window, cx));
+
+            app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+            app.watchdog_draft.ai_auto_analyze = false;
+            app.set_watchdog_provider(AiCliProvider::Pi, cx);
+            app.watchdog_input_model
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| {
+                    i.set_value("claude-sonnet-4-6", window, cx);
+                });
+
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+    assert_eq!(
+        read(&view, cx, |a| a.notice.as_ref().map(|(_, s)| *s)),
+        Some(gpui_omarchy::Status::Success)
+    );
+
+    let db = StorageDb::open(&db_path).expect("reopen db");
+    let saved_app = db.load_app_settings().expect("app settings");
+    assert!(saved_app.updated_at_secs > 0);
+    assert_eq!(
+        saved_app,
+        AppSettings {
+            power_preset: "miser".into(),
+            default_depth: 5,
+            apparent_size: true,
+            include_hidden: true,
+            follow_system_appearance: false,
+            ssh_session_duration_minutes: 30,
+            updated_at_secs: saved_app.updated_at_secs,
+        }
+    );
+    let saved_wd = db.watchdog().expect("wd").load_config().expect("wd cfg");
+    assert!(saved_wd.updated_at_secs > 0);
+    assert_eq!(
+        saved_wd,
+        WatchdogConfig {
+            enabled: true,
+            min_free_gb: 35,
+            updated_at_secs: saved_wd.updated_at_secs,
+            ..WatchdogConfig::default()
+        }
+    );
+    let saved_webhooks = db.list_webhooks().expect("webhooks");
+    assert_eq!(saved_webhooks.len(), 1);
+    assert_eq!(saved_webhooks[0].name, "ops");
+    assert_eq!(saved_webhooks[0].url, "https://hooks.example.com/ruum");
+    assert_eq!(saved_webhooks[0].timeout_secs, 15);
+    assert_eq!(saved_webhooks[0].headers_json, "{\"X-Token\":\"abc\"}");
+    assert!(saved_webhooks[0].enabled);
+
+    let saved_ai = db.load_ai_config().expect("ai cfg");
+    assert!(saved_ai.updated_at_secs > 0);
+    assert_eq!(
+        saved_ai,
+        AiConfig {
+            provider: AiCliProvider::Pi,
+            custom_command: String::new(),
+            extra_args: String::new(),
+            model: Some("claude-sonnet-4-6".into()),
+            auto_analyze_on_alert: false,
+            updated_at_secs: saved_ai.updated_at_secs,
+        }
+    );
+
+    // Fresh Ruum loads identical state back from SQLite ruum.db.
+    let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
+    update(&fresh_view, fresh_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.reload_watchdog_config_and_prepare_settings();
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(fresh_cx);
+    read(&fresh_view, fresh_cx, |app| {
+        assert_eq!(app.app_settings.default_depth, 5);
+        assert!(app.app_settings.apparent_size);
+        assert!(app.app_settings.include_hidden);
+        assert!(!app.app_settings.follow_system_appearance);
+        assert_eq!(app.app_settings.ssh_session_duration_minutes, 30);
+        assert_eq!(app.webhooks, saved_webhooks);
+        assert_eq!(app.ai_config, saved_ai);
+        assert_eq!(app.watchdog_config, saved_wd);
+    });
+}
+
+#[gpui_kit::test]
+fn host_tabs_strip_preserves_sessions_and_local_tab_is_unclosable(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::{ExploreHostTab, ExploreSessionSnapshot, HostTabKey};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // Mark a path on the local session.
+    update(&view, cx, |app, cx| {
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+    });
+    let local_root = read(&view, cx, |a| a.root_path.clone());
+    let local_marks_len = read(&view, cx, |a| a.marks.len());
+    assert_eq!(local_marks_len, 1);
+
+    draw(cx);
+    assert!(cx.debug_bounds("host-tabs").is_some());
+    assert!(cx.debug_bounds("host-tab-local").is_some());
+    assert!(cx.debug_bounds("host-tab-close-local").is_none());
+
+    // Add a remote SSH tab with its own snapshot tree and switch to it.
+    let remote_fixture = fixture();
+    let remote_tree =
+        std::sync::Arc::new(scan(remote_fixture.path(), options()).unwrap());
+    let mut remote_marks = crate::marks::Marks::default();
+    remote_marks.toggle(ruum_core::removal::Target {
+        path: PathBuf::from("/srv/remote/var.log"),
+        bytes: 2048,
+        is_dir: false,
+        hidden: false,
+    });
+    let mut remote_snap = ExploreSessionSnapshot::default();
+    remote_snap.root_path = PathBuf::from("/srv/remote");
+    remote_snap.scan_root = PathBuf::from("/srv/remote");
+    remote_snap.tree = Some(std::sync::Arc::clone(&remote_tree));
+    remote_snap.scanned_at = 100;
+    remote_snap.marks = remote_marks;
+    remote_snap.remote = Some("prod-1".into());
+    remote_snap.remote_platform = "linux".into();
+    remote_snap.active_ssh_profile_id = Some("srv-1".into());
+    update(&view, cx, |app, cx| {
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh("srv-1".into()),
+            label: "prod-1".into(),
+            session: Some(remote_snap),
+        });
+        cx.notify();
+    });
+    draw(cx);
+    let ssh_tab = cx.debug_bounds("host-tab-0").expect("ssh tab 0");
+    assert!(cx.debug_bounds("host-tab-close-0").is_some());
+    cx.simulate_click(ssh_tab.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert_eq!(app.active_host_tab, HostTabKey::Ssh("srv-1".into()));
+        assert_eq!(app.remote.as_deref(), Some("prod-1"));
+        assert_eq!(app.root_path, PathBuf::from("/srv/remote"));
+        assert_eq!(app.marks.len(), 1);
+        assert!(app.tree.is_some());
+    });
+
+    // Click Local tab -> restores local tree & marks intact!
+    let local_tab = cx.debug_bounds("host-tab-local").expect("local tab");
+    cx.simulate_click(local_tab.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.active_host_tab, HostTabKey::Local);
+        assert!(app.remote.is_none());
+        assert_eq!(app.root_path, local_root);
+        assert_eq!(app.marks.len(), local_marks_len);
+        assert!(app.tree.is_some());
+    });
+
+    // Switch back to SSH tab and click its close button -> falls back to Local.
+    let ssh_tab = cx.debug_bounds("host-tab-0").expect("ssh tab 0");
+    cx.simulate_click(ssh_tab.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    let close_btn = cx.debug_bounds("host-tab-close-0").expect("ssh close btn");
+    cx.simulate_click(close_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.active_host_tab, HostTabKey::Local);
+        assert_eq!(app.host_tabs.len(), 1);
+        assert!(app.remote.is_none());
+        assert_eq!(app.root_path, local_root);
+        assert!(app.tree.is_some());
+    });
+
+    // Local tab can never be closed.
+    update(&view, cx, |app, cx| {
+        app.close_host_tab(&HostTabKey::Local, cx);
+    });
+    assert_eq!(read(&view, cx, |a| a.host_tabs.len()), 1);
+}
+
+#[gpui_kit::test]
+fn sources_ssh_tilde_default_and_action_icon_buttons_and_spinners(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Sources, cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+
+    let add_btn = cx.debug_bounds("ssh-add-btn").expect("ssh add icon button");
+    cx.simulate_click(add_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    let val = cx.update(|_, cx| {
+        view.read(cx)
+            .ssh_input_default_path
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .value()
+            .to_string()
+    });
+    assert_eq!(val, "~");
+
+    // Save SSH profile directly to db and verify card icon buttons + spinners.
+    {
+        let db = ruum_core::storage::StorageDb::open(&db_path).expect("db");
+        db.add_ssh_profile(&ruum_core::storage::SshProfile {
+            id: String::new(),
+            alias: "staging".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_mode: ruum_core::storage::AuthMode::PrivateKey,
+            default_path: Some("~".into()),
+            created_at_secs: 1,
+            updated_at_secs: 1,
+            last_total_bytes: None,
+            last_available_bytes: None,
+            last_scanned_secs: None,
+        })
+        .expect("add profile");
+    }
+    update(&view, cx, |app, cx| {
+        app.close_ssh_form(cx);
+        app.reload_ssh_profiles();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-connect-0").is_some());
+    assert!(cx.debug_bounds("ssh-check-0").is_some());
+    assert!(cx.debug_bounds("ssh-ai-0").is_some());
+    assert!(cx.debug_bounds("ssh-edit-0").is_some());
+    assert!(cx.debug_bounds("ssh-delete-0").is_some());
+
+    // Spinners render when checking/analyzing profile.
+    let id = read(&view, cx, |a| a.ssh_profiles[0].id.clone());
+    update(&view, cx, |app, cx| {
+        app.ssh_checking_profiles.insert(id.clone());
+        app.ssh_analyzing_profiles.insert(id);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-check-spin-0").is_some());
+    assert!(cx.debug_bounds("ssh-ai-spin-0").is_some());
+}
+
+#[gpui_kit::test]
+fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::removal::RemovalMode;
+    use ruum_core::watchdog_config::{CleanupProposal, ProposalItem};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let file_a = temp.path().join("a.log");
+    let file_b = temp.path().join("b.log");
+    std::fs::write(&file_a, b"aaaa").expect("write a");
+    std::fs::write(&file_b, b"bbbb").expect("write b");
+
+    let proposal = CleanupProposal {
+        timestamp_secs: 100,
+        summary: "Two stale logs".into(),
+        items: vec![
+            ProposalItem::new(
+                file_a.clone(),
+                4,
+                RemovalMode::Permanent,
+                Some("stale".into()),
+                None,
+            ),
+            ProposalItem::new(
+                file_b.clone(),
+                4,
+                RemovalMode::Permanent,
+                Some("stale".into()),
+                None,
+            ),
+        ],
+    };
+    {
+        let db = ruum_core::storage::StorageDb::open(&db_path).expect("db");
+        let ai_state =
+            ruum_core::storage::AiState::from_proposal(&proposal, 100)
+                .expect("ai state");
+        db.save_ai_state(&ai_state).expect("save ai state");
+    }
+
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.reload_watchdog_state();
+        app.navigate_rail(Screen::Watchdog, cx);
+    });
+    assert_eq!(
+        read(&view, cx, |a| a.ai_proposal.as_ref().map(|p| p.items.len())),
+        Some(2)
+    );
+
+    // Confirm cleaning only `file_a` -> `file_b` remains in Watchdog proposal.
+    let req = crate::state::proposal_confirm_request(
+        temp.path().to_path_buf(),
+        &proposal,
+        crate::i18n::Locale::En,
+    );
+    let win = cx
+        .update(|_, cx| {
+            crate::open_local_confirm_window(req, Some(db_path.clone()), cx)
+        })
+        .expect("confirm win");
+    let mut confirm_cx = VisualTestContext::from_window(win.into(), &cx.cx);
+    draw(&mut confirm_cx);
+    let check_b = confirm_cx
+        .debug_bounds("check-item-1")
+        .expect("second item checkbox");
+    confirm_cx.simulate_click(check_b.center(), gpui_kit::Modifiers::none());
+    draw(&mut confirm_cx);
+    let confirm_btn = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    confirm_cx
+        .simulate_click(confirm_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(!file_a.exists());
+    assert!(file_b.exists());
+    let remaining = read(&view, cx, |a| {
+        a.ai_proposal
+            .as_ref()
+            .map(|p| p.items.iter().map(|i| i.path.clone()).collect::<Vec<_>>())
+    });
+    assert_eq!(remaining, Some(vec![file_b.clone()]));
+
+    // Confirm remaining `file_b` -> proposal becomes None.
+    let prop_b = read(&view, cx, |a| a.ai_proposal.clone().unwrap());
+    let req_b = crate::state::proposal_confirm_request(
+        temp.path().to_path_buf(),
+        &prop_b,
+        crate::i18n::Locale::En,
+    );
+    let win_b = cx
+        .update(|_, cx| {
+            crate::open_local_confirm_window(req_b, Some(db_path), cx)
+        })
+        .expect("confirm win b");
+    let mut confirm_cx_b = VisualTestContext::from_window(win_b.into(), &cx.cx);
+    draw(&mut confirm_cx_b);
+    let confirm_btn_b = confirm_cx_b
+        .debug_bounds("confirm-clean")
+        .expect("confirm button b");
+    confirm_cx_b
+        .simulate_click(confirm_btn_b.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(!file_b.exists());
+    assert!(read(&view, cx, |a| a.ai_proposal.is_none()));
+
+    // Remote confirmation modal carries `remote_profile_id` and stays isolated.
+    let remote_modal = crate::state::CleanupConfirmModal::new(
+        crate::state::remote_proposal_confirm_request(
+            PathBuf::from("/srv/home"),
+            "prod",
+            &proposal,
+            crate::i18n::Locale::En,
+        ),
+        None,
+        None,
+    )
+    .with_remote_profile("srv-1".into());
+    assert_eq!(remote_modal.remote_profile_id.as_deref(), Some("srv-1"));
+    assert!(read(&view, cx, |a| a.ai_proposal.is_none()));
+}
+
+#[gpui_kit::test]
+fn settings_categories_preserve_drafts_webhook_crud_guide_and_icon_model_select(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(900.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    // Edit General draft & switch across categories -> draft is preserved!
+    update(&view, cx, |app, cx| {
+        app.watchdog_draft.apparent_size = true;
+        app.set_settings_category(crate::state::SettingsCategory::Webhook, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("setting-webhook-guide-toggle").is_some());
+    assert!(cx.debug_bounds("setting-webhook-guide").is_some());
+
+    let toggle_guide = cx
+        .debug_bounds("setting-webhook-guide-toggle")
+        .expect("guide toggle");
+    cx.simulate_click(toggle_guide.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("setting-webhook-guide").is_none());
+
+    let toggle_guide = cx
+        .debug_bounds("setting-webhook-guide-toggle")
+        .expect("guide toggle");
+    cx.simulate_click(toggle_guide.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("setting-webhook-guide").is_some());
+
+    // Add -> Edit -> Toggle -> Delete webhook in UI.
+    let add_wh = cx
+        .debug_bounds("setting-webhook-add-btn")
+        .expect("add webhook btn");
+    cx.simulate_click(add_wh.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.webhook_input_name
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("alerts", window, cx));
+            app.setting_input_webhook_url.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("https://hooks.example.com/a", window, cx);
+                },
+            );
+            app.save_webhook_form(cx);
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("setting-webhook-row-0").is_some());
+    assert!(cx.debug_bounds("setting-webhook-test-0").is_some());
+    assert!(cx.debug_bounds("setting-webhook-edit-0").is_some());
+    assert!(cx.debug_bounds("setting-webhook-delete-0").is_some());
+
+    let toggle_wh = cx
+        .debug_bounds("setting-webhook-toggle-0")
+        .expect("webhook toggle");
+    cx.simulate_click(toggle_wh.center(), gpui_kit::Modifiers::none());
+    assert!(!read(&view, cx, |a| a.webhooks[0].enabled));
+
+    let del_wh = cx
+        .debug_bounds("setting-webhook-delete-0")
+        .expect("webhook delete");
+    cx.simulate_click(del_wh.center(), gpui_kit::Modifiers::none());
+    assert!(read(&view, cx, |a| a.webhooks.is_empty()));
+
+    // Switch back to General -> draft preserved, then check AI icon-only select.
+    update(&view, cx, |app, cx| {
+        app.set_settings_category(crate::state::SettingsCategory::General, cx);
+    });
+    assert!(read(&view, cx, |a| a.watchdog_draft.apparent_size));
+    update(&view, cx, |app, cx| {
+        app.watchdog_models = vec![ruum_core::ai_cli::DiscoveredModel {
+            id: "m1".into(),
+            label: "M1".into(),
+            provider: None,
+        }];
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(cx);
+    let sel_btn = cx
+        .debug_bounds("setting-model-select-0")
+        .expect("icon-only model select");
+    assert!(
+        sel_btn.size.width < px(60.),
+        "expected compact icon-only model select button, got {sel_btn:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn local_confirm_cleanup_posts_started_then_done_notifications_and_toast(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::{CleanupConfirmItem, CleanupConfirmRequest};
+    use ruum_core::watchdog::{
+        NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_CLEANUP_STARTED,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let target = temp.path().join("junk/stale.bin");
+    std::fs::write(&target, vec![b'x'; 2048]).expect("write target");
+
+    let tree = scan(temp.path(), options()).expect("scan fixture");
+    let root_path = temp.path().to_path_buf();
+    let db_for_win = db_path.clone();
+    let main_win = cx.add_window(move |_, cx| {
+        let mut app = Ruum::with_tree(root_path, tree, options(), 3, cx);
+        app.locale = crate::i18n::Locale::Zh;
+        app.db_path = Some(db_for_win);
+        app
+    });
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(main_win),
+            cx,
+        );
+    });
+
+    let req = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: "Local AI Cleanup".into(),
+        summary: Some("Confirm stale files".into()),
+        items: vec![CleanupConfirmItem {
+            path: target.clone(),
+            bytes: 2048,
+            mode: RemovalMode::Permanent,
+            reason: Some("stale".into()),
+            git_warning: None,
+        }],
+    };
+    let win = cx
+        .update(|cx| crate::open_local_confirm_window(req, Some(db_path), cx))
+        .expect("open local confirm window");
+    win.update(cx, |confirm_win, _, _| {
+        confirm_win.set_locale(crate::i18n::Locale::Zh);
+    })
+    .expect("set locale");
+
+    let mut confirm_cx = VisualTestContext::from_window(win.into(), cx);
+    draw(&mut confirm_cx);
+    let confirm_btn = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    confirm_cx
+        .simulate_click(confirm_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(!target.exists());
+    let after = cx.shown_system_notifications();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].tag.as_ref(), NOTIF_TAG_CLEANUP_STARTED);
+    assert_eq!(
+        after[0].title.as_ref(),
+        crate::i18n::messages::cleanup_started_notif_title(
+            crate::i18n::Locale::Zh
+        )
+    );
+    assert!(after[0].body.contains("正在后台清理"));
+    assert!(after[0].body.contains("请稍等"));
+    assert_eq!(after[1].tag.as_ref(), NOTIF_TAG_CLEANUP_DONE);
+    assert_eq!(
+        after[1].title.as_ref(),
+        crate::i18n::messages::cleanup_complete_notif_title(
+            crate::i18n::Locale::Zh
+        )
+    );
+    assert_eq!(
+        main_win
+            .read_with(cx, |a, _| a.notice.as_ref().map(|(_, s)| *s))
+            .expect("read notice"),
+        Some(gpui_omarchy::Status::Success)
+    );
+
+    // Also verify synchronous immediate state before background tasks drain:
+    // calling `confirm` directly emits `NOTIF_TAG_CLEANUP_STARTED` and sets
+    // `Status::Neutral` on the open main window prior to `run_until_parked()`.
+    let target2 = temp.path().join("junk/stale2.bin");
+    std::fs::write(&target2, vec![b'y'; 1024]).expect("write target2");
+    let req2 = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: "Local AI Cleanup 2".into(),
+        summary: None,
+        items: vec![CleanupConfirmItem {
+            path: target2.clone(),
+            bytes: 1024,
+            mode: RemovalMode::Permanent,
+            reason: None,
+            git_warning: None,
+        }],
+    };
+    let win2 = cx
+        .update(|cx| crate::open_local_confirm_window(req2, None, cx))
+        .expect("open second local confirm window");
+    win2.update(cx, |confirm_win, window, cx| {
+        confirm_win.set_locale(crate::i18n::Locale::En);
+        confirm_win.confirm(window, cx);
+    })
+    .expect("confirm second window");
+
+    let immediate = cx.shown_system_notifications();
+    assert_eq!(immediate.len(), 3);
+    assert_eq!(immediate[2].tag.as_ref(), NOTIF_TAG_CLEANUP_STARTED);
+    assert_eq!(
+        main_win
+            .read_with(cx, |a, _| a.notice.as_ref().map(|(_, s)| *s))
+            .expect("read immediate neutral notice"),
+        Some(gpui_omarchy::Status::Neutral)
+    );
+
+    cx.run_until_parked();
+    assert!(!target2.exists());
+    let final_notifs = cx.shown_system_notifications();
+    assert_eq!(final_notifs.len(), 4);
+    assert_eq!(final_notifs[3].tag.as_ref(), NOTIF_TAG_CLEANUP_DONE);
+    assert_eq!(
+        main_win
+            .read_with(cx, |a, _| a.notice.as_ref().map(|(_, s)| *s))
+            .expect("read final success notice"),
+        Some(gpui_omarchy::Status::Success)
+    );
+}
+
+#[gpui_kit::test]
+fn ipc_and_standalone_confirm_notify_only_on_nonempty_confirm(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+    };
+    use ruum_core::watchdog::NOTIF_TAG_CLEANUP_STARTED;
+    use std::sync::mpsc::channel;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let item_path = temp.path().join("junk/blob.bin");
+    let req = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: "External Cleanup".into(),
+        summary: None,
+        items: vec![CleanupConfirmItem {
+            path: item_path,
+            bytes: 4096,
+            mode: RemovalMode::Trash,
+            reason: None,
+            git_warning: None,
+        }],
+    };
+
+    // 1. Cancel does NOT emit any notification.
+    let (cancel_tx, cancel_rx) = channel();
+    let cancel_win = cx
+        .update(|cx| {
+            crate::open_confirm_window(req.clone(), Some(cancel_tx), None, cx)
+        })
+        .expect("open cancel win");
+    let mut cancel_cx = VisualTestContext::from_window(cancel_win.into(), cx);
+    draw(&mut cancel_cx);
+    let cancel_btn = cancel_cx
+        .debug_bounds("confirm-cancel")
+        .expect("cancel button");
+    cancel_cx.simulate_click(cancel_btn.center(), gpui_kit::Modifiers::none());
+    assert_eq!(
+        cancel_rx.recv().expect("decision"),
+        CleanupConfirmDecision::Cancelled
+    );
+    assert!(cx.shown_system_notifications().is_empty());
+
+    // 2. Confirm with zero selected items does NOT emit any notification.
+    let (zero_tx, _zero_rx) = channel();
+    let zero_win = cx
+        .update(|cx| {
+            crate::open_confirm_window(req.clone(), Some(zero_tx), None, cx)
+        })
+        .expect("open zero win");
+    let mut zero_cx = VisualTestContext::from_window(zero_win.into(), cx);
+    draw(&mut zero_cx);
+    let check_0 = zero_cx.debug_bounds("check-item-0").expect("checkbox 0");
+    zero_cx.simulate_click(check_0.center(), gpui_kit::Modifiers::none());
+    draw(&mut zero_cx);
+    let confirm_zero = zero_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    zero_cx.simulate_click(confirm_zero.center(), gpui_kit::Modifiers::none());
+    assert!(cx.shown_system_notifications().is_empty());
+    zero_win
+        .update(cx, crate::CleanupConfirmWindow::cancel)
+        .expect("close zero win");
+
+    // 3. IPC confirm with selection emits `NOTIF_TAG_CLEANUP_STARTED`.
+    let (ipc_tx, ipc_rx) = channel();
+    let ipc_win = cx
+        .update(|cx| {
+            crate::open_confirm_window(req.clone(), Some(ipc_tx), None, cx)
+        })
+        .expect("open ipc win");
+    let mut ipc_cx = VisualTestContext::from_window(ipc_win.into(), cx);
+    draw(&mut ipc_cx);
+    let confirm_ipc = ipc_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    ipc_cx.simulate_click(confirm_ipc.center(), gpui_kit::Modifiers::none());
+    assert!(matches!(
+        ipc_rx.recv().expect("ipc decision"),
+        CleanupConfirmDecision::Confirmed { selected_paths }
+            if selected_paths.len() == 1
+    ));
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tag.as_ref(), NOTIF_TAG_CLEANUP_STARTED);
+
+    // 4. Standalone `--confirm-cleanup` mode emits `NOTIF_TAG_CLEANUP_STARTED`.
+    let resp_dir = tempfile::tempdir().expect("resp dir");
+    let resp_file = resp_dir.path().join("resp.json");
+    let (standalone_win, standalone_cx) = cx.add_window_view(|_, cx| {
+        crate::CleanupConfirmWindow::new(
+            req,
+            None,
+            Some(resp_file.clone()),
+            true,
+            cx,
+        )
+    });
+    draw(standalone_cx);
+    let confirm_standalone = standalone_cx
+        .debug_bounds("confirm-clean")
+        .expect("standalone confirm");
+    standalone_cx.simulate_click(
+        confirm_standalone.center(),
+        gpui_kit::Modifiers::none(),
+    );
+    assert!(resp_file.exists());
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 2);
+    assert_eq!(shown[1].tag.as_ref(), NOTIF_TAG_CLEANUP_STARTED);
+    let _ = standalone_win;
 }

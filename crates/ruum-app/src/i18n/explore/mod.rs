@@ -53,6 +53,20 @@ pub const fn logo_tooltip(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn host_tab_local(locale: Locale) -> &'static str {
+    pick(locale, "Local", "本机", "ローカル", "로컬")
+}
+
+pub const fn close_host_tab_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Close remote host tab",
+        "关闭远程主机标签页",
+        "リモートホストタブを閉じる",
+        "원격 호스트 탭 닫기",
+    )
+}
+
 pub const fn crumb_widen_tooltip(locale: Locale) -> &'static str {
     pick(
         locale,

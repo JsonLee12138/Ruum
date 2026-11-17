@@ -3,4 +3,16 @@ set -eu
 
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 APPDIR=${APPDIR:-"$HERE"}
-exec "$APPDIR/usr/bin/ruum" "$@"
+
+if [ "${RUUM_ASKPASS_CMD-}" = "ssh-askpass" ]; then
+    exec "$APPDIR/usr/bin/ruum" "$@"
+fi
+
+case "${1-}" in
+    help|-h|--help|scan|ssh|config|watchdog|analyze|mcp|extract-scanner|ssh-askpass)
+        exec "$APPDIR/usr/bin/ruum" "$@"
+        ;;
+    *)
+        exec "$APPDIR/usr/bin/ruum-gui" "$@"
+        ;;
+esac

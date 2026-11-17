@@ -17,6 +17,10 @@ contents:
     dst: "/usr/bin/ruum"
     file_info:
       mode: 0755
+  - src: "@GUI_BIN_PATH@"
+    dst: "/usr/bin/ruum-gui"
+    file_info:
+      mode: 0755
   - src: "@DESKTOP_PATH@"
     dst: "/usr/share/applications/ruum.desktop"
     file_info:

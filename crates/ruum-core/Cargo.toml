@@ -9,15 +9,56 @@ description = "Filesystem scanning and treemap layout for ruum"
 [lints]
 workspace = true
 
+[[bin]]
+name = "ruum"
+path = "src/bin/ruum.rs"
+required-features = ["service"]
+
+[features]
+default = ["service"]
+service = [
+    "dep:aes-gcm",
+    "dep:anyhow",
+    "dep:base64",
+    "dep:hmac",
+    "dep:interprocess",
+    "dep:keyring",
+    "dep:rand_core",
+    "dep:rsa",
+    "dep:rusqlite",
+    "dep:ruum-watchdog",
+    "dep:ssh-key",
+    "dep:ureq",
+    "dep:url",
+    "dep:uuid",
+    "dep:zeroize",
+]
+
 [dependencies]
+aes-gcm = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+dunce = { workspace = true }
+hmac = { workspace = true, optional = true }
+interprocess = { workspace = true, optional = true }
+keyring = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
 rayon = { workspace = true }
+rsa = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+ruum-watchdog = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+ssh-key = { workspace = true, optional = true }
 sys-locale = { workspace = true }
 tempfile = "3"
+ureq = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 # rustix has no filesystem calls on Windows; `windows.rs` covers them there.
 [target.'cfg(not(windows))'.dependencies]

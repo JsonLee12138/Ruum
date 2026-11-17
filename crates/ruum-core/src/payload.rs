@@ -43,7 +43,25 @@ pub fn digest(bytes: &[u8]) -> String {
 
 impl Archive {
     pub fn current() -> io::Result<Option<Self>> {
-        Self::open(&std::env::current_exe()?)
+        Self::open_with_sibling_fallback(&std::env::current_exe()?)
+    }
+
+    pub fn open_with_sibling_fallback(
+        current_exe: &Path,
+    ) -> io::Result<Option<Self>> {
+        let canonical = dunce::canonicalize(current_exe)
+            .unwrap_or_else(|_| current_exe.to_path_buf());
+        if let Some(archive) = Self::open(&canonical)? {
+            return Ok(Some(archive));
+        }
+        let sibling_name = if cfg!(windows) { "ruum.exe" } else { "ruum" };
+        if let Some(parent) = canonical.parent() {
+            let sibling = parent.join(sibling_name);
+            if sibling != canonical && sibling.is_file() {
+                return Self::open(&sibling);
+            }
+        }
+        Ok(None)
     }
 
     pub fn open(path: &Path) -> io::Result<Option<Self>> {
@@ -260,5 +278,52 @@ mod tests {
         bytes.extend_from_slice(MAGIC);
         std::fs::write(&path, bytes).unwrap();
         assert!(Archive::open(&path).is_err());
+    }
+
+    #[test]
+    fn sibling_fallback_resolves_ruum_from_gui_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("MacOS");
+        let link_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+
+        let cli_name = if cfg!(windows) { "ruum.exe" } else { "ruum" };
+        let gui_name = if cfg!(windows) {
+            "ruum-gui.exe"
+        } else {
+            "ruum-gui"
+        };
+        let cli_bin = app_dir.join(cli_name);
+        let gui_bin = app_dir.join(gui_name);
+        let helper = dir.path().join("helper");
+        std::fs::write(&cli_bin, b"cli-bin").unwrap();
+        std::fs::write(&gui_bin, b"gui-bin-no-trailer").unwrap();
+        std::fs::write(&helper, elf()).unwrap();
+
+        // Without trailer on sibling CLI, returns None.
+        assert!(
+            Archive::open_with_sibling_fallback(&gui_bin)
+                .unwrap()
+                .is_none()
+        );
+
+        // Append trailer to sibling CLI `ruum`.
+        append(&cli_bin, &[("x86_64".into(), helper)]).unwrap();
+
+        let from_gui = Archive::open_with_sibling_fallback(&gui_bin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_gui.load("x86_64").unwrap().1, elf());
+
+        #[cfg(unix)]
+        {
+            let symlinked_gui = link_dir.join("ruum-gui");
+            std::os::unix::fs::symlink(&gui_bin, &symlinked_gui).unwrap();
+            let from_link = Archive::open_with_sibling_fallback(&symlinked_gui)
+                .unwrap()
+                .unwrap();
+            assert_eq!(from_link.load("x86_64").unwrap().1, elf());
+        }
     }
 }

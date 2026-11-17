@@ -219,7 +219,6 @@ mod tests {
             assert!(!pages::settings_title(locale).is_empty());
             assert!(!messages::title_choose_source(locale).is_empty());
             assert!(!messages::plus_more(3, locale).is_empty());
-            assert!(!messages::usage(locale).is_empty());
             assert!(!messages::nothing_to_copy(locale).is_empty());
             assert!(!common::menu_install_cli(locale).is_empty());
             assert!(!pages::cli_tool_title(locale).is_empty());
@@ -234,7 +233,33 @@ mod tests {
             );
             assert!(!pages::cli_install_btn(locale).is_empty());
             assert!(!pages::cli_uninstall_btn(locale).is_empty());
-            assert!(!pages::cli_updating_btn(locale).is_empty());
+            assert!(!explore::host_tab_local(locale).is_empty());
+            assert!(!explore::close_host_tab_tooltip(locale).is_empty());
+            assert!(!pages::ssh_check_space_tooltip(locale).is_empty());
+            assert!(!pages::ssh_ai_analyze_tooltip(locale).is_empty());
+            assert!(!pages::settings_tab_general(locale).is_empty());
+            assert!(!pages::settings_tab_watchdog(locale).is_empty());
+            assert!(!pages::settings_tab_webhook(locale).is_empty());
+            assert!(!pages::settings_tab_ai(locale).is_empty());
+            assert!(!pages::settings_tab_cli(locale).is_empty());
+            assert!(!pages::webhook_guide_title(locale).is_empty());
+            assert!(!pages::webhook_guide_flow(locale).is_empty());
+            assert!(
+                !messages::ai_proposal_remote_title("prod", locale).is_empty()
+            );
+            assert!(!messages::webhook_saved("ops", locale).is_empty());
+            assert!(!messages::webhook_deleted("ops", locale).is_empty());
+            assert!(
+                !messages::webhook_test_succeeded("ops", locale).is_empty()
+            );
+            assert!(
+                !messages::ssh_check_space_failed("prod", "err", locale)
+                    .is_empty()
+            );
+            assert!(
+                !messages::ssh_ai_analyze_failed("prod", "err", locale)
+                    .is_empty()
+            );
             assert!(!pages::ai_auto_analyze(locale).is_empty());
             assert!(pages::enable_service(locale).contains("Windows"));
             assert!(!messages::invalid_watchdog_number(locale).is_empty());
@@ -245,8 +270,55 @@ mod tests {
             assert!(!messages::cli_uninstalled(locale).is_empty());
             assert!(!messages::cli_install_failed("err", locale).is_empty());
             assert!(!messages::cli_uninstall_failed("err", locale).is_empty());
+            assert!(!pages::ssh_servers_title(locale).is_empty());
+            assert!(!pages::add_ssh_server(locale).is_empty());
+            assert!(!pages::connect_and_scan(locale).is_empty());
+            assert!(!pages::auth_badge_private_key(locale).is_empty());
+            assert!(!pages::auth_badge_password(locale).is_empty());
+            assert!(!pages::remote_connect_title(locale).is_empty());
+            assert!(
+                !pages::remote_connect_desc("scan_directory", locale)
+                    .is_empty()
+            );
+            assert!(!pages::remote_connect_approve(locale).is_empty());
+            assert!(!pages::remote_connect_deny(locale).is_empty());
+            assert!(!pages::general_settings_title(locale).is_empty());
+            assert!(!pages::webhook_title(locale).is_empty());
+            assert!(!messages::ssh_invalid_input("err", locale).is_empty());
+            assert!(!pages::enable_webhook(locale).is_empty());
+            assert!(!messages::title_confirm_remote_connect(locale).is_empty());
+            assert!(!messages::cleanup_started_notif_title(locale).is_empty());
+            assert!(
+                !messages::cleanup_started_notif_body(2, 1_500_000, locale)
+                    .is_empty()
+            );
+            assert!(!messages::ssh_profile_saved("prod", locale).is_empty());
+            assert!(!messages::ssh_profile_deleted("prod", locale).is_empty());
+            assert!(
+                !messages::invalid_webhook_config("bad", locale).is_empty()
+            );
         }
         for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert_ne!(
+                pages::ssh_servers_title(locale),
+                pages::ssh_servers_title(Locale::En)
+            );
+            assert_ne!(
+                pages::remote_connect_title(locale),
+                pages::remote_connect_title(Locale::En)
+            );
+            assert_ne!(
+                pages::webhook_title(locale),
+                pages::webhook_title(Locale::En)
+            );
+            assert_ne!(
+                pages::general_settings_title(locale),
+                pages::general_settings_title(Locale::En)
+            );
+            assert_ne!(
+                messages::title_confirm_remote_connect(locale),
+                messages::title_confirm_remote_connect(Locale::En)
+            );
             assert_ne!(
                 common::menu_install_cli(locale),
                 common::menu_install_cli(Locale::En)
@@ -279,6 +351,22 @@ mod tests {
                 messages::plus_more(3, locale),
                 messages::plus_more(3, Locale::En)
             );
+            assert_ne!(
+                messages::cleanup_started_notif_title(locale),
+                messages::cleanup_started_notif_title(Locale::En)
+            );
+            assert_ne!(
+                messages::cleanup_started_notif_body(2, 1_500_000, locale),
+                messages::cleanup_started_notif_body(2, 1_500_000, Locale::En)
+            );
         }
+        assert!(
+            messages::cleanup_started_notif_body(2, 1_500_000, Locale::Zh)
+                .contains("正在后台清理")
+        );
+        assert!(
+            messages::cleanup_started_notif_body(2, 1_500_000, Locale::Zh)
+                .contains("请稍等")
+        );
     }
 }

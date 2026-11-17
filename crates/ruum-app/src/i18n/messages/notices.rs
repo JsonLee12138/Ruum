@@ -388,6 +388,155 @@ pub fn power_no_dir(label: &str, locale: Locale) -> String {
     }
 }
 
+pub const fn title_confirm_remote_connect(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "ruum \u{00b7} Confirm Remote SSH Connection",
+        "ruum \u{00b7} \u{786e}\u{8ba4}\u{8fdc}\u{7a0b} SSH \u{8fde}\u{63a5}",
+        "ruum \u{00b7} \u{30ea}\u{30e2}\u{30fc}\u{30c8} SSH \u{63a5}\u{7d9a}\u{306e}\u{78ba}\u{8a8d}",
+        "ruum \u{00b7} \u{c6d0}\u{aca9} SSH \u{c5f0}\u{acb0} \u{d655}\u{c778}",
+    )
+}
+
+pub const fn invalid_general_number(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Enter valid positive integers for default depth and SSH lease.",
+        "\u{8bf7}\u{4e3a}\u{9ed8}\u{8ba4}\u{6df1}\u{5ea6}\u{548c} SSH \u{79df}\u{671f}\u{8f93}\u{5165}\u{6709}\u{6548}\u{7684}\u{6b63}\u{6574}\u{6570}\u{3002}",
+        "\u{30c7}\u{30d5}\u{30a9}\u{30eb}\u{30c8}\u{6df1}\u{5ea6}\u{3068} SSH \u{671f}\u{9593}\u{306b}\u{6709}\u{52b9}\u{306a}\u{6b63}\u{306e}\u{6574}\u{6570}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{ae30}\u{bcf8} \u{ae4a}\u{c774}\u{c640} SSH \u{c138}\u{c158} \u{ae30}\u{ac04}\u{c5d0} \u{c62c}\u{bc14}\u{b978} \u{c591}\u{c758} \u{c815}\u{c218}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub fn invalid_webhook_config(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Invalid webhook settings: {err}"),
+        Locale::Zh => {
+            format!("Webhook \u{8bbe}\u{7f6e}\u{65e0}\u{6548}\u{ff1a}{err}")
+        }
+        Locale::Ja => format!(
+            "Webhook \u{8a2d}\u{5b9a}\u{304c}\u{7121}\u{52b9}\u{3067}\u{3059}: {err}"
+        ),
+        Locale::Ko => {
+            format!("\u{c798}\u{babb}\u{b41c} Webhook \u{c124}\u{c815}: {err}")
+        }
+    }
+}
+
+pub fn ssh_profile_saved(alias: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Saved SSH server `{alias}`"),
+        Locale::Zh => format!(
+            "\u{5df2}\u{4fdd}\u{5b58} SSH \u{670d}\u{52a1}\u{5668}\u{300c}{alias}\u{300d}"
+        ),
+        Locale::Ja => format!(
+            "SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{300c}{alias}\u{300d}\u{3092}\u{4fdd}\u{5b58}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!(
+            "SSH \u{c11c}\u{bc84} `{alias}`\u{b97c} \u{c800}\u{c7a5}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}"
+        ),
+    }
+}
+
+pub fn ssh_profile_deleted(alias: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Deleted SSH server `{alias}`"),
+        Locale::Zh => format!(
+            "\u{5df2}\u{5220}\u{9664} SSH \u{670d}\u{52a1}\u{5668}\u{300c}{alias}\u{300d}"
+        ),
+        Locale::Ja => format!(
+            "SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{300c}{alias}\u{300d}\u{3092}\u{524a}\u{9664}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!(
+            "SSH \u{c11c}\u{bc84} `{alias}`\u{b97c} \u{c0ad}\u{c81c}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}"
+        ),
+    }
+}
+
+pub fn ssh_profile_save_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to save SSH server: {err}"),
+        Locale::Zh => format!(
+            "\u{4fdd}\u{5b58} SSH \u{670d}\u{52a1}\u{5668}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{306e}\u{4fdd}\u{5b58}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "SSH \u{c11c}\u{bc84} \u{c800}\u{c7a5} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn ssh_profile_delete_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to delete SSH server: {err}"),
+        Locale::Zh => format!(
+            "\u{5220}\u{9664} SSH \u{670d}\u{52a1}\u{5668}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{306e}\u{524a}\u{9664}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "SSH \u{c11c}\u{bc84} \u{c0ad}\u{c81c} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn ssh_connect_failed(alias: &str, err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to connect to `{alias}`: {err}"),
+        Locale::Zh => format!(
+            "\u{8fde}\u{63a5}\u{300c}{alias}\u{300d}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "\u{300c}{alias}\u{300d}\u{3078}\u{306e}\u{63a5}\u{7d9a}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => {
+            format!("`{alias}` \u{c5f0}\u{acb0} \u{c2e4}\u{d328}: {err}")
+        }
+    }
+}
+
+pub const fn ssh_secret_required(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Enter a password or private key for this authentication mode.",
+        "\u{8bf7}\u{4e3a}\u{5f53}\u{524d}\u{8ba4}\u{8bc1}\u{65b9}\u{5f0f}\u{8f93}\u{5165}\u{5bc6}\u{7801}\u{6216}\u{79c1}\u{94a5}\u{3002}",
+        "\u{3053}\u{306e}\u{8a8d}\u{8a3c}\u{65b9}\u{5f0f}\u{306e}\u{30d1}\u{30b9}\u{30ef}\u{30fc}\u{30c9}\u{307e}\u{305f}\u{306f}\u{79d8}\u{5bc6}\u{9375}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{c774} \u{c778}\u{c99d} \u{bc29}\u{c2dd}\u{c5d0} \u{d544}\u{c694}\u{d55c} \u{be44}\u{bc00}\u{bc88}\u{d638} \u{b610}\u{b294} \u{ac1c}\u{c778} \u{d0a4}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn ssh_invalid_port(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "SSH port must be a number between 1 and 65535.",
+        "SSH \u{7aef}\u{53e3}\u{5fc5}\u{987b}\u{4e3a} 1 \u{5230} 65535 \u{4e4b}\u{95f4}\u{7684}\u{6574}\u{6570}\u{3002}",
+        "SSH \u{30dd}\u{30fc}\u{30c8}\u{306f} 1 \u{304b}\u{3089} 65535 \u{306e}\u{9593}\u{306e}\u{6570}\u{5024}\u{3067}\u{3042}\u{308b}\u{5fc5}\u{8981}\u{304c}\u{3042}\u{308a}\u{307e}\u{3059}\u{3002}",
+        "SSH \u{d3ec}\u{d2b8}\u{b294} 1\u{c5d0}\u{c11c} 65535 \u{c0ac}\u{c774}\u{c758} \u{c22b}\u{c790}\u{c5ec}\u{c57c} \u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub fn ssh_invalid_input(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Invalid SSH server settings: {err}"),
+        Locale::Zh => {
+            format!(
+                "SSH \u{670d}\u{52a1}\u{5668}\u{8bbe}\u{7f6e}\u{65e0}\u{6548}\u{ff1a}{err}"
+            )
+        }
+        Locale::Ja => format!(
+            "SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{8a2d}\u{5b9a}\u{304c}\u{7121}\u{52b9}\u{3067}\u{3059}: {err}"
+        ),
+        Locale::Ko => {
+            format!(
+                "\u{c798}\u{babb}\u{b41c} SSH \u{c11c}\u{bc84} \u{c124}\u{c815}: {err}"
+            )
+        }
+    }
+}
+
 pub const fn remote_identity_changed(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -582,5 +731,171 @@ pub fn still_not_admin(err: &str, locale: Locale) -> String {
         Locale::Zh => format!("仍未获得管理员权限：{err}"),
         Locale::Ja => format!("管理者権限を取得できませんでした: {err}"),
         Locale::Ko => format!("관리자 권한을 얻지 못했습니다: {err}"),
+    }
+}
+
+pub fn ssh_space_checked_healthy(
+    alias: &str,
+    free: &str,
+    total: &str,
+    min_gb: u64,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "{alias}: {free} free of {total} \u{2014} healthy (above {min_gb} GB)"
+        ),
+        Locale::Zh => format!(
+            "{alias}\u{ff1a}\u{53ef}\u{7528} {free} / \u{5171} {total} \u{2014} \u{5065}\u{5eb7}\u{ff08}\u{9ad8}\u{4e8e} {min_gb} GB\u{ff09}"
+        ),
+        Locale::Ja => format!(
+            "{alias}: \u{7a7a}\u{304d} {free} / {total} \u{2014} \u{6b63}\u{5e38}\u{ff08}{min_gb} GB \u{4ee5}\u{4e0a}\u{ff09}"
+        ),
+        Locale::Ko => format!(
+            "{alias}: \u{c5ec}\u{c720} {free} / {total} \u{2014} \u{c815}\u{c0c1}({min_gb} GB \u{c774}\u{c0c1})"
+        ),
+    }
+}
+
+pub fn ssh_space_checked_below(
+    alias: &str,
+    free: &str,
+    total: &str,
+    min_gb: u64,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "{alias}: {free} free of {total} \u{2014} below {min_gb} GB threshold"
+        ),
+        Locale::Zh => format!(
+            "{alias}\u{ff1a}\u{53ef}\u{7528} {free} / \u{5171} {total} \u{2014} \u{4f4e}\u{4e8e} {min_gb} GB \u{9608}\u{503c}"
+        ),
+        Locale::Ja => format!(
+            "{alias}: \u{7a7a}\u{304d} {free} / {total} \u{2014} {min_gb} GB \u{3057}\u{304d}\u{3044}\u{5024}\u{672a}\u{6e80}"
+        ),
+        Locale::Ko => format!(
+            "{alias}: \u{c5ec}\u{c720} {free} / {total} \u{2014} {min_gb} GB \u{c784}\u{acc4}\u{ac12} \u{bbf8}\u{b9cc}"
+        ),
+    }
+}
+
+pub fn ssh_check_space_failed(
+    alias: &str,
+    err: &str,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!("Remote space check failed for `{alias}`: {err}"),
+        Locale::Zh => format!(
+            "\u{68c0}\u{67e5}\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d}\u{7a7a}\u{95f4}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{78ba}\u{8a8d}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "\u{c6d0}\u{aca9} `{alias}` \u{acf5}\u{ac04} \u{d655}\u{c778} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn ssh_ai_analyze_failed(alias: &str, err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Remote AI analysis failed for `{alias}`: {err}"),
+        Locale::Zh => format!(
+            "\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d} AI \u{5206}\u{6790}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e} AI \u{5206}\u{6790}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "\u{c6d0}\u{aca9} `{alias}` AI \u{bd84}\u{c11d} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn ssh_remote_cleanup_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Remote cleanup failed: {err}"),
+        Locale::Zh => format!(
+            "\u{8fdc}\u{7a0b}\u{6e05}\u{7406}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{5931}\u{6557}: {err}"
+        ),
+        Locale::Ko => {
+            format!("\u{c6d0}\u{aca9} \u{c815}\u{b9ac} \u{c2e4}\u{d328}: {err}")
+        }
+    }
+}
+
+pub fn webhook_saved(name: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Saved webhook `{name}`"),
+        Locale::Zh => {
+            format!("\u{5df2}\u{4fdd}\u{5b58} Webhook\u{300c}{name}\u{300d}")
+        }
+        Locale::Ja => format!(
+            "Webhook \u{300c}{name}\u{300d}\u{3092}\u{4fdd}\u{5b58}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!("Webhook `{name}` \u{c800}\u{c7a5}\u{b428}"),
+    }
+}
+
+pub fn webhook_deleted(name: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Deleted webhook `{name}`"),
+        Locale::Zh => {
+            format!("\u{5df2}\u{5220}\u{9664} Webhook\u{300c}{name}\u{300d}")
+        }
+        Locale::Ja => format!(
+            "Webhook \u{300c}{name}\u{300d}\u{3092}\u{524a}\u{9664}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!("Webhook `{name}` \u{c0ad}\u{c81c}\u{b428}"),
+    }
+}
+
+pub fn webhook_test_succeeded(name: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Test webhook sent to `{name}`"),
+        Locale::Zh => format!(
+            "\u{5df2}\u{5411}\u{300c}{name}\u{300d}\u{53d1}\u{9001}\u{6d4b}\u{8bd5} Webhook"
+        ),
+        Locale::Ja => format!(
+            "\u{300c}{name}\u{300d}\u{3078}\u{30c6}\u{30b9}\u{30c8} Webhook \u{3092}\u{9001}\u{4fe1}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!(
+            "`{name}`\u{c5d0} \u{d14c}\u{c2a4}\u{d2b8} Webhook \u{c804}\u{c1a1} \u{c644}\u{b8cc}"
+        ),
+    }
+}
+
+pub fn webhook_test_failed(name: &str, err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Webhook test failed for `{name}`: {err}"),
+        Locale::Zh => format!(
+            "\u{300c}{name}\u{300d}Webhook \u{6d4b}\u{8bd5}\u{5931}\u{8d25}\u{ff1a}{err}"
+        ),
+        Locale::Ja => format!(
+            "\u{300c}{name}\u{300d}\u{306e} Webhook \u{30c6}\u{30b9}\u{30c8}\u{5931}\u{6557}: {err}"
+        ),
+        Locale::Ko => format!(
+            "`{name}` Webhook \u{d14c}\u{c2a4}\u{d2b8} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn webhook_save_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to save webhook: {err}"),
+        Locale::Zh => {
+            format!("\u{4fdd}\u{5b58} Webhook \u{5931}\u{8d25}\u{ff1a}{err}")
+        }
+        Locale::Ja => format!(
+            "Webhook \u{306e}\u{4fdd}\u{5b58}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => {
+            format!("Webhook \u{c800}\u{c7a5} \u{c2e4}\u{d328}: {err}")
+        }
     }
 }

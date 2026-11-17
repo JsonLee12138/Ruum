@@ -9,10 +9,11 @@ use gpui_kit::base::CheckboxState;
 use gpui_kit::base::input::InputState;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Animation, AnimationExt as _, Context, Div, ElementId, Entity, FocusHandle,
-    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, Rems, Stateful, StatefulInteractiveElement as _,
-    Styled, Svg, Transformation, Window, div, radians, svg,
+    Animation, AnimationExt as _, AnyElement, Context, Div, ElementId, Entity,
+    FocusHandle, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, Rems, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled, Svg, Transformation, Window, div,
+    radians, svg,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, IconName, button, checkbox, dialog_button,
@@ -21,10 +22,15 @@ use gpui_omarchy::{
 use ruum_core::cli_install::CliInstallStatus;
 use ruum_core::removal::RemovalMode;
 use ruum_core::size::human_bytes;
+use ruum_core::storage::AuthMode;
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::AiCliProvider;
 
-use crate::state::{CleanupConfirmModal, Ruum, Screen};
+use crate::power::PowerEfficiency;
+use crate::state::{
+    CleanupConfirmModal, RemoteConnectConfirmModal, Ruum, Screen,
+    SettingsCategory,
+};
 use crate::ui::{icon, size, space, text};
 
 const ZAP_SVG: &[u8] = br#"<svg
@@ -41,6 +47,51 @@ const ZAP_SVG: &[u8] = br#"<svg
   <path d="M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z" />
 </svg>"#;
 
+const PENCIL_SVG: &[u8] = br#"<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+  <path d="m15 5 4 4" />
+</svg>"#;
+
+const TRASH_SVG: &[u8] = br#"<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M3 6h18" />
+  <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+  <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+</svg>"#;
+
+const CIRCLE_SVG: &[u8] = br#"<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <circle cx="12" cy="12" r="10" />
+</svg>"#;
+
 fn zap_icon(color: Hsla) -> Svg {
     svg()
         .data(ZAP_SVG)
@@ -49,20 +100,78 @@ fn zap_icon(color: Hsla) -> Svg {
         .text_color(color)
 }
 
-fn spinning_loader(id: impl Into<ElementId>, color: Hsla) -> impl IntoElement {
+fn pencil_icon(color: Hsla) -> Svg {
     svg()
-        .path(IconName::LoaderCircle.path())
+        .data(PENCIL_SVG)
         .size(icon::MD)
         .flex_shrink_0()
         .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |this, phase| {
-                this.with_transformation(Transformation::rotate(radians(
-                    phase * std::f32::consts::TAU,
-                )))
-            },
+}
+
+fn trash_icon(color: Hsla) -> Svg {
+    svg()
+        .data(TRASH_SVG)
+        .size(icon::MD)
+        .flex_shrink_0()
+        .text_color(color)
+}
+
+fn circle_icon(color: Hsla) -> Svg {
+    svg()
+        .data(CIRCLE_SVG)
+        .size(icon::MD)
+        .flex_shrink_0()
+        .text_color(color)
+}
+
+fn action_button_with_spinner(
+    id: impl Into<ElementId>,
+    spin_id: impl Into<SharedString>,
+    label: &'static str,
+    loading: bool,
+    variant: ButtonVariant,
+    cx: &gpui_kit::App,
+) -> gpui_omarchy::Button {
+    let theme = cx.omarchy();
+    let spin_color = if variant == ButtonVariant::Primary {
+        theme.accent
+    } else {
+        theme.foreground
+    };
+    button(id, "", variant, cx)
+        .accessibility_label(label)
+        .when(loading, |btn| {
+            btn.child(spinning_loader(spin_id, spin_color))
+        })
+        .child(label)
+}
+
+fn spinning_loader(
+    id: impl Into<SharedString>,
+    color: Hsla,
+) -> impl IntoElement {
+    let sel: SharedString = id.into();
+    let debug_sel = sel.to_string();
+    div()
+        .debug_selector(move || debug_sel)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(IconName::LoaderCircle.path())
+                .size(icon::MD)
+                .flex_shrink_0()
+                .text_color(color)
+                .with_animation(
+                    ElementId::Name(sel),
+                    Animation::new(Duration::from_millis(900)).repeat(),
+                    |this, phase| {
+                        this.with_transformation(Transformation::rotate(
+                            radians(phase * std::f32::consts::TAU),
+                        ))
+                    },
+                ),
         )
 }
 
@@ -189,6 +298,597 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
         )))
 }
 
+fn ssh_profiles_card(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+
+    let mut card = dialog_popup(cx).w_full().child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(space::MD)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XXS)
+                    .child(dialog_title(
+                        crate::i18n::pages::ssh_servers_title(locale),
+                        cx,
+                    ))
+                    .child(dialog_description(
+                        crate::i18n::pages::ssh_servers_desc(locale),
+                        cx,
+                    )),
+            )
+            .child(
+                div().debug_selector(|| "ssh-add-btn".into()).child(
+                    with_tooltip(
+                        gpui_omarchy::icon_button(
+                            "ssh-add-btn",
+                            IconName::Plus,
+                            crate::i18n::pages::add_ssh_server(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.open_add_ssh_form(cx);
+                            },
+                        )),
+                        crate::i18n::pages::add_ssh_server(locale),
+                    ),
+                ),
+            ),
+    );
+
+    if app.ssh_profiles.is_empty() && !app.ssh_form_open {
+        card = card.child(dialog_description(
+            crate::i18n::pages::no_ssh_servers(locale),
+            cx,
+        ));
+    } else if !app.ssh_profiles.is_empty() {
+        let mut list = div().flex().flex_col().gap(space::SM);
+        for (index, profile) in app.ssh_profiles.iter().enumerate() {
+            let auth_badge = match profile.auth_mode {
+                AuthMode::PrivateKey => {
+                    crate::i18n::pages::auth_badge_private_key(locale)
+                }
+                AuthMode::Password => {
+                    crate::i18n::pages::auth_badge_password(locale)
+                }
+            };
+            let endpoint = format!(
+                "{}@{}:{}",
+                profile.username, profile.host, profile.port
+            );
+            let space_line = match (
+                profile.last_available_bytes,
+                profile.last_total_bytes,
+            ) {
+                (Some(avail), Some(total)) => {
+                    let age =
+                        format_checked_age(profile.last_scanned_secs, locale);
+                    crate::i18n::pages::ssh_cached_space(
+                        &human_bytes(avail),
+                        &human_bytes(total),
+                        &age,
+                        locale,
+                    )
+                }
+                _ => crate::i18n::pages::ssh_never_scanned(locale).to_owned(),
+            };
+            let is_scanning = app.is_ssh_profile_scanning(&profile.id);
+            let is_checking = app.ssh_checking_profiles.contains(&profile.id);
+            let is_analyzing = app.ssh_analyzing_profiles.contains(&profile.id);
+            let id_connect = profile.id.clone();
+            let id_check = profile.id.clone();
+            let id_ai = profile.id.clone();
+            let id_edit = profile.id.clone();
+            let id_delete = profile.id.clone();
+
+            let connect_btn = div()
+                .debug_selector(move || format!("ssh-connect-{index}"))
+                .child(with_tooltip(
+                    if is_scanning {
+                        button(
+                            ElementId::Name(
+                                format!("ssh-connect-{index}").into(),
+                            ),
+                            "",
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .accessibility_label(
+                            crate::i18n::pages::connect_and_scan(locale),
+                        )
+                        .p(space::SM)
+                        .justify_center()
+                        .child(spinning_loader(
+                            format!("ssh-connect-spin-{index}"),
+                            theme.accent,
+                        ))
+                    } else {
+                        gpui_omarchy::icon_button(
+                            ElementId::Name(
+                                format!("ssh-connect-{index}").into(),
+                            ),
+                            IconName::Play,
+                            crate::i18n::pages::connect_and_scan(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                    }
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.connect_ssh_profile(&id_connect, cx);
+                        },
+                    )),
+                    crate::i18n::pages::connect_and_scan(locale),
+                ));
+
+            let check_btn = div()
+                .debug_selector(move || format!("ssh-check-{index}"))
+                .child(with_tooltip(
+                    if is_checking {
+                        button(
+                            ElementId::Name(
+                                format!("ssh-check-{index}").into(),
+                            ),
+                            "",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .accessibility_label(
+                            crate::i18n::pages::ssh_check_space_tooltip(locale),
+                        )
+                        .p(space::SM)
+                        .justify_center()
+                        .child(spinning_loader(
+                            format!("ssh-check-spin-{index}"),
+                            theme.foreground,
+                        ))
+                    } else {
+                        gpui_omarchy::icon_button(
+                            ElementId::Name(
+                                format!("ssh-check-{index}").into(),
+                            ),
+                            IconName::HardDrive,
+                            crate::i18n::pages::ssh_check_space_tooltip(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                    }
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.check_ssh_profile_space(&id_check, cx);
+                        },
+                    )),
+                    crate::i18n::pages::ssh_check_space_tooltip(locale),
+                ));
+
+            let ai_btn = div()
+                .debug_selector(move || format!("ssh-ai-{index}"))
+                .child(with_tooltip(
+                    if is_analyzing {
+                        button(
+                            ElementId::Name(format!("ssh-ai-{index}").into()),
+                            "",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .accessibility_label(
+                            crate::i18n::pages::ssh_ai_analyze_tooltip(locale),
+                        )
+                        .p(space::SM)
+                        .justify_center()
+                        .child(spinning_loader(
+                            format!("ssh-ai-spin-{index}"),
+                            theme.foreground,
+                        ))
+                    } else {
+                        gpui_omarchy::icon_button(
+                            ElementId::Name(format!("ssh-ai-{index}").into()),
+                            IconName::Bot,
+                            crate::i18n::pages::ssh_ai_analyze_tooltip(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                    }
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.analyze_ssh_profile(&id_ai, cx);
+                        },
+                    )),
+                    crate::i18n::pages::ssh_ai_analyze_tooltip(locale),
+                ));
+
+            let edit_btn = div()
+                .debug_selector(move || format!("ssh-edit-{index}"))
+                .child(with_tooltip(
+                    button(
+                        ElementId::Name(format!("ssh-edit-{index}").into()),
+                        "",
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .accessibility_label(crate::i18n::pages::edit_ssh_server(
+                        locale,
+                    ))
+                    .p(space::SM)
+                    .justify_center()
+                    .child(pencil_icon(theme.foreground))
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.open_edit_ssh_form(&id_edit, cx);
+                        },
+                    )),
+                    crate::i18n::pages::edit_ssh_server(locale),
+                ));
+
+            let delete_btn = div()
+                .debug_selector(move || format!("ssh-delete-{index}"))
+                .child(with_tooltip(
+                    button(
+                        ElementId::Name(format!("ssh-delete-{index}").into()),
+                        "",
+                        ButtonVariant::Danger,
+                        cx,
+                    )
+                    .accessibility_label(crate::i18n::pages::delete_ssh_server(
+                        locale,
+                    ))
+                    .p(space::SM)
+                    .justify_center()
+                    .child(trash_icon(theme.danger))
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.delete_ssh_profile_card(&id_delete, cx);
+                        },
+                    )),
+                    crate::i18n::pages::delete_ssh_server(locale),
+                ));
+
+            list = list.child(
+                div()
+                    .id(ElementId::Name(format!("ssh-card-{index}").into()))
+                    .debug_selector(move || format!("ssh-card-{index}"))
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .p(space::MD)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.divider())
+                    .bg(theme.normal_fill())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(space::SM)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(space::SM)
+                                    .child(
+                                        div()
+                                            .text_size(text::BODY)
+                                            .text_color(theme.bright)
+                                            .child(profile.alias.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(space::XS)
+                                            .py(space::XXS)
+                                            .rounded(space::XS)
+                                            .bg(theme.accent.opacity(0.16))
+                                            .text_size(text::CAPTION)
+                                            .text_color(theme.accent)
+                                            .child(auth_badge),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(space::XS)
+                                    .child(connect_btn)
+                                    .child(check_btn)
+                                    .child(ai_btn)
+                                    .child(edit_btn)
+                                    .child(delete_btn),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(space::MD)
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(endpoint)
+                            .children(profile.default_path.as_ref().map(|p| {
+                                crate::i18n::pages::ssh_default_path_display(
+                                    p, locale,
+                                )
+                            }))
+                            .child(space_line),
+                    ),
+            );
+        }
+        card = card.child(list);
+    }
+
+    if app.ssh_form_open
+        && let (
+            Some(alias_in),
+            Some(host_in),
+            Some(port_in),
+            Some(user_in),
+            Some(path_in),
+            Some(pass_in),
+            Some(key_in),
+            Some(phrase_in),
+        ) = (
+            app.ssh_input_alias.as_ref(),
+            app.ssh_input_host.as_ref(),
+            app.ssh_input_port.as_ref(),
+            app.ssh_input_username.as_ref(),
+            app.ssh_input_default_path.as_ref(),
+            app.ssh_input_password.as_ref(),
+            app.ssh_input_private_key.as_ref(),
+            app.ssh_input_passphrase.as_ref(),
+        )
+    {
+        let form_title = if app.ssh_form_editing_id.is_some() {
+            crate::i18n::pages::ssh_form_edit_title(locale)
+        } else {
+            crate::i18n::pages::ssh_form_add_title(locale)
+        };
+        let is_key = app.ssh_form_auth_mode == AuthMode::PrivateKey;
+        let auth_row = div()
+            .flex()
+            .flex_col()
+            .gap(space::XS)
+            .child(
+                div()
+                    .text_color(theme.secondary)
+                    .child(crate::i18n::pages::ssh_form_auth_mode(locale)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(space::SM)
+                    .child(
+                        div()
+                            .debug_selector(|| "ssh-form-auth-key".into())
+                            .child(
+                                button(
+                                    "ssh-form-auth-key",
+                                    crate::i18n::pages::auth_badge_private_key(
+                                        locale,
+                                    ),
+                                    if is_key {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Secondary
+                                    },
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_ssh_form_auth_mode(
+                                            AuthMode::PrivateKey,
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "ssh-form-auth-password".into())
+                            .child(
+                                button(
+                                    "ssh-form-auth-password",
+                                    crate::i18n::pages::auth_badge_password(
+                                        locale,
+                                    ),
+                                    if is_key {
+                                        ButtonVariant::Secondary
+                                    } else {
+                                        ButtonVariant::Primary
+                                    },
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_ssh_form_auth_mode(
+                                            AuthMode::Password,
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                            ),
+                    ),
+            );
+
+        let mut form = div()
+            .id("ssh-form")
+            .debug_selector(|| "ssh-form".into())
+            .flex()
+            .flex_col()
+            .gap(space::SM)
+            .p(space::MD)
+            .rounded(space::XS)
+            .border_1()
+            .border_color(theme.control_border())
+            .bg(theme.normal_fill())
+            .child(dialog_title(form_title, cx))
+            .child(setting_input_field(
+                "ssh-form-alias",
+                crate::i18n::pages::ssh_form_alias(locale),
+                alias_in,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(space::SM)
+                    .child(
+                        setting_input_field(
+                            "ssh-form-host",
+                            crate::i18n::pages::ssh_form_host(locale),
+                            host_in,
+                            theme.secondary,
+                            window,
+                            cx,
+                        )
+                        .flex_1(),
+                    )
+                    .child(
+                        setting_input_field(
+                            "ssh-form-port",
+                            crate::i18n::pages::ssh_form_port(locale),
+                            port_in,
+                            theme.secondary,
+                            window,
+                            cx,
+                        )
+                        .w(Rems(6.0)),
+                    ),
+            )
+            .child(setting_input_field(
+                "ssh-form-username",
+                crate::i18n::pages::ssh_form_username(locale),
+                user_in,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(setting_input_field(
+                "ssh-form-default-path",
+                crate::i18n::pages::ssh_form_default_path(locale),
+                path_in,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(auth_row);
+
+        if is_key {
+            form = form
+                .child(setting_input_field(
+                    "ssh-form-private-key",
+                    crate::i18n::pages::ssh_form_private_key(locale),
+                    key_in,
+                    theme.secondary,
+                    window,
+                    cx,
+                ))
+                .child(setting_input_field(
+                    "ssh-form-passphrase",
+                    crate::i18n::pages::ssh_form_passphrase(locale),
+                    phrase_in,
+                    theme.secondary,
+                    window,
+                    cx,
+                ));
+        } else {
+            form = form.child(setting_input_field(
+                "ssh-form-password",
+                crate::i18n::pages::ssh_form_password(locale),
+                pass_in,
+                theme.secondary,
+                window,
+                cx,
+            ));
+        }
+
+        if app.ssh_form_editing_id.is_some() {
+            form = form.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(crate::i18n::pages::placeholder_ssh_secret_keep(
+                        locale,
+                    )),
+            );
+        }
+        if let Some(ref err) = app.ssh_form_error {
+            form = form.child(
+                div()
+                    .debug_selector(|| "ssh-form-error".into())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.danger)
+                    .child(err.clone()),
+            );
+        }
+
+        form = form.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(space::SM)
+                .child(
+                    div().debug_selector(|| "ssh-form-cancel".into()).child(
+                        button(
+                            "ssh-form-cancel",
+                            crate::i18n::pages::cancel(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.close_ssh_form(cx);
+                            },
+                        )),
+                    ),
+                )
+                .child(
+                    div().debug_selector(|| "ssh-form-save".into()).child(
+                        button(
+                            "ssh-form-save",
+                            crate::i18n::pages::ssh_form_save(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.save_ssh_profile_form(cx);
+                            },
+                        )),
+                    ),
+                ),
+        );
+
+        card = card.child(form);
+    }
+
+    div()
+        .id("ssh-profiles-card")
+        .debug_selector(|| "ssh-profiles-card".into())
+        .w_full()
+        .child(card)
+}
+
 /// Full-page Sources and Drives selection screen.
 pub fn sources_page(
     app: &Ruum,
@@ -197,11 +897,6 @@ pub fn sources_page(
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let locale = app.locale;
-    let source_ready = app.picker_source_matches(cx);
-    let source = app.volumes_source.as_ref().map_or_else(
-        || crate::i18n::pages::this_computer(locale).to_owned(),
-        |host| crate::i18n::pages::ssh_read_only(host, locale),
-    );
 
     let mut rows = div()
         .id("volume-rows")
@@ -260,63 +955,10 @@ pub fn sources_page(
         );
     }
 
-    let host = app
-        .picker_host
-        .as_ref()
-        .expect("picker prepared before rendering");
     let path = app
         .picker_path
         .as_ref()
         .expect("picker prepared before rendering");
-
-    let source_card = dialog_popup(cx)
-        .w_full()
-        .child(dialog_title(
-            crate::i18n::pages::card_source_title(locale),
-            cx,
-        ))
-        .child(dialog_description(
-            crate::i18n::pages::card_source_desc(locale),
-            cx,
-        ))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap(space::SM)
-                .child(
-                    button(
-                        "source-local",
-                        crate::i18n::pages::this_computer(locale),
-                        ButtonVariant::Secondary,
-                        cx,
-                    )
-                    .on_click(cx.listener(
-                        |this, _, window, cx| {
-                            this.choose_local_source(window, cx);
-                        },
-                    )),
-                )
-                .child(
-                    gpui_omarchy::input("source-host", host, window, cx)
-                        .debug_selector(|| "source-host".into())
-                        .flex_1(),
-                )
-                .child(
-                    button(
-                        "source-connect",
-                        crate::i18n::pages::connect_ssh(locale),
-                        ButtonVariant::Secondary,
-                        cx,
-                    )
-                    .on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.connect_picker(cx);
-                        },
-                    )),
-                ),
-        )
-        .child(div().text_color(theme.bright).child(source));
 
     let mounts_card =
         dialog_popup(cx)
@@ -348,9 +990,7 @@ pub fn sources_page(
                             cx,
                         )
                         .disabled(
-                            !source_ready
-                                || app.volumes_loading
-                                || app.volumes_error.is_some(),
+                            app.volumes_loading || app.volumes_error.is_some(),
                         )
                         .on_click(cx.listener(
                             |this, _, _, cx| {
@@ -371,8 +1011,7 @@ pub fn sources_page(
                         cx,
                     )
                     .disabled(
-                        !source_ready
-                            || app.volumes_loading
+                        app.volumes_loading
                             || app.volumes_error.is_some()
                             || app.volumes.is_empty(),
                     )
@@ -384,6 +1023,8 @@ pub fn sources_page(
                     )),
                 ),
             );
+
+    let ssh_card = ssh_profiles_card(app, window, cx);
 
     let subtitle = if app.awaiting_root {
         crate::i18n::pages::sources_subtitle_awaiting(locale)
@@ -425,7 +1066,7 @@ pub fn sources_page(
                 .w_full()
                 .gap(space::LG)
                 .overflow_y_scroll()
-                .child(source_card)
+                .child(ssh_card)
                 .child(mounts_card),
         )
 }
@@ -455,10 +1096,14 @@ pub fn watchdog_page(
         .as_ref()
         .map_or_else(|| "/".to_string(), |h| h.display().to_string());
 
-    let space_opt = app.watchdog_home_space.as_ref().or(if cfg!(test) {
-        app.space.as_ref()
-    } else {
-        None
+    let space_opt = app.watchdog_home_space.as_ref().or_else(|| {
+        if cfg!(test) {
+            (app.remote.is_none())
+                .then_some(app.space.as_ref())
+                .flatten()
+        } else {
+            None
+        }
     });
     let thresh_bytes = app
         .watchdog_config
@@ -519,9 +1164,11 @@ pub fn watchdog_page(
                                 crate::i18n::pages::monitored_root(locale),
                             ),
                         )
-                        .child(
-                            div().text_color(theme.bright).child(home_display),
-                        ),
+                        .child(div().text_color(theme.bright).child(format!(
+                            "{}  ·  {}",
+                            crate::i18n::pages::this_computer(locale),
+                            home_display
+                        ))),
                 )
                 .child(
                     div()
@@ -623,11 +1270,13 @@ pub fn watchdog_page(
                     div()
                         .debug_selector(|| "watchdog-check-space".into())
                         .child(
-                            button(
+                            action_button_with_spinner(
                                 "watchdog-check-space",
+                                "watchdog-check-space-spin",
                                 crate::i18n::pages::check_disk_space_now(
                                     locale,
                                 ),
+                                app.watchdog_checking_space,
                                 ButtonVariant::Secondary,
                                 cx,
                             )
@@ -642,15 +1291,11 @@ pub fn watchdog_page(
                     div()
                         .debug_selector(|| "watchdog-ai-analyze".into())
                         .child(
-                            button(
+                            action_button_with_spinner(
                                 "watchdog-ai-analyze",
-                                if app.watchdog_analyzing {
-                                    crate::i18n::pages::analyzing(locale)
-                                } else {
-                                    crate::i18n::pages::run_ai_analysis_now(
-                                        locale,
-                                    )
-                                },
+                                "watchdog-ai-analyze-spin",
+                                crate::i18n::pages::run_ai_analysis_now(locale),
+                                app.watchdog_analyzing,
                                 if app.watchdog_analyzing {
                                     ButtonVariant::Secondary
                                 } else {
@@ -668,7 +1313,7 @@ pub fn watchdog_page(
         );
 
     let proposal_card =
-        if let Some(ref prop) = app.watchdog_state.last_proposal {
+        if let Some(ref prop) = app.ai_proposal {
             let total_candidate_bytes: u64 =
                 prop.items.iter().map(|i| i.bytes).sum();
             dialog_popup(cx)
@@ -769,15 +1414,219 @@ fn setting_input_field(
         )
 }
 
-/// Settings configuration page.
-pub fn settings_page(
+fn general_settings_section(
     app: &Ruum,
     window: &Window,
     cx: &mut Context<'_, Ruum>,
-) -> impl IntoElement {
+) -> AnyElement {
     let theme = cx.omarchy().clone();
     let locale = app.locale;
+    let input_default_depth = app
+        .setting_input_default_depth
+        .as_ref()
+        .expect("inputs initialized");
+    let input_ssh_duration = app
+        .setting_input_ssh_duration
+        .as_ref()
+        .expect("inputs initialized");
 
+    let is_apparent = app.watchdog_draft.apparent_size;
+    let is_hidden = app.watchdog_draft.include_hidden;
+    let is_follow_appearance = app.watchdog_draft.follow_system_appearance;
+    let current_preset = app.watchdog_draft.power_preset;
+
+    let entity_apparent = cx.entity().downgrade();
+    let entity_hidden = entity_apparent.clone();
+    let entity_appearance = entity_apparent.clone();
+
+    let mut preset_buttons = div().flex().flex_row().flex_wrap().gap(space::SM);
+    for preset in PowerEfficiency::ALL {
+        if !preset.available(app.cpu_threads) {
+            continue;
+        }
+        let is_selected = preset == current_preset;
+        let id = ElementId::Name(
+            format!("setting-power-preset-{}", preset.key()).into(),
+        );
+        let sel_id = format!("setting-power-preset-{}", preset.key());
+        preset_buttons = preset_buttons.child(
+            div().debug_selector(move || sel_id).child(
+                button(
+                    id,
+                    preset.label_in(app.cpu_threads, locale),
+                    if is_selected {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    cx,
+                )
+                .on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.watchdog_draft.power_preset = preset;
+                        cx.notify();
+                    },
+                )),
+            ),
+        );
+    }
+
+    div()
+        .id("setting-general-section")
+        .debug_selector(|| "setting-general-section".into())
+        .w_full()
+        .child(
+            dialog_popup(cx)
+                .w_full()
+                .child(dialog_title(
+                    crate::i18n::pages::general_settings_title(locale),
+                    cx,
+                ))
+        .child(dialog_description(
+            crate::i18n::pages::general_settings_desc(locale),
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::MD)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XS)
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::general_power_preset(locale),
+                        ))
+                        .child(preset_buttons),
+                )
+                .child(setting_input_field(
+                    "setting-default-depth-input",
+                    crate::i18n::pages::general_default_depth(locale),
+                    input_default_depth,
+                    theme.secondary,
+                    window,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .debug_selector(|| "setting-apparent-size".into())
+                        .child(
+                            checkbox(
+                                "setting-apparent-size",
+                                crate::i18n::pages::general_apparent_size(
+                                    locale,
+                                ),
+                                if is_apparent {
+                                    CheckboxState::Checked
+                                } else {
+                                    CheckboxState::Unchecked
+                                },
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(
+                                move |_, _, _, cx| {
+                                    let _ = entity_apparent.update(
+                                        cx,
+                                        |this, cx| {
+                                            this.watchdog_draft.apparent_size =
+                                                !this
+                                                    .watchdog_draft
+                                                    .apparent_size;
+                                            cx.notify();
+                                        },
+                                    );
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "setting-include-hidden".into())
+                        .child(
+                            checkbox(
+                                "setting-include-hidden",
+                                crate::i18n::pages::general_include_hidden(
+                                    locale,
+                                ),
+                                if is_hidden {
+                                    CheckboxState::Checked
+                                } else {
+                                    CheckboxState::Unchecked
+                                },
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(
+                                move |_, _, _, cx| {
+                                    let _ =
+                                        entity_hidden.update(cx, |this, cx| {
+                                            this.watchdog_draft
+                                                .include_hidden = !this
+                                                .watchdog_draft
+                                                .include_hidden;
+                                            cx.notify();
+                                        });
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "setting-follow-appearance".into())
+                        .child(
+                            checkbox(
+                                "setting-follow-appearance",
+                                crate::i18n::pages::general_follow_appearance(
+                                    locale,
+                                ),
+                                if is_follow_appearance {
+                                    CheckboxState::Checked
+                                } else {
+                                    CheckboxState::Unchecked
+                                },
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(
+                                move |_, _, _, cx| {
+                                    let _ = entity_appearance.update(
+                                        cx,
+                                        |this, cx| {
+                                            this.watchdog_draft
+                                                .follow_system_appearance =
+                                                !this
+                                                    .watchdog_draft
+                                                    .follow_system_appearance;
+                                            cx.notify();
+                                        },
+                                    );
+                                },
+                            ),
+                        ),
+                )
+                .child(setting_input_field(
+                    "setting-ssh-duration-input",
+                    crate::i18n::pages::general_ssh_lease_minutes(locale),
+                    input_ssh_duration,
+                    theme.secondary,
+                    window,
+                    cx,
+                )),
+        ),
+        )
+        .into_any_element()
+}
+
+fn watchdog_settings_section(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> AnyElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
     let input_min_free = app
         .watchdog_input_min_free
         .as_ref()
@@ -790,29 +1639,13 @@ pub fn settings_page(
         .watchdog_input_cooldown
         .as_ref()
         .expect("inputs initialized");
-    let input_custom_cmd = app
-        .watchdog_input_custom_cmd
-        .as_ref()
-        .expect("inputs initialized");
-    let input_extra_args = app
-        .watchdog_input_extra_args
-        .as_ref()
-        .expect("inputs initialized");
-    let input_model = app
-        .watchdog_input_model
-        .as_ref()
-        .expect("inputs initialized");
 
     let is_enabled = app.watchdog_draft.enabled;
     let is_service = app.watchdog_draft.background_service;
-    let is_auto_analyze = app.watchdog_draft.ai_auto_analyze;
-    let current_provider = app.watchdog_draft.ai_provider;
-
     let entity_watchdog = cx.entity().downgrade();
     let entity_service = entity_watchdog.clone();
-    let entity_auto_analyze = entity_watchdog.clone();
 
-    let watchdog_section = dialog_popup(cx)
+    dialog_popup(cx)
         .w_full()
         .child(dialog_title(
             crate::i18n::pages::watchdog_monitoring_title(locale),
@@ -907,7 +1740,580 @@ pub fn settings_page(
                     window,
                     cx,
                 )),
+        )
+        .into_any_element()
+}
+
+const WEBHOOK_HEADERS_EXAMPLE: &str =
+    r#"{"Authorization": "Bearer <token>", "X-Source": "ruum"}"#;
+const WEBHOOK_PAYLOAD_EXAMPLE: &str = r#"{
+  "event": "ruum.disk.low_space",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "host": { "hostname": "srv-1", "machine_id": "...", "platform": "linux" },
+  "mount": {
+    "path": "/home",
+    "available_bytes": 1073741824,
+    "total_bytes": 107374182400,
+    "threshold_bytes": 5368709120
+  }
+}"#;
+const WEBHOOK_CLI_EXAMPLE: &str = "ruum config webhook add --name ops --url https://hooks.example.com/ruum --enable";
+
+fn webhook_settings_section(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> AnyElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+
+    let mut guide_card = dialog_popup(cx).w_full().child(
+        div()
+            .id("setting-webhook-guide-toggle")
+            .debug_selector(|| "setting-webhook-guide-toggle".into())
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(space::SM)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_webhook_guide(cx);
+            }))
+            .child(dialog_title(
+                crate::i18n::pages::webhook_guide_title(locale),
+                cx,
+            ))
+            .child(
+                gpui_omarchy::icon(if app.webhook_guide_open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(icon::SM)
+                .text_color(theme.secondary),
+            ),
+    );
+    if app.webhook_guide_open {
+        guide_card = guide_card.child(
+            div()
+                .id("setting-webhook-guide")
+                .debug_selector(|| "setting-webhook-guide".into())
+                .flex()
+                .flex_col()
+                .gap(space::SM)
+                .p(space::MD)
+                .rounded(space::XS)
+                .border_1()
+                .border_color(theme.divider())
+                .bg(theme.normal_fill())
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.bright)
+                        .child(crate::i18n::pages::webhook_guide_flow(locale)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XXS)
+                        .child(
+                            div()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(
+                                    crate::i18n::pages::webhook_guide_headers_label(
+                                        locale,
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p(space::XS)
+                                .rounded(space::XXS)
+                                .bg(theme.background)
+                                .font_family(theme.font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.bright)
+                                .child(WEBHOOK_HEADERS_EXAMPLE),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XXS)
+                        .child(
+                            div()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(
+                                    crate::i18n::pages::webhook_guide_payload_label(
+                                        locale,
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p(space::XS)
+                                .rounded(space::XXS)
+                                .bg(theme.background)
+                                .font_family(theme.font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.bright)
+                                .child(WEBHOOK_PAYLOAD_EXAMPLE),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XXS)
+                        .child(
+                            div()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(
+                                    crate::i18n::pages::webhook_guide_cli_label(
+                                        locale,
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p(space::XS)
+                                .rounded(space::XXS)
+                                .bg(theme.background)
+                                .font_family(theme.font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.bright)
+                                .child(WEBHOOK_CLI_EXAMPLE),
+                        ),
+                ),
         );
+    }
+
+    let mut list_card = dialog_popup(cx).w_full().child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(space::MD)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XXS)
+                    .child(dialog_title(
+                        crate::i18n::pages::webhook_title(locale),
+                        cx,
+                    ))
+                    .child(dialog_description(
+                        crate::i18n::pages::webhook_desc(locale),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "setting-webhook-add-btn".into())
+                    .child(with_tooltip(
+                        gpui_omarchy::icon_button(
+                            "setting-webhook-add-btn",
+                            IconName::Plus,
+                            crate::i18n::pages::webhook_add_tooltip(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.open_add_webhook_form(cx);
+                            },
+                        )),
+                        crate::i18n::pages::webhook_add_tooltip(locale),
+                    )),
+            ),
+    );
+
+    if app.webhooks.is_empty() && !app.webhook_form_open {
+        list_card = list_card.child(dialog_description(
+            crate::i18n::pages::webhook_none(locale),
+            cx,
+        ));
+    } else if !app.webhooks.is_empty() {
+        let mut rows = div().flex().flex_col().gap(space::SM);
+        for (i, hook) in app.webhooks.iter().enumerate() {
+            let is_testing = app.webhook_testing_ids.contains(&hook.id);
+            let id_toggle = hook.id.clone();
+            let id_test = hook.id.clone();
+            let id_edit = hook.id.clone();
+            let id_delete = hook.id.clone();
+
+            let toggle_badge = div()
+                .id(ElementId::Name(
+                    format!("setting-webhook-toggle-{i}").into(),
+                ))
+                .debug_selector(move || format!("setting-webhook-toggle-{i}"))
+                .cursor_pointer()
+                .px(space::XS)
+                .py(space::XXS)
+                .rounded(space::XS)
+                .bg(if hook.enabled {
+                    theme.accent.opacity(0.18)
+                } else {
+                    theme.divider()
+                })
+                .text_size(text::CAPTION)
+                .text_color(if hook.enabled {
+                    theme.accent
+                } else {
+                    theme.secondary
+                })
+                .child(if hook.enabled {
+                    crate::i18n::pages::webhook_enabled_badge(locale)
+                } else {
+                    crate::i18n::pages::webhook_disabled_badge(locale)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_webhook_enabled(&id_toggle, cx);
+                }));
+
+            let test_btn = div()
+                .debug_selector(move || format!("setting-webhook-test-{i}"))
+                .child(with_tooltip(
+                    if is_testing {
+                        button(
+                            ElementId::Name(
+                                format!("setting-webhook-test-{i}").into(),
+                            ),
+                            "",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .accessibility_label(
+                            crate::i18n::pages::webhook_test_tooltip(locale),
+                        )
+                        .p(space::SM)
+                        .justify_center()
+                        .child(spinning_loader(
+                            format!("setting-webhook-test-spin-{i}"),
+                            theme.foreground,
+                        ))
+                    } else {
+                        gpui_omarchy::icon_button(
+                            ElementId::Name(
+                                format!("setting-webhook-test-{i}").into(),
+                            ),
+                            IconName::Play,
+                            crate::i18n::pages::webhook_test_tooltip(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                    }
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.test_webhook_endpoint_now(&id_test, cx);
+                        },
+                    )),
+                    crate::i18n::pages::webhook_test_tooltip(locale),
+                ));
+
+            let edit_btn = div()
+                .debug_selector(move || format!("setting-webhook-edit-{i}"))
+                .child(with_tooltip(
+                    button(
+                        ElementId::Name(
+                            format!("setting-webhook-edit-{i}").into(),
+                        ),
+                        "",
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .accessibility_label(crate::i18n::pages::edit_ssh_server(
+                        locale,
+                    ))
+                    .p(space::SM)
+                    .justify_center()
+                    .child(pencil_icon(theme.foreground))
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.open_edit_webhook_form(&id_edit, cx);
+                        },
+                    )),
+                    crate::i18n::pages::edit_ssh_server(locale),
+                ));
+
+            let delete_btn = div()
+                .debug_selector(move || format!("setting-webhook-delete-{i}"))
+                .child(with_tooltip(
+                    button(
+                        ElementId::Name(
+                            format!("setting-webhook-delete-{i}").into(),
+                        ),
+                        "",
+                        ButtonVariant::Danger,
+                        cx,
+                    )
+                    .accessibility_label(crate::i18n::pages::delete_ssh_server(
+                        locale,
+                    ))
+                    .p(space::SM)
+                    .justify_center()
+                    .child(trash_icon(theme.danger))
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.delete_webhook_endpoint(&id_delete, cx);
+                        },
+                    )),
+                    crate::i18n::pages::delete_ssh_server(locale),
+                ));
+
+            rows = rows.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("setting-webhook-row-{i}").into(),
+                    ))
+                    .debug_selector(move || format!("setting-webhook-row-{i}"))
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .p(space::MD)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.divider())
+                    .bg(theme.normal_fill())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(space::SM)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(space::SM)
+                                    .child(
+                                        div()
+                                            .text_size(text::BODY)
+                                            .text_color(theme.bright)
+                                            .child(hook.name.clone()),
+                                    )
+                                    .child(toggle_badge),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(space::XS)
+                                    .child(test_btn)
+                                    .child(edit_btn)
+                                    .child(delete_btn),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(space::MD)
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(hook.url.clone())
+                            .child(
+                                crate::i18n::pages::webhook_timeout_summary(
+                                    hook.timeout_secs,
+                                    locale,
+                                ),
+                            ),
+                    ),
+            );
+        }
+        list_card = list_card.child(rows);
+    }
+
+    if app.webhook_form_open
+        && let (
+            Some(input_name),
+            Some(input_url),
+            Some(input_timeout),
+            Some(input_headers),
+        ) = (
+            app.webhook_input_name.as_ref(),
+            app.setting_input_webhook_url.as_ref(),
+            app.setting_input_webhook_timeout.as_ref(),
+            app.setting_input_webhook_headers.as_ref(),
+        )
+    {
+        let form_title = if app.webhook_form_editing_id.is_some() {
+            crate::i18n::pages::webhook_form_edit_title(locale)
+        } else {
+            crate::i18n::pages::webhook_form_add_title(locale)
+        };
+        let entity_enabled = cx.entity().downgrade();
+        let mut form = div()
+            .id("setting-webhook-form")
+            .debug_selector(|| "setting-webhook-form".into())
+            .flex()
+            .flex_col()
+            .gap(space::SM)
+            .p(space::MD)
+            .rounded(space::XS)
+            .border_1()
+            .border_color(theme.control_border())
+            .bg(theme.normal_fill())
+            .child(dialog_title(form_title, cx))
+            .child(setting_input_field(
+                "setting-webhook-name-input",
+                crate::i18n::pages::webhook_name_label(locale),
+                input_name,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(setting_input_field(
+                "setting-webhook-url-input",
+                crate::i18n::pages::webhook_url(locale),
+                input_url,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(setting_input_field(
+                "setting-webhook-timeout-input",
+                crate::i18n::pages::webhook_timeout_secs(locale),
+                input_timeout,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(setting_input_field(
+                "setting-webhook-headers-input",
+                crate::i18n::pages::webhook_headers_json(locale),
+                input_headers,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(
+                div()
+                    .debug_selector(|| "setting-webhook-enabled".into())
+                    .child(
+                        checkbox(
+                            "setting-webhook-enabled",
+                            crate::i18n::pages::enable_webhook(locale),
+                            if app.webhook_form_enabled {
+                                CheckboxState::Checked
+                            } else {
+                                CheckboxState::Unchecked
+                            },
+                            cx,
+                        )
+                        .tab_stop(false)
+                        .on_change(
+                            move |_, _, _, cx| {
+                                let _ =
+                                    entity_enabled.update(cx, |this, cx| {
+                                        this.webhook_form_enabled =
+                                            !this.webhook_form_enabled;
+                                        cx.notify();
+                                    });
+                            },
+                        ),
+                    ),
+            );
+        if let Some(ref err) = app.webhook_form_error {
+            form = form.child(
+                div()
+                    .debug_selector(|| "setting-webhook-form-error".into())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.danger)
+                    .child(err.clone()),
+            );
+        }
+        form = form.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .debug_selector(|| "setting-webhook-cancel".into())
+                        .child(
+                            button(
+                                "setting-webhook-cancel",
+                                crate::i18n::pages::cancel(locale),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.close_webhook_form(cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "setting-webhook-save".into())
+                        .child(
+                            button(
+                                "setting-webhook-save",
+                                crate::i18n::pages::webhook_save(locale),
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.save_webhook_form(cx);
+                                },
+                            )),
+                        ),
+                ),
+        );
+        list_card = list_card.child(form);
+    }
+
+    div()
+        .id("setting-webhook-section")
+        .debug_selector(|| "setting-webhook-section".into())
+        .flex()
+        .flex_col()
+        .gap(space::LG)
+        .w_full()
+        .child(guide_card)
+        .child(list_card)
+        .into_any_element()
+}
+
+fn ai_settings_section(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> AnyElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let input_custom_cmd = app
+        .watchdog_input_custom_cmd
+        .as_ref()
+        .expect("inputs initialized");
+    let input_extra_args = app
+        .watchdog_input_extra_args
+        .as_ref()
+        .expect("inputs initialized");
+    let input_model = app
+        .watchdog_input_model
+        .as_ref()
+        .expect("inputs initialized");
+
+    let is_auto_analyze = app.watchdog_draft.ai_auto_analyze;
+    let current_provider = app.watchdog_draft.ai_provider;
+    let entity_auto_analyze = cx.entity().downgrade();
 
     let mut provider_buttons = div().flex().flex_row().gap(space::SM);
     for provider in AiCliProvider::ALL {
@@ -972,7 +2378,7 @@ pub fn settings_page(
         .child(provider_buttons);
 
     let show_custom_cmd = current_provider == AiCliProvider::Custom
-        || !app.watchdog_config.custom_command.is_empty()
+        || !app.ai_config.custom_command.is_empty()
         || !input_custom_cmd.read(cx).value().trim().is_empty();
     if show_custom_cmd {
         ai_section = ai_section.child(setting_input_field(
@@ -1011,13 +2417,11 @@ pub fn settings_page(
                 .gap(space::MD)
                 .child(
                     div().debug_selector(|| "setting-test-cli".into()).child(
-                        button(
+                        action_button_with_spinner(
                             "setting-test-cli",
-                            if app.watchdog_testing {
-                                crate::i18n::pages::testing(locale)
-                            } else {
-                                crate::i18n::pages::test_cli_connection(locale)
-                            },
+                            "setting-test-cli-spin",
+                            crate::i18n::pages::test_cli_connection(locale),
+                            app.watchdog_testing,
                             ButtonVariant::Secondary,
                             cx,
                         )
@@ -1032,13 +2436,11 @@ pub fn settings_page(
                     div()
                         .debug_selector(|| "setting-fetch-models".into())
                         .child(
-                            button(
+                            action_button_with_spinner(
                                 "setting-fetch-models",
-                                if app.watchdog_fetching_models {
-                                    crate::i18n::pages::fetching(locale)
-                                } else {
-                                    crate::i18n::pages::fetch_models(locale)
-                                },
+                                "setting-fetch-models-spin",
+                                crate::i18n::pages::fetch_models(locale),
+                                app.watchdog_fetching_models,
                                 ButtonVariant::Secondary,
                                 cx,
                             )
@@ -1113,9 +2515,7 @@ pub fn settings_page(
                     }))
                     .child(if is_benchmarking {
                         spinning_loader(
-                            ElementId::Name(
-                                format!("setting-model-spin-{index}").into(),
-                            ),
+                            format!("setting-model-spin-{index}"),
                             theme.accent,
                         )
                         .into_any_element()
@@ -1142,58 +2542,45 @@ pub fn settings_page(
                 speed_tooltip,
             );
 
-            let select_control = if is_selected {
-                div()
-                    .id(ElementId::Name(
-                        format!("setting-model-select-{index}").into(),
-                    ))
-                    .debug_selector(move || {
-                        format!("setting-model-select-{index}")
-                    })
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(space::XXS)
-                    .px(space::SM)
-                    .py(space::XS)
-                    .rounded(space::XS)
-                    .bg(theme.accent.opacity(0.18))
-                    .text_size(text::CAPTION)
-                    .text_color(theme.accent)
-                    .child(
-                        gpui_omarchy::icon(IconName::CircleCheck)
-                            .size(icon::SM)
-                            .text_color(theme.accent),
-                    )
-                    .child(crate::i18n::pages::selected(locale))
-                    .into_any_element()
+            let select_tooltip = if is_selected {
+                crate::i18n::pages::selected(locale)
             } else {
-                div()
-                    .debug_selector(move || {
-                        format!("setting-model-select-{index}")
-                    })
-                    .child(
-                        button(
-                            ElementId::Name(
-                                format!("setting-model-select-btn-{index}")
-                                    .into(),
-                            ),
-                            crate::i18n::pages::select(locale),
-                            ButtonVariant::Secondary,
-                            cx,
-                        )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.select_watchdog_model(
-                                    &select_btn_id,
-                                    window,
-                                    cx,
-                                );
-                            },
-                        )),
-                    )
-                    .into_any_element()
+                crate::i18n::pages::select(locale)
             };
+            let select_control = div()
+                .debug_selector(move || format!("setting-model-select-{index}"))
+                .child(with_tooltip(
+                    button(
+                        ElementId::Name(
+                            format!("setting-model-select-{index}").into(),
+                        ),
+                        "",
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .accessibility_label(select_tooltip)
+                    .p(space::XS)
+                    .justify_center()
+                    .when(is_selected, |b| b.bg(theme.accent.opacity(0.18)))
+                    .child(if is_selected {
+                        gpui_omarchy::icon(IconName::CircleCheck)
+                            .size(icon::MD)
+                            .text_color(theme.accent)
+                            .into_any_element()
+                    } else {
+                        circle_icon(theme.secondary).into_any_element()
+                    })
+                    .on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.select_watchdog_model(
+                                &select_btn_id,
+                                window,
+                                cx,
+                            );
+                        },
+                    )),
+                    select_tooltip,
+                ));
 
             model_rows = model_rows.child(
                 div()
@@ -1312,6 +2699,12 @@ pub fn settings_page(
         ai_section = ai_section.child(models_header).child(model_rows);
     }
 
+    ai_section.into_any_element()
+}
+
+fn cli_settings_section(app: &Ruum, cx: &Context<'_, Ruum>) -> AnyElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
     let (cli_status_text, cli_in_path_hint, cli_installed) =
         match &app.cli_install_status {
             Some(CliInstallStatus::Installed { path, in_path }) => {
@@ -1334,14 +2727,12 @@ pub fn settings_page(
                 false,
             ),
         };
-    let cli_btn_label = if app.cli_updating {
-        crate::i18n::pages::cli_updating_btn(locale)
-    } else if cli_installed {
+    let cli_btn_label = if cli_installed {
         crate::i18n::pages::cli_uninstall_btn(locale)
     } else {
         crate::i18n::pages::cli_install_btn(locale)
     };
-    let cli_section = dialog_popup(cx)
+    dialog_popup(cx)
         .w_full()
         .child(dialog_title(crate::i18n::pages::cli_tool_title(locale), cx))
         .child(dialog_description(
@@ -1374,9 +2765,11 @@ pub fn settings_page(
                 )
                 .child(
                     div().debug_selector(|| "setting-cli-btn".into()).child(
-                        button(
+                        action_button_with_spinner(
                             "setting-cli-btn",
+                            "setting-cli-btn-spin",
                             cli_btn_label,
+                            app.cli_updating,
                             if cli_installed || app.cli_updating {
                                 ButtonVariant::Secondary
                             } else {
@@ -1396,23 +2789,149 @@ pub fn settings_page(
                         )),
                     ),
                 ),
-        );
+        )
+        .into_any_element()
+}
+
+fn settings_nav_tab(
+    id: &'static str,
+    category: SettingsCategory,
+    icon_name: IconName,
+    label: &'static str,
+    active: bool,
+    cx: &Context<'_, Ruum>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .cursor_pointer()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .px(space::MD)
+        .py(space::SM)
+        .rounded(space::XS)
+        .border_1()
+        .border_color(if active {
+            theme.accent.opacity(0.45)
+        } else {
+            theme.accent.opacity(0.0)
+        })
+        .bg(if active {
+            theme.accent.opacity(0.16)
+        } else {
+            theme.accent.opacity(0.0)
+        })
+        .text_size(text::BODY)
+        .text_color(if active {
+            theme.bright
+        } else {
+            theme.secondary
+        })
+        .hover(|s| s.bg(theme.hover_fill()).text_color(theme.bright))
+        .child(gpui_omarchy::icon(icon_name).size(icon::MD).text_color(
+            if active {
+                theme.accent
+            } else {
+                theme.secondary
+            },
+        ))
+        .child(label)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_settings_category(category, cx);
+        }))
+}
+
+/// Settings configuration page with Zed/VS Code style categorized sidebar.
+pub fn settings_page(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+
+    let nav_sidebar = div()
+        .id("settings-nav")
+        .debug_selector(|| "settings-nav".into())
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .w(size::SETTINGS_NAV)
+        .h_full()
+        .border_r_1()
+        .border_color(theme.divider())
+        .p(space::MD)
+        .gap(space::XS)
+        .child(settings_nav_tab(
+            "setting-tab-general",
+            SettingsCategory::General,
+            IconName::Settings,
+            crate::i18n::pages::settings_tab_general(locale),
+            app.settings_category == SettingsCategory::General,
+            cx,
+        ))
+        .child(settings_nav_tab(
+            "setting-tab-watchdog",
+            SettingsCategory::Watchdog,
+            IconName::Eye,
+            crate::i18n::pages::settings_tab_watchdog(locale),
+            app.settings_category == SettingsCategory::Watchdog,
+            cx,
+        ))
+        .child(settings_nav_tab(
+            "setting-tab-webhook",
+            SettingsCategory::Webhook,
+            IconName::Bell,
+            crate::i18n::pages::settings_tab_webhook(locale),
+            app.settings_category == SettingsCategory::Webhook,
+            cx,
+        ))
+        .child(settings_nav_tab(
+            "setting-tab-ai",
+            SettingsCategory::Ai,
+            IconName::Bot,
+            crate::i18n::pages::settings_tab_ai(locale),
+            app.settings_category == SettingsCategory::Ai,
+            cx,
+        ))
+        .child(settings_nav_tab(
+            "setting-tab-cli",
+            SettingsCategory::Cli,
+            IconName::SquareTerminal,
+            crate::i18n::pages::settings_tab_cli(locale),
+            app.settings_category == SettingsCategory::Cli,
+            cx,
+        ));
+
+    let section_body = match app.settings_category {
+        SettingsCategory::General => general_settings_section(app, window, cx),
+        SettingsCategory::Watchdog => {
+            watchdog_settings_section(app, window, cx)
+        }
+        SettingsCategory::Webhook => webhook_settings_section(app, window, cx),
+        SettingsCategory::Ai => ai_settings_section(app, window, cx),
+        SettingsCategory::Cli => cli_settings_section(app, cx),
+    };
 
     let save_bar = div()
         .flex()
         .flex_row()
         .items_center()
         .justify_end()
-        .gap(space::MD)
+        .px(space::XXL)
+        .py(space::MD)
+        .border_t_1()
+        .border_color(theme.divider())
         .child(
             div().debug_selector(|| "setting-save-btn".into()).child(
-                button(
+                action_button_with_spinner(
                     "setting-save-btn",
-                    if app.watchdog_saving {
-                        crate::i18n::pages::saving(locale)
-                    } else {
-                        crate::i18n::pages::save_settings(locale)
-                    },
+                    "setting-save-btn-spin",
+                    crate::i18n::pages::save_settings(locale),
+                    app.watchdog_saving,
                     ButtonVariant::Primary,
                     cx,
                 )
@@ -1428,26 +2947,51 @@ pub fn settings_page(
         .id("settings-page")
         .debug_selector(|| "settings-page".into())
         .flex()
-        .flex_col()
+        .flex_row()
         .flex_1()
         .size_full()
-        .p(space::XXL)
-        .gap(space::LG)
-        .overflow_y_scroll()
+        .min_h_0()
+        .overflow_hidden()
+        .child(nav_sidebar)
         .child(
             div()
-                .text_size(text::TITLE)
-                .child(crate::i18n::pages::settings_title(locale)),
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XS)
+                        .px(space::XXL)
+                        .pt(space::XL)
+                        .pb(space::MD)
+                        .child(
+                            div().text_size(text::TITLE).child(
+                                crate::i18n::pages::settings_title(locale),
+                            ),
+                        )
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::settings_subtitle(locale),
+                        )),
+                )
+                .child(
+                    div()
+                        .id("settings-content")
+                        .debug_selector(|| "settings-content".into())
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px(space::XXL)
+                        .pb(space::LG)
+                        .child(section_body),
+                )
+                .child(save_bar),
         )
-        .child(
-            div()
-                .text_color(theme.secondary)
-                .child(crate::i18n::pages::settings_subtitle(locale)),
-        )
-        .child(watchdog_section)
-        .child(ai_section)
-        .child(cli_section)
-        .child(save_bar)
 }
 
 /// Standalone interactive confirmation window content for cleanup proposals.
@@ -1733,6 +3277,167 @@ pub fn cleanup_confirm_view(
         }))
         .flex()
         .flex_col()
+        .size_full()
+        .p(space::XL)
+        .bg(theme.background)
+        .text_color(theme.foreground)
+        .font_family(theme.font)
+        .text_size(text::BODY)
+        .child(card)
+}
+
+/// Shared remote SSH connection confirmation card for overlay & standalone popup.
+pub fn remote_connect_confirm_card<V: 'static>(
+    modal: &RemoteConnectConfirmModal,
+    locale: crate::i18n::Locale,
+    on_approve: impl Fn(&mut V, &mut Window, &mut Context<'_, V>) + 'static,
+    on_deny: impl Fn(&mut V, &mut Window, &mut Context<'_, V>) + 'static,
+    cx: &Context<'_, V>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let req = &modal.request;
+    let endpoint = format!("{}@{}:{}", req.username, req.host, req.port);
+    let auth_label = match req.auth_mode.as_str() {
+        "private_key" => crate::i18n::pages::auth_badge_private_key(locale),
+        "password" => crate::i18n::pages::auth_badge_password(locale),
+        other => other,
+    };
+
+    let detail_row = |label: &'static str, value: String| {
+        div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .gap(space::MD)
+            .child(div().text_color(theme.secondary).child(label))
+            .child(div().text_color(theme.bright).child(value))
+    };
+
+    div()
+        .id("remote-connect-confirm-popup")
+        .debug_selector(|| "remote-connect-confirm-popup".into())
+        .w_full()
+        .max_w(size::HELP)
+        .child(
+            dialog_popup(cx)
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(space::MD)
+        .child(dialog_title(
+            crate::i18n::pages::remote_connect_title(locale),
+            cx,
+        ))
+        .child(dialog_description(
+            crate::i18n::pages::remote_connect_desc(&req.tool_name, locale),
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XS)
+                .p(space::SM)
+                .rounded(space::XS)
+                .border_1()
+                .border_color(theme.divider())
+                .bg(theme.normal_fill())
+                .child(detail_row(
+                    crate::i18n::pages::remote_connect_target_label(locale),
+                    req.target_label.clone(),
+                ))
+                .child(detail_row(
+                    crate::i18n::pages::remote_connect_endpoint_label(locale),
+                    endpoint,
+                ))
+                .child(detail_row(
+                    crate::i18n::pages::remote_connect_auth_label(locale),
+                    auth_label.to_owned(),
+                ))
+                .child(detail_row(
+                    crate::i18n::pages::remote_connect_tool_label(locale),
+                    req.tool_name.clone(),
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .debug_selector(|| "remote-connect-deny".into())
+                        .child(
+                            dialog_button(
+                                "remote-connect-deny",
+                                crate::i18n::pages::remote_connect_deny(locale),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    on_deny(this, window, cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "remote-connect-approve".into())
+                        .child(
+                            dialog_button(
+                                "remote-connect-approve",
+                                crate::i18n::pages::remote_connect_approve(
+                                    locale,
+                                ),
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    on_approve(this, window, cx);
+                                },
+                            )),
+                        ),
+                ),
+        ),
+        )
+}
+
+/// Standalone interactive confirmation window content for MCP remote SSH
+/// connection prompts.
+pub fn remote_connect_confirm_view(
+    modal: &RemoteConnectConfirmModal,
+    focus: &FocusHandle,
+    locale: crate::i18n::Locale,
+    cx: &Context<'_, crate::RemoteConnectConfirmWindow>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let card = remote_connect_confirm_card(
+        modal,
+        locale,
+        super::RemoteConnectConfirmWindow::approve,
+        super::RemoteConnectConfirmWindow::deny,
+        cx,
+    );
+
+    div()
+        .id("remote-connect-confirm-window")
+        .debug_selector(|| "remote-connect-confirm-window".into())
+        .track_focus(focus)
+        .key_context("RemoteConnectConfirm")
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            match event.keystroke.key.as_str() {
+                "escape" => this.deny(window, cx),
+                "enter" => this.approve(window, cx),
+                _ => {}
+            }
+        }))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
         .size_full()
         .p(space::XL)
         .bg(theme.background)

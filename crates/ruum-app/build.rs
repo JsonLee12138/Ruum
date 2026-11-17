@@ -58,7 +58,7 @@ fn main() {
     );
 
     println!("cargo:rerun-if-changed={}", icon.display());
-    println!("cargo:rustc-link-arg-bin=ruum={}", res.display());
+    println!("cargo:rustc-link-arg-bin=ruum-gui={}", res.display());
 }
 
 #[cfg(not(windows))]

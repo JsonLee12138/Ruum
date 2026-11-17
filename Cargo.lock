@@ -6527,7 +6527,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dunce",
@@ -6546,7 +6546,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -6581,7 +6581,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-scan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "ruum-core",
@@ -6591,7 +6591,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-watchdog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -9598,7 +9598,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ruum-core",
  "sha2 0.10.9",

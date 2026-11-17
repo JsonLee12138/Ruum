@@ -344,6 +344,9 @@ jobs:
       RUSTFLAGS: -C target-feature=+crt-static
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      DOTNET_ROLL_FORWARD: Major
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
     steps:
       - run: git config --global core.autocrlf false
 
@@ -367,13 +370,19 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $dotnetTools = Join-Path $env:USERPROFILE ".dotnet\tools"
-          $dotnetTools >> $env:GITHUB_PATH
-          if (-not (Test-Path (Join-Path $dotnetTools "wix.exe")) -and
-              -not (Get-Command wix.exe -ErrorAction SilentlyContinue)) {
-            dotnet tool install --global wix
-            if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed" }
+          $wixToolDir = Join-Path $env:RUNNER_TEMP "wix-tool"
+          if (Test-Path -LiteralPath $wixToolDir) {
+            Remove-Item -Recurse -Force -LiteralPath $wixToolDir
           }
+          dotnet tool install wix --version 5.0.2 --tool-path $wixToolDir
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix 5.0.2 failed with exit code $LASTEXITCODE" }
+          $wixExe = Join-Path $wixToolDir "wix.exe"
+          if (-not (Test-Path -LiteralPath $wixExe -PathType Leaf)) {
+            throw "wix.exe not found at '$wixExe' after installation"
+          }
+          & $wixExe --version
+          if ($LASTEXITCODE -ne 0) { throw "wix --version verification failed with exit code $LASTEXITCODE" }
+          "WIX_PATH=$wixExe" >> $env:GITHUB_ENV
 
           function Get-InnoCandidates {
             $candidates = [System.Collections.Generic.List[string]]::new()
@@ -689,7 +698,7 @@ jobs:
           Copy-Item "target\release\ruum.exe", README.md, LICENSE, THIRD_PARTY_NOTICES.md $zipStage
           Compress-Archive -Path $zipStage -DestinationPath "dist\$name.zip"
 
-          wix build (Join-Path $stageDir "ruum.wxs") -arch $wixArch -o "dist\$name.msi"
+          & $env:WIX_PATH build (Join-Path $stageDir "ruum.wxs") -arch $wixArch -o "dist\$name.msi"
           if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 
           & $env:ISCC_PATH (Join-Path $stageDir "ruum.iss")

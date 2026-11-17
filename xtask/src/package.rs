@@ -911,4 +911,18 @@ mod tests {
         let wxs = fs::read_to_string(tricky.join("ruum.wxs")).unwrap();
         assert!(wxs.contains("a&amp;b"));
     }
+
+    #[test]
+    fn windows_release_workflow_pins_wix5_and_roll_forward() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        assert!(workflow.contains("DOTNET_ROLL_FORWARD: Major"));
+        assert!(
+            workflow.contains(
+                "dotnet tool install wix --version 5.0.2 --tool-path"
+            )
+        );
+        assert!(workflow.contains("WIX_PATH="));
+        assert!(workflow.contains("& $env:WIX_PATH build"));
+        assert!(!workflow.contains("dotnet tool install --global wix"));
+    }
 }

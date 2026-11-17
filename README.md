@@ -1,650 +1,431 @@
 # ruum
 
-![ruum: a home directory as a treemap, coloured by kind of data, with reclaimable space hatched and the selection, findings and free space in the side panel](assets/screenshot.png)
+[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-Find what is filling a disk, mark what should go, and remove it — with the
-volume's free space in view the whole time.
+![ruum treemap window showing the left icon rail, category legend, color-coded treemap with hatched reclaimable space, Selection and Worth a look side panel, and live disk free-space meter](assets/screenshot.png)
 
-ruum is a treemap for Omarchy. Choose a local or SSH source, then a
-mounted volume or directory; no scan starts until you explicitly accept.
-It draws every directory as a nested mosaic sized by its real disk cost,
-and lets you walk into it with the keyboard or the mouse. Mark as much as you
-like; nothing happens until you review the list and commit, and the permanent
-path always asks first.
+Find what is filling a disk, mark what should go, and clean it up safely — with your volume's free space in view the whole time.
 
-Built with [GPUI](https://gpui-kit.com/) through
-[gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
-Omarchy theme and behaves like the rest of the desktop.
+**ruum** is a cross-platform treemap disk analyzer and cleanup companion for **macOS**, **Linux**, and **Windows**. Built with [GPUI](https://gpui-kit.com/) and [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), it turns your drives and remote SSH servers into an interactive nested mosaic sized by real disk usage, pairs it with non-destructive mark-and-review workflows, and adds a low-overhead **Disk Space Watchdog**, **AI cleanup assistant**, and headless **`stdio` MCP server** (`ruum mcp`). The UI and CLI automatically localize into English, Simplified Chinese (`zh`), Japanese (`ja`), and Korean (`ko`).
 
-## Install
+## Why "Ruum"?
 
-Download a package from the
-[latest release](https://github.com/JsonLee12138/Ruum/releases/latest)
-(`x86_64` or `aarch64`):
+**Ruum** takes its name from the Old Norse sense of **spaciousness** and **open room** (*rúm*). A disk analyzer shouldn't just draw another dense tree of numbers — its purpose is to clear away accumulated build artifacts, forgotten caches, and stray clutter so your drives have open breathing room again.
 
-- **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
-- **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage:** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
-- **Portable tarball:** unpack `ruum-*-x86_64-linux.tar.gz` and run `./install.sh` inside (or copy `ruum` onto your `PATH`)
+---
 
-Or build it from source:
+## Table of Contents
 
-```sh
-git clone https://github.com/JsonLee12138/Ruum.git
-cd Ruum
-make install
-```
+1. [Installation & Initial Setup](#installation--initial-setup)
+2. [Quick Start Tutorial (3 Steps to Free Up Space)](#quick-start-tutorial-3-steps-to-free-up-space)
+3. [Remote Server Analysis over SSH](#remote-server-analysis-over-ssh)
+4. [Disk Space Watchdog & AI Cleanup Assistant](#disk-space-watchdog--ai-cleanup-assistant)
+5. [MCP Server Integration for AI Agents](#mcp-server-integration-for-ai-agents)
+6. [CLI & Keyboard Shortcuts Reference](#cli--keyboard-shortcuts-reference)
+7. [Safety Guards, Measurement Notes & Development](#safety-guards-measurement-notes--development)
+8. [License](#license)
 
-`make install` builds a release binary and puts three things under `~/.local`
-(no root needed):
+---
 
-- `~/.local/bin/ruum`
-- a desktop entry, so ruum is in the launcher and in a file manager's
-  **Open with** for a directory (it adds a handler; it never becomes the
-  default)
-- an icon
-
-`sudo make install PREFIX=/usr/local` installs system-wide; `make uninstall`
-removes exactly what was installed.
-
-On Arch, including Omarchy, ruum is in the AUR:
-[`ruum`](https://aur.archlinux.org/packages/ruum) builds each release
-from source, and
-[`ruum-bin`](https://aur.archlinux.org/packages/ruum-bin) installs
-the release binary:
-
-```sh
-yay -S ruum-bin
-```
-
-If another installed version wins on `PATH`, the installer warns which one.
-Run `export PATH="$HOME/.local/bin:$PATH"` and add that setting to your shell
-configuration so the locally installed build takes precedence.
-
-For Linux builds with embedded SSH helpers, also install the two Rust
-standard-library targets (no external C cross-compiler is needed):
-
-```sh
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-```
-
-You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
-can drive (Vulkan). Distributions often package an older Rust;
-[rustup](https://rustup.rs) installs a current one. The repo pins 1.97 in
-`rust-toolchain.toml`, so with rustup the right toolchain is fetched on the
-first build even if `rustup default` points at something older.
+## Installation & Initial Setup
 
 ### macOS
 
-Install via Homebrew or download an installer from
-the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest)
-(`aarch64-macos` for Apple Silicon, `x86_64-macos` for Intel; macOS 11 or
-newer):
+Install via Homebrew (macOS 11 or newer, Apple Silicon `aarch64-macos` & Intel `x86_64-macos`):
 
 ```sh
 brew tap JsonLee12138/tap && brew install --cask ruum
 ```
 
-`Casks/ruum.rb` in
-[`JsonLee12138/homebrew-tap`](https://github.com/JsonLee12138/homebrew-tap) is
-automatically synced from the `ruum.rb` asset published with each `Ruum`
-release.
+Or download an installer from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest):
 
-Or install manually:
+- **Disk image (`.dmg`):** open `ruum-*-aarch64-macos.dmg` (or `x86_64`) and drag `ruum.app` into `Applications`.
+- **Installer package (`.pkg`):** run `ruum-*-aarch64-macos.pkg` to install `/Applications/ruum.app` and link `/usr/local/bin/ruum`.
+- **Archive (`.zip`):** unzip `ruum-*-aarch64-macos.zip` and drag `ruum.app` into `Applications`.
 
-- **Disk image (`.dmg`):** open `ruum-*-aarch64-macos.dmg` and drag `ruum.app`
-  into `Applications`.
-- **Installer package (`.pkg`):** run `ruum-*-aarch64-macos.pkg` to install
-  `/Applications/ruum.app` and link `/usr/local/bin/ruum`.
-- **Archive (`.zip`):** unzip `ruum-*-aarch64-macos.zip` and drag `ruum.app`
-  into `Applications`.
+**First-launch setup on macOS:**
 
-A release that was not signed and notarized is stopped by Gatekeeper: macOS
-says it "is damaged and can't be opened" or "cannot be verified". The app is
-fine; the browser marked the download as quarantined. Clear the mark once:
+1. **Clear Gatekeeper quarantine (for unsigned builds):** if macOS reports that the app cannot be verified or appears damaged, clear the browser quarantine attribute once:
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/ruum.app
+   ```
+   *(Or open it once and choose **Open Anyway** in **System Settings › Privacy & Security**.)*
+2. **Grant Full Disk Access:** to inspect protected locations (Mail, Messages, Safari, Trash, and other app containers), grant **ruum** **Full Disk Access** in **System Settings › Privacy & Security** — the side panel shows an **Open Privacy Settings** button whenever items are unreadable — then reopen the app. If you launch `ruum` from a terminal, your terminal app also needs Full Disk Access. macOS also prompts once for Desktop, Documents, and Downloads.
 
-```sh
-xattr -dr com.apple.quarantine /Applications/ruum.app
-```
+### Linux
 
-(Or open it once, then choose **Open Anyway** in System Settings › Privacy &
-Security.)
+Download a package from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest) (`x86_64` or `aarch64`):
 
-Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools.
-macOS does not come with Rust; install it with [rustup](https://rustup.rs).
+- **Arch / Omarchy (AUR):**
+  ```sh
+  yay -S ruum-bin   # prebuilt release binary
+  # or:
+  yay -S ruum       # build from source
+  ```
+- **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
+- **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
+- **AppImage:** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
+- **Portable tarball:** unpack `ruum-*-x86_64-linux.tar.gz` and run `./install.sh` (or copy `ruum` onto your `PATH`).
 
-```sh
-make install     # ~/Applications/ruum.app, and ~/.local/bin/ruum
-make bundle-all  # target/bundle/ruum.app, .zip, .dmg, and .pkg
-make uninstall
-```
+**Hyprland floating window rule:** Hyprland tiles new windows by default; ruum works best in a roomy floating window (`class` is `ruum`):
 
-To see everything, give ruum **Full Disk Access** in System Settings ›
-Privacy & Security (the panel offers a button when it is missing), then
-reopen it. Without it macOS hides Mail, Messages, Safari, other apps' data
-and the Trash, and ruum counts them as unreadable. Started from a
-terminal, it is the terminal that needs the access. macOS also asks once
-each for Desktop, Documents and Downloads.
-
-What is different from Linux:
-
-- **Free space** is what `df` reports. Finder's figure is larger: it counts
-  purgeable space (caches and local snapshots macOS will clear on its own).
-- **Cloned files** (copies APFS shares blocks between, as Finder's Duplicate
-  makes) are each counted in full, so a total can exceed what deleting them
-  frees.
-- **Time Machine's local snapshots** are not files and do not appear; they
-  are part of the gap between the scan and the disk's used space.
-- **Cloud-only folders** (iCloud Drive, Dropbox and the like, evicted to the
-  server) are not opened, so a scan never downloads them.
-
-To sign and notarize a build for others, with Developer ID certificates in
-the keychain and credentials saved by `xcrun notarytool store-credentials`:
-
-```sh
-NOTARY_PROFILE=<profile> cargo xtask bundle --all \
-  --sign "Developer ID Application: Name (TEAMID)" \
-  --installer-sign "Developer ID Installer: Name (TEAMID)" \
-  --notarize
+```ini
+windowrule = float, class:^(ruum)$
+windowrule = size 1400 900, class:^(ruum)$
 ```
 
 ### Windows
 
-On Windows 10 or 11 (`x86_64` or `aarch64`), download an installer or portable
-archive from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest):
+On Windows 10 or 11 (`x86_64` or `aarch64`), download from the [latest release](https://github.com/JsonLee12138/Ruum/releases/latest):
 
-- **Installer wizard (`-setup.exe`):** run `ruum-*-x86_64-windows-setup.exe`
-  (supports silent install, Start Menu/Desktop shortcuts, and optional `PATH`
-  registration).
-- **MSI package (`.msi`):** install `ruum-*-x86_64-windows.msi` per-machine
-  with Start Menu shortcut and optional system `PATH` feature.
-- **Portable archive (`.zip`):** unpack `ruum-*-x86_64-windows.zip` anywhere
-  and run `ruum.exe`.
+- **Installer wizard (`-setup.exe`):** run `ruum-*-x86_64-windows-setup.exe` (supports silent install, Start Menu/Desktop shortcuts, and optional `PATH` registration).
+- **MSI package (`.msi`):** install `ruum-*-x86_64-windows.msi` per-machine with Start Menu shortcut and optional `PATH` feature.
+- **Portable archive (`.zip`):** unpack `ruum-*-x86_64-windows.zip` anywhere and run `ruum.exe`.
 
-Or build it with Rust 1.97 or newer, from [rustup](https://rustup.rs), and the
-MSVC toolchain (Visual Studio Build Tools, C++ workload):
+**NTFS fast scans on Windows:** when scanning a whole NTFS drive (such as `C:\`) without `--follow-links`, running as Administrator lets ruum read the NTFS Master File Table (MFT) directly — several times faster than directory traversal — and inspect protected folders like `System Volume Information`. The side panel offers **Restart as Administrator** whenever elevation can speed up or unlock unreadable items.
 
-```powershell
-git clone https://github.com/JsonLee12138/Ruum.git
-cd Ruum
-cargo build --release    # target\release\ruum.exe
-```
+### Build from Source & Verify Downloads
 
-See [On Windows](#on-windows) for what differs there.
+Building requires **Rust 1.97 or newer** (pinned in `rust-toolchain.toml` via [rustup](https://rustup.rs)).
 
-### Verify downloads & release automation
+- **macOS & Linux** (Linux also requires a Wayland or X11 session with a Vulkan-capable GPU, plus the `musl` stdlib targets for embedded static SSH helpers):
+  ```sh
+  # Linux only (for embedded static SSH helpers, no C cross-compiler required):
+  rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-Every release publishes `SHA256SUMS`, per-artifact `.sha256` files, and Sigstore
-build provenance attestations:
+  git clone https://github.com/JsonLee12138/Ruum.git
+  cd Ruum
+  make install
+  ```
+  - On **Linux**, `make install` installs `~/.local/bin/ruum`, a desktop entry (adding an **Open with** handler for directories without changing your default file manager), and the `ruum.svg` icon. Use `sudo make install PREFIX=/usr/local` for system-wide installation, or `make uninstall` to remove everything it placed.
+  - On **macOS**, `make install` builds and installs `~/Applications/ruum.app` and symlinks `~/.local/bin/ruum` (requires Xcode or Command Line Tools).
+  - If an older binary earlier on `PATH` shadows `~/.local/bin/ruum`, add `export PATH="$HOME/.local/bin:$PATH"` to your shell configuration.
+- **Windows** (MSVC toolchain / Visual Studio Build Tools with C++ workload):
+  ```powershell
+  git clone https://github.com/JsonLee12138/Ruum.git
+  cd Ruum
+  cargo build --release    # target\release\ruum.exe
+  ```
+
+**Verify release artifacts:** every release publishes `SHA256SUMS`, per-artifact `.sha256` files, and Sigstore build provenance attestations:
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify <downloaded-artifact> --repo JsonLee12138/Ruum
 ```
 
-The release workflow works without paid signing certificates or external tokens
-(building ad-hoc on macOS and unsigned on Windows by default). Optional
-repository secrets enable signing and notarization:
+### Register the `ruum` CLI in `PATH`
 
-- **macOS:** `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`,
-  `MACOS_SIGN_IDENTITY`, optional `MACOS_INSTALLER_SIGN_IDENTITY`,
-  `NOTARY_KEY_P8`, `NOTARY_KEY_ID`, `NOTARY_ISSUER`
-- **Windows:** `WINDOWS_CERT_PFX` (base64 `.pfx`), `WINDOWS_CERT_PASSWORD`
+If you installed the desktop app from a `.dmg`, `.zip`, or portable archive, register the `ruum` terminal command in one click:
 
-Each release uploads `ruum.rb` as a release asset; `Casks/ruum.rb` is
-automatically synced by `JsonLee12138/homebrew-tap` from that asset without
-configuring a cross-repo `HOMEBREW_TAP_TOKEN` PAT in this repository.
+1. Open **Settings** (`⌘,` on macOS, `Ctrl+,` on Linux & Windows, or click the gear icon in the Left Icon Rail).
+2. Under **Command-Line Tool**, click **Install CLI Command** (also accessible from the macOS menu bar via **ruum › Install CLI Command…**).
 
-## Use
+This registers `/usr/local/bin/ruum` on macOS, `~/.local/bin/ruum` on Linux, or copies `ruum.exe` into `%LOCALAPPDATA%\Programs\ruum\bin` and updates your user `Path` on Windows — enabling `ruum`, `ruum ssh`, `ruum watchdog`, and `ruum mcp` from any shell or AI agent.
+
+---
+
+## Quick Start Tutorial (3 Steps to Free Up Space)
+
+### Step 1: Choose a Source & Scan Root
+
+1. **Launch ruum:** running `ruum` scans your home directory (`~`) immediately, largest entries first.
+2. **Pick another folder, drive, or remote host:** press `v` (or click **Source…** in the right panel, click the **ruum** logo, or run `ruum --choose`) to open **Sources & Drives**:
+   - Choose **This computer** (or enter an SSH target and click **Connect SSH**). Discovery lists mounts without probing network shares or scanning files.
+   - Select a mounted volume and click **Scan selected root**, or type any absolute path and click **Scan directory**.
+3. **Widen to the whole disk anytime:** press `g`, launch `ruum --disk`, or click an ancestor breadcrumb above your scan root (such as `/`). Widening is **memoized**: the subtree already scanned is reused so going from `~` to `/` only walks directories outside `~`.
+
+### Step 2: Explore & Locate Space Hogs
+
+Use the **Left Icon Rail** on the far left edge to switch between **Explore treemap**, **Sources & Drives**, **Watchdog**, and **Settings**.
+
+In the **Explore** screen:
+
+- **Read the treemap at a glance:**
+  - **Tile area** shows proportional disk usage (or file count).
+  - **Colors** classify what data is: **Code**, **Agent scratch**, **Toolchains**, **Synced**, **Git**, **Media**, **Documents**, and **Cache** (`Other` is neutral).
+  - **Diagonal hatching** marks **Reclaimable** directories (caches, sync history, package stores, compiler/bundler build output, reinstallable dependencies, sandbox layers, snapshots, trash, temporary files).
+- **Tune the view controls** in the top bar:
+  - **Size / Files / Age** (`t`): switch between allocated bytes, file count, or last-write **Age** (**This week** through **Older**).
+  - **Hidden files** (`i`): include or skip dotfiles and hidden folders (included by default because `~/.cache` often dominates home usage).
+  - **Apparent size** (`d`): toggle between real allocated blocks (`st_blocks × 512`) and logical file lengths (`ls -l`).
+  - **Depth 1–6** (`[` / `]`): draw fewer or more nested levels simultaneously (default `3`).
+  - **Power Efficiency**: choose worker presets (`Miser`, `Balanced`, `Aggressive`, `Drain My Battery`) for future scans, or pass `--scan-threads` via CLI.
+- **Navigate and filter quickly:**
+  - **Scroll wheel** zooms smoothly toward the cursor and descends continuously into subdirectories; scroll out to climb back up.
+  - Press `Enter` to open the selected directory at any depth, `Backspace` or `Esc` to step up, `Alt+←` / `Alt+→` (`⌘[` / `⌘]` on macOS, or mouse side buttons) to move through history, `← ↑ ↓ →` or `hjkl` to step between tiles, and `Tab` to cycle to the next largest sibling.
+  - Press `/` to filter by name — only matching paths stay colored; press `Enter` to isolate matches or `Esc` to clear.
+- **Inspect the right side panel:**
+  - **Selection:** large size readout, **Of scan** percentage, **Files** count, **Last write** age, **Kind**, and hook-free **Git** status (uncommitted changes, stashes, unpushed commits), plus **Open** and **Mark for removal** buttons.
+  - **Worth a look:** automatically surfaced top reclaimable folders, stale worktrees, and untouched experiment directories.
+  - **Marked** & **Disk:** running list of marked items and a live **Disk** bar projecting how much free space you recover after cleanup.
+
+### Step 3: Mark, Review & Clean Up Safely
+
+Marking is **100% non-destructive** — nothing is touched on disk until you review and commit:
+
+1. **Mark targets:** hover over any tile or select it with arrows and press `Space` or `x` (or `⌘`-click on macOS / `Ctrl`-click on Linux & Windows to mark without moving focus). Marking a directory automatically absorbs any marks inside it (**Goes with `<ancestor>`**), and space savings are never double-counted.
+2. **Open Review:** press `c` or click **Review N marked · frees …** at the bottom of the side panel.
+3. **Choose how to clean up (or hand off):**
+   - **Move to trash** (`m`, default when available): moves items to the OS Trash / Recycle Bin / XDG Trash (`trash-put`, `gio trash`, or built-in XDG trash), so they remain recoverable until emptied.
+   - **Delete permanently** (`p`): `rm -rf` semantics — always opens an explicit confirmation modal listing the items and bytes to be freed before anything is deleted.
+   - **Export instead of deleting:** press `s` (**Save list…**) to export a plain path list, or `a` (**Copy as prompt**) to copy a carefully guarded prompt for a coding agent.
+4. **Commit & verify:** press `Enter` (or click the action button). Once finished, **ruum** automatically rescans the root and opens **Done**, showing the actual **volume freed** measured before and after cleanup.
+
+---
+
+## Remote Server Analysis over SSH
+
+Inspect servers without moving files or risking accidental remote deletions:
 
 ```sh
-ruum            # choose a local/SSH source and root
-ruum ~          # explicitly scan home
-ruum --disk     # the whole disk it lives on
-ruum ~/src      # or any directory
-ruum --help     # options: apparent size, follow links, skip hidden, …
+ruum ssh dev                 # connect and pick a remote mount or root
+ruum ssh user@server /var    # scan a specific remote directory directly
+ruum ssh dev --disk          # scan the volume holding the remote home directory
+ruum ssh dev -a /srv         # measure apparent size on /srv
+ruum ssh dev --check /var/log  # headless CLI summary without opening a GUI window
 ```
 
-### Servers over SSH (read-only)
+You can also connect from inside the app via **Sources & Drives › Connect SSH** by entering an SSH host alias or `user@host`.
+
+### How Remote Scanner Deployment Works
+
+- **Linux packaged builds (`make build` / `cargo xtask portable`):** bundle static `x86_64` and `aarch64` `musl` Linux scanners inside the executable. On connect, ruum checks the server's OS/CPU and uploads the matching helper to `~/.cache/ruum/ssh/<sha256>/` (checksum-verified, no `sudo`, no system package changes, no dependency on remote `glibc`). You can also extract a binary manually:
+  ```sh
+  ruum extract-scanner x86_64 ./ruum-scan
+  ruum extract-scanner aarch64 ./ruum-scan-arm64
+  ```
+- **Development, macOS, or Windows desktop builds:** install the small headless helper (`ruum-scan`, no GUI dependencies) on the remote server's `PATH` or `~/.local/bin/ruum-scan`:
+  ```sh
+  # On the remote server inside a checkout:
+  make install-scan
+  # Or:
+  cargo install --path crates/ruum-scan --locked
+  ```
+- **Authentication & connection safety:** ruum uses your normal SSH config, keys, and `ssh-agent`. Terminal launches can prompt for passwords/passphrases directly; GUI launches rely on key/agent auth or an SSH askpass helper. Connect once with `ssh dev` to trust the host key. One compressed SSH stream carries bounded records without storing the tree in remote memory, stops at nested mounts, and terminates cleanly on disconnect.
+
+### Read-Only Remote Review & Safe Export Workflow
+
+Remote GUI sessions are **strictly export-only** — trash/delete buttons, Git checks, and local reveal actions are disabled, and free space is sampled at scan time (press `r` to refresh):
+
+1. Mark target paths on the treemap (`Space` / `x`), then press `c` to open **Review**.
+2. Choose an export option:
+   - **Copy as prompt** (`a`): includes SSH host, remote OS, scan root, marked paths, sizes, and mandatory safety instructions requiring hostname and machine ID verification before any deletion.
+   - **Save list…** (`s`): saves remote paths locally, one path per line.
+   - **Copy delete script** (`y`) / **Save delete script…** (`e`): produces a GNU/Linux shell script. Running the script with no flags **only previews** the targets; running `sh ruum-delete.sh --delete` connects to the SSH host, verifies that the remote server's actual kernel hostname and machine ID (`HostIdentity`) match the scanned machine (aborting on mismatch), and refuses system, root, home, mount-point, or symlink-redirected paths.
+
+---
+
+## Disk Space Watchdog & AI Cleanup Assistant
+
+Let **ruum** watch your free space silently in the background (`O(1)` `statvfs` / disk-space check — zero background directory walks) and propose safe cleanup candidates when space runs low.
+
+### 1. Configure Watchdog & Background Service
+
+Open **Settings** (`⌘,` on macOS / `Ctrl+,` on Linux & Windows):
+
+1. Toggle **Enable Watchdog Free-Space Monitoring**.
+2. Toggle **Run as OS Background Service at Login (launchd / systemd / Windows)** to manage the native background daemon:
+   - **macOS:** `launchd` user agent (`com.ruum.watchdog`)
+   - **Linux:** `systemd --user` service (`ruum-watchdog.service`)
+   - **Windows:** zero-UAC `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry + hidden background process (`CREATE_NO_WINDOW`)
+   *(You can also run the monitor manually from a terminal via `ruum watchdog` or a single check with `ruum watchdog --once`.)*
+3. Adjust thresholds:
+   - **Minimum Free Space Threshold (GB):** default `20` GB (min `1` GB).
+   - **Check Interval (minutes):** default `5` minutes (min `30` seconds).
+   - **Re-Alert Cooldown (min 5 minutes):** default `360` minutes / 6 hours (min `5` minutes).
+4. Toggle **Automatically Run AI Analysis on Low Disk Space** if you want the configured AI CLI to prepare a cleanup proposal automatically when free space drops below your threshold.
+5. Click **Save Settings**.
+
+### 2. Configure an AI Assistant CLI
+
+Still on the **Settings** page under **AI Assistant CLI**:
+
+1. Choose a provider preset: **Agy**, **Pi**, **Codex**, or **Custom** (with **Custom Executable Command / Path** and **Custom Extra Arguments**).
+2. Optionally set **Model Override (optional)**, click **Test CLI Connection** to verify the executable, or click **Fetch Models** and test latency per model (or benchmark all models) to pick the fastest model.
+3. Click **Save Settings**.
+
+### 3. Review & Confirm AI Cleanup Proposals
+
+- Open the **Watchdog** page from the Left Icon Rail (or click the **System Tray / Menu Bar** icon) to inspect **Volume Status**, run **Check Disk Space Now**, trigger **Run AI Analysis Now**, or open **Review & Confirm…** (**Review Latest Proposal…** in the tray).
+- **Nothing is ever deleted unattended.** Every AI proposal opens in the standalone **Confirm Cleanup** window (`ruum --confirm-cleanup ...`):
+  - Inspect each candidate's read-only removal-mode badge (**Trash** / **Permanent**), path, byte size, reason, and local Git dirty/unpushed warning.
+  - Use **Select All** / **Select None** or individual checkboxes to choose which paths to keep or clean.
+  - Click **Confirm & Clean** (or **Cancel** to abort safely).
+- *Tray residency note:* when the system tray / menu bar icon is active, closing the main window keeps ruum running quietly in the background; press `⌘Q` / `Ctrl+Q` (or `q` in Explore view), or choose **Quit Ruum** from the tray, to exit completely.
+
+---
+
+## MCP Server Integration for AI Agents
+
+**ruum** includes a headless Model Context Protocol (`stdio` JSON-RPC 2.0) server with zero GUI startup and clean `stdout` framing (`ruum mcp`).
+
+### Configure Your MCP Client
+
+First ensure `ruum` is on `PATH` (via **Settings › Command-Line Tool › Install CLI Command**), then add `ruum` to your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "ruum": {
+      "command": "ruum",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+For strictly non-destructive analysis sessions, pass `--read-only`:
+
+```json
+{
+  "mcpServers": {
+    "ruum": {
+      "command": "ruum",
+      "args": ["mcp", "--read-only"]
+    }
+  }
+}
+```
+
+### Exposed MCP Tools (8 Tools)
+
+| Tool | Scope | Key Arguments | Safety Boundary |
+| --- | --- | --- | --- |
+| `list_volumes` | Local / SSH | `ssh_host?` | Read-only mount discovery; no file walk |
+| `scan_directory` | Local / SSH | `path?`, `disk?`, `ssh_host?`, `apparent_size?`, `include_hidden?`, `max_entries?`, `rescan?` | Read-only scan; cached in session |
+| `inspect_subtree` | Local / SSH | `root`, `subpath?`, `filter?`, `ssh_host?`, `max_entries?` | Read-only tree lookup & substring search |
+| `find_reclaimable` | Local / SSH | `root`, `ssh_host?`, `limit?` | Read-only heuristic findings (caches, build dirs, worktrees) |
+| `check_git_safety` | Local only | `paths` (array) | Hook-free read-only Git status; rejects `ssh_host` |
+| `plan_removal` | Local / SSH | `root`, `targets` (array), `ssh_host?` | Dry-run validation against `removal` guards; never deletes |
+| `trash_paths` | Local / SSH | `root`, `targets` (array), `ssh_host?` | Disabled in `--read-only`; **requires interactive GUI Confirm Cleanup checkbox approval** |
+| `delete_permanently` | Local only | `root`, `targets` (array), `reason?` | Disabled in `--read-only`; forbidden over `ssh_host`; **requires GUI Confirm Cleanup checkbox approval + OS native auth (e.g. Touch ID)** |
+
+If `CleanupConfirmAdapter` or OS native authentication fails, times out, or has no interactive desktop session, mutating tools fail closed and remove nothing.
+
+---
+
+## CLI & Keyboard Shortcuts Reference
+
+### CLI Commands & Options
 
 ```sh
-ruum ssh dev                 # connect and choose a remote root
-ruum ssh user@server /var    # an explicit remote path
-ruum ssh dev --disk          # the disk containing the remote home
-ruum ssh dev -a /srv         # apparent size instead of allocated blocks
+ruum [OPTIONS] [PATH]                  # scan PATH (defaults to ~)
+ruum ssh HOST [OPTIONS] [PATH]         # inspect a remote host over SSH (read-only)
+ruum mcp [--read-only]                 # run stdio MCP server
+ruum watchdog [--once]                 # run disk watchdog daemon (or single check)
+ruum extract-scanner ARCH OUTPUT       # extract embedded Linux helper (x86_64 | aarch64)
 ```
 
-Linux builds made with `make build` / `cargo xtask portable` include static
-**x86-64 and ARM64 Linux scanners appended to the executable**. SSH detects
-the server's OS/CPU and uploads the matching scanner only when its checked
-cache is missing or damaged. The cache is private and content-addressed under
-`~/.cache/ruum/ssh/<sha256>/` (or the server's `XDG_CACHE_HOME`).
-Uploads are checksum-verified and atomically installed; there is no sudo,
-system-package change or dependency on the server's glibc version.
-
-This uses stable Rust's musl targets rather than Cosmopolitan: the existing
-Rust/rayon/rustix scanner has no supported stable Cosmopolitan target. These
-are Linux binaries, not a single executable for every OS; ARM64 is built and
-ELF-validated, while x86-64 was also executed against a real server.
-
-You can extract a helper without opening a window, or test the entire
-SSH/deployment/scan path headlessly:
-
-```sh
-ruum extract-scanner x86_64 ./ruum-scan
-ruum extract-scanner aarch64 ./ruum-scan-arm64
-ruum ssh dev --check /var/log
-```
-
-The appended manifest stores architecture, byte ranges and SHA-256 hashes.
-Do not run `strip` after packaging: it discards the trailer. The Linux release
-pipeline strips first, embeds last, and ships that single file. Appending to
-signed macOS/Windows executables needs platform-specific signature handling;
-those builds do not yet embed helpers.
-
-For a development or non-Linux desktop build without the trailer, install
-the small **ruum-scan** helper on the server first:
-
-```sh
-# On the server, inside the checkout:
-make install-scan               # ~/.local/bin/ruum-scan; no GUI deps
-# Or:
-cargo install --path crates/ruum-scan --locked
-```
-
-The helper can be on the server's **non-interactive SSH PATH** or at
-`~/.local/bin/ruum-scan` (the default install location); ruum tries
-both. A binary copied from another machine must match the server's OS,
-architecture and runtime. The manually built native helper may need the
-server's libc; the embedded Linux helpers are static. Ruum never runs
-sudo or changes the server's configuration.
-SSH keeps your normal authentication settings. When launched from a
-terminal, it can ask for a password or key passphrase there; GUI launches
-need key/agent access or a working SSH askpass helper. Connect once with
-`ssh dev` to verify access and accept its host key.
-
-The protocol also supports lightweight root discovery, separate from a scan:
-it reads the target's mount namespace without walking or probing the listed
-paths. Same-device mounts remain distinct choices; capacity is unknown
-until a root is explicitly selected. Discovery requests omit scan fields,
-so outdated helpers reject them instead of silently scanning their home.
-
-The Linux/macOS helper streams a depth-first walk directly to stdout. It
-never constructs a tree or retains a directory's children: memory scales
-with open ancestors, not file count. Deep directories are not rejected
-at an arbitrary depth; filesystem errors are reported as unreadable.
-Hardlink identities are sent to the desktop, which uses the local scanner's
-compact identity index to count each inode once. The helper keeps no
-per-file identity table in negotiated desktop-de-duplication mode; links
-outside the chosen root cannot fill one. Older clients retain bounded
-helper-side accounting for wire compatibility. A resource limit fails
-explicitly instead of returning a partial tree. Symlinks are not followed,
-and every nested mount is skipped, even a bind mount or same-device
-subvolume. Select those as separate roots.
-
-While indexing, a quiet sidebar shows live files, directories, measured
-bytes, read errors and elapsed time. Counters and paths use monospace type
-in fixed lanes; changing values do not re-center or reflow the screen.
-Narrow windows use a compact progress footer instead.
-
-Ordinary local walks and current SSH helpers paint a **live top-level
-overview** before the full tree arrives. These are measured contributions,
-not complete directory sizes. Updates are limited to once a second, in
-arrival order, with at most 128 named buckets plus an overflow bucket. The
-preview is kept separate from the real tree: it cannot be navigated,
-marked or removed. On completion the full, actionable treemap replaces it;
-on error or cancellation the preview is discarded. The Windows file-table
-fast path still waits for its complete tree. Remote scans also show a
-sampled recent directory and connection / helper setup / indexing / treemap
-stages. Progress uses a single replaceable snapshot, not a growing event
-queue; path updates are throttled to five per second. There is no guessed
-percentage: the total is unknown until the walk finishes. Older helpers
-still provide counters from their streamed records, without path samples.
-
-One compressed SSH connection carries a bounded JSON request on stdin and
-compact postorder records on stdout. The client keeps stdin open so the
-helper exits on disconnect, including while scanning or blocked on output.
-Linux helpers also enforce a 1 GiB address-space ceiling, disable core dumps,
-and stop after five minutes. File contents never cross the connection and
-paths are never interpolated into remote shell commands. Only the desktop
-retains the complete tree for offline navigation; its memory still scales
-with entry count. The native Windows helper currently retains the original
-tree-building scan path.
-
-Remote mode is **export-only**. Mark with Space, open review with `c`, then:
-
-- **Copy as prompt** (`a`): includes the SSH host, remote OS, scan root,
-  selected paths, sizes and cleanup precautions. It requires verifying the
-  actual scanned hostname and machine ID before any destructive operation,
-  and stopping if either check fails or cannot be performed.
-- **Save list…** (`s`): remote paths, one per line, saved locally.
-- **Copy delete script** (`y`), or **Save delete script…** (`e`): a
-  GNU/Linux shell script, copied to the clipboard or saved locally.
-  Running it without arguments only previews the selection. After reviewing
-  it, `sh ruum-delete.sh --delete` connects to the named SSH host and
-  runs the exported commands there, never against the local paths.
-
-There are no trash/delete buttons or removal-mode choices in remote review.
-Deletion shortcuts and removal entry points are disabled too. Git inspection,
-local folder selection and file-manager reveal are disabled so remote names
-cannot accidentally act on this computer. Free space is sampled when the
-scan starts, **not live**; press `r` to refresh.
-
-Before deleting, scripts compare the server's actual kernel hostname and
-machine ID against the identity captured in the scan—not the SSH alias.
-Missing identity or any mismatch aborts. The check runs on the SSH target,
-not the computer launching the wrapper. Pasting the script previews it by
-default and runs in a subshell, so its exit cannot close your terminal.
-
-Exports are not an automatic cleanup recommendation. Scripts refuse system
-paths, the scan root, home or its ancestors, symlinked/changed canonical paths,
-and paths containing mount points. Control-character names are omitted.
-These checks do not eliminate filesystem races or tell you whether git work
-is backed up; review the script and prefer a tool's own cleanup command for
-tool-owned data. The remote helper itself has no delete operation.
-
-### The screen
-
-- **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
-  tree a crumb goes there, and its ▾ lists its siblings, largest first with
-  their share and size, to jump sideways (arrows and Enter work too). Above
-  the scanned root a crumb is dimmer, and clicking it widens the scan to
-  there (see below).
-- **Under it:** the scan totals, the filter when one is typed, and the legend.
-- **Mosaic:** colour is the *kind* of data — code, agent scratch,
-  toolchains, synced files, git, media, documents, caches — at one muted
-  level, lighter with depth. A diagonal hatch is space that can be had back
-  (caches, sync history, package stores, build output), independent of
-  colour. Top-level directories carry a strip of their colour and a name
-  band; deeper open directories a slim label row. In **Age** mode colour is
-  the last write instead, from this week to older.
-- **Panel:** the selection (its size set large, share of the scan, files,
-  last write, and for a checkout what git says — changes, stashes, unpushed
-  commits); *Worth a look*, the largest things that could plausibly go;
-  what is marked; and the disk, free now and after the marks, with the way
-  to the review screen. Drag its left edge to resize it; double-click the
-  edge to reset.
-
-One colour is kept apart: amber marks the selection, the main action, and
-what can be had back.
-
-The kinds come from directory names and a few shapes (a bare git repository,
-`target` beside a `Cargo.toml`). Some of the names are specific to one
-machine; see `crates/ruum-core/src/classify.rs`.
-
-### Marking
-
-Space, X, Enter and the arrows act on the tile under the mouse if the mouse
-moved last, and on the keyboard selection after you use an arrow or Tab.
-
-A marked tile takes the danger colour, and so does everything inside it:
-removing a directory takes its contents with it. Marking a directory absorbs
-any marks already inside it, and something inside a marked directory cannot be
-marked or kept on its own; its panel offers to unmark the directory instead.
-Marking is reversible — press it again — and the saving is never counted twice.
-
-### Zooming and going in
-
-Scroll to magnify toward the pointer. The wheel magnifies until the directory
-under the pointer fills the view, and the next notch goes into it — one
-continuous motion, with the directory's contents growing into place. Scroll the
-other way to come back out. Enter goes into the selected directory at any
-depth, and Backspace or Escape goes up one level. `<` and `>`, beside the
-Size / Files / Age switch, go back and forward through the directories visited,
-as do `alt ←` `alt →` (also `⌘[` `⌘]` on macOS) and the mouse's side
-buttons. `+` and `-` magnify without going in; `0` resets.
-
-### Removing
-
-`c` (or **Review…**) opens the list of everything marked. Unmark anything
-there, then choose:
-
-- **Move to trash** — the default when a trash is available. On macOS that is
-  the system Trash, the same move as Finder's (on another disk, that disk's
-  own Trash; network shares often have none). Elsewhere it is `trash-put`
-  from trash-cli, then `gio trash`, then a built-in XDG trash. Recoverable
-  until the trash is emptied, so it commits directly.
-- **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
-  that names what goes and how much comes back.
-
-When it finishes, ruum scans again so the numbers on screen match the disk,
-and shows how much free space was actually gained.
-
-## Keys
-
-| key | does |
+| Flag | Description |
 | --- | --- |
-| `space` / `x` | mark or unmark the tile you point at |
-| `ctrl`-click (`⌘`-click on macOS) | mark without moving the selection |
-| `enter` | open that directory, at any depth |
-| `⌫` / `esc` | go up one directory |
-| `alt ←` `alt →` | back and forward through where you have been |
-| `←` `↑` `↓` `→` | move between tiles at this level |
-| `tab` | next largest sibling |
-| scroll | zoom toward a directory, then go into it |
-| `shift`-scroll | pan the magnified view |
-| `[` `]` | draw fewer or more levels at once |
-| `-` `=` `0` | magnify, shrink, reset the view |
-| `ctrl =` `ctrl -` `ctrl 0` (`⌘` on macOS) | interface zoom |
-| `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
-| `c` | review the marked list |
-| `t` | size, files or age: what areas and colours say |
-| `d` | disk usage or apparent size |
-| `i` | include or skip hidden entries |
-| `r` | scan again |
-| `esc` while scanning | stop the scan |
-| `v` | choose a local/SSH source and root |
-| `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
-| `g` | the whole disk |
-| `p` | show or hide the selection line |
-| `o` | show it in Finder, File Explorer or the file manager |
-| right-click | show that tile in Finder, File Explorer or the file manager |
-| `?` | every key |
-| `q` | quit |
+| `--choose` | Open **Sources & Drives** before scanning |
+| `-a`, `--apparent-size` | Measure apparent file length instead of allocated blocks |
+| `-l`, `--follow-links` | Follow symlinks (local scans only) |
+| `-H`, `--no-hidden` | Skip dotfiles and dot-directories |
+| `-D`, `--disk` | Scan the whole disk containing your home directory |
+| `-X`, `--cross-filesystems` | Include other mounted disks, network shares, and pseudo-filesystems below `PATH` (local only; off by default) |
+| `-d`, `--depth N` | Initial treemap levels drawn at once (`1`–`6`, default `3`) |
+| `--power-efficiency PRESET` | Worker preset: `miser`, `balanced` (default), `aggressive`, `drain-my-battery` |
+| `--scan-threads N` | Fixed scan workers (capped by available CPU count) |
+| `--adaptive-threads` | Opt into experimental adaptive thread admission |
+| `--fixed-threads` | Disable adaptive admission and CPU governor |
+| `--thread-throughput-percent N` | Retain this percent of sampled initial throughput (default `80`) |
+| `--thread-system-cpu-percent N` | Best-effort host CPU budget percent; `0` disables (default `80`) |
+| `--metric files\|bytes` | Rank tiles by file count (`files`) or bytes (`bytes`) |
+| `--open-screen SCREEN` | Start directly on `explore`, `sources`, `watchdog`, or `settings` |
+| `--check` | With `ssh`: deploy helper and print scan summary without opening a window |
+| `-h`, `--help` | Show localized CLI usage help |
 
-On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘R to
-rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
-window quits); other ⌘ chords are left to the system. On Linux and Windows
-the same work with ctrl, with F5 to rescan too.
+### Keyboard & Mouse Shortcuts — Explore View
 
-On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
-commits, `esc` goes back. Or hand the list on instead of acting on it: `s`
-saves it as a text file, one path per line, and `a` copies a prompt for a
-coding agent: free the space by removing what you picked, checking each path
-first (git work that exists nowhere else, a tool's own clean command) and
-touching nothing else. A name holding a newline is left out of the list and
-escaped in the prompt, so it cannot pass for another path.
+| Key / Input | Action |
+| --- | --- |
+| `Space` / `x` | Mark or unmark the pointed/selected tile |
+| `Ctrl`-click (`⌘`-click on macOS) | Mark or unmark without moving the selection |
+| `Enter` | Open the selected directory at any depth |
+| `Backspace` (`⌫`) / `Esc` / `u` | Go up one directory (when no filter/scan/selection overrides `Esc`) |
+| `Alt+←` / `Alt+→` (`⌘[` / `⌘]` on macOS, mouse side buttons) | Navigate back and forward through visited directories |
+| `←` `↑` `↓` `→` / `h` `j` `k` `l` | Move between tiles at the current level |
+| `Tab` / `Shift+Tab` | Next / previous largest sibling |
+| Scroll wheel | Zoom toward a directory and enter it continuously |
+| `Shift`-scroll | Pan the magnified treemap view |
+| `[` / `]` | Draw fewer or more treemap depth levels (`1`–`6`) |
+| `-` / `=` (`+`) / `0` | Shrink, magnify, or reset the view transform |
+| `Ctrl` (`⌘` on macOS) + `=` / `-` / `0` | Interface zoom |
+| `/` (or `s`) | Filter by name (`Enter` shows only matches; `Esc` clears) |
+| `c` | Open **Review** for marked items |
+| `t` | Cycle **Size**, **Files**, and **Age** modes |
+| `d` | Toggle **Disk usage** vs **Apparent size** |
+| `i` | Toggle **Hidden files** |
+| `r` / `Ctrl+R` (`⌘R` on macOS) / `F5` | Scan again from the same root |
+| `Esc` (while scanning) | Cancel the scan in progress |
+| `v` | Open **Sources & Drives** |
+| `Ctrl+O` (`⌘O` on macOS) | Choose another local directory to scan |
+| `g` | Scan the whole disk (or click an ancestor breadcrumb above root) |
+| `p` | Show or hide the selection details panel |
+| `o` / `Ctrl+Shift+R` (`⌘⇧R`) / Right-click | Reveal in Finder, File Explorer, or the file manager |
+| `Ctrl+,` (`⌘,` on macOS) | Open **Settings** |
+| `?` | Toggle full keyboard & mouse help overlay |
+| `q` / `Ctrl+Q` (`⌘Q` on macOS) | Quit ruum (`Ctrl+W` / `⌘W` closes the focused window) |
 
-## What it measures
+### Keyboard Shortcuts — Review View
 
-- **Disk usage** by default: `st_blocks × 512`, the number `du` reports and the
-  space that actually comes back when a file is deleted. Apparent size (what
-  `ls -l` shows) is one toggle away.
-- **Hardlinks once.** Two names for one inode cost one file.
-- **Hidden entries included**, because `~/.cache` is often the biggest thing in
-  a home directory. Symlinks are not followed.
-- **The projection counts one volume.** The meter shows the scanned volume's
-  free space, so it adds up only the marks whose bytes come back to that
-  volume, by the same rule the scan bounds the volume with. With `-X`, a mark
-  on a disk mounted inside the tree, on a network share or in a snapshot
-  subvolume is left out of the projection — removing it gives its space back
-  somewhere else, or, in a snapshot, shares its blocks with the live files —
-  and the panel and the review screen say what was left out. A mark whose
-  volume cannot be told is not claimed either.
+| Key | Action |
+| --- | --- |
+| `m` | Select **Move to trash** (local only) |
+| `p` | Select **Delete permanently** (local only) |
+| `!` | Unmark all items |
+| `s` | **Save list…** (one path per line) |
+| `a` | **Copy as prompt** for a coding agent |
+| `y` / `e` | **Copy delete script** / **Save delete script…** (exports a preview-first GNU/Linux shell script for shell or remote SSH review) |
+| `Enter` | Commit the chosen removal mode (local only; permanent always confirms) |
+| `Esc` | Go back to **Explore** |
 
-The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
-scope per root, a completion counter per directory so no directory is built
-before its last subdirectory lands, and one bottom-up pass that aggregates sizes
-and removes duplicate hardlinks.
+---
 
-## Choosing sources and roots
+## Safety Guards, Measurement Notes & Development
 
-Launch without a path to choose **This computer** or enter an SSH alias /
-`user@host` and press **Connect SSH**. Discovery reads that machine's mount
-namespace, not file contents. It never starts a scan or probes mounted
-network filesystems just to fill the list.
+### Built-In Removal & Git Safety Guards
 
-Select a mount and choose **Scan selected root**, or enter an absolute
-directory path and choose **Scan directory**. Enter acts on the focused
-host/path field or the highlighted mount. Escape cancels discovery and
-returns to the current scan, or the idle welcome screen at startup.
+All deletion rules are enforced in `crates/ruum-core/src/removal.rs` and backed by tests against real directory trees:
 
-During exploration, press `v`, click **Source…** beside the disk name,
-or click the ruum logo to reopen the same chooser. The source being
-browsed is shown explicitly, and connecting never retargets an existing
-scan. Changing machines on acceptance clears the old machine's marks,
-identity and navigation history; an absolute path is not an identity
-across hosts. A rescan that detects a changed or lost remote machine
-identity also clears marks, even if the SSH alias is unchanged.
+- Only paths strictly inside the scanned root can be removed.
+- The filesystem root, the scanned root, your home directory, and any directory holding your home directory or a system tree are always refused.
+- Mount points and directories containing mount points are refused; permanent deletion stops at mount boundaries rather than crossing filesystems.
+- Protected OS and package-manager trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, `/gnu/store`, Homebrew prefixes, etc.) are refused even when writable.
+- On Windows, `Windows`, `Program Files`, `ProgramData`, `System Volume Information`, `Recovery`, `Boot`, page/hibernation files, and top-level user profile folders (`FOLDERID_UserProfiles`, e.g. `C:\Users\*`) are refused, while subdirectories inside profiles remain cleanable.
+- Symlinks are unlinked rather than followed; paths are never interpolated into a shell (a file named `-rf` is treated safely as a filename).
+- Git inspection runs read-only with fsmonitor, hooks, and pager disabled, and refuses to evaluate repositories with custom filter drivers.
 
-Pseudo-filesystems, snapshots and automount triggers are filtered out.
-Linux bind mounts and btrfs subvolumes remain individually selectable,
-even when they share a device. Free space is measured only after choosing
-a root. Explicit command-line paths and `--disk` still start directly;
-`ssh HOST --check [PATH]` remains the headless scan command.
+### Disk Accounting & Platform Differences
 
-## The whole disk
+- **Allocated blocks vs. apparent size:** default sizes come from `st_blocks × 512` (Unix) and NTFS cluster allocation (Windows), matching what is actually reclaimed on delete.
+- **Hardlinks counted once:** multiple hardlinks to the same inode are deduplicated during bottom-up tree aggregation.
+- **One volume per projection:** nested mount points (including Linux bind mounts and same-device `btrfs` subvolumes) are skipped by default; when `-X` is used locally, marks on other volumes are excluded from the live free-space projection meter.
+- **macOS specifics:** free space matches `df` (excluding Finder's purgeable space); APFS file clones share blocks so deleting one copy may free less than shown; Time Machine local snapshots are excluded from walks; cloud-evicted folders (iCloud Drive, Dropbox) are never opened or downloaded.
 
-Click `/` (or any directory above the scanned root) in the trail, press
-`g`, run `ruum --disk`, or use the launcher's *Scan the whole disk*
-action. `g` and `--disk` scan the disk your home directory lives on — `/`
-on Omarchy and on macOS. On macOS the Data volume's second mount,
-`/System/Volumes/Data`, is skipped: it is `/Users`, `/Applications` and the
-rest again under other names.
-
-Widening is memoized: the tree already measured is handed to the wider walk
-and reused where it is reached, so going from `~` to `/` reads only what is
-outside `~` (on this machine, seconds instead of a full rescan). The current
-view stays on screen until the wider tree lands, which then opens with the
-directory you came from selected. Going back down is just navigation.
-
-By default a scan stops at **every nested mount point**, including bind
-mounts and same-device btrfs subvolumes. Boundaries are checked by path,
-before metadata or directory reads, so an automounted NAS is not activated
-just to measure its parent. Choose `/home`, `/var/log`, or another mount as
-its own root rather than implicitly traversing it from `/`.
-
-Local `-X` explicitly crosses mounts; remote streaming scans reject it.
-A local mark on another volume is still removed, but is not added to the
-metered volume's free-space projection.
-
-Without root, some system directories cannot be read; they are counted as
-unreadable in the top bar rather than guessed at.
-
-## On Windows
-
-The same program, with Windows' answers to the questions above:
-
-- **Disk usage** is the allocation NTFS reports for each file: whole
-  clusters, less for a compressed or sparse file, nothing for one small
-  enough to live in its file record. It arrives with the directory listing
-  itself (`FileIdExtdDirectoryInfo`), so it costs no more than the walk.
-  Hardlinks count once on NTFS.
-- **The whole disk** is the drive your profile is on, usually `C:\`. A
-  folder another volume is mounted on is a link, like a junction, and is
-  not entered, so a scan stays on one volume; `-l` follows links, and with
-  them mounted folders.
-- **Run as administrator** and the whole disk is read from NTFS's master
-  file table instead of walked, as WizTree does: one pass over the table in
-  large reads. On a 4-million-file `C:\` that took about 3.4 s against 11.2
-  s for WizTree and about 20 s for the walk. It also sees what the walk is
-  refused, such as System Volume Information. It is used only for a whole
-  NTFS drive, since a folder would still cost the whole table, and not with
-  `-l`, whose links the table does not follow. ruum flushes the volume
-  after its own removals so the rescan shows them; changes other programs
-  made seconds before may not show yet.
-  Started without admin rights, ruum walks as before. On a whole NTFS
-  drive without `-l`, or once Windows refuses the walk a folder, the side
-  panel offers **Restart as Administrator**, which reopens the same folder
-  and options through the UAC prompt; during a widening scan, the wider
-  folder being scanned.
-- **Move to trash** is the Recycle Bin, through the shell, which asks
-  before destroying anything it cannot recycle.
-- **Refused besides the rules below:** Windows, Program Files and
-  ProgramData, what Windows keeps at the top of its drive (System Volume
-  Information, Recovery, Boot, and the page and hibernation files, which
-  Settings turns off), any folder holding your profile, such as
-  `C:\Users`, and every profile in the folder Windows keeps them in
-  (`C:\Users\*`, `Public` and `Default` included), since an elevated
-  ruum may run as another account and can reach them all. What is
-  inside a profile can still be removed, as under your own. Names compare
-  without regard to case, as Windows compares them.
-- **Hidden** means a name starting with a dot, or the hidden attribute, so
-  `-H` drops `AppData` as Explorer hides it.
-- **The theme** follows Windows' light or dark setting, since there is no
-  Omarchy theme to follow. It does on macOS too, and on GNOME and KDE.
-
-## What it refuses to do
-
-The removal rules live in `crates/ruum-core/src/removal.rs`, and each one is
-tested:
-
-- only paths under the scanned root can be removed;
-- the filesystem root, the scanned root and your home directory are refused;
-- a mount point is refused, and so is anything with a mount point inside it,
-  since removing it would reach into another filesystem; permanent deletion
-  also stops at a mount boundary rather than descending into one (a btrfs
-  subvolume that is not mounted goes with its directory, as the scan shows
-  it);
-- a directory holding your home directory or a system tree is refused (on
-  macOS `/Users` is on the same volume as `/`, and `/opt` holds
-  `/opt/homebrew`);
-- system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`,
-  `/gnu/store`, Homebrew's prefix on macOS and Linux, …) are
-  refused even where permissions would allow it: packages own them, and
-  pacman, paccache or `journalctl --vacuum` are the tools;
-- a symlink is unlinked, never followed;
-- nothing is passed through a shell — a file called `-rf` is just a file;
-- selecting a checkout never runs a program it names: git is asked with its
-  fsmonitor, hooks and pager off, and a checkout that defines its own filter
-  drivers is not asked for its status at all ("changes unknown").
-
-## On Hyprland
-
-Hyprland tiles new windows, so ruum opens into whatever tile it is given.
-It is designed for a roomy window; float it, or give it a rule. The window
-class is `ruum`.
-
-```
-windowrule = float, class:^(ruum)$
-windowrule = size 1400 900, class:^(ruum)$
-```
-
-## Develop
+### Development
 
 ```sh
-make run      # release build, opening the source/root chooser
-make lint     # rustfmt --check, then clippy with every warning an error
-make test     # scanner, layout and removal tests, plus window-harness tests
-make test-ssh # real localhost SSH scans/errors; Linux, bun + openssh required
-make ci       # lint, then test
+make run       # release build, opening Sources & Drives
+make lint      # rustfmt --check + clippy --all-targets -D warnings
+make test      # core unit/filesystem tests + GPUI window-harness tests
+make test-ssh  # real localhost SSH tests (Linux; requires bun + openssh)
+make ci        # lint, then test
 ```
 
-The lint gate is strict on purpose: `clippy::all` and `clippy::pedantic` are
-errors, and every exception is written down with its reason in `Cargo.toml`.
-The window-harness tests draw real frames and press real keys — including one
-that marks a directory, confirms the deletion and checks that the files are
-gone while their neighbours are not.
+On Windows, run `cargo xtask lint`, `cargo xtask test`, and `cargo build --release` directly.
 
-| path | what lives there |
+| Path | Responsibility |
 | --- | --- |
-| `crates/ruum-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
-| `crates/ruum-app/src/state.rs` | every action the interface can take, and the key map |
-| `crates/ruum-app/src/views.rs` | the screens |
-| `crates/ruum-app/src/treemap_view.rs` | painting the mosaic and its labels |
-| `crates/ruum-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
-| `crates/ruum-app/src/tests.rs` | end-to-end tests through a real window |
-| `packaging/`, `assets/`, `Makefile` | the desktop entry, the icon, and install |
+| `crates/ruum-core` | Scanning, tree aggregation, squarified layout, space accounting, removal guards, Watchdog, AI CLI, SSH & MCP |
+| `crates/ruum-scan` | Lightweight headless remote SSH scanner binary (no GUI dependencies) |
+| `crates/ruum-app` | GPUI desktop interface, state/keybindings, localization (`en`/`zh`/`ja`/`ko`), tray & window-harness tests |
+| `xtask/`, `packaging/`, `assets/` | Release bundling, cross-platform installers, icons, and desktop entry templates |
 
-The interface follows the
-[GPUI Kit design guides](https://gpui-kit.com/versions/main/docs/design-guides/):
-every size is on one `rem` scale so interface zoom keeps its proportions,
-primary is reserved for what Enter does, and the only question the app asks is
-the one it cannot take back.
+---
 
 ## License
 
-`GPL-3.0-only` — see [LICENSE](LICENSE). Portions derived from upstream
-`disktree` / `ruum` are attributed under the MIT License in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+`GPL-3.0-only` — see [LICENSE](LICENSE). Portions derived from upstream `disktree` / `ruum` are attributed under the MIT License in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

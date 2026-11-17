@@ -161,3 +161,16 @@ and `cargo build --release` directly; CI runs the gate on both systems.
   the files are gone while unmarked neighbours are untouched.
 * Rendering was verified by those tests and by running the app against a real
   home directory; it has not been eyeballed in every theme and font size.
+
+
+### 严苛的技术调研与方案引用规范（违者视为调研失败）：
+
+当你被要求“参考某代码/模块/库”编写技术方案或分析报告时：
+
+1. 【禁止空洞引用】：严禁仅罗列类名、文件名或通用概念（如“参考了 UserModule”）。
+2. 【行号级代码快照（Code Snippet with Line Numbers）】：
+   - 提到的每一个参考结论，必须用引用块展示真实代码片段，并标明文件路径与精确行号（如 `src/auth/service.py#L45-L62`）。
+3. 【调用链与数据流实质证据】：
+   - 必须明确写出：输入参数是什么 -> 经过了哪个核心判断分支 -> 发生了什么副作用（如写 DB/发 MQ） -> 返回了什么。
+4. 【批判性对比（Diff Analysis）】：
+   - 必须回答：该参考模块的实现存在哪些缺陷或边界条件限制（如高并发下的死锁风险、缺少超时控制）？新方案是在哪一行代码逻辑上做出的改进？

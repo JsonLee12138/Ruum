@@ -1,6 +1,8 @@
 //! Headless helper: no GPUI dependency and no destructive command surface.
 use std::io::{self, BufReader, BufWriter, Read as _};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const SCAN_DEADLINE: Duration = Duration::from_mins(5);
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -8,10 +10,11 @@ fn main() -> io::Result<()> {
         limit_resources()?;
         // A live client is not permission to monopolise the server forever,
         // including when a filesystem syscall cannot be cancelled.
+        let deadline = Instant::now() + SCAN_DEADLINE;
         std::thread::Builder::new()
             .name("scan-deadline".into())
-            .spawn(|| {
-                std::thread::park_timeout(Duration::from_mins(5));
+            .spawn(move || {
+                wait_until_deadline(deadline, Instant::now, std::thread::sleep);
                 eprintln!(
                     "Remote scan exceeded five minutes; scan a smaller path."
                 );
@@ -90,4 +93,69 @@ fn limit_resources() -> io::Result<()> {
 #[allow(clippy::unnecessary_wraps, reason = "same fallible API as Linux")]
 const fn limit_resources() -> io::Result<()> {
     Ok(())
+}
+
+/// Wait until `deadline` is reached, looping across any early wakeups.
+fn wait_until_deadline<N, W>(deadline: Instant, mut now: N, mut wait: W)
+where
+    N: FnMut() -> Instant,
+    W: FnMut(Duration),
+{
+    loop {
+        let current = now();
+        if current >= deadline {
+            break;
+        }
+        wait(deadline.saturating_duration_since(current));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn deadline_wait_ignores_spurious_early_wakeups() {
+        let base = Instant::now();
+        let deadline = base + SCAN_DEADLINE;
+        let clock = Cell::new(base);
+        let wake_offsets = [
+            Duration::from_secs(1),
+            Duration::from_mins(2),
+            SCAN_DEADLINE,
+        ];
+        let mut step = 0usize;
+        let mut waits = Vec::new();
+
+        wait_until_deadline(
+            deadline,
+            || clock.get(),
+            |duration| {
+                waits.push(duration);
+                clock.set(base + wake_offsets[step]);
+                step += 1;
+            },
+        );
+
+        assert!(clock.get() >= deadline);
+        assert_eq!(step, wake_offsets.len());
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_mins(5),
+                Duration::from_secs(299),
+                Duration::from_mins(3),
+            ]
+        );
+
+        let mut late_waits = Vec::new();
+        wait_until_deadline(
+            deadline,
+            || deadline + Duration::from_secs(1),
+            |duration| late_waits.push(duration),
+        );
+        assert!(late_waits.is_empty());
+    }
 }

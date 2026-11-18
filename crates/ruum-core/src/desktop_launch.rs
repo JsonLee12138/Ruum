@@ -357,7 +357,7 @@ mod tests {
             link
         };
         #[cfg(not(unix))]
-        let linked_cli = real_cli.clone();
+        let linked_cli = real_cli;
 
         let adapter = DesktopLaunchFactory::create_for(DesktopLaunchOs::MacOs);
 

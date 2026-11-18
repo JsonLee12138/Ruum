@@ -22,6 +22,7 @@ const BUNDLE_ID: &str = "io.github.tobi.ruum";
 /// What the binary is built for at least; `LSMinimumSystemVersion` in
 /// `packaging/macos/Info.plist.in` says the same, and GPUI needs 10.15.7.
 const DEPLOYMENT_TARGET: &str = "11.0";
+const HDIUTIL_BACKOFFS_MS: [u64; 5] = [500, 1000, 2000, 4000, 8000];
 
 const DISTRIBUTION_TEMPLATE: &str =
     include_str!("../../packaging/macos/Distribution.xml.in");
@@ -326,6 +327,32 @@ fn archive(app: &Path, zip: &Path) -> Result<(), String> {
     )
 }
 
+/// Retry a macOS disk-image operation when Spotlight or `diskimagesiod`
+/// (`diskimages-helper`) briefly holds an exclusive lock (`EBUSY`/`EAGAIN`).
+fn retry_with_backoff<F, S>(
+    backoffs_ms: &[u64],
+    mut sleep_fn: S,
+    mut op: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+    S: FnMut(Duration),
+{
+    let mut last_err = None;
+    for attempt in 0..=backoffs_ms.len() {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if let Some(&delay) = backoffs_ms.get(attempt) {
+                    sleep_fn(Duration::from_millis(delay));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "operation failed".into()))
+}
+
 fn build_dmg(
     app: &Path,
     dmg: &Path,
@@ -346,45 +373,36 @@ fn build_dmg(
         })?;
     }
 
-    // Spotlight indexing on fresh staging directories can briefly trigger EBUSY.
-    let backoffs_ms = [500_u64, 1000, 2000];
-    let mut last_err = None;
-    for attempt in 0..=backoffs_ms.len() {
-        let outcome = tool(
-            Command::new("hdiutil")
-                .args(["create", "-volname", "ruum", "-srcfolder"])
-                .arg(&stage)
-                .args(["-ov", "-format", "UDZO"])
-                .arg(dmg),
-        );
-        match outcome {
-            Ok(()) => {
-                last_err = None;
-                break;
-            }
-            Err(err) => {
+    let create_outcome =
+        retry_with_backoff(&HDIUTIL_BACKOFFS_MS, std::thread::sleep, || {
+            let outcome = tool(
+                Command::new("hdiutil")
+                    .args(["create", "-volname", "ruum", "-srcfolder"])
+                    .arg(&stage)
+                    .args(["-ov", "-format", "UDZO"])
+                    .arg(dmg),
+            );
+            if outcome.is_err() {
                 let _ = fs::remove_file(dmg);
-                last_err = Some(err);
-                if let Some(&delay) = backoffs_ms.get(attempt) {
-                    std::thread::sleep(Duration::from_millis(delay));
-                }
             }
-        }
-    }
+            outcome
+        });
     remove_dir_if_exists(&stage)?;
-    if let Some(err) = last_err {
-        return Err(err);
-    }
+    create_outcome?;
 
     if let Some(id) = identity {
-        tool(
-            Command::new("codesign")
-                .args(["--force", "--timestamp", "--sign"])
-                .arg(id)
-                .arg(dmg),
-        )?;
+        retry_with_backoff(&HDIUTIL_BACKOFFS_MS, std::thread::sleep, || {
+            tool(
+                Command::new("codesign")
+                    .args(["--force", "--timestamp", "--sign"])
+                    .arg(id)
+                    .arg(dmg),
+            )
+        })?;
     }
-    tool(Command::new("hdiutil").arg("verify").arg(dmg))
+    retry_with_backoff(&HDIUTIL_BACKOFFS_MS, std::thread::sleep, || {
+        tool(Command::new("hdiutil").arg("verify").arg(dmg))
+    })
 }
 
 fn build_pkg(
@@ -716,5 +734,69 @@ mod tests {
         assert!(comp.contains("<key>BundleIsRelocatable</key>\n\t\t<false/>"));
         assert!(comp.contains("<string>ruum.app</string>"));
         assert!(POSTINSTALL_SCRIPT.contains("/usr/local/bin/ruum"));
+    }
+
+    #[test]
+    fn retries_transient_failures_with_configured_backoffs() {
+        let mut sleeps: Vec<u64> = Vec::new();
+        let mut attempts = 0_usize;
+        let immediate = retry_with_backoff(
+            &HDIUTIL_BACKOFFS_MS,
+            |d| {
+                sleeps.push(
+                    u64::try_from(d.as_millis()).expect("backoff fits u64"),
+                );
+            },
+            || {
+                attempts += 1;
+                Ok(())
+            },
+        );
+        assert!(immediate.is_ok());
+        assert_eq!(attempts, 1);
+        assert!(sleeps.is_empty());
+
+        sleeps.clear();
+        attempts = 0;
+        let third_ok = retry_with_backoff(
+            &HDIUTIL_BACKOFFS_MS,
+            |d| {
+                sleeps.push(
+                    u64::try_from(d.as_millis()).expect("backoff fits u64"),
+                );
+            },
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(format!("transient error #{attempts}"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(third_ok.is_ok());
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps, vec![500, 1000]);
+
+        sleeps.clear();
+        attempts = 0;
+        let exhausted = retry_with_backoff(
+            &HDIUTIL_BACKOFFS_MS,
+            |d| {
+                sleeps.push(
+                    u64::try_from(d.as_millis()).expect("backoff fits u64"),
+                );
+            },
+            || {
+                attempts += 1;
+                Err(format!("persistent error #{attempts}"))
+            },
+        );
+        assert_eq!(
+            exhausted.expect_err("exhausted retries must fail"),
+            "persistent error #6"
+        );
+        assert_eq!(attempts, HDIUTIL_BACKOFFS_MS.len() + 1);
+        assert_eq!(sleeps, HDIUTIL_BACKOFFS_MS);
     }
 }

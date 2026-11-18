@@ -300,7 +300,17 @@ jobs:
             cp "target/bundle/ruum-$VERSION-$ARCH-macos.$ext" dist/
           done
 
-          hdiutil verify "dist/ruum-$VERSION-$ARCH-macos.dmg"
+          verified=false
+          for delay in 1 2 4 8 0; do
+            if hdiutil verify "dist/ruum-$VERSION-$ARCH-macos.dmg"; then
+              verified=true
+              break
+            fi
+            if [ "$delay" -gt 0 ]; then
+              sleep "$delay"
+            fi
+          done
+          [ "$verified" = "true" ]
           pkgutil --expand "dist/ruum-$VERSION-$ARCH-macos.pkg" \
             "$RUNNER_TEMP/pkg-expanded"
           lsbom "$RUNNER_TEMP/pkg-expanded"/*/Bom \

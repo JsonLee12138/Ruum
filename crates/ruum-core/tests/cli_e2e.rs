@@ -16,6 +16,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use ruum_core::confirm::{
     CleanupConfirmDecision, IpcListenerGuard, IpcRequest, IpcResponse,
     RemoteConnectConfirmDecision, load_or_create_ipc_token,
@@ -177,12 +178,9 @@ impl Sandbox {
         self.config_dir().join("ruum.db")
     }
 
+    #[cfg(unix)]
     fn ipc_endpoint(&self) -> PathBuf {
-        if cfg!(windows) {
-            self.config_dir().join("ipc.port")
-        } else {
-            self.xdg_runtime.join("ruum-ipc.sock")
-        }
+        self.xdg_runtime.join("ruum-ipc.sock")
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -1363,7 +1361,7 @@ fn cli_mcp_stdio_end_to_end_and_fail_closed() {
     let root_str = sb.scan_root.to_string_lossy().into_owned();
     let temp_log_str = temp_log.to_string_lossy().into_owned();
 
-    let mut requests = vec![
+    let requests = vec![
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1423,11 +1421,7 @@ fn cli_mcp_stdio_end_to_end_and_fail_closed() {
                 "arguments": { "root": root_str, "targets": [temp_log_str] }
             }
         }),
-    ];
-
-    #[cfg(unix)]
-    {
-        requests.push(json!({
+        json!({
             "jsonrpc": "2.0",
             "id": 8,
             "method": "tools/call",
@@ -1435,8 +1429,8 @@ fn cli_mcp_stdio_end_to_end_and_fail_closed() {
                 "name": "trash_paths",
                 "arguments": { "root": root_str, "targets": [temp_log_str] }
             }
-        }));
-        requests.push(json!({
+        }),
+        json!({
             "jsonrpc": "2.0",
             "id": 9,
             "method": "tools/call",
@@ -1444,8 +1438,8 @@ fn cli_mcp_stdio_end_to_end_and_fail_closed() {
                 "name": "delete_permanently",
                 "arguments": { "root": root_str, "targets": [temp_log_str] }
             }
-        }));
-    }
+        }),
+    ];
 
     let (out, resps) = run_mcp_session(&sb, &[], &requests);
     assert!(out.status.success(), "mcp failed: {}", stderr_str(&out));
@@ -1507,31 +1501,28 @@ fn cli_mcp_stdio_end_to_end_and_fail_closed() {
     assert_eq!(plan["targets"].as_array().map(Vec::len), Some(1));
     assert_eq!(plan["blocked"].as_array().map(Vec::len), Some(0));
 
-    #[cfg(unix)]
-    {
-        let (err, trash_res) = parse_tool_result(&resps[7]);
-        assert!(err, "trash_paths must fail closed without GUI: {trash_res}");
-        assert!(
-            trash_res
-                .as_str()
-                .unwrap_or_default()
-                .contains("graphical desktop"),
-            "unexpected trash error: {trash_res}"
-        );
+    let (err, trash_res) = parse_tool_result(&resps[7]);
+    assert!(err, "trash_paths must fail closed without GUI: {trash_res}");
+    assert!(
+        trash_res
+            .as_str()
+            .unwrap_or_default()
+            .contains("graphical desktop"),
+        "unexpected trash error: {trash_res}"
+    );
 
-        let (err, perm_res) = parse_tool_result(&resps[8]);
-        assert!(
-            err,
-            "delete_permanently must fail closed without GUI: {perm_res}"
-        );
-        assert!(
-            perm_res
-                .as_str()
-                .unwrap_or_default()
-                .contains("graphical desktop"),
-            "unexpected delete_permanently error: {perm_res}"
-        );
-    }
+    let (err, perm_res) = parse_tool_result(&resps[8]);
+    assert!(
+        err,
+        "delete_permanently must fail closed without GUI: {perm_res}"
+    );
+    assert!(
+        perm_res
+            .as_str()
+            .unwrap_or_default()
+            .contains("graphical desktop"),
+        "unexpected delete_permanently error: {perm_res}"
+    );
 
     assert!(temp_log.exists(), "temp.log must not be deleted");
 

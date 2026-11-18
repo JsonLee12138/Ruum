@@ -174,3 +174,20 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    - 必须明确写出：输入参数是什么 -> 经过了哪个核心判断分支 -> 发生了什么副作用（如写 DB/发 MQ） -> 返回了什么。
 4. 【批判性对比（Diff Analysis）】：
    - 必须回答：该参考模块的实现存在哪些缺陷或边界条件限制（如高并发下的死锁风险、缺少超时控制）？新方案是在哪一行代码逻辑上做出的改进？
+
+<!-- lernstoff:start -->
+### Lernstoff Wiki & Memory Routing Rules
+
+1. **Search Before Research**:
+   - Before researching unfamiliar code, diagnosing recurring issues, or formulating architecture designs, always query repository memory via `lernstoff_search_memory`.
+
+2. **Triggering `lernstoff-wiki` Skill**:
+   - Invoke `skills/lernstoff-wiki` (or `/lernstoff-wiki`) whenever:
+     * Post-research or post-debugging yields durable, falsifiable engineering propositions.
+     * Open inquiries reach >= 5 related concept notes and require higher-order synthesis (`SYNTHESIZE_CLUSTER`).
+     * Periodic maintenance or buffer promotion (`lernstoff_consolidate_scratchpad`) is requested.
+
+3. **Cognitive Gatekeeping Red Line**:
+   - **Never bypass the hippocampal gate**: All candidate claims, external findings, and notes must pass through `lernstoff_probe_delta` and `lernstoff_crystallize_note` with Socratic defense.
+   - Direct unstructured edits to `wiki/` or `inbox/scratchpad.md` are strictly prohibited.
+<!-- lernstoff:end -->

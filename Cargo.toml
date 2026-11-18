@@ -28,7 +28,8 @@ interprocess = "2"
 keyring = { version = "3", features = [
     "apple-native",
     "windows-native",
-    "sync-secret-service",
+    "async-secret-service",
+    "async-io",
     "crypto-rust",
 ] }
 rand_core = { version = "0.6", features = ["getrandom"] }

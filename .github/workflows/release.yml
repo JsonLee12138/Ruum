@@ -194,7 +194,7 @@ jobs:
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.AppImage
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-linux-${{ matrix.arch }}
           path: dist/*
@@ -320,7 +320,7 @@ jobs:
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-macos.pkg
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-macos-${{ matrix.arch }}
           path: dist/*
@@ -736,7 +736,7 @@ jobs:
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-windows-setup.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-windows-${{ matrix.arch }}
           path: dist/*
@@ -760,7 +760,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist

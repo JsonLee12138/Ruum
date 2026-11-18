@@ -62,6 +62,115 @@ pub trait CommandRunner: Send + Sync {
     ) -> io::Result<CommandOutput>;
 }
 
+fn is_windows_batch_script(program: &Path) -> bool {
+    program
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+        })
+}
+
+fn sanitize_windows_batch_arg(arg: &str) -> String {
+    arg.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
+fn extract_npm_shim_script_path(
+    content: &str,
+    shim_dir: &Path,
+) -> Option<PathBuf> {
+    const PREFIXES: [&str; 4] = ["%~dp0\\", "%dp0%\\", "%~dp0/", "%dp0%/"];
+    let lower = content.to_ascii_lowercase();
+    let mut cursor = 0;
+
+    while cursor < lower.len() {
+        let rest = &lower[cursor..];
+        let next = PREFIXES
+            .iter()
+            .filter_map(|prefix| rest.find(prefix).map(|pos| (pos, *prefix)))
+            .min_by_key(|(pos, _)| *pos);
+        let Some((rel_pos, prefix)) = next else {
+            break;
+        };
+        let match_start = cursor + rel_pos;
+        let path_start = match_start + prefix.len();
+        cursor = path_start;
+
+        let quoted =
+            match_start > 0 && content.as_bytes()[match_start - 1] == b'"';
+        let tail = &content[path_start..];
+        let path_len = if quoted {
+            let Some(end_quote) = tail.find('"') else {
+                continue;
+            };
+            if tail[..end_quote].contains(['\r', '\n']) {
+                continue;
+            }
+            end_quote
+        } else {
+            tail.find(|c: char| {
+                c.is_ascii_whitespace() || matches!(c, '"' | '&' | '|' | ')')
+            })
+            .unwrap_or(tail.len())
+        };
+
+        let rel_path = &tail[..path_len];
+        if rel_path.ends_with(['\\', '/']) {
+            continue;
+        }
+
+        let mut candidate = shim_dir.to_path_buf();
+        let mut has_segment = false;
+        let mut rejected = false;
+        for seg in rel_path.split(['\\', '/']) {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                rejected = true;
+                break;
+            }
+            candidate.push(seg);
+            has_segment = true;
+        }
+        let is_js = candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("js")
+                    || ext.eq_ignore_ascii_case("cjs")
+                    || ext.eq_ignore_ascii_case("mjs")
+            });
+        if !rejected && has_segment && is_js && candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn unwrap_npm_cmd_shim_with(
+    program: &Path,
+    is_windows: bool,
+    enriched_path: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    const MAX_SHIM_BYTES: u64 = 32_768;
+
+    if !is_windows || !is_windows_batch_script(program) {
+        return None;
+    }
+    let meta = fs::metadata(program).ok()?;
+    if meta.len() > MAX_SHIM_BYTES {
+        return None;
+    }
+    let shim_dir = program.parent()?;
+    let content = fs::read_to_string(program).ok()?;
+    let js_path = extract_npm_shim_script_path(&content, shim_dir)?;
+    let node_exe = resolve_with_windows_exts(Some(shim_dir), "node", true)
+        .or_else(|| resolve_cli_executable_with("node", true, enriched_path))?;
+    Some((node_exe, js_path))
+}
+
 /// Run an external command with piped output, non-interactive defaults, and timeout.
 fn run_command_with_timeout(
     program: &Path,
@@ -69,8 +178,38 @@ fn run_command_with_timeout(
     envs: &[(&str, &str)],
     timeout: Duration,
 ) -> io::Result<CommandOutput> {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
+    let (effective_program, effective_args): (PathBuf, Vec<String>) =
+        if cfg!(windows) && is_windows_batch_script(program) {
+            let path_env = envs
+                .iter()
+                .rev()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                .map_or_else(enriched_path_var, |(_, v)| (*v).to_string());
+            if let Some((node_exe, js_script)) =
+                unwrap_npm_cmd_shim_with(program, true, &path_env)
+            {
+                let mut node_args = Vec::with_capacity(args.len() + 1);
+                node_args.push(js_script.to_string_lossy().into_owned());
+                node_args.extend(args.iter().copied().map(str::to_owned));
+                (node_exe, node_args)
+            } else {
+                (
+                    program.to_path_buf(),
+                    args.iter()
+                        .copied()
+                        .map(sanitize_windows_batch_arg)
+                        .collect(),
+                )
+            }
+        } else {
+            (
+                program.to_path_buf(),
+                args.iter().copied().map(str::to_owned).collect(),
+            )
+        };
+
+    let mut cmd = Command::new(&effective_program);
+    cmd.args(&effective_args);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -2387,5 +2526,145 @@ mod tests {
         assert_eq!(prop.summary, "Found target");
         assert_eq!(prop.items.len(), 1);
         assert_eq!(prop.items[0].path, target_dir);
+    }
+
+    #[test]
+    fn windows_batch_detection_arg_sanitization_and_npm_shim_unwrap() {
+        assert!(is_windows_batch_script(Path::new("codex.cmd")));
+        assert!(is_windows_batch_script(Path::new("CODEX.CMD")));
+        assert!(is_windows_batch_script(Path::new("pi.bat")));
+        assert!(is_windows_batch_script(Path::new("PI.BAT")));
+        assert!(!is_windows_batch_script(Path::new("codex.exe")));
+        assert!(!is_windows_batch_script(Path::new("codex")));
+        assert!(!is_windows_batch_script(Path::new("codex.js")));
+
+        let raw_prompt =
+            "line1\r\nline2\n\"quoted\" %TEMP% <json>{\"a\":1}\rline3";
+        let sanitized = sanitize_windows_batch_arg(raw_prompt);
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\n'));
+        assert_eq!(
+            sanitized,
+            "line1 line2 \"quoted\" %TEMP% <json>{\"a\":1} line3"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let shim_dir = temp.path().join("npm");
+        let node_path_dir = temp.path().join("nodejs");
+        fs::create_dir_all(&shim_dir).unwrap();
+        fs::create_dir_all(&node_path_dir).unwrap();
+
+        let codex_js = shim_dir.join("node_modules/@openai/codex/bin/codex.js");
+        let pi_mjs = shim_dir.join("node_modules/pi/cli.mjs");
+        let agy_cjs = shim_dir.join("node_modules/agy/entry.cjs");
+        let escape_js = temp.path().join("escape.js");
+        let helper_exe = shim_dir.join("helper.exe");
+        for file in [&codex_js, &pi_mjs, &agy_cjs, &escape_js, &helper_exe] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"// stub\n").unwrap();
+        }
+
+        let path_node = node_path_dir.join("node.exe");
+        fs::write(&path_node, b"").unwrap();
+        let path_str = node_path_dir.to_string_lossy().into_owned();
+
+        let codex_cmd = shim_dir.join("codex.cmd");
+        fs::write(
+            &codex_cmd,
+            "@IF EXIST \"%~dp0\\node.exe\" (\r\n\
+               \"%~dp0\\node.exe\" \"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n\
+             ) ELSE (\r\n\
+               node \"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n\
+             )\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            unwrap_npm_cmd_shim_with(&codex_cmd, false, &path_str),
+            None
+        );
+        assert_eq!(
+            unwrap_npm_cmd_shim_with(&codex_cmd, true, &path_str),
+            Some((path_node, codex_js))
+        );
+
+        let local_node = shim_dir.join("node.exe");
+        fs::write(&local_node, b"").unwrap();
+
+        let pi_cmd = shim_dir.join("pi.cmd");
+        fs::write(
+            &pi_cmd,
+            "@ECHO off\r\n\"%DP0%\\node_modules\\pi\\cli.mjs\" %*\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unwrap_npm_cmd_shim_with(&pi_cmd, true, ""),
+            Some((local_node.clone(), pi_mjs))
+        );
+
+        let agy_bat = shim_dir.join("agy.bat");
+        fs::write(
+            &agy_bat,
+            "@ECHO off\r\n\"%dp0%\\node_modules\\agy\\entry.cjs\" %*\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unwrap_npm_cmd_shim_with(&agy_bat, true, ""),
+            Some((local_node, agy_cjs))
+        );
+
+        let escape_cmd = shim_dir.join("escape.cmd");
+        fs::write(&escape_cmd, "\"%~dp0\\..\\escape.js\" %*\r\n").unwrap();
+        assert_eq!(unwrap_npm_cmd_shim_with(&escape_cmd, true, ""), None);
+
+        let missing_cmd = shim_dir.join("missing.cmd");
+        fs::write(&missing_cmd, "\"%~dp0\\node_modules\\missing.js\" %*\r\n")
+            .unwrap();
+        assert_eq!(unwrap_npm_cmd_shim_with(&missing_cmd, true, ""), None);
+
+        let non_js_cmd = shim_dir.join("non-js.cmd");
+        fs::write(&non_js_cmd, "\"%~dp0\\helper.exe\" %*\r\n").unwrap();
+        assert_eq!(unwrap_npm_cmd_shim_with(&non_js_cmd, true, ""), None);
+
+        let huge_cmd = shim_dir.join("huge.cmd");
+        let mut huge = String::from("\"%~dp0\\node_modules\\pi\\cli.mjs\"\r\n");
+        huge.push_str(&"REM padding\r\n".repeat(4_000));
+        fs::write(&huge_cmd, huge).unwrap();
+        assert_eq!(unwrap_npm_cmd_shim_with(&huge_cmd, true, ""), None);
+
+        assert_eq!(unwrap_npm_cmd_shim_with(&helper_exe, true, ""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_real_cmd_executes_with_sanitized_multiline_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let cmd_path = temp.path().join("echo-prompt.cmd");
+        fs::write(&cmd_path, "@echo off\r\necho %*\r\n").unwrap();
+
+        let prompt =
+            "line1\r\nline2\n\"quoted\" %TEMP% <json>{\"ok\":true}</json>";
+        let output = DefaultCommandRunner
+            .run(&cmd_path, &[prompt], &[("TEMP", "RUUM_SAFE_TEMP")])
+            .unwrap();
+        assert!(output.success(), "stderr: {}", output.stderr);
+        assert!(output.stdout.contains("line1"), "stdout: {}", output.stdout);
+        assert!(output.stdout.contains("line2"), "stdout: {}", output.stdout);
+        assert!(
+            output.stdout.contains("quoted"),
+            "stdout: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("<json>"),
+            "stdout: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("%TEMP%")
+                || output.stdout.contains("RUUM_SAFE_TEMP"),
+            "stdout: {}",
+            output.stdout
+        );
     }
 }

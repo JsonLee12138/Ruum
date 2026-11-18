@@ -27,6 +27,9 @@ pub const NOTIF_TAG_CLEANUP_DONE: &str = "ruum.cleanup_complete";
 /// Notification tag for AI analysis completion / proposals.
 pub const NOTIF_TAG_AI_ANALYSIS: &str = "ruum.ai_analysis";
 
+/// Environment variable disabling fallback OS notification commands when `"1"`.
+pub const ENV_DISABLE_OS_NOTIFICATIONS: &str = "RUUM_DISABLE_OS_NOTIFICATIONS";
+
 const MACOS_OSASCRIPT_NOTIFY: &str = "display notification \
     (system attribute \"RUUM_NOTIF_BODY\") \
     with title (system attribute \"RUUM_NOTIF_TITLE\")";
@@ -53,23 +56,34 @@ pub enum NotificationOs {
     Windows,
 }
 
+fn os_notifications_disabled() -> bool {
+    std::env::var(ENV_DISABLE_OS_NOTIFICATIONS).is_ok_and(|v| v.trim() == "1")
+}
+
 /// Captured IPC and environment state used by notification adapters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NotificationEnv {
     pub ipc_target: Option<PathBuf>,
     pub ipc_token: Option<String>,
+    pub suppress_os_fallback: bool,
 }
 
 impl NotificationEnv {
     /// Capture current local IPC socket/port and authentication token.
     #[must_use]
     pub fn current() -> Self {
+        let suppress_os_fallback = os_notifications_disabled();
         let Some((target, token)) = resolve_ipc_target_and_token() else {
-            return Self::default();
+            return Self {
+                ipc_target: None,
+                ipc_token: None,
+                suppress_os_fallback,
+            };
         };
         Self {
             ipc_target: Some(target),
             ipc_token: Some(token),
+            suppress_os_fallback,
         }
     }
 
@@ -79,6 +93,7 @@ impl NotificationEnv {
         Self {
             ipc_target: Some(target),
             ipc_token: Some(token),
+            suppress_os_fallback: false,
         }
     }
 
@@ -88,6 +103,7 @@ impl NotificationEnv {
         Self {
             ipc_target: None,
             ipc_token: None,
+            suppress_os_fallback: false,
         }
     }
 }
@@ -160,6 +176,9 @@ impl NotificationAdapter for MacOsNotificationAdapter {
         if try_env_ipc_notification(env, tag, title, body) {
             return Ok(());
         }
+        if env.suppress_os_fallback {
+            return Ok(());
+        }
         dispatch_osascript_notification(runner, title, body)
     }
 }
@@ -199,6 +218,9 @@ impl NotificationAdapter for LinuxNotificationAdapter {
         if try_env_ipc_notification(env, tag, title, body) {
             return Ok(());
         }
+        if env.suppress_os_fallback {
+            return Ok(());
+        }
         dispatch_notify_send(runner, title, body)
     }
 }
@@ -236,6 +258,9 @@ impl NotificationAdapter for WindowsNotificationAdapter {
         body: &str,
     ) -> io::Result<()> {
         if try_env_ipc_notification(env, tag, title, body) {
+            return Ok(());
+        }
+        if env.suppress_os_fallback {
             return Ok(());
         }
         dispatch_powershell_toast(runner, tag, title, body)
@@ -494,9 +519,11 @@ pub fn send_fallback_os_notification(
     title: &str,
     body: &str,
 ) -> io::Result<()> {
+    let mut env = NotificationEnv::without_ipc();
+    env.suppress_os_fallback = os_notifications_disabled();
     let runner = DefaultCommandRunner;
     let _ = NotificationFactory::create().notify_with_env(
-        &NotificationEnv::without_ipc(),
+        &env,
         &runner,
         NOTIF_TAG_LOW_SPACE,
         title,
@@ -790,5 +817,96 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn suppress_os_fallback_skips_os_commands_while_preserving_ipc() {
+        assert!(!NotificationEnv::without_ipc().suppress_os_fallback);
+
+        let suppressed_no_ipc = NotificationEnv {
+            suppress_os_fallback: true,
+            ..NotificationEnv::without_ipc()
+        };
+        for os in [
+            NotificationOs::MacOs,
+            NotificationOs::Linux,
+            NotificationOs::Windows,
+        ] {
+            let adapter = NotificationFactory::create_for(os);
+            let runner = RecordingRunner {
+                fail_io: true,
+                ..RecordingRunner::default()
+            };
+            adapter
+                .notify_with_env(
+                    &suppressed_no_ipc,
+                    &runner,
+                    NOTIF_TAG_LOW_SPACE,
+                    "Low Disk",
+                    "Only 2 GB left",
+                )
+                .unwrap();
+            assert!(
+                runner.calls.lock().unwrap().is_empty(),
+                "OS fallback command must be skipped when suppressed for {os:?}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let token = "notify_suppressed_token_1234567890123456".to_string();
+
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("notify.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("notify.port");
+
+        let listener = IpcListenerGuard::bind(&socket_or_port).unwrap();
+        let server_token = token.clone();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_srv = Arc::clone(&received);
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let rec = Arc::clone(&received_srv);
+                listener
+                    .accept_and_handle(&server_token, move |req| {
+                        rec.lock().unwrap().push(req);
+                        Ok(IpcResponse::Ok)
+                    })
+                    .unwrap();
+            }
+        });
+
+        let mut env = NotificationEnv::with_ipc(socket_or_port, token);
+        assert!(!env.suppress_os_fallback);
+        env.suppress_os_fallback = true;
+
+        for os in [
+            NotificationOs::MacOs,
+            NotificationOs::Linux,
+            NotificationOs::Windows,
+        ] {
+            let adapter = NotificationFactory::create_for(os);
+            let runner = RecordingRunner {
+                fail_io: true,
+                ..RecordingRunner::default()
+            };
+            adapter
+                .notify_with_env(
+                    &env,
+                    &runner,
+                    NOTIF_TAG_LOW_SPACE,
+                    "Low Disk",
+                    "Only 2 GB left",
+                )
+                .unwrap();
+            assert!(
+                runner.calls.lock().unwrap().is_empty(),
+                "OS command must not run when IPC succeeded for {os:?}"
+            );
+        }
+
+        handle.join().unwrap();
+        assert_eq!(received.lock().unwrap().len(), 3);
     }
 }

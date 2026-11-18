@@ -167,7 +167,7 @@ impl RootSecretAdapter for MacOsRootSecretAdapter {
     }
 }
 
-/// Linux Secret Service root secret adapter (`sync-secret-service`).
+/// Linux Secret Service root secret adapter (`async-secret-service` + `zbus`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxRootSecretAdapter;
 

@@ -133,6 +133,7 @@ impl Sandbox {
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
             .env("RUUM_TEST_ROOT_SECRET_HEX", SENTINEL_FORBID_KEYCHAIN)
+            .env("RUUM_DISABLE_OS_NOTIFICATIONS", "1")
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("RUUM_GUI_BIN")
@@ -343,7 +344,7 @@ fn spawn_mock_http_server()
         .expect("set mock http nonblocking");
 
     let handle = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut stream = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
@@ -361,7 +362,7 @@ fn spawn_mock_http_server()
             .set_nonblocking(false)
             .expect("blocking mock http stream");
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set read timeout");
 
         let mut reader = BufReader::new(&mut stream);

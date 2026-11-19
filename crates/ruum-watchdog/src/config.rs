@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -178,22 +178,39 @@ const fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-fn retry_on_busy<T>(
+const BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+const fn busy_backoff(attempt: u64) -> Duration {
+    let jitter_ms = 15 + ((attempt.saturating_mul(17)) % 35);
+    Duration::from_millis(jitter_ms)
+}
+
+fn retry_on_busy_with_timeout<T>(
+    timeout: Duration,
     mut op: impl FnMut() -> rusqlite::Result<T>,
 ) -> io::Result<T> {
-    const MAX_ATTEMPTS: usize = 40;
-    const BACKOFF: Duration = Duration::from_millis(25);
-    let mut attempt = 0;
+    let deadline = Instant::now() + timeout;
+    let mut attempt = 0_u64;
     loop {
         match op() {
             Ok(val) => return Ok(val),
-            Err(err) if is_sqlite_busy(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(BACKOFF);
+            Err(err) if is_sqlite_busy(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(sqlite_err(&err));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let sleep_for = busy_backoff(attempt).min(remaining);
+                attempt = attempt.saturating_add(1);
+                std::thread::sleep(sleep_for);
             }
             Err(err) => return Err(sqlite_err(&err)),
         }
     }
+}
+
+fn retry_on_busy<T>(op: impl FnMut() -> rusqlite::Result<T>) -> io::Result<T> {
+    retry_on_busy_with_timeout(BUSY_RETRY_TIMEOUT, op)
 }
 
 fn u64_to_sqlite_i64(val: u64) -> i64 {
@@ -228,7 +245,7 @@ impl WatchdogConfigService {
         {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path).map_err(|e| sqlite_err(&e))?;
+        let conn = retry_on_busy(|| Connection::open(&db_path))?;
         // Set busy_timeout before switching to WAL and retry transient
         // SQLITE_BUSY/SQLITE_LOCKED during initial DELETE -> WAL transition.
         retry_on_busy(|| {
@@ -260,13 +277,21 @@ impl WatchdogConfigService {
         &self.db_path
     }
 
+    fn with_conn_retry<T>(
+        &self,
+        mut op: impl FnMut(&mut Connection) -> rusqlite::Result<T>,
+    ) -> io::Result<T> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("watchdog config mutex poisoned"))?;
+        retry_on_busy(|| op(&mut conn))
+    }
+
     /// Load watchdog configuration, falling back to defaults when no row
     /// exists yet.
     pub fn load_config(&self) -> io::Result<WatchdogConfig> {
-        let row = {
-            let conn = self.conn.lock().map_err(|_| {
-                io::Error::other("watchdog config mutex poisoned")
-            })?;
+        let row = self.with_conn_retry(|conn| {
             conn.query_row(
                 "SELECT enabled, background_service, min_free_gb, \
                  poll_interval_secs, cooldown_secs, updated_at_secs \
@@ -292,50 +317,42 @@ impl WatchdogConfigService {
                 },
             )
             .optional()
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         Ok(row.unwrap_or_default().normalized())
     }
 
     /// Atomically upsert normalized watchdog configuration into `ruum.db`.
     pub fn save_config(&self, config: &WatchdogConfig) -> io::Result<()> {
         let norm = config.normalized();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| io::Error::other("watchdog config mutex poisoned"))?;
-        conn.execute(
-            "INSERT INTO watchdog_config (
-                id, enabled, background_service, min_free_gb,
-                poll_interval_secs, cooldown_secs, updated_at_secs
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                enabled = excluded.enabled,
-                background_service = excluded.background_service,
-                min_free_gb = excluded.min_free_gb,
-                poll_interval_secs = excluded.poll_interval_secs,
-                cooldown_secs = excluded.cooldown_secs,
-                updated_at_secs = excluded.updated_at_secs",
-            params![
-                i64::from(norm.enabled),
-                i64::from(norm.background_service),
-                u64_to_sqlite_i64(norm.min_free_gb),
-                u64_to_sqlite_i64(norm.poll_interval_secs),
-                u64_to_sqlite_i64(norm.cooldown_secs),
-                u64_to_sqlite_i64(norm.updated_at_secs),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(())
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO watchdog_config (
+                    id, enabled, background_service, min_free_gb,
+                    poll_interval_secs, cooldown_secs, updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    background_service = excluded.background_service,
+                    min_free_gb = excluded.min_free_gb,
+                    poll_interval_secs = excluded.poll_interval_secs,
+                    cooldown_secs = excluded.cooldown_secs,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![
+                    i64::from(norm.enabled),
+                    i64::from(norm.background_service),
+                    u64_to_sqlite_i64(norm.min_free_gb),
+                    u64_to_sqlite_i64(norm.poll_interval_secs),
+                    u64_to_sqlite_i64(norm.cooldown_secs),
+                    u64_to_sqlite_i64(norm.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })
     }
 
     /// Load watchdog cooldown state, falling back to empty state when absent.
     pub fn load_state(&self) -> io::Result<WatchdogState> {
-        let row = {
-            let conn = self.conn.lock().map_err(|_| {
-                io::Error::other("watchdog config mutex poisoned")
-            })?;
+        let row = self.with_conn_retry(|conn| {
             conn.query_row(
                 "SELECT last_checked_secs, last_triggered_secs, \
                  last_triggered_threshold_gb \
@@ -356,35 +373,31 @@ impl WatchdogConfigService {
                 },
             )
             .optional()
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         Ok(row.unwrap_or_default())
     }
 
     /// Atomically upsert watchdog cooldown state into `ruum.db`.
     pub fn save_state(&self, state: &WatchdogState) -> io::Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| io::Error::other("watchdog config mutex poisoned"))?;
-        conn.execute(
-            "INSERT INTO watchdog_state (
-                id, last_checked_secs, last_triggered_secs,
-                last_triggered_threshold_gb
-             ) VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET
-                last_checked_secs = excluded.last_checked_secs,
-                last_triggered_secs = excluded.last_triggered_secs,
-                last_triggered_threshold_gb = excluded.last_triggered_threshold_gb",
-            params![
-                state.last_checked_secs.map(u64_to_sqlite_i64),
-                state.last_triggered_secs.map(u64_to_sqlite_i64),
-                state.last_triggered_threshold_gb.map(u64_to_sqlite_i64),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(())
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO watchdog_state (
+                    id, last_checked_secs, last_triggered_secs,
+                    last_triggered_threshold_gb
+                 ) VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    last_checked_secs = excluded.last_checked_secs,
+                    last_triggered_secs = excluded.last_triggered_secs,
+                    last_triggered_threshold_gb =
+                        excluded.last_triggered_threshold_gb",
+                params![
+                    state.last_checked_secs.map(u64_to_sqlite_i64),
+                    state.last_triggered_secs.map(u64_to_sqlite_i64),
+                    state.last_triggered_threshold_gb.map(u64_to_sqlite_i64),
+                ],
+            )
+            .map(|_| ())
+        })
     }
 }
 
@@ -584,5 +597,129 @@ mod tests {
             config_dir_for(false, false, home, None, None),
             Some(PathBuf::from("/users/tester/.config/ruum"))
         );
+    }
+
+    fn with_contended_write_lock(
+        db_path: &Path,
+        hold: Duration,
+        op: impl FnOnce(),
+    ) {
+        let lock_path = db_path.to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let lock_conn = Connection::open(&lock_path).unwrap();
+            lock_conn
+                .execute_batch("PRAGMA busy_timeout = 5000;")
+                .unwrap();
+            lock_conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            lock_conn.execute_batch("COMMIT;").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        op();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn retry_on_busy_recovers_from_transient_busy_and_locked() {
+        let mut attempts = 0_usize;
+        let value = retry_on_busy(|| {
+            attempts += 1;
+            if attempts <= 42 {
+                let code = if attempts.is_multiple_of(2) {
+                    rusqlite::ffi::SQLITE_LOCKED
+                } else {
+                    rusqlite::ffi::SQLITE_BUSY
+                };
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(code),
+                    Some("transient lock".to_owned()),
+                ))
+            } else {
+                Ok(99_u32)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 99);
+        assert_eq!(attempts, 43);
+    }
+
+    #[test]
+    fn retry_on_busy_passes_through_non_busy_error_immediately() {
+        let mut attempts = 0_usize;
+        let err = retry_on_busy::<()>(|| {
+            attempts += 1;
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some("constraint failed".to_owned()),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn retry_on_busy_with_timeout_expires_after_deadline() {
+        let started = Instant::now();
+        let mut attempts = 0_usize;
+        let err =
+            retry_on_busy_with_timeout::<()>(Duration::from_millis(60), || {
+                attempts += 1;
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("always busy".to_owned()),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(attempts >= 2);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn save_config_retries_on_sqlite_busy_with_zero_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let svc = WatchdogConfigService::open(&db_path).unwrap();
+        {
+            let conn = svc.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        }
+
+        let cfg = WatchdogConfig {
+            enabled: true,
+            background_service: true,
+            min_free_gb: 30,
+            poll_interval_secs: 120,
+            cooldown_secs: 900,
+            updated_at_secs: 1_700_000_777,
+        };
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            svc.save_config(&cfg).unwrap();
+        });
+        assert_eq!(svc.load_config().unwrap(), cfg);
+    }
+
+    #[test]
+    fn save_state_retries_on_sqlite_busy_with_zero_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let svc = WatchdogConfigService::open(&db_path).unwrap();
+        {
+            let conn = svc.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        }
+
+        let state = WatchdogState {
+            last_checked_secs: Some(1_700_000_888),
+            last_triggered_secs: Some(1_700_000_800),
+            last_triggered_threshold_gb: Some(25),
+        };
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            svc.save_state(&state).unwrap();
+        });
+        assert_eq!(svc.load_state().unwrap(), state);
     }
 }

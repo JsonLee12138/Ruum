@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
     Connection, ErrorCode, OptionalExtension as _, Row, TransactionBehavior,
@@ -883,22 +883,70 @@ const fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-fn retry_on_busy<T>(
-    mut op: impl FnMut() -> rusqlite::Result<T>,
+const BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+const fn busy_backoff(attempt: u64) -> Duration {
+    let jitter_ms = 15 + ((attempt.saturating_mul(17)) % 35);
+    Duration::from_millis(jitter_ms)
+}
+
+enum DbOpError {
+    Sqlite(rusqlite::Error),
+    Io(io::Error),
+}
+
+impl From<rusqlite::Error> for DbOpError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err)
+    }
+}
+
+impl From<io::Error> for DbOpError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+fn retry_on_busy_io_with_timeout<T>(
+    timeout: Duration,
+    mut op: impl FnMut() -> Result<T, DbOpError>,
 ) -> io::Result<T> {
-    const MAX_ATTEMPTS: usize = 40;
-    const BACKOFF: Duration = Duration::from_millis(25);
-    let mut attempt = 0;
+    let deadline = Instant::now() + timeout;
+    let mut attempt = 0_u64;
     loop {
         match op() {
             Ok(val) => return Ok(val),
-            Err(err) if is_sqlite_busy(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(BACKOFF);
+            Err(DbOpError::Sqlite(err)) if is_sqlite_busy(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(sqlite_err(&err));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let sleep_for = busy_backoff(attempt).min(remaining);
+                attempt = attempt.saturating_add(1);
+                std::thread::sleep(sleep_for);
             }
-            Err(err) => return Err(sqlite_err(&err)),
+            Err(DbOpError::Sqlite(err)) => return Err(sqlite_err(&err)),
+            Err(DbOpError::Io(err)) => return Err(err),
         }
     }
+}
+
+fn retry_on_busy_io<T>(
+    op: impl FnMut() -> Result<T, DbOpError>,
+) -> io::Result<T> {
+    retry_on_busy_io_with_timeout(BUSY_RETRY_TIMEOUT, op)
+}
+
+fn retry_on_busy_with_timeout<T>(
+    timeout: Duration,
+    mut op: impl FnMut() -> rusqlite::Result<T>,
+) -> io::Result<T> {
+    retry_on_busy_io_with_timeout(timeout, || Ok(op()?))
+}
+
+fn retry_on_busy<T>(op: impl FnMut() -> rusqlite::Result<T>) -> io::Result<T> {
+    retry_on_busy_with_timeout(BUSY_RETRY_TIMEOUT, op)
 }
 
 impl StorageDb {
@@ -911,7 +959,7 @@ impl StorageDb {
         {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path).map_err(|e| sqlite_err(&e))?;
+        let conn = retry_on_busy(|| Connection::open(&db_path))?;
         // Set busy_timeout before switching to WAL and retry transient
         // SQLITE_BUSY/SQLITE_LOCKED during initial DELETE -> WAL transition.
         retry_on_busy(|| {
@@ -958,10 +1006,24 @@ impl StorageDb {
             .map_err(|_| io::Error::other("storage db mutex poisoned"))
     }
 
+    fn with_conn_retry_io<T>(
+        &self,
+        mut op: impl FnMut(&mut Connection) -> Result<T, DbOpError>,
+    ) -> io::Result<T> {
+        let mut conn = self.lock_conn()?;
+        retry_on_busy_io(|| op(&mut conn))
+    }
+
+    fn with_conn_retry<T>(
+        &self,
+        mut op: impl FnMut(&mut Connection) -> rusqlite::Result<T>,
+    ) -> io::Result<T> {
+        self.with_conn_retry_io(|conn| Ok(op(conn)?))
+    }
+
     /// Load `app_settings`, returning defaults if no row has been saved yet.
     pub fn load_app_settings(&self) -> io::Result<AppSettings> {
-        let row = {
-            let conn = self.lock_conn()?;
+        let row = self.with_conn_retry(|conn| {
             conn.query_row(
                 "SELECT power_preset, default_depth, apparent_size, \
                  include_hidden, follow_system_appearance, \
@@ -991,43 +1053,41 @@ impl StorageDb {
                 },
             )
             .optional()
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         Ok(row.unwrap_or_default().normalized())
     }
 
     /// Persist normalized `app_settings`.
     pub fn save_app_settings(&self, settings: &AppSettings) -> io::Result<()> {
         let norm = settings.normalized();
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT INTO app_settings (
-                id, power_preset, default_depth, apparent_size,
-                include_hidden, follow_system_appearance,
-                ssh_session_duration_minutes, updated_at_secs
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-                power_preset = excluded.power_preset,
-                default_depth = excluded.default_depth,
-                apparent_size = excluded.apparent_size,
-                include_hidden = excluded.include_hidden,
-                follow_system_appearance = excluded.follow_system_appearance,
-                ssh_session_duration_minutes =
-                    excluded.ssh_session_duration_minutes,
-                updated_at_secs = excluded.updated_at_secs",
-            params![
-                norm.power_preset,
-                i64::from(norm.default_depth),
-                i64::from(norm.apparent_size),
-                i64::from(norm.include_hidden),
-                i64::from(norm.follow_system_appearance),
-                u64_to_sqlite_i64(norm.ssh_session_duration_minutes),
-                u64_to_sqlite_i64(norm.updated_at_secs),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(())
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO app_settings (
+                    id, power_preset, default_depth, apparent_size,
+                    include_hidden, follow_system_appearance,
+                    ssh_session_duration_minutes, updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    power_preset = excluded.power_preset,
+                    default_depth = excluded.default_depth,
+                    apparent_size = excluded.apparent_size,
+                    include_hidden = excluded.include_hidden,
+                    follow_system_appearance = excluded.follow_system_appearance,
+                    ssh_session_duration_minutes =
+                        excluded.ssh_session_duration_minutes,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![
+                    norm.power_preset,
+                    i64::from(norm.default_depth),
+                    i64::from(norm.apparent_size),
+                    i64::from(norm.include_hidden),
+                    i64::from(norm.follow_system_appearance),
+                    u64_to_sqlite_i64(norm.ssh_session_duration_minutes),
+                    u64_to_sqlite_i64(norm.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })
     }
 
     /// Insert a new SSH profile, generating a unique `id` when empty.
@@ -1084,39 +1144,39 @@ impl StorageDb {
             updated_at_secs: updated_at,
         };
 
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT INTO ssh_profiles (
-                id, alias, host, port, username, auth_mode, default_path,
-                last_total_bytes, last_available_bytes, last_scanned_secs,
-                pending_script_path, pending_script_items,
-                pending_reclaim_bytes, pending_created_secs,
-                created_at_secs, updated_at_secs
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16
-             )",
-            params![
-                inserted.id,
-                inserted.alias,
-                inserted.host,
-                i64::from(inserted.port),
-                inserted.username,
-                inserted.auth_mode.as_str(),
-                inserted.default_path,
-                inserted.last_total_bytes.map(u64_to_sqlite_i64),
-                inserted.last_available_bytes.map(u64_to_sqlite_i64),
-                inserted.last_scanned_secs.map(u64_to_sqlite_i64),
-                inserted.pending_script_path,
-                inserted.pending_script_items.map(u64_to_sqlite_i64),
-                inserted.pending_reclaim_bytes.map(u64_to_sqlite_i64),
-                inserted.pending_created_secs.map(u64_to_sqlite_i64),
-                u64_to_sqlite_i64(inserted.created_at_secs),
-                u64_to_sqlite_i64(inserted.updated_at_secs),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO ssh_profiles (
+                    id, alias, host, port, username, auth_mode, default_path,
+                    last_total_bytes, last_available_bytes, last_scanned_secs,
+                    pending_script_path, pending_script_items,
+                    pending_reclaim_bytes, pending_created_secs,
+                    created_at_secs, updated_at_secs
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16
+                 )",
+                params![
+                    inserted.id,
+                    inserted.alias,
+                    inserted.host,
+                    i64::from(inserted.port),
+                    inserted.username,
+                    inserted.auth_mode.as_str(),
+                    inserted.default_path,
+                    inserted.last_total_bytes.map(u64_to_sqlite_i64),
+                    inserted.last_available_bytes.map(u64_to_sqlite_i64),
+                    inserted.last_scanned_secs.map(u64_to_sqlite_i64),
+                    inserted.pending_script_path,
+                    inserted.pending_script_items.map(u64_to_sqlite_i64),
+                    inserted.pending_reclaim_bytes.map(u64_to_sqlite_i64),
+                    inserted.pending_created_secs.map(u64_to_sqlite_i64),
+                    u64_to_sqlite_i64(inserted.created_at_secs),
+                    u64_to_sqlite_i64(inserted.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })?;
         Ok(inserted)
     }
 
@@ -1139,8 +1199,7 @@ impl StorageDb {
             profile.updated_at_secs
         };
 
-        let changed = {
-            let conn = self.lock_conn()?;
+        let changed = self.with_conn_retry(|conn| {
             conn.execute(
                 "UPDATE ssh_profiles SET
                     alias = ?2,
@@ -1162,8 +1221,7 @@ impl StorageDb {
                     u64_to_sqlite_i64(updated_at),
                 ],
             )
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         if changed == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1184,13 +1242,10 @@ impl StorageDb {
         id: &str,
     ) -> io::Result<Option<SshProfile>> {
         let sql = format!("{SSH_PROFILE_SELECT} WHERE id = ?1");
-        let conn = self.lock_conn()?;
-        let res = conn
-            .query_row(&sql, [id.trim()], row_to_ssh_profile)
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(res)
+        self.with_conn_retry(|conn| {
+            conn.query_row(&sql, [id.trim()], row_to_ssh_profile)
+                .optional()
+        })
     }
 
     /// Fetch a saved SSH profile by unique display `alias`.
@@ -1199,13 +1254,10 @@ impl StorageDb {
         alias: &str,
     ) -> io::Result<Option<SshProfile>> {
         let sql = format!("{SSH_PROFILE_SELECT} WHERE alias = ?1");
-        let conn = self.lock_conn()?;
-        let res = conn
-            .query_row(&sql, [alias.trim()], row_to_ssh_profile)
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(res)
+        self.with_conn_retry(|conn| {
+            conn.query_row(&sql, [alias.trim()], row_to_ssh_profile)
+                .optional()
+        })
     }
 
     /// Fetch a saved SSH profile matching either `id` or `alias`.
@@ -1219,13 +1271,9 @@ impl StorageDb {
         }
         let sql =
             format!("{SSH_PROFILE_SELECT} WHERE id = ?1 OR alias = ?1 LIMIT 1");
-        let conn = self.lock_conn()?;
-        let res = conn
-            .query_row(&sql, [key], row_to_ssh_profile)
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(res)
+        self.with_conn_retry(|conn| {
+            conn.query_row(&sql, [key], row_to_ssh_profile).optional()
+        })
     }
 
     /// List all saved SSH profiles ordered deterministically by `alias`.
@@ -1234,27 +1282,18 @@ impl StorageDb {
             "{SSH_PROFILE_SELECT} \
              ORDER BY alias COLLATE NOCASE ASC, created_at_secs ASC, id ASC"
         );
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(&sql).map_err(|e| sqlite_err(&e))?;
-        let rows = stmt
-            .query_map([], row_to_ssh_profile)
-            .map_err(|e| sqlite_err(&e))?;
-        let mut out = Vec::new();
-        for item in rows {
-            out.push(item.map_err(|e| sqlite_err(&e))?);
-        }
-        drop(stmt);
-        drop(conn);
-        Ok(out)
+        self.with_conn_retry(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], row_to_ssh_profile)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
     }
 
     /// Delete a saved SSH profile by `id`, returning whether a row existed.
     pub fn delete_ssh_profile(&self, id: &str) -> io::Result<bool> {
-        let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM ssh_profiles WHERE id = ?1", [id.trim()])
-            .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
+        let changed = self.with_conn_retry(|conn| {
+            conn.execute("DELETE FROM ssh_profiles WHERE id = ?1", [id.trim()])
+        })?;
         Ok(changed > 0)
     }
 
@@ -1267,8 +1306,7 @@ impl StorageDb {
         scanned_secs: u64,
     ) -> io::Result<()> {
         let id = id.trim();
-        let changed = {
-            let conn = self.lock_conn()?;
+        let changed = self.with_conn_retry(|conn| {
             conn.execute(
                 "UPDATE ssh_profiles SET
                     last_total_bytes = ?2,
@@ -1284,8 +1322,7 @@ impl StorageDb {
                     u64_to_sqlite_i64(scanned_secs),
                 ],
             )
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         if changed == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1317,8 +1354,7 @@ impl StorageDb {
                 "pending script path must not be empty or contain control chars",
             ));
         }
-        let changed = {
-            let conn = self.lock_conn()?;
+        let changed = self.with_conn_retry(|conn| {
             conn.execute(
                 "UPDATE ssh_profiles SET
                     pending_script_path = ?2,
@@ -1336,8 +1372,7 @@ impl StorageDb {
                     u64_to_sqlite_i64(created_secs),
                 ],
             )
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         if changed == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1351,8 +1386,7 @@ impl StorageDb {
     pub fn clear_ssh_profile_pending_script(&self, id: &str) -> io::Result<()> {
         let id = id.trim();
         let updated_at = now_unix_secs();
-        let changed = {
-            let conn = self.lock_conn()?;
+        let changed = self.with_conn_retry(|conn| {
             conn.execute(
                 "UPDATE ssh_profiles SET
                     pending_script_path = NULL,
@@ -1363,8 +1397,7 @@ impl StorageDb {
                  WHERE id = ?1",
                 params![id, u64_to_sqlite_i64(updated_at)],
             )
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         if changed == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1381,18 +1414,11 @@ impl StorageDb {
             "{WEBHOOK_ENDPOINT_SELECT} \
              ORDER BY name COLLATE NOCASE ASC, created_at_secs ASC, id ASC"
         );
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(&sql).map_err(|e| sqlite_err(&e))?;
-        let rows = stmt
-            .query_map([], row_to_webhook_endpoint)
-            .map_err(|e| sqlite_err(&e))?;
-        let mut out = Vec::new();
-        for item in rows {
-            out.push(item.map_err(|e| sqlite_err(&e))?);
-        }
-        drop(stmt);
-        drop(conn);
-        Ok(out)
+        self.with_conn_retry(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], row_to_webhook_endpoint)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
     }
 
     /// Fetch a webhook endpoint matching either `id` or `name` (preferring
@@ -1412,13 +1438,10 @@ impl StorageDb {
                       created_at_secs ASC, id ASC \
              LIMIT 1"
         );
-        let conn = self.lock_conn()?;
-        let res = conn
-            .query_row(&sql, [key], row_to_webhook_endpoint)
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(res)
+        self.with_conn_retry(|conn| {
+            conn.query_row(&sql, [key], row_to_webhook_endpoint)
+                .optional()
+        })
     }
 
     /// Insert a new webhook endpoint, generating a unique `id` when empty.
@@ -1465,25 +1488,25 @@ impl StorageDb {
             updated_at_secs: updated_at,
         };
 
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT INTO webhook_endpoints (
-                id, name, enabled, url, headers_json,
-                timeout_secs, created_at_secs, updated_at_secs
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                inserted.id,
-                inserted.name,
-                i64::from(inserted.enabled),
-                inserted.url,
-                inserted.headers_json,
-                u64_to_sqlite_i64(inserted.timeout_secs),
-                u64_to_sqlite_i64(inserted.created_at_secs),
-                u64_to_sqlite_i64(inserted.updated_at_secs),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO webhook_endpoints (
+                    id, name, enabled, url, headers_json,
+                    timeout_secs, created_at_secs, updated_at_secs
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    inserted.id,
+                    inserted.name,
+                    i64::from(inserted.enabled),
+                    inserted.url,
+                    inserted.headers_json,
+                    u64_to_sqlite_i64(inserted.timeout_secs),
+                    u64_to_sqlite_i64(inserted.created_at_secs),
+                    u64_to_sqlite_i64(inserted.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })?;
         Ok(inserted)
     }
 
@@ -1505,8 +1528,7 @@ impl StorageDb {
             clean.updated_at_secs
         };
 
-        let changed = {
-            let conn = self.lock_conn()?;
+        let changed = self.with_conn_retry(|conn| {
             conn.execute(
                 "UPDATE webhook_endpoints SET
                     name = ?2,
@@ -1526,8 +1548,7 @@ impl StorageDb {
                     u64_to_sqlite_i64(updated_at),
                 ],
             )
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         if changed == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1548,90 +1569,83 @@ impl StorageDb {
         if id.is_empty() {
             return Ok(false);
         }
-        let mut conn = self.lock_conn()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| sqlite_err(&e))?;
-        let changed = tx
-            .execute("DELETE FROM webhook_endpoints WHERE id = ?1", [id])
-            .map_err(|e| sqlite_err(&e))?;
-        if changed > 0 {
-            let has_remaining: bool = tx
-                .query_row(
+        self.with_conn_retry(|conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx
+                .execute("DELETE FROM webhook_endpoints WHERE id = ?1", [id])?;
+            if changed > 0 {
+                let has_remaining: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM webhook_endpoints)",
                     [],
                     |r| r.get(0),
-                )
-                .map_err(|e| sqlite_err(&e))?;
-            if !has_remaining {
-                tx.execute("DELETE FROM webhook_config WHERE id = 1", [])
-                    .map_err(|e| sqlite_err(&e))?;
+                )?;
+                if !has_remaining {
+                    tx.execute("DELETE FROM webhook_config WHERE id = 1", [])?;
+                }
             }
-        }
-        tx.commit().map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(changed > 0)
+            tx.commit()?;
+            Ok(changed > 0)
+        })
     }
 
     /// Load `webhook_config`, reading the primary endpoint in
     /// `webhook_endpoints` first and falling back to legacy `webhook_config`.
     pub fn load_webhook_config(&self) -> io::Result<WebhookConfig> {
-        let conn = self.lock_conn()?;
-        let endpoint_row = conn
-            .query_row(
-                "SELECT enabled, url, headers_json, timeout_secs, \
-                 updated_at_secs FROM webhook_endpoints \
-                 ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, \
-                          created_at_secs ASC, id ASC \
-                 LIMIT 1",
-                [DEFAULT_WEBHOOK_ID],
-                |row| {
-                    let enabled: i64 = row.get(0)?;
-                    let url: String = row.get(1)?;
-                    let headers_json: String = row.get(2)?;
-                    let timeout_secs: i64 = row.get(3)?;
-                    let updated_at_secs: i64 = row.get(4)?;
-                    Ok(WebhookConfig {
-                        enabled: enabled != 0,
-                        url,
-                        headers_json,
-                        timeout_secs: sqlite_i64_to_u64(timeout_secs)
-                            .max(MIN_WEBHOOK_TIMEOUT_SECS),
-                        updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
-        if let Some(cfg) = endpoint_row {
-            return Ok(cfg);
-        }
+        self.with_conn_retry(|conn| {
+            let endpoint_row = conn
+                .query_row(
+                    "SELECT enabled, url, headers_json, timeout_secs, \
+                     updated_at_secs FROM webhook_endpoints \
+                     ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, \
+                              created_at_secs ASC, id ASC \
+                     LIMIT 1",
+                    [DEFAULT_WEBHOOK_ID],
+                    |row| {
+                        let enabled: i64 = row.get(0)?;
+                        let url: String = row.get(1)?;
+                        let headers_json: String = row.get(2)?;
+                        let timeout_secs: i64 = row.get(3)?;
+                        let updated_at_secs: i64 = row.get(4)?;
+                        Ok(WebhookConfig {
+                            enabled: enabled != 0,
+                            url,
+                            headers_json,
+                            timeout_secs: sqlite_i64_to_u64(timeout_secs)
+                                .max(MIN_WEBHOOK_TIMEOUT_SECS),
+                            updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(cfg) = endpoint_row {
+                return Ok(cfg);
+            }
 
-        let row = conn
-            .query_row(
-                "SELECT enabled, url, headers_json, timeout_secs, \
-                 updated_at_secs FROM webhook_config WHERE id = 1",
-                [],
-                |row| {
-                    let enabled: i64 = row.get(0)?;
-                    let url: String = row.get(1)?;
-                    let headers_json: String = row.get(2)?;
-                    let timeout_secs: i64 = row.get(3)?;
-                    let updated_at_secs: i64 = row.get(4)?;
-                    Ok(WebhookConfig {
-                        enabled: enabled != 0,
-                        url,
-                        headers_json,
-                        timeout_secs: sqlite_i64_to_u64(timeout_secs)
-                            .max(MIN_WEBHOOK_TIMEOUT_SECS),
-                        updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(row.unwrap_or_default())
+            let row = conn
+                .query_row(
+                    "SELECT enabled, url, headers_json, timeout_secs, \
+                     updated_at_secs FROM webhook_config WHERE id = 1",
+                    [],
+                    |row| {
+                        let enabled: i64 = row.get(0)?;
+                        let url: String = row.get(1)?;
+                        let headers_json: String = row.get(2)?;
+                        let timeout_secs: i64 = row.get(3)?;
+                        let updated_at_secs: i64 = row.get(4)?;
+                        Ok(WebhookConfig {
+                            enabled: enabled != 0,
+                            url,
+                            headers_json,
+                            timeout_secs: sqlite_i64_to_u64(timeout_secs)
+                                .max(MIN_WEBHOOK_TIMEOUT_SECS),
+                            updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(row.unwrap_or_default())
+        })
     }
 
     /// Validate and persist `webhook_config`, keeping the primary
@@ -1641,96 +1655,89 @@ impl StorageDb {
         config: &WebhookConfig,
     ) -> io::Result<()> {
         let clean = config.validated()?;
-        let mut conn = self.lock_conn()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| sqlite_err(&e))?;
-        tx.execute(
-            "INSERT INTO webhook_config (
-                id, enabled, url, headers_json, timeout_secs, updated_at_secs
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET
-                enabled = excluded.enabled,
-                url = excluded.url,
-                headers_json = excluded.headers_json,
-                timeout_secs = excluded.timeout_secs,
-                updated_at_secs = excluded.updated_at_secs",
-            params![
-                i64::from(clean.enabled),
-                clean.url,
-                clean.headers_json,
-                u64_to_sqlite_i64(clean.timeout_secs),
-                u64_to_sqlite_i64(clean.updated_at_secs),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-
-        if clean.url.is_empty() {
+        self.with_conn_retry(|conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
-                "DELETE FROM webhook_endpoints WHERE id = ?1",
-                [DEFAULT_WEBHOOK_ID],
-            )
-            .map_err(|e| sqlite_err(&e))?;
-        } else {
-            let existing_id: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM webhook_endpoints \
-                     ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, \
-                              created_at_secs ASC, id ASC \
-                     LIMIT 1",
+                "INSERT INTO webhook_config (
+                    id, enabled, url, headers_json, timeout_secs,
+                    updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    url = excluded.url,
+                    headers_json = excluded.headers_json,
+                    timeout_secs = excluded.timeout_secs,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![
+                    i64::from(clean.enabled),
+                    clean.url,
+                    clean.headers_json,
+                    u64_to_sqlite_i64(clean.timeout_secs),
+                    u64_to_sqlite_i64(clean.updated_at_secs),
+                ],
+            )?;
+
+            if clean.url.is_empty() {
+                tx.execute(
+                    "DELETE FROM webhook_endpoints WHERE id = ?1",
                     [DEFAULT_WEBHOOK_ID],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| sqlite_err(&e))?;
-            if let Some(target_id) = existing_id {
-                tx.execute(
-                    "UPDATE webhook_endpoints SET
-                        enabled = ?2,
-                        url = ?3,
-                        headers_json = ?4,
-                        timeout_secs = ?5,
-                        updated_at_secs = ?6
-                     WHERE id = ?1",
-                    params![
-                        target_id,
-                        i64::from(clean.enabled),
-                        clean.url,
-                        clean.headers_json,
-                        u64_to_sqlite_i64(clean.timeout_secs),
-                        u64_to_sqlite_i64(clean.updated_at_secs),
-                    ],
-                )
-                .map_err(|e| sqlite_err(&e))?;
+                )?;
             } else {
-                tx.execute(
-                    "INSERT INTO webhook_endpoints (
-                        id, name, enabled, url, headers_json,
-                        timeout_secs, created_at_secs, updated_at_secs
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        DEFAULT_WEBHOOK_ID,
-                        DEFAULT_WEBHOOK_NAME,
-                        i64::from(clean.enabled),
-                        clean.url,
-                        clean.headers_json,
-                        u64_to_sqlite_i64(clean.timeout_secs),
-                        u64_to_sqlite_i64(clean.updated_at_secs),
-                        u64_to_sqlite_i64(clean.updated_at_secs),
-                    ],
-                )
-                .map_err(|e| sqlite_err(&e))?;
+                let existing_id: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM webhook_endpoints \
+                         ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, \
+                                  created_at_secs ASC, id ASC \
+                         LIMIT 1",
+                        [DEFAULT_WEBHOOK_ID],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(target_id) = existing_id {
+                    tx.execute(
+                        "UPDATE webhook_endpoints SET
+                            enabled = ?2,
+                            url = ?3,
+                            headers_json = ?4,
+                            timeout_secs = ?5,
+                            updated_at_secs = ?6
+                         WHERE id = ?1",
+                        params![
+                            target_id,
+                            i64::from(clean.enabled),
+                            clean.url,
+                            clean.headers_json,
+                            u64_to_sqlite_i64(clean.timeout_secs),
+                            u64_to_sqlite_i64(clean.updated_at_secs),
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO webhook_endpoints (
+                            id, name, enabled, url, headers_json,
+                            timeout_secs, created_at_secs, updated_at_secs
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            DEFAULT_WEBHOOK_ID,
+                            DEFAULT_WEBHOOK_NAME,
+                            i64::from(clean.enabled),
+                            clean.url,
+                            clean.headers_json,
+                            u64_to_sqlite_i64(clean.timeout_secs),
+                            u64_to_sqlite_i64(clean.updated_at_secs),
+                            u64_to_sqlite_i64(clean.updated_at_secs),
+                        ],
+                    )?;
+                }
             }
-        }
-        tx.commit().map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(())
+            tx.commit()
+        })
     }
 
     /// Load `ai_config`, returning defaults if no row has been saved yet.
     pub fn load_ai_config(&self) -> io::Result<AiConfig> {
-        let row = {
-            let conn = self.lock_conn()?;
+        let row = self.with_conn_retry(|conn| {
             conn.query_row(
                 "SELECT auto_analyze_on_alert, provider, custom_command, \
                  extra_args, model, updated_at_secs \
@@ -1767,45 +1774,42 @@ impl StorageDb {
                 },
             )
             .optional()
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         Ok(row.unwrap_or_default().normalized())
     }
 
     /// Persist normalized `ai_config`.
     pub fn save_ai_config(&self, config: &AiConfig) -> io::Result<()> {
         let norm = config.normalized();
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT INTO ai_config (
-                id, auto_analyze_on_alert, provider, custom_command,
-                extra_args, model, updated_at_secs
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                auto_analyze_on_alert = excluded.auto_analyze_on_alert,
-                provider = excluded.provider,
-                custom_command = excluded.custom_command,
-                extra_args = excluded.extra_args,
-                model = excluded.model,
-                updated_at_secs = excluded.updated_at_secs",
-            params![
-                i64::from(norm.auto_analyze_on_alert),
-                norm.provider.id(),
-                norm.custom_command,
-                norm.extra_args,
-                norm.model,
-                u64_to_sqlite_i64(norm.updated_at_secs),
-            ],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(())
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO ai_config (
+                    id, auto_analyze_on_alert, provider, custom_command,
+                    extra_args, model, updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    auto_analyze_on_alert = excluded.auto_analyze_on_alert,
+                    provider = excluded.provider,
+                    custom_command = excluded.custom_command,
+                    extra_args = excluded.extra_args,
+                    model = excluded.model,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![
+                    i64::from(norm.auto_analyze_on_alert),
+                    norm.provider.id(),
+                    norm.custom_command,
+                    norm.extra_args,
+                    norm.model,
+                    u64_to_sqlite_i64(norm.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })
     }
 
     /// Load `ai_state`, returning empty state if no row has been saved yet.
     pub fn load_ai_state(&self) -> io::Result<AiState> {
-        let row = {
-            let conn = self.lock_conn()?;
+        let row = self.with_conn_retry(|conn| {
             conn.query_row(
                 "SELECT last_proposal_json, updated_at_secs \
                  FROM ai_state WHERE id = 1",
@@ -1820,8 +1824,7 @@ impl StorageDb {
                 },
             )
             .optional()
-            .map_err(|e| sqlite_err(&e))?
-        };
+        })?;
         Ok(row.unwrap_or_default())
     }
 
@@ -1846,18 +1849,17 @@ impl StorageDb {
             None => None,
         };
 
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT INTO ai_state (id, last_proposal_json, updated_at_secs)
-             VALUES (1, ?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET
-                last_proposal_json = excluded.last_proposal_json,
-                updated_at_secs = excluded.updated_at_secs",
-            params![clean_json, u64_to_sqlite_i64(state.updated_at_secs)],
-        )
-        .map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(())
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO ai_state (id, last_proposal_json, updated_at_secs)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    last_proposal_json = excluded.last_proposal_json,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![clean_json, u64_to_sqlite_i64(state.updated_at_secs)],
+            )
+            .map(|_| ())
+        })
     }
 
     /// Remove confirmed/cleaned paths from `ai_state.last_proposal_json`,
@@ -1868,47 +1870,46 @@ impl StorageDb {
         removed_paths: &[PathBuf],
         now_secs: u64,
     ) -> io::Result<Option<CleanupProposal>> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| sqlite_err(&e))?;
-        let row = tx
-            .query_row(
-                "SELECT last_proposal_json, updated_at_secs \
-                 FROM ai_state WHERE id = 1",
-                [],
-                |row| {
-                    let last_proposal_json: Option<String> = row.get(0)?;
-                    let updated_at_secs: i64 = row.get(1)?;
-                    Ok(AiState {
-                        last_proposal_json,
-                        updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| sqlite_err(&e))?;
+        self.with_conn_retry_io(|conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row = tx
+                .query_row(
+                    "SELECT last_proposal_json, updated_at_secs \
+                     FROM ai_state WHERE id = 1",
+                    [],
+                    |row| {
+                        let last_proposal_json: Option<String> = row.get(0)?;
+                        let updated_at_secs: i64 = row.get(1)?;
+                        Ok(AiState {
+                            last_proposal_json,
+                            updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
+                        })
+                    },
+                )
+                .optional()?;
 
-        let mut state = row.unwrap_or_default();
-        let before_json = state.last_proposal_json.clone();
-        let remaining = state.prune_confirmed_paths(removed_paths, now_secs)?;
-        if state.last_proposal_json != before_json {
-            tx.execute(
-                "INSERT INTO ai_state (id, last_proposal_json, updated_at_secs)
-                 VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET
-                    last_proposal_json = excluded.last_proposal_json,
-                    updated_at_secs = excluded.updated_at_secs",
-                params![
-                    state.last_proposal_json,
-                    u64_to_sqlite_i64(state.updated_at_secs),
-                ],
-            )
-            .map_err(|e| sqlite_err(&e))?;
-        }
-        tx.commit().map_err(|e| sqlite_err(&e))?;
-        drop(conn);
-        Ok(remaining)
+            let mut state = row.unwrap_or_default();
+            let before_json = state.last_proposal_json.clone();
+            let remaining =
+                state.prune_confirmed_paths(removed_paths, now_secs)?;
+            if state.last_proposal_json != before_json {
+                tx.execute(
+                    "INSERT INTO ai_state
+                        (id, last_proposal_json, updated_at_secs)
+                     VALUES (1, ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                        last_proposal_json = excluded.last_proposal_json,
+                        updated_at_secs = excluded.updated_at_secs",
+                    params![
+                        state.last_proposal_json,
+                        u64_to_sqlite_i64(state.updated_at_secs),
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(remaining)
+        })
     }
 }
 
@@ -2716,5 +2717,215 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         let err2 = db.clear_ssh_profile_pending_script("missing").unwrap_err();
         assert_eq!(err2.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn with_contended_write_lock(
+        db_path: &Path,
+        hold: Duration,
+        op: impl FnOnce(),
+    ) {
+        let lock_path = db_path.to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let lock_conn = Connection::open(&lock_path).unwrap();
+            lock_conn
+                .execute_batch("PRAGMA busy_timeout = 5000;")
+                .unwrap();
+            lock_conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            lock_conn.execute_batch("COMMIT;").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        op();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn retry_on_busy_recovers_from_transient_busy_and_locked() {
+        let mut attempts = 0_usize;
+        let value = retry_on_busy(|| {
+            attempts += 1;
+            if attempts <= 42 {
+                let code = if attempts.is_multiple_of(2) {
+                    rusqlite::ffi::SQLITE_LOCKED
+                } else {
+                    rusqlite::ffi::SQLITE_BUSY
+                };
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(code),
+                    Some("transient lock".to_owned()),
+                ))
+            } else {
+                Ok(77_u32)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 77);
+        assert_eq!(attempts, 43);
+    }
+
+    #[test]
+    fn retry_on_busy_passes_through_non_busy_error_immediately() {
+        let mut attempts = 0_usize;
+        let err = retry_on_busy::<()>(|| {
+            attempts += 1;
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some("UNIQUE constraint failed: ssh_profiles.alias".to_owned()),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn retry_on_busy_with_timeout_expires_after_deadline() {
+        let started = Instant::now();
+        let mut attempts = 0_usize;
+        let err =
+            retry_on_busy_with_timeout::<()>(Duration::from_millis(60), || {
+                attempts += 1;
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("always busy".to_owned()),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(attempts >= 2);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn prune_ai_state_paths_returns_io_error_without_retrying() {
+        let mut attempts = 0_usize;
+        let err = retry_on_busy_io::<()>(|| {
+            attempts += 1;
+            Err(DbOpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid json",
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = StorageDb::open(temp.path().join("ruum.db")).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO ai_state (id, last_proposal_json, updated_at_secs)
+                 VALUES (1, '{corrupt', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let started = Instant::now();
+        let prune_err = db
+            .prune_ai_state_paths(&[PathBuf::from("/tmp/cache/one")], 10)
+            .unwrap_err();
+        assert_eq!(prune_err.kind(), io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn save_app_settings_retries_on_sqlite_busy_with_zero_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let db = StorageDb::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        }
+
+        let settings = AppSettings {
+            power_preset: "aggressive".to_owned(),
+            default_depth: 4,
+            apparent_size: true,
+            include_hidden: false,
+            follow_system_appearance: false,
+            ssh_session_duration_minutes: 20,
+            updated_at_secs: 1_700_000_555,
+        };
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            db.save_app_settings(&settings).unwrap();
+        });
+        assert_eq!(db.load_app_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn save_webhook_config_retries_on_sqlite_busy_with_zero_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let db = StorageDb::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        }
+
+        let cfg = WebhookConfig {
+            enabled: true,
+            url: "https://hooks.example.com/busy".to_owned(),
+            headers_json: r#"{"X-Test":"1"}"#.to_owned(),
+            timeout_secs: 7,
+            updated_at_secs: 1_700_000_666,
+        };
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            db.save_webhook_config(&cfg).unwrap();
+        });
+        assert_eq!(db.load_webhook_config().unwrap(), cfg);
+    }
+
+    #[test]
+    fn prune_ai_state_paths_retries_on_sqlite_busy_with_zero_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let db = StorageDb::open(&db_path).unwrap();
+
+        let p1 = PathBuf::from("/tmp/cache/prune-one");
+        let p2 = PathBuf::from("/tmp/cache/prune-two");
+        let proposal = CleanupProposal {
+            timestamp_secs: 1_700_000_000,
+            summary: "Busy contention prune".to_owned(),
+            items: vec![
+                ProposalItem::new(
+                    p1.clone(),
+                    128,
+                    RemovalMode::Trash,
+                    None,
+                    None,
+                ),
+                ProposalItem::new(
+                    p2.clone(),
+                    256,
+                    RemovalMode::Trash,
+                    None,
+                    None,
+                ),
+            ],
+            docker_targets: Vec::new(),
+        };
+        let state = AiState::from_proposal(&proposal, 1_700_000_000).unwrap();
+        db.save_ai_state(&state).unwrap();
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        }
+
+        let mut remaining = None;
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            remaining = db
+                .prune_ai_state_paths(std::slice::from_ref(&p1), 1_700_000_777)
+                .unwrap();
+        });
+        let rem = remaining.expect("second item should remain");
+        assert_eq!(rem.items.len(), 1);
+        assert_eq!(rem.items[0].path, p2);
+        let loaded = db.load_ai_state().unwrap();
+        assert_eq!(loaded.updated_at_secs, 1_700_000_777);
     }
 }

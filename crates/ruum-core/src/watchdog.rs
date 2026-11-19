@@ -244,10 +244,14 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
                 title: i18n::recommended_cleanup_title(self.locale).to_string(),
                 summary: Some(prop.summary.clone()),
                 items: confirm_items,
+                docker_items: Vec::new(),
+                docker_permission_hint: None,
             };
 
-            if let Ok(CleanupConfirmDecision::Confirmed { selected_paths }) =
-                self.confirm_adapter.confirm(&request)
+            if let Ok(CleanupConfirmDecision::Confirmed {
+                selected_paths,
+                ..
+            }) = self.confirm_adapter.confirm(&request)
             {
                 let approved_items: Vec<ProposalItem> = prop
                     .items
@@ -692,10 +696,13 @@ fn run_once_in(
             title: i18n::recommended_cleanup_title(locale).to_string(),
             summary: Some(prop.summary.clone()),
             items: confirm_items,
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
 
-        if let Ok(CleanupConfirmDecision::Confirmed { selected_paths }) =
-            confirm_adapter.confirm(&request)
+        if let Ok(CleanupConfirmDecision::Confirmed {
+            selected_paths, ..
+        }) = confirm_adapter.confirm(&request)
         {
             confirmed = true;
             // Whitelist intersection
@@ -1126,6 +1133,7 @@ mod tests {
         let confirm = MockConfirm {
             decision: CleanupConfirmDecision::Confirmed {
                 selected_paths: vec![target_dir],
+                selected_docker_targets: Vec::new(),
             },
         };
 
@@ -1960,6 +1968,7 @@ mod tests {
         let confirm = MockConfirm {
             decision: CleanupConfirmDecision::Confirmed {
                 selected_paths: vec![target_dir.clone()],
+                selected_docker_targets: Vec::new(),
             },
         };
         let notifier = MockNotification::default();
@@ -2077,6 +2086,7 @@ mod tests {
         let confirm = MockConfirm {
             decision: CleanupConfirmDecision::Confirmed {
                 selected_paths: vec![item_clean.clone()],
+                selected_docker_targets: Vec::new(),
             },
         };
         let notifier = MockNotification::default();

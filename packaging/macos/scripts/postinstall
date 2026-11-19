@@ -3,3 +3,5 @@ set -eu
 
 mkdir -p /usr/local/bin
 ln -sf /Applications/ruum.app/Contents/MacOS/ruum /usr/local/bin/ruum
+touch /Applications/ruum.app /Applications/ruum.app/Contents/Info.plist || true
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/ruum.app >/dev/null 2>&1 || true

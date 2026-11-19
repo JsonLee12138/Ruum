@@ -29,6 +29,7 @@ mod ui;
 mod views;
 mod watchdog_runtime;
 mod widgets;
+mod window_chrome;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -46,13 +47,20 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use gpui_kit::{
-    App, AppContext as _, FocusHandle, Global, IntoElement, Pixels, Render,
-    Size, Window, WindowHandle, WindowOptions, px, size,
+    App, AppContext as _, AssetSource, FocusHandle, Global, IntoElement,
+    Pixels, Render, SharedString, Size, WeakEntity, Window, WindowHandle,
+    WindowOptions, px, size,
 };
 use ruum_core::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmRequest,
     RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
 };
+use ruum_core::docker_adapter::{DockerEnv, DockerFactory, DockerProbeStatus};
+use ruum_core::export::{
+    RemoteCleanupScriptSpec, build_remote_cleanup_script,
+    write_cleanup_script_atomic,
+};
+use ruum_core::removal::Target;
 use ruum_core::scan::ScanOptions;
 use ruum_core::storage::StorageDb;
 use state::{CleanupConfirmModal, RemoteConnectConfirmModal, Ruum, Screen};
@@ -64,6 +72,28 @@ pub(crate) fn resolve_cli_exe() -> PathBuf {
         .ok()
         .and_then(|exe| ruum_core::cli_install::resolve_cli_binary(&exe).ok())
         .unwrap_or_else(|| PathBuf::from("ruum"))
+}
+
+gpui_kit::assets::icon_assets!(ExtraIconAssets, [Container]);
+
+struct RuumAssets;
+
+impl AssetSource for RuumAssets {
+    fn load(
+        &self,
+        path: &str,
+    ) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(bytes) = ExtraIconAssets.load(path)? {
+            return Ok(Some(bytes));
+        }
+        gpui_kit::assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut items = ExtraIconAssets.list(path)?;
+        items.extend(gpui_kit::assets::Assets.list(path)?);
+        Ok(items)
+    }
 }
 
 /// What the GUI command line asked for.
@@ -159,7 +189,7 @@ fn run() -> Result<()> {
         initial_screen: args.initial_screen,
     };
 
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(RuumAssets);
     app.on_reopen(|cx| {
         open_or_navigate_main_window(None, cx);
     });
@@ -186,8 +216,11 @@ fn run() -> Result<()> {
             .and_then(|db| db.watchdog().ok())
             .and_then(|svc| svc.load_config().ok())
             .unwrap_or_default();
+        let shared_cred_store =
+            ruum_core::credentials::LazyCredentialStore::open_default().ok();
         cx.set_global(AppRuntime {
             launch,
+            cred_store: shared_cred_store.clone(),
             main_window: None,
             confirm_window: None,
             remote_connect_window: None,
@@ -203,12 +236,28 @@ fn run() -> Result<()> {
             service_sync_in_flight: false,
             watchdog_config: initial_watchdog_config,
         });
+        if !cfg!(test)
+            && let Some(store) = shared_cred_store
+        {
+            let db_path = ruum_watchdog::ruum_db_path();
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = preload_credentials_if_needed(
+                        db_path.as_deref(),
+                        &store,
+                    );
+                })
+                .detach();
+        }
 
         cx.on_action(|_: &app_menu::OpenExplore, cx| {
             open_or_navigate_main_window(Some(Screen::Explore), cx);
         });
-        cx.on_action(|_: &app_menu::OpenSources, cx| {
-            open_or_navigate_main_window(Some(Screen::Sources), cx);
+        cx.on_action(|_: &app_menu::OpenDocker, cx| {
+            open_or_navigate_main_window(Some(Screen::Docker), cx);
+        });
+        cx.on_action(|_: &app_menu::OpenRemote, cx| {
+            open_or_navigate_main_window(Some(Screen::Remote), cx);
         });
         cx.on_action(|_: &app_menu::OpenWatchdog, cx| {
             open_or_navigate_main_window(Some(Screen::Watchdog), cx);
@@ -299,9 +348,26 @@ pub struct CleanupConfirmWindow {
     pub db_path: Option<PathBuf>,
     pub remote_session: Option<Arc<ruum_core::ssh_session::SshSession>>,
     pub remote_header: Option<ruum_core::remote::Header>,
+    pub docker: DockerProbeStatus,
 }
 
 impl CleanupConfirmWindow {
+    /// Close request from the client-side titlebar: must go through
+    /// `cancel` so the waiting requester is answered; only a dead entity
+    /// falls back to removing the window outright.
+    pub fn close_from_chrome(
+        entity: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if entity
+            .update(cx, |this, cx| this.cancel(window, cx))
+            .is_err()
+        {
+            window.remove_window();
+        }
+    }
+
     pub fn new(
         request: CleanupConfirmRequest,
         responder: Option<Sender<CleanupConfirmDecision>>,
@@ -318,6 +384,7 @@ impl CleanupConfirmWindow {
             db_path: None,
             remote_session: None,
             remote_header: None,
+            docker: DockerProbeStatus::default(),
         }
     }
 
@@ -327,11 +394,13 @@ impl CleanupConfirmWindow {
         remote_profile_id: Option<String>,
         remote_session: Option<Arc<ruum_core::ssh_session::SshSession>>,
         remote_header: Option<ruum_core::remote::Header>,
+        docker: DockerProbeStatus,
     ) {
         self.db_path = db_path;
         self.modal.remote_profile_id = remote_profile_id;
         self.remote_session = remote_session;
         self.remote_header = remote_header;
+        self.docker = docker;
     }
 
     #[cfg(test)]
@@ -353,6 +422,7 @@ impl CleanupConfirmWindow {
         self.db_path = None;
         self.remote_session = None;
         self.remote_header = None;
+        self.docker = DockerProbeStatus::default();
         cx.notify();
     }
 
@@ -393,192 +463,56 @@ impl CleanupConfirmWindow {
         let confirm_only = self.confirm_only;
         let locale = self.locale;
         let mut sync_fallback_notif: Option<(String, String)> = None;
-        if let CleanupConfirmDecision::Confirmed { selected_paths } = decision
-            && !selected_paths.is_empty()
+        if let CleanupConfirmDecision::Confirmed {
+            selected_paths,
+            selected_docker_targets,
+        } = decision
+            && (!selected_paths.is_empty()
+                || !selected_docker_targets.is_empty())
         {
-            let selected_count = selected_paths.len();
-            let started_title =
-                i18n::messages::cleanup_started_notif_title(locale);
-            let started_body = i18n::messages::cleanup_started_notif_body(
-                selected_count,
-                selected_bytes,
-                locale,
-            );
-            if confirm_only
-                && !cfg!(test)
-                && !notifications::has_native_notification_identity()
+            if is_in_app
+                && let Some(profile_id) = self.modal.remote_profile_id.clone()
             {
-                sync_fallback_notif =
-                    Some((started_title.to_owned(), started_body));
-            } else {
-                post_app_notification(
-                    ruum_core::watchdog::NOTIF_TAG_CLEANUP_STARTED,
-                    started_title,
-                    &started_body,
+                self.confirm_remote_script(
+                    profile_id,
+                    &selected_paths,
+                    selected_docker_targets,
+                    selected_bytes,
                     cx,
                 );
-            }
-            if is_in_app {
-                update_open_main_window(cx, |app, cx| {
-                    let msg = i18n::messages::cleanup_started_notif_body(
+            } else {
+                let selected_count =
+                    selected_paths.len() + selected_docker_targets.len();
+                let started_title =
+                    i18n::messages::cleanup_started_notif_title(locale);
+                let started_body = i18n::messages::cleanup_started_notif_body(
+                    selected_count,
+                    selected_bytes,
+                    locale,
+                );
+                if confirm_only
+                    && !cfg!(test)
+                    && !notifications::has_native_notification_identity()
+                {
+                    sync_fallback_notif =
+                        Some((started_title.to_owned(), started_body));
+                } else {
+                    post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_CLEANUP_STARTED,
+                        started_title,
+                        &started_body,
+                        cx,
+                    );
+                }
+                if is_in_app {
+                    self.confirm_local_cleanup(
+                        &selected_paths,
+                        selected_docker_targets,
                         selected_count,
                         selected_bytes,
-                        app.locale,
+                        locale,
+                        cx,
                     );
-                    app.push_toast(msg, gpui_omarchy::Status::Neutral, cx);
-                });
-                let approved_items: Vec<
-                    ruum_core::watchdog_config::ProposalItem,
-                > = self
-                    .modal
-                    .request
-                    .items
-                    .iter()
-                    .filter(|i| selected_paths.contains(&i.path))
-                    .map(|i| {
-                        ruum_core::watchdog_config::ProposalItem::new(
-                            i.path.clone(),
-                            i.bytes,
-                            i.mode,
-                            i.reason.clone(),
-                            i.git_warning.clone(),
-                        )
-                    })
-                    .collect();
-                if !approved_items.is_empty() {
-                    if self.modal.remote_profile_id.is_some()
-                        && let (Some(session), Some(header)) = (
-                            self.remote_session.clone(),
-                            self.remote_header.clone(),
-                        )
-                    {
-                        let targets: Vec<ruum_core::removal::Target> =
-                            approved_items
-                                .iter()
-                                .map(|item| ruum_core::removal::Target {
-                                    path: item.path.clone(),
-                                    bytes: item.bytes,
-                                    is_dir: false,
-                                    hidden: item.path.file_name().is_some_and(
-                                        |n| {
-                                            n.to_string_lossy().starts_with('.')
-                                        },
-                                    ),
-                                })
-                                .collect();
-                        let count = targets.len();
-                        let bytes: u64 = targets.iter().map(|t| t.bytes).sum();
-                        let task = cx.background_executor().spawn(async move {
-                            ruum_core::remote_trash::execute_remote_trash_with_session(
-                                &session, &targets, &header,
-                            )
-                            .map_err(|err| err.to_string())
-                        });
-                        cx.spawn(async move |_, cx| {
-                            let res = task.await;
-                            cx.update(|cx| match res {
-                                Ok(()) => {
-                                    let summary =
-                                        i18n::messages::cleaned_items_summary(
-                                            count, bytes, locale,
-                                        );
-                                    if count > 0 {
-                                        post_app_notification(
-                                            ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
-                                            i18n::messages::cleanup_complete_notif_title(
-                                                locale,
-                                            ),
-                                            &summary,
-                                            cx,
-                                        );
-                                    }
-                                    update_open_main_window(cx, |app, cx| {
-                                        app.push_toast(
-                                            i18n::messages::cleaned_items_summary(
-                                                count, bytes, app.locale,
-                                            ),
-                                            gpui_omarchy::Status::Success,
-                                            cx,
-                                        );
-                                    });
-                                }
-                                Err(err) => {
-                                    update_open_main_window(cx, |app, cx| {
-                                        app.push_toast(
-                                            i18n::messages::ssh_remote_cleanup_failed(
-                                                &err, app.locale,
-                                            ),
-                                            gpui_omarchy::Status::Error,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            });
-                        })
-                        .detach();
-                    } else {
-                        let root = self.modal.request.root.clone();
-                        let db_path = self.db_path.clone();
-                        let task = cx.background_executor().spawn(async move {
-                            let (bytes, count, cleaned_paths) =
-                                ruum_core::watchdog::execute_confirmed_cleanup_tracked(
-                                    &approved_items,
-                                    &root,
-                                );
-                            let mut pruned_paths = cleaned_paths;
-                            for item in &approved_items {
-                                if !item.path.exists()
-                                    && !pruned_paths.contains(&item.path)
-                                {
-                                    pruned_paths.push(item.path.clone());
-                                }
-                            }
-                            if !pruned_paths.is_empty()
-                                && let Some(path) = db_path.as_deref()
-                                && let Ok(db) =
-                                    ruum_core::storage::StorageDb::open(path)
-                            {
-                                let now_secs = now_unix_secs();
-                                let _ = db.prune_ai_state_paths(
-                                    &pruned_paths,
-                                    now_secs,
-                                );
-                            }
-                            (bytes, count, pruned_paths)
-                        });
-                        cx.spawn(async move |_, cx| {
-                            let (bytes, count, pruned_paths) = task.await;
-                            let summary =
-                                i18n::messages::cleaned_items_summary(
-                                    count, bytes, locale,
-                                );
-                            cx.update(|cx| {
-                                if count > 0 {
-                                    post_app_notification(
-                                        ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
-                                        i18n::messages::cleanup_complete_notif_title(
-                                            locale,
-                                        ),
-                                        &summary,
-                                        cx,
-                                    );
-                                }
-                                refresh_tray_status(cx);
-                                update_open_main_window(cx, |app, cx| {
-                                    app.prune_local_ai_proposal(&pruned_paths);
-                                    app.reload_watchdog_state();
-                                    app.notice = Some((
-                                        i18n::messages::cleaned_items_summary(
-                                            count, bytes, app.locale,
-                                        ),
-                                        gpui_omarchy::Status::Success,
-                                    ));
-                                    cx.notify();
-                                });
-                            });
-                        })
-                        .detach();
-                    }
                 }
             }
         }
@@ -592,6 +526,337 @@ impl CleanupConfirmWindow {
             app_menu::request_quit(cx);
         }
     }
+
+    fn confirm_remote_script(
+        &self,
+        profile_id: String,
+        selected_paths: &[PathBuf],
+        docker_targets: Vec<ruum_core::docker_adapter::DockerCleanTarget>,
+        selected_bytes: u64,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        let db = self
+            .db_path
+            .as_deref()
+            .and_then(|p| StorageDb::open(p).ok())
+            .or_else(|| StorageDb::open_default().ok());
+        let profile = db
+            .as_ref()
+            .and_then(|d| d.list_ssh_profiles().ok())
+            .and_then(|list| list.into_iter().find(|p| p.id == profile_id));
+        let session_meta = self.remote_session.as_ref().map(|s| {
+            let ep = s.endpoint();
+            (
+                ep.label().to_owned(),
+                ep.host().to_owned(),
+                ep.port(),
+                ep.username().to_owned(),
+            )
+        });
+        let (alias, host, port, username) = if let Some(p) = profile {
+            (p.alias, p.host, p.port, p.username)
+        } else if let Some((label, host, port, user)) = session_meta {
+            (label, host, port, user)
+        } else {
+            update_open_main_window(cx, |app, cx| {
+                app.push_toast(
+                    i18n::messages::script_generate_failed(
+                        "SSH profile not found in storage",
+                        app.locale,
+                    ),
+                    gpui_omarchy::Status::Error,
+                    cx,
+                );
+            });
+            return;
+        };
+
+        let targets: Vec<Target> = self
+            .modal
+            .request
+            .items
+            .iter()
+            .filter(|item| selected_paths.contains(&item.path))
+            .map(|item| {
+                let hidden = item
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'));
+                Target {
+                    path: item.path.clone(),
+                    bytes: item.bytes,
+                    is_dir: false,
+                    hidden,
+                }
+            })
+            .collect();
+        let total_count = targets.len() + docker_targets.len();
+        let header = self.remote_header.clone().unwrap_or_else(|| {
+            ruum_core::remote::Header::new(
+                self.modal.request.root.clone(),
+                None,
+                "linux",
+                None,
+            )
+        });
+        let spec = RemoteCleanupScriptSpec {
+            profile_alias: alias.clone(),
+            host,
+            port,
+            username,
+            header,
+            targets,
+            docker_targets,
+        };
+        let script_content = match build_remote_cleanup_script(&spec) {
+            Ok(content) => content,
+            Err(err) => {
+                update_open_main_window(cx, |app, cx| {
+                    app.push_toast(
+                        i18n::messages::script_generate_failed(
+                            &err, app.locale,
+                        ),
+                        gpui_omarchy::Status::Error,
+                        cx,
+                    );
+                });
+                return;
+            }
+        };
+        let Some(app_data_dir) = self
+            .db_path
+            .as_deref()
+            .and_then(|p| p.parent().filter(|d| !d.as_os_str().is_empty()))
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                db.as_ref()
+                    .and_then(|d| d.db_path().parent())
+                    .map(std::path::Path::to_path_buf)
+            })
+            .or_else(ruum_watchdog::config::config_dir)
+        else {
+            update_open_main_window(cx, |app, cx| {
+                app.push_toast(
+                    i18n::messages::script_generate_failed(
+                        "cannot resolve application data directory",
+                        app.locale,
+                    ),
+                    gpui_omarchy::Status::Error,
+                    cx,
+                );
+            });
+            return;
+        };
+        let now_secs = now_unix_secs();
+        let script_path = match write_cleanup_script_atomic(
+            &app_data_dir,
+            &alias,
+            now_secs,
+            &script_content,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let err_msg = err.to_string();
+                update_open_main_window(cx, |app, cx| {
+                    app.push_toast(
+                        i18n::messages::script_generate_failed(
+                            &err_msg, app.locale,
+                        ),
+                        gpui_omarchy::Status::Error,
+                        cx,
+                    );
+                });
+                return;
+            }
+        };
+        if let Some(d) = db {
+            let _ = d.set_ssh_profile_pending_script(
+                &profile_id,
+                &script_path,
+                total_count as u64,
+                selected_bytes,
+                now_secs,
+            );
+        }
+        update_open_main_window(cx, |app, cx| {
+            app.present_generated_remote_script(
+                profile_id,
+                alias,
+                script_path,
+                total_count,
+                selected_bytes,
+                cx,
+            );
+        });
+    }
+
+    fn confirm_local_cleanup(
+        &self,
+        selected_paths: &[PathBuf],
+        selected_docker_targets: Vec<
+            ruum_core::docker_adapter::DockerCleanTarget,
+        >,
+        selected_count: usize,
+        selected_bytes: u64,
+        locale: i18n::Locale,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) {
+        update_open_main_window(cx, |app, cx| {
+            let msg = i18n::messages::cleanup_started_notif_body(
+                selected_count,
+                selected_bytes,
+                app.locale,
+            );
+            app.push_toast(msg, gpui_omarchy::Status::Neutral, cx);
+        });
+        let approved_items: Vec<ruum_core::watchdog_config::ProposalItem> =
+            self.modal
+                .request
+                .items
+                .iter()
+                .filter(|i| selected_paths.contains(&i.path))
+                .map(|i| {
+                    ruum_core::watchdog_config::ProposalItem::new(
+                        i.path.clone(),
+                        i.bytes,
+                        i.mode,
+                        i.reason.clone(),
+                        i.git_warning.clone(),
+                    )
+                })
+                .collect();
+        if approved_items.is_empty() && selected_docker_targets.is_empty() {
+            return;
+        }
+        let root = self.modal.request.root.clone();
+        let db_path = self.db_path.clone();
+        let docker_status = self.docker.clone();
+        let docker_estimates: Vec<(
+            ruum_core::docker_adapter::DockerCleanTarget,
+            u64,
+        )> = self
+            .modal
+            .request
+            .docker_items
+            .iter()
+            .map(|i| (i.target.clone(), i.reclaimable_bytes))
+            .collect();
+        let task = cx.background_executor().spawn(async move {
+            let (mut total_bytes, mut total_count, mut pruned_paths) =
+                if approved_items.is_empty() {
+                    (0_u64, 0_usize, Vec::new())
+                } else {
+                    ruum_core::watchdog::execute_confirmed_cleanup_tracked(
+                        &approved_items,
+                        &root,
+                    )
+                };
+            for item in &approved_items {
+                if !item.path.exists() && !pruned_paths.contains(&item.path) {
+                    pruned_paths.push(item.path.clone());
+                }
+            }
+            if !pruned_paths.is_empty()
+                && let Some(path) = db_path.as_deref()
+                && let Ok(db) = StorageDb::open(path)
+            {
+                let _ = db.prune_ai_state_paths(&pruned_paths, now_unix_secs());
+            }
+            let mut docker_err: Option<String> = None;
+            let fresh_docker = if selected_docker_targets.is_empty() {
+                None
+            } else {
+                let adapter = DockerFactory::create();
+                let env = DockerEnv::current();
+                if let DockerProbeStatus::Available(summary) = docker_status {
+                    let outcomes = adapter.run_clean_targets(
+                        &env,
+                        &summary,
+                        &selected_docker_targets,
+                    );
+                    for outcome in outcomes {
+                        let est = docker_estimates
+                            .iter()
+                            .find(|(t, _)| *t == outcome.target)
+                            .map_or(0, |(_, b)| *b);
+                        match outcome.result {
+                            Ok(()) => {
+                                total_bytes = total_bytes.saturating_add(est);
+                                total_count += 1;
+                            }
+                            Err(err) if docker_err.is_none() => {
+                                docker_err = Some(err);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                } else {
+                    docker_err =
+                        Some("Docker summary unavailable for cleanup".into());
+                }
+                Some(adapter.probe(&env))
+            };
+            let fresh_space = ruum_core::space::space_info(&root).ok();
+            (
+                total_bytes,
+                total_count,
+                pruned_paths,
+                fresh_space,
+                fresh_docker,
+                docker_err,
+            )
+        });
+        cx.spawn(async move |_, cx| {
+            let (
+                bytes,
+                count,
+                pruned_paths,
+                fresh_space,
+                fresh_docker,
+                docker_err,
+            ) = task.await;
+            let summary =
+                i18n::messages::cleaned_items_summary(count, bytes, locale);
+            cx.update(|cx| {
+                if count > 0 {
+                    post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
+                        i18n::messages::cleanup_complete_notif_title(locale),
+                        &summary,
+                        cx,
+                    );
+                }
+                refresh_tray_status(cx);
+                update_open_main_window(cx, |app, cx| {
+                    app.prune_local_ai_proposal(&pruned_paths);
+                    if let Some(space) = fresh_space {
+                        app.space = Some(space);
+                    }
+                    if let Some(docker) = fresh_docker {
+                        app.apply_local_docker_status(docker);
+                    }
+                    app.reload_watchdog_state();
+                    app.notice = Some(
+                        if let Some(err) = docker_err
+                            && count == 0
+                        {
+                            (err, gpui_omarchy::Status::Error)
+                        } else {
+                            (
+                                i18n::messages::cleaned_items_summary(
+                                    count, bytes, app.locale,
+                                ),
+                                gpui_omarchy::Status::Success,
+                            )
+                        },
+                    );
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
 }
 
 impl Render for CleanupConfirmWindow {
@@ -600,11 +865,19 @@ impl Render for CleanupConfirmWindow {
         _window: &mut Window,
         cx: &mut gpui_kit::Context<'_, Self>,
     ) -> impl IntoElement {
-        rail_pages::cleanup_confirm_view(
+        let content = rail_pages::cleanup_confirm_view(
             &self.modal,
             &self.focus,
             self.locale,
             cx,
+        );
+        let entity = cx.entity().downgrade();
+        window_chrome::wrap_window_chrome(
+            i18n::messages::title_confirm_cleanup(self.locale),
+            content,
+            move |window, cx| {
+                Self::close_from_chrome(&entity, window, cx);
+            },
         )
     }
 }
@@ -624,31 +897,36 @@ pub fn open_confirm_window(
 pub fn open_local_confirm_window(
     request: CleanupConfirmRequest,
     db_path: Option<PathBuf>,
+    docker: DockerProbeStatus,
     cx: &mut App,
 ) -> Option<WindowHandle<CleanupConfirmWindow>> {
     let handle = open_confirm_window(request, None, None, cx)?;
     let _ = handle.update(cx, |win, _, _| {
-        win.set_target_context(db_path, None, None, None);
+        win.set_target_context(db_path, None, None, None, docker);
     });
     Some(handle)
 }
 
 /// Open (or update) a remote SSH AI cleanup confirmation window scoped to a
-/// specific `SshSession` and `Header` (never pruning local Watchdog state).
+/// specific `SshSession`, `Header`, and storage DB (generates cleanup script
+/// on confirm).
 pub fn open_remote_confirm_window(
     request: CleanupConfirmRequest,
     remote_profile_id: String,
     session: Arc<ruum_core::ssh_session::SshSession>,
     header: ruum_core::remote::Header,
+    db_path: Option<PathBuf>,
     cx: &mut App,
 ) -> Option<WindowHandle<CleanupConfirmWindow>> {
+    let docker = header.docker.clone();
     let handle = open_confirm_window(request, None, None, cx)?;
     let _ = handle.update(cx, |win, _, _| {
         win.set_target_context(
-            None,
+            db_path,
             Some(remote_profile_id),
             Some(session),
             Some(header),
+            docker,
         );
     });
     Some(handle)
@@ -702,11 +980,9 @@ fn open_confirm_window_with_mode(
     let window = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(gpui_kit::WindowBounds::Windowed(
-                    gpui_kit::Bounds::new(
-                        gpui_kit::point(px(200.), px(150.)),
-                        size(px(760.), px(560.)),
-                    ),
+                window_bounds: Some(gpui_kit::WindowBounds::centered(
+                    size(px(760.), px(560.)),
+                    cx,
                 )),
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some(
@@ -725,6 +1001,7 @@ fn open_confirm_window_with_mode(
                 if native_look {
                     appearance::follow(window);
                 }
+                window_chrome::observe_window_chrome(window);
                 let entity = cx.new(|cx| {
                     CleanupConfirmWindow::new(
                         request,
@@ -771,6 +1048,19 @@ pub struct RemoteConnectConfirmWindow {
 }
 
 impl RemoteConnectConfirmWindow {
+    /// Close request from the client-side titlebar: must go through
+    /// `deny` so the waiting requester is answered; only a dead entity
+    /// falls back to removing the window outright.
+    pub fn close_from_chrome(
+        entity: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if entity.update(cx, |this, cx| this.deny(window, cx)).is_err() {
+            window.remove_window();
+        }
+    }
+
     pub fn new(
         request: RemoteConnectConfirmRequest,
         responder: Option<Sender<RemoteConnectConfirmDecision>>,
@@ -850,11 +1140,19 @@ impl Render for RemoteConnectConfirmWindow {
         _window: &mut Window,
         cx: &mut gpui_kit::Context<'_, Self>,
     ) -> impl IntoElement {
-        rail_pages::remote_connect_confirm_view(
+        let content = rail_pages::remote_connect_confirm_view(
             &self.modal,
             &self.focus,
             self.locale,
             cx,
+        );
+        let entity = cx.entity().downgrade();
+        window_chrome::wrap_window_chrome(
+            i18n::messages::title_confirm_remote_connect(self.locale),
+            content,
+            move |window, cx| {
+                Self::close_from_chrome(&entity, window, cx);
+            },
         )
     }
 }
@@ -907,11 +1205,9 @@ pub(crate) fn open_remote_connect_confirm_window_with_mode(
     let window = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(gpui_kit::WindowBounds::Windowed(
-                    gpui_kit::Bounds::new(
-                        gpui_kit::point(px(240.), px(180.)),
-                        size(px(560.), px(380.)),
-                    ),
+                window_bounds: Some(gpui_kit::WindowBounds::centered(
+                    size(px(560.), px(380.)),
+                    cx,
                 )),
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some(
@@ -930,6 +1226,7 @@ pub(crate) fn open_remote_connect_confirm_window_with_mode(
                 if native_look {
                     appearance::follow(window);
                 }
+                window_chrome::observe_window_chrome(window);
                 let entity = cx.new(|cx| {
                     RemoteConnectConfirmWindow::new(
                         request,
@@ -1033,6 +1330,7 @@ type NotificationChannelPayload = (String, String, String);
 #[derive(Debug)]
 pub(crate) struct AppRuntime {
     launch: LaunchConfig,
+    pub(crate) cred_store: Option<ruum_core::credentials::LazyCredentialStore>,
     pub(crate) main_window: Option<WindowHandle<Ruum>>,
     confirm_window: Option<WindowHandle<CleanupConfirmWindow>>,
     remote_connect_window: Option<WindowHandle<RemoteConnectConfirmWindow>>,
@@ -1076,6 +1374,7 @@ pub(crate) fn install_test_runtime(
             native_look: false,
             initial_screen: None,
         },
+        cred_store: None,
         main_window,
         confirm_window: None,
         remote_connect_window: None,
@@ -1172,15 +1471,53 @@ impl ruum_core::watchdog::NotificationAdapter for InProcessNotificationAdapter {
     }
 }
 
-/// Compute initial main window dimensions (60% of primary display, minimum
-/// 800x600), falling back to a 1440x900 screen when no display is reported.
+/// Default main window size (`1440×900`, centered on the primary display).
+pub(crate) const DEFAULT_MAIN_WINDOW_SIZE: Size<Pixels> =
+    size(px(1440.), px(900.));
+
+/// Minimum main window size (`900×600`).
+pub(crate) const MIN_MAIN_WINDOW_SIZE: Size<Pixels> = size(px(900.), px(600.));
+
+/// Pre-authorize the process-shared credential store once in the background
+/// when an existing `ruum.db` has saved SSH profiles and
+/// `device-credentials.enc` already exists on disk. Never creates an empty DB.
+pub(crate) fn preload_credentials_if_needed(
+    db_path: Option<&std::path::Path>,
+    store: &ruum_core::credentials::LazyCredentialStore,
+) -> Result<bool, String> {
+    if store.is_loaded() || !store.has_encrypted_file() {
+        return Ok(false);
+    }
+    let Some(path) = db_path.filter(|p| p.is_file()) else {
+        return Ok(false);
+    };
+    let db = StorageDb::open(path).map_err(|err| err.to_string())?;
+    let profiles = db.list_ssh_profiles().map_err(|err| err.to_string())?;
+    if profiles.is_empty() {
+        return Ok(false);
+    }
+    store.preload()
+}
+
+/// Compute initial main window dimensions (default 1440x900, clamped to the
+/// primary display and at least 900x600).
 #[must_use]
 pub(crate) fn initial_main_window_size(
     screen_size: Option<Size<Pixels>>,
 ) -> Size<Pixels> {
-    let screen = screen_size.unwrap_or_else(|| size(px(1440.), px(900.)));
-    let width = (screen.width.as_f32() * 0.6).round().max(800.0);
-    let height = (screen.height.as_f32() * 0.6).round().max(600.0);
+    let Some(screen) = screen_size else {
+        return DEFAULT_MAIN_WINDOW_SIZE;
+    };
+    let width = screen
+        .width
+        .as_f32()
+        .min(DEFAULT_MAIN_WINDOW_SIZE.width.as_f32())
+        .max(MIN_MAIN_WINDOW_SIZE.width.as_f32());
+    let height = screen
+        .height
+        .as_f32()
+        .min(DEFAULT_MAIN_WINDOW_SIZE.height.as_f32())
+        .max(MIN_MAIN_WINDOW_SIZE.height.as_f32());
     size(px(width), px(height))
 }
 
@@ -1188,11 +1525,12 @@ fn open_main_window(
     cx: &mut App,
     title_root_override: Option<PathBuf>,
 ) -> WindowHandle<Ruum> {
-    let launch = cx
-        .try_global::<AppRuntime>()
-        .expect("AppRuntime installed before opening main window")
-        .launch
-        .clone();
+    let (launch, shared_cred_store) = {
+        let rt = cx
+            .try_global::<AppRuntime>()
+            .expect("AppRuntime installed before opening main window");
+        (rt.launch.clone(), rt.cred_store.clone())
+    };
     let home = std::env::home_dir();
     let title_root = title_root_override.unwrap_or_else(|| launch.root.clone());
     let native_look = launch.native_look;
@@ -1229,37 +1567,37 @@ fn open_main_window(
                 // and the desktop entry's StartupWMClass and the documented
                 // window rule both match `ruum`.
                 app_id: Some("ruum".to_owned()),
-                window_min_size: Some(size(px(800.), px(600.))),
+                window_min_size: Some(MIN_MAIN_WINDOW_SIZE),
                 ..Default::default()
             },
             move |window, cx| {
                 if native_look {
                     appearance::follow(window);
                 }
+                window_chrome::observe_window_chrome(window);
                 cx.new(|cx| {
                     let mut app = if launch.choose_root {
-                        Ruum::choose(
+                        Ruum::choose_with_cred_store(
                             launch.options,
                             launch.depth,
                             launch.remote,
+                            shared_cred_store,
                             cx,
                         )
                     } else {
-                        Ruum::open(
+                        Ruum::open_with_cred_store(
                             launch.root,
                             launch.options,
                             launch.depth,
                             launch.remote,
                             launch.remote_disk,
+                            shared_cred_store,
                             cx,
                         )
                     };
                     app.power_choice = launch.power;
                     if let Some(screen) = launch.initial_screen {
-                        app.navigate_rail(screen, cx);
-                        if screen == Screen::Watchdog {
-                            app.reload_watchdog_state();
-                        }
+                        app.apply_target_screen(screen, cx);
                     }
                     app
                 })
@@ -1285,6 +1623,13 @@ pub(crate) fn install_notification_handler(cx: &App) {
     cx.on_system_notification_response(|response, cx| {
         handle_notification_response(&response, cx);
     });
+    if !cfg!(test) {
+        cx.background_executor()
+            .spawn(async {
+                let _ = ruum_core::notify::sync_notification_icon();
+            })
+            .detach();
+    }
 }
 
 #[must_use]
@@ -1339,7 +1684,10 @@ pub(crate) fn post_app_notification(
         .detach();
 }
 
-fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
+pub(crate) fn open_or_navigate_main_window(
+    target: Option<Screen>,
+    cx: &mut App,
+) {
     let windows = cx.windows();
     let existing = cx
         .try_global::<AppRuntime>()
@@ -1349,10 +1697,7 @@ fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
     if let Some(handle) = existing {
         let _ = handle.update(cx, |app, window, cx| {
             if let Some(screen) = target {
-                app.navigate_rail(screen, cx);
-                if screen == Screen::Watchdog {
-                    app.reload_watchdog_state();
-                }
+                app.apply_target_screen(screen, cx);
             }
             let focus = app.focus.clone();
             window.focus(&focus, cx);
@@ -1365,10 +1710,7 @@ fn open_or_navigate_main_window(target: Option<Screen>, cx: &mut App) {
     let window = open_main_window(cx, None);
     if let Some(screen) = target {
         let _ = window.update(cx, |app, window, cx| {
-            app.navigate_rail(screen, cx);
-            if screen == Screen::Watchdog {
-                app.reload_watchdog_state();
-            }
+            app.apply_target_screen(screen, cx);
             let focus = app.focus.clone();
             window.focus(&focus, cx);
             window.activate_window();
@@ -1407,8 +1749,8 @@ fn drain_tray_actions(cx: &mut App) {
             tray_menu::TrayAction::OpenRuum => {
                 open_or_navigate_main_window(None, cx);
             }
-            tray_menu::TrayAction::OpenSources => {
-                open_or_navigate_main_window(Some(Screen::Sources), cx);
+            tray_menu::TrayAction::OpenRemote => {
+                open_or_navigate_main_window(Some(Screen::Remote), cx);
             }
             tray_menu::TrayAction::OpenWatchdog => {
                 open_or_navigate_main_window(Some(Screen::Watchdog), cx);
@@ -1643,7 +1985,8 @@ fn trigger_background_ai_analysis(cx: &mut App) {
             ruum_core::storage::AiState::from_proposal(&proposal, now_secs)
                 .unwrap_or_default();
         let _ = db.save_ai_state(&ai_state);
-        Ok::<_, std::io::Error>((home, proposal))
+        let docker = DockerFactory::create().probe(&DockerEnv::current());
+        Ok::<_, std::io::Error>((home, proposal, docker))
     });
 
     cx.spawn(async move |cx| {
@@ -1659,8 +2002,13 @@ fn trigger_background_ai_analysis(cx: &mut App) {
             refresh_tray_status(cx);
             let locale = i18n::Locale::current();
             match res {
-                Ok((home, proposal)) => {
-                    if proposal.items.is_empty() {
+                Ok((home, proposal, docker)) => {
+                    let request = state::proposal_confirm_request_with_docker(
+                        home, &proposal, &docker, locale,
+                    );
+                    if request.items.is_empty()
+                        && request.docker_items.is_empty()
+                    {
                         post_app_notification(
                             ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
                             i18n::messages::ai_analysis_notif_title(locale),
@@ -1668,13 +2016,10 @@ fn trigger_background_ai_analysis(cx: &mut App) {
                             cx,
                         );
                     } else {
-                        let request = state::proposal_confirm_request(
-                            home, &proposal, locale,
-                        );
                         let db_path = StorageDb::open_default()
                             .ok()
                             .map(|db| db.db_path().to_path_buf());
-                        open_local_confirm_window(request, db_path, cx);
+                        open_local_confirm_window(request, db_path, docker, cx);
                     }
                 }
                 Err(err) => {
@@ -1697,7 +2042,9 @@ fn review_latest_proposal_from_tray(cx: &mut App) {
     let proposal = db
         .and_then(|db| db.load_ai_state().ok())
         .and_then(|s| s.parse_proposal().ok().flatten());
-    let Some(prop) = proposal.filter(|p| !p.items.is_empty()) else {
+    let Some(prop) = proposal
+        .filter(|p| !p.items.is_empty() || !p.docker_targets.is_empty())
+    else {
         open_or_navigate_main_window(Some(Screen::Watchdog), cx);
         return;
     };
@@ -1707,9 +2054,18 @@ fn review_latest_proposal_from_tray(cx: &mut App) {
         open_or_navigate_main_window(Some(Screen::Watchdog), cx);
         return;
     };
-    let request =
-        state::proposal_confirm_request(home, &prop, i18n::Locale::current());
-    open_local_confirm_window(request, db_path, cx);
+    let docker = DockerFactory::create().probe(&DockerEnv::current());
+    let request = state::proposal_confirm_request_with_docker(
+        home,
+        &prop,
+        &docker,
+        i18n::Locale::current(),
+    );
+    if request.items.is_empty() && request.docker_items.is_empty() {
+        open_or_navigate_main_window(Some(Screen::Watchdog), cx);
+        return;
+    }
+    open_local_confirm_window(request, db_path, docker, cx);
 }
 
 fn now_unix_secs() -> u64 {
@@ -1938,11 +2294,13 @@ pub(crate) fn parse_gui_args(
 fn parse_open_screen(value: &str) -> Result<Screen> {
     match value {
         "explore" => Ok(Screen::Explore),
-        "sources" => Ok(Screen::Sources),
+        "docker" => Ok(Screen::Docker),
+        "remote" | "sources" => Ok(Screen::Remote),
         "watchdog" => Ok(Screen::Watchdog),
         "settings" => Ok(Screen::Settings),
         other => anyhow::bail!(
-            "unknown screen {other}; try explore, sources, watchdog, or settings"
+            "unknown screen {other}; try explore, docker, remote, watchdog, \
+             or settings"
         ),
     }
 }
@@ -1969,7 +2327,7 @@ fn parse_gui_args_with_power(
             "--open-screen" => {
                 let value = text(
                     args.next(),
-                    "--open-screen needs a screen (explore, sources, \
+                    "--open-screen needs a screen (explore, docker, remote, \
                      watchdog, settings)",
                 )?;
                 initial_screen = Some(parse_open_screen(&value)?);
@@ -2174,10 +2532,22 @@ mod argument_tests {
             Some(Screen::Explore)
         );
         assert_eq!(
+            parse_gui_args(arguments(&["--open-screen", "docker"]))
+                .unwrap()
+                .initial_screen,
+            Some(Screen::Docker)
+        );
+        assert_eq!(
+            parse_gui_args(arguments(&["--open-screen", "remote"]))
+                .unwrap()
+                .initial_screen,
+            Some(Screen::Remote)
+        );
+        assert_eq!(
             parse_gui_args(arguments(&["--open-screen", "sources"]))
                 .unwrap()
                 .initial_screen,
-            Some(Screen::Sources)
+            Some(Screen::Remote)
         );
         assert_eq!(
             parse_gui_args(arguments(&["--open-screen", "watchdog"]))
@@ -2221,5 +2591,23 @@ mod argument_tests {
             None
         );
         assert_eq!(target_screen_for_notification_tag("ruum.other"), None);
+    }
+
+    #[test]
+    fn ruum_assets_provides_container_and_default_icons() {
+        use gpui_kit::assets::IconName;
+
+        assert!(
+            RuumAssets
+                .load(IconName::Container.path().as_ref())
+                .expect("container icon lookup")
+                .is_some()
+        );
+        assert!(
+            RuumAssets
+                .load(IconName::Folder.path().as_ref())
+                .expect("default folder icon lookup")
+                .is_some()
+        );
     }
 }

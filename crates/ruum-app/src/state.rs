@@ -25,9 +25,18 @@ use ruum_core::cli_install::{
 };
 use ruum_core::confirm::{
     CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
-    RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
+    DockerConfirmItem, RemoteConnectConfirmDecision,
+    RemoteConnectConfirmRequest,
 };
 use ruum_core::credentials::LazyCredentialStore;
+use ruum_core::docker_adapter::{
+    DockerCleanOutcome, DockerCleanTarget, DockerEnv, DockerFactory,
+    DockerProbeStatus, validate_targets_against_summary,
+};
+use ruum_core::export::{
+    RemoteCleanupScriptSpec, build_remote_cleanup_script,
+    write_cleanup_script_atomic,
+};
 use ruum_core::filter::{Keep, Matches, filter};
 use ruum_core::insights::{Candidate, worth_a_look};
 use ruum_core::removal::{
@@ -41,6 +50,9 @@ use ruum_core::storage::{
     AiConfig, AppSettings, AuthMode, SshProfile, StorageDb, WebhookConfig,
     WebhookEndpoint,
 };
+use ruum_core::terminal_launcher::{TerminalEnv, TerminalFactory};
+#[cfg(test)]
+use ruum_core::terminal_launcher::{TerminalLaunchPlan, TerminalOs};
 use ruum_core::tree::{Metric, Node, path_of};
 use ruum_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
@@ -48,7 +60,7 @@ use ruum_core::treemap::{
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::{AiCliProvider, CleanupProposal};
 use ruum_watchdog::{MIN_COOLDOWN_SECS, WatchdogConfig, WatchdogState};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use crate::git::GitState;
 
@@ -125,8 +137,11 @@ pub enum Screen {
     /// Walk the treemap and mark what should go.
     #[default]
     Explore,
-    /// Choose a local mount or remote SSH source and root.
-    Sources,
+    /// Dedicated Docker workspace for inspecting and cleaning images,
+    /// containers, and build cache.
+    Docker,
+    /// Manage saved remote SSH server configurations.
+    Remote,
     /// Volume free space monitor and AI cleanup proposals.
     Watchdog,
     /// Application preferences and watchdog configuration.
@@ -344,11 +359,31 @@ pub struct RunSummary {
     pub failed: usize,
 }
 
+/// Category grouping for Docker cleanup checkboxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockerGroupKind {
+    BuildCache,
+    Images,
+    Containers,
+}
+
+/// Interactive dialog state shown after generating a deterministic remote
+/// cleanup script.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedScriptDialog {
+    pub profile_id: String,
+    pub alias: String,
+    pub script_path: PathBuf,
+    pub item_count: usize,
+    pub reclaim_bytes: u64,
+}
+
 /// Interactive modal state holding proposed items for user review and confirmation.
 #[derive(Debug)]
 pub struct CleanupConfirmModal {
     pub request: CleanupConfirmRequest,
     pub checked_paths: BTreeSet<PathBuf>,
+    pub checked_docker_targets: HashSet<DockerCleanTarget>,
     pub responder: Option<std::sync::mpsc::Sender<CleanupConfirmDecision>>,
     pub response_file: Option<PathBuf>,
     pub remote_profile_id: Option<String>,
@@ -356,7 +391,8 @@ pub struct CleanupConfirmModal {
 }
 
 impl CleanupConfirmModal {
-    /// Create a new modal with all candidate paths checked by default.
+    /// Create a new modal with candidate paths and default-checked Docker items
+    /// selected.
     #[must_use]
     pub fn new(
         request: CleanupConfirmRequest,
@@ -367,9 +403,16 @@ impl CleanupConfirmModal {
         for item in &request.items {
             checked_paths.insert(item.path.clone());
         }
+        let mut checked_docker_targets = HashSet::new();
+        for item in &request.docker_items {
+            if item.default_checked {
+                checked_docker_targets.insert(item.target.clone());
+            }
+        }
         Self {
             request,
             checked_paths,
+            checked_docker_targets,
             responder,
             response_file,
             remote_profile_id: None,
@@ -397,29 +440,85 @@ impl CleanupConfirmModal {
         }
     }
 
+    #[must_use]
+    pub fn is_docker_checked(&self, target: &DockerCleanTarget) -> bool {
+        self.checked_docker_targets.contains(target)
+    }
+
+    pub fn toggle_docker_target(&mut self, target: &DockerCleanTarget) {
+        if self.checked_docker_targets.contains(target) {
+            self.checked_docker_targets.remove(target);
+        } else {
+            self.checked_docker_targets.insert(target.clone());
+        }
+    }
+
+    pub fn toggle_docker_group(&mut self, group: DockerGroupKind) {
+        let targets: Vec<DockerCleanTarget> = self
+            .request
+            .docker_items
+            .iter()
+            .filter(|i| docker_target_matches_group(&i.target, group))
+            .map(|i| i.target.clone())
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let all_checked = targets
+            .iter()
+            .all(|t| self.checked_docker_targets.contains(t));
+        if all_checked {
+            for t in &targets {
+                self.checked_docker_targets.remove(t);
+            }
+        } else {
+            for t in targets {
+                self.checked_docker_targets.insert(t);
+            }
+        }
+    }
+
     pub fn select_all(&mut self) {
         for item in &self.request.items {
             self.checked_paths.insert(item.path.clone());
+        }
+        for item in &self.request.docker_items {
+            self.checked_docker_targets.insert(item.target.clone());
         }
     }
 
     pub fn select_none(&mut self) {
         self.checked_paths.clear();
+        self.checked_docker_targets.clear();
+    }
+
+    #[must_use]
+    pub const fn total_count(&self) -> usize {
+        self.request.items.len() + self.request.docker_items.len()
     }
 
     #[must_use]
     pub fn selected_count(&self) -> usize {
-        self.checked_paths.len()
+        self.checked_paths.len() + self.checked_docker_targets.len()
     }
 
     #[must_use]
     pub fn selected_bytes(&self) -> u64 {
-        self.request
+        let file_bytes: u64 = self
+            .request
             .items
             .iter()
             .filter(|i| self.checked_paths.contains(&i.path))
             .map(|i| i.bytes)
-            .sum()
+            .sum();
+        let docker_bytes: u64 = self
+            .request
+            .docker_items
+            .iter()
+            .filter(|i| self.checked_docker_targets.contains(&i.target))
+            .map(|i| i.reclaimable_bytes)
+            .sum();
+        file_bytes.saturating_add(docker_bytes)
     }
 
     pub fn confirm(&mut self) -> CleanupConfirmDecision {
@@ -431,7 +530,17 @@ impl CleanupConfirmModal {
             .filter(|i| self.checked_paths.contains(&i.path))
             .map(|i| i.path.clone())
             .collect();
-        let decision = CleanupConfirmDecision::Confirmed { selected_paths };
+        let selected_docker_targets: Vec<DockerCleanTarget> = self
+            .request
+            .docker_items
+            .iter()
+            .filter(|i| self.checked_docker_targets.contains(&i.target))
+            .map(|i| i.target.clone())
+            .collect();
+        let decision = CleanupConfirmDecision::Confirmed {
+            selected_paths,
+            selected_docker_targets,
+        };
         if let Some(resp) = self.responder.take() {
             let _ = resp.send(decision.clone());
         }
@@ -468,10 +577,273 @@ impl Drop for CleanupConfirmModal {
     }
 }
 
+#[must_use]
+pub const fn docker_target_matches_group(
+    target: &DockerCleanTarget,
+    group: DockerGroupKind,
+) -> bool {
+    matches!(
+        (target, group),
+        (DockerCleanTarget::BuildCache, DockerGroupKind::BuildCache)
+            | (DockerCleanTarget::Image { .. }, DockerGroupKind::Images)
+            | (
+                DockerCleanTarget::Container { .. },
+                DockerGroupKind::Containers
+            )
+    )
+}
+
+#[must_use]
+pub fn docker_short_id(id: &str) -> String {
+    id.strip_prefix("sha256:")
+        .unwrap_or(id)
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn sync_docker_defaults_for(
+    docker: &DockerProbeStatus,
+    checked: &mut HashSet<DockerCleanTarget>,
+    initialized: &mut bool,
+    locale: crate::i18n::Locale,
+) {
+    let (items, _) = build_docker_confirm_items(docker, &[], locale);
+    checked.clear();
+    for item in items {
+        if item.default_checked {
+            checked.insert(item.target);
+        }
+    }
+    *initialized = true;
+}
+
+fn toggle_docker_target_in(
+    checked: &mut HashSet<DockerCleanTarget>,
+    target: &DockerCleanTarget,
+) {
+    if checked.contains(target) {
+        checked.remove(target);
+    } else {
+        checked.insert(target.clone());
+    }
+}
+
+fn select_all_docker_in(
+    docker: &DockerProbeStatus,
+    checked: &mut HashSet<DockerCleanTarget>,
+    locale: crate::i18n::Locale,
+) {
+    let (items, _) = build_docker_confirm_items(docker, &[], locale);
+    for item in items {
+        checked.insert(item.target);
+    }
+}
+
+fn toggle_docker_group_in(
+    docker: &DockerProbeStatus,
+    checked: &mut HashSet<DockerCleanTarget>,
+    group: DockerGroupKind,
+    locale: crate::i18n::Locale,
+) {
+    let (items, _) = build_docker_confirm_items(docker, &[], locale);
+    let targets: Vec<DockerCleanTarget> = items
+        .into_iter()
+        .filter(|i| docker_target_matches_group(&i.target, group))
+        .map(|i| i.target)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let all_checked = targets.iter().all(|t| checked.contains(t));
+    if all_checked {
+        for t in &targets {
+            checked.remove(t);
+        }
+    } else {
+        for t in targets {
+            checked.insert(t);
+        }
+    }
+}
+
+fn selected_docker_targets_in(
+    docker: &DockerProbeStatus,
+    checked: &HashSet<DockerCleanTarget>,
+) -> Vec<DockerCleanTarget> {
+    let DockerProbeStatus::Available(summary) = docker else {
+        return Vec::new();
+    };
+    let requested: Vec<DockerCleanTarget> = checked.iter().cloned().collect();
+    validate_targets_against_summary(&requested, summary)
+}
+
+fn selected_docker_bytes_in(
+    docker: &DockerProbeStatus,
+    checked: &HashSet<DockerCleanTarget>,
+    locale: crate::i18n::Locale,
+) -> u64 {
+    let (items, _) = build_docker_confirm_items(docker, &[], locale);
+    items
+        .into_iter()
+        .filter(|i| checked.contains(&i.target))
+        .map(|i| i.reclaimable_bytes)
+        .sum()
+}
+
+/// Build item-level Docker confirmation checkboxes and optional permission hint
+/// from a [`DockerProbeStatus`].
+#[must_use]
+pub fn build_docker_confirm_items(
+    docker: &DockerProbeStatus,
+    ai_recommended: &[DockerCleanTarget],
+    locale: crate::i18n::Locale,
+) -> (Vec<DockerConfirmItem>, Option<String>) {
+    let summary = match docker {
+        DockerProbeStatus::Available(summary) => summary,
+        DockerProbeStatus::PermissionDenied { socket_hint } => {
+            return (Vec::new(), Some(socket_hint.clone()));
+        }
+        DockerProbeStatus::NotInstalled | DockerProbeStatus::DaemonStopped => {
+            return (Vec::new(), None);
+        }
+    };
+
+    let mut items = Vec::new();
+    let ai_reason = crate::i18n::review::docker_ai_recommended(locale);
+
+    let standalone_bc = summary
+        .build_cache_reclaimable_bytes
+        .max(summary.build_cache.reclaimable_bytes);
+    if standalone_bc > 0 || summary.build_cache_shared_bytes > 0 {
+        let target = DockerCleanTarget::BuildCache;
+        let is_ai = ai_recommended.contains(&target);
+        let reclaim_str = ruum_core::size::human_bytes(standalone_bc);
+        let shared_str = (summary.build_cache_shared_bytes > 0).then(|| {
+            ruum_core::size::human_bytes(summary.build_cache_shared_bytes)
+        });
+        items.push(DockerConfirmItem {
+            target,
+            label: crate::i18n::review::docker_build_cache_label(locale)
+                .to_owned(),
+            detail: Some(crate::i18n::pages::docker_build_cache_detail(
+                &reclaim_str,
+                shared_str.as_deref(),
+                locale,
+            )),
+            reclaimable_bytes: standalone_bc,
+            default_checked: standalone_bc > 0 || is_ai,
+            reason: is_ai.then(|| ai_reason.to_owned()),
+        });
+    }
+
+    for img in &summary.removable_images {
+        let reference = (!img.dangling
+            && !img.repository.is_empty()
+            && img.repository != "<none>"
+            && !img.tag.is_empty()
+            && img.tag != "<none>")
+            .then(|| format!("{}:{}", img.repository, img.tag));
+        let label = reference
+            .clone()
+            .unwrap_or_else(|| "<none>:<none>".to_owned());
+        let short_id = docker_short_id(&img.id);
+        let detail = if img.created_since.is_empty() {
+            Some(short_id)
+        } else {
+            Some(format!("{short_id} \u{00b7} {}", img.created_since))
+        };
+        let reclaimable_bytes = if img.unique_bytes > 0 {
+            img.unique_bytes
+        } else {
+            img.size_bytes
+        };
+        let is_ai = ai_recommended.iter().any(|t| match t {
+            DockerCleanTarget::Image {
+                id,
+                reference: target_ref,
+                ..
+            } => {
+                id == &img.id
+                    && (target_ref.is_none()
+                        || target_ref.as_deref() == reference.as_deref())
+            }
+            _ => false,
+        });
+        items.push(DockerConfirmItem {
+            target: DockerCleanTarget::Image {
+                id: img.id.clone(),
+                reference,
+                dangling: img.dangling,
+            },
+            label,
+            detail,
+            reclaimable_bytes,
+            default_checked: img.dangling || is_ai,
+            reason: is_ai.then(|| ai_reason.to_owned()),
+        });
+    }
+
+    for ctr in &summary.stopped_containers {
+        let short_id = docker_short_id(&ctr.id);
+        let label = if ctr.name.is_empty() {
+            short_id
+        } else {
+            ctr.name.clone()
+        };
+        let status_part = if ctr.status.is_empty() {
+            ctr.state.as_str()
+        } else {
+            ctr.status.as_str()
+        };
+        let detail = match (ctr.image.is_empty(), status_part.is_empty()) {
+            (false, false) => {
+                Some(format!("{} \u{00b7} {status_part}", ctr.image))
+            }
+            (false, true) => Some(ctr.image.clone()),
+            (true, false) => Some(status_part.to_owned()),
+            (true, true) => None,
+        };
+        let is_ai = ai_recommended.iter().any(|t| {
+            matches!(t, DockerCleanTarget::Container { id, .. } if id == &ctr.id)
+        });
+        items.push(DockerConfirmItem {
+            target: DockerCleanTarget::Container {
+                id: ctr.id.clone(),
+                name: ctr.name.clone(),
+            },
+            label,
+            detail,
+            reclaimable_bytes: ctr.size_bytes,
+            default_checked: is_ai,
+            reason: is_ai.then(|| ai_reason.to_owned()),
+        });
+    }
+
+    (items, None)
+}
+
 /// Build a standalone confirmation request from a saved AI cleanup proposal.
+#[cfg(test)]
 pub fn proposal_confirm_request(
     root: PathBuf,
     proposal: &ruum_core::watchdog_config::CleanupProposal,
+    locale: crate::i18n::Locale,
+) -> CleanupConfirmRequest {
+    proposal_confirm_request_with_docker(
+        root,
+        proposal,
+        &DockerProbeStatus::NotInstalled,
+        locale,
+    )
+}
+
+/// Build a standalone confirmation request from a saved local AI cleanup
+/// proposal and live [`DockerProbeStatus`].
+pub fn proposal_confirm_request_with_docker(
+    root: PathBuf,
+    proposal: &ruum_core::watchdog_config::CleanupProposal,
+    docker: &DockerProbeStatus,
     locale: crate::i18n::Locale,
 ) -> CleanupConfirmRequest {
     let items = proposal
@@ -485,21 +857,44 @@ pub fn proposal_confirm_request(
             git_warning: item.git_warning.clone(),
         })
         .collect();
+    let (docker_items, docker_permission_hint) =
+        build_docker_confirm_items(docker, &proposal.docker_targets, locale);
     CleanupConfirmRequest {
         root,
         title: crate::i18n::messages::ai_proposal_title(locale).to_string(),
         summary: Some(proposal.summary.clone()),
         items,
+        docker_items,
+        docker_permission_hint,
     }
 }
 
 /// Build a standalone confirmation request from a remote SSH AI proposal.
+#[cfg(test)]
 pub fn remote_proposal_confirm_request(
     root: PathBuf,
     alias: &str,
     proposal: &ruum_core::watchdog_config::CleanupProposal,
     locale: crate::i18n::Locale,
 ) -> CleanupConfirmRequest {
+    remote_proposal_confirm_request_with_docker(
+        root,
+        alias,
+        proposal,
+        &DockerProbeStatus::NotInstalled,
+        locale,
+    )
+}
+
+/// Build a standalone confirmation request from a remote SSH AI proposal and
+/// snapshot [`DockerProbeStatus`].
+pub fn remote_proposal_confirm_request_with_docker(
+    root: PathBuf,
+    alias: &str,
+    proposal: &ruum_core::watchdog_config::CleanupProposal,
+    docker: &DockerProbeStatus,
+    locale: crate::i18n::Locale,
+) -> CleanupConfirmRequest {
     let items = proposal
         .items
         .iter()
@@ -511,11 +906,15 @@ pub fn remote_proposal_confirm_request(
             git_warning: item.git_warning.clone(),
         })
         .collect();
+    let (docker_items, docker_permission_hint) =
+        build_docker_confirm_items(docker, &proposal.docker_targets, locale);
     CleanupConfirmRequest {
         root,
         title: crate::i18n::messages::ai_proposal_remote_title(alias, locale),
         summary: Some(proposal.summary.clone()),
         items,
+        docker_items,
+        docker_permission_hint,
     }
 }
 
@@ -656,6 +1055,10 @@ pub struct ExploreSessionSnapshot {
     pub remote: Option<String>,
     pub remote_platform: String,
     pub remote_identity: Option<ruum_core::identity::HostIdentity>,
+    pub remote_header: Option<ruum_core::remote::Header>,
+    pub docker: DockerProbeStatus,
+    pub review_docker_checked: HashSet<DockerCleanTarget>,
+    pub review_docker_initialized: bool,
     pub insights: Vec<Candidate>,
     pub git: FxHashMap<PathBuf, Option<GitState>>,
     git_pending: FxHashSet<PathBuf>,
@@ -709,6 +1112,10 @@ impl Default for ExploreSessionSnapshot {
             remote: None,
             remote_platform: String::new(),
             remote_identity: None,
+            remote_header: None,
+            docker: DockerProbeStatus::default(),
+            review_docker_checked: HashSet::new(),
+            review_docker_initialized: false,
             insights: Vec::new(),
             git: FxHashMap::default(),
             git_pending: FxHashSet::default(),
@@ -808,6 +1215,19 @@ pub struct Ruum {
     preview_updated: Option<Instant>,
     remote_platform: String,
     pub remote_identity: Option<ruum_core::identity::HostIdentity>,
+    pub remote_header: Option<ruum_core::remote::Header>,
+    pub docker: DockerProbeStatus,
+    pub docker_probing: bool,
+    pub review_docker_checked: HashSet<DockerCleanTarget>,
+    pub review_docker_initialized: bool,
+    pub local_docker: DockerProbeStatus,
+    pub local_docker_checked: HashSet<DockerCleanTarget>,
+    pub local_docker_initialized: bool,
+    pub local_docker_probing: bool,
+    pub remote_docker_modal_open: bool,
+    pub pending_open_docker: bool,
+    pub generated_script_dialog: Option<GeneratedScriptDialog>,
+    pub done_return_screen: Screen,
     pub home: Option<PathBuf>,
     pub options: ScanOptions,
     pub power_choice: Option<crate::power::PowerEfficiency>,
@@ -823,7 +1243,7 @@ pub struct Ruum {
     pub active_ssh_profile_id: Option<String>,
     /// Active in-memory SSH session (`SSH_AUTH_SOCK` or `SSH_ASKPASS`).
     pub active_ssh_session: Option<Arc<SshSession>>,
-    /// Whether the inline SSH Add/Edit form is open on `Screen::Sources`.
+    /// Whether the inline SSH Add/Edit form is open on `Screen::Remote`.
     pub ssh_form_open: bool,
     /// Profile ID being edited, or `None` when adding a new SSH server.
     pub ssh_form_editing_id: Option<String>,
@@ -909,6 +1329,7 @@ pub struct Ruum {
     pub rem: f32,
     pub run: Option<RemovalHandle>,
     pub run_epoch: u64,
+    pub run_stage: Option<String>,
     pub run_summary: RunSummary,
     pub run_log: Vec<(PathBuf, Result<(), String>)>,
     pub space: Option<SpaceInfo>,
@@ -966,6 +1387,9 @@ pub struct Ruum {
     /// could be read.
     pub volumes_open: bool,
     pub volumes_loading: bool,
+    /// When `Some(profile_id)`, the volume/directory modal targets that remote
+    /// SSH profile (`RemoteRoots::discover_with_session`); when `None`, local.
+    pub volume_picker_remote_profile_id: Option<String>,
     pub awaiting_root: bool,
     pub volumes_error: Option<String>,
     pub picker_error: Option<String>,
@@ -1088,6 +1512,15 @@ pub struct Ruum {
     pub cli_install_os: Option<ruum_core::cli_install::CliInstallOs>,
     #[cfg(test)]
     pub cli_install_exe: Option<PathBuf>,
+    #[cfg(test)]
+    pub docker_runner:
+        Option<Arc<dyn ruum_core::docker_adapter::DockerCommandRunner>>,
+    #[cfg(test)]
+    pub terminal_env_override: Option<TerminalEnv>,
+    #[cfg(test)]
+    pub terminal_os_override: Option<TerminalOs>,
+    #[cfg(test)]
+    pub terminal_launch_log: Vec<(String, TerminalLaunchPlan)>,
 }
 
 impl Ruum {
@@ -1101,6 +1534,7 @@ impl Ruum {
         Self::open(root_path, options, depth, None, false, cx)
     }
 
+    #[cfg(test)]
     pub fn open(
         root_path: PathBuf,
         options: ScanOptions,
@@ -1109,19 +1543,72 @@ impl Ruum {
         remote_disk: bool,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        Self::build(root_path, options, depth, remote, remote_disk, true, cx)
+        Self::open_with_cred_store(
+            root_path,
+            options,
+            depth,
+            remote,
+            remote_disk,
+            None,
+            cx,
+        )
+    }
+
+    pub(crate) fn open_with_cred_store(
+        root_path: PathBuf,
+        options: ScanOptions,
+        depth: u32,
+        remote: Option<String>,
+        remote_disk: bool,
+        cred_store: Option<LazyCredentialStore>,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        Self::build(
+            root_path,
+            options,
+            depth,
+            remote,
+            remote_disk,
+            true,
+            cred_store,
+            cx,
+        )
     }
 
     /// Startup without a scan: discovering roots is not consent to walk one.
+    #[cfg(test)]
     pub fn choose(
         options: ScanOptions,
         depth: u32,
         remote: Option<String>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        Self::build(PathBuf::new(), options, depth, remote, false, false, cx)
+        Self::choose_with_cred_store(options, depth, remote, None, cx)
     }
 
+    pub(crate) fn choose_with_cred_store(
+        options: ScanOptions,
+        depth: u32,
+        remote: Option<String>,
+        cred_store: Option<LazyCredentialStore>,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        Self::build(
+            PathBuf::new(),
+            options,
+            depth,
+            remote,
+            false,
+            false,
+            cred_store,
+            cx,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal window bootstrap passes launch flags and shared store"
+    )]
     fn build(
         root_path: PathBuf,
         options: ScanOptions,
@@ -1129,6 +1616,7 @@ impl Ruum {
         remote: Option<String>,
         remote_disk: bool,
         start: bool,
+        shared_cred_store: Option<LazyCredentialStore>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let local = remote.is_none();
@@ -1154,7 +1642,7 @@ impl Ruum {
         ) = if cfg!(test) {
             (
                 None,
-                None,
+                shared_cred_store,
                 AppSettings::default(),
                 WatchdogConfig::default(),
                 WatchdogState::default(),
@@ -1167,7 +1655,8 @@ impl Ruum {
             )
         } else {
             let db_path = ruum_watchdog::ruum_db_path();
-            let cred_store = LazyCredentialStore::open_default().ok();
+            let cred_store = shared_cred_store
+                .or_else(|| LazyCredentialStore::open_default().ok());
             let (app_s, wd_c, wd_s, wh_c, wh_list, ai_c, ai_p, profiles) =
                 db_path
                     .as_deref()
@@ -1233,6 +1722,19 @@ impl Ruum {
             remote_progress: ruum_core::remote_progress::Progress::default(),
             remote_platform: String::new(),
             remote_identity: None,
+            remote_header: None,
+            docker: DockerProbeStatus::default(),
+            docker_probing: false,
+            review_docker_checked: HashSet::new(),
+            review_docker_initialized: false,
+            local_docker: DockerProbeStatus::default(),
+            local_docker_checked: HashSet::new(),
+            local_docker_initialized: false,
+            local_docker_probing: false,
+            remote_docker_modal_open: false,
+            pending_open_docker: false,
+            generated_script_dialog: None,
+            done_return_screen: Screen::Explore,
             home,
             options,
             power_choice,
@@ -1303,6 +1805,7 @@ impl Ruum {
             rem: crate::ui::BASE_REM,
             run: None,
             run_epoch: 0,
+            run_stage: None,
             run_summary: RunSummary::default(),
             run_log: Vec::new(),
             space,
@@ -1332,6 +1835,7 @@ impl Ruum {
             disk_root: None,
             volumes_open: false,
             volumes_loading: false,
+            volume_picker_remote_profile_id: None,
             awaiting_root: !start,
             volumes_error: None,
             picker_error: None,
@@ -1404,10 +1908,20 @@ impl Ruum {
             cli_install_os: None,
             #[cfg(test)]
             cli_install_exe: None,
+            #[cfg(test)]
+            docker_runner: None,
+            #[cfg(test)]
+            terminal_env_override: None,
+            #[cfg(test)]
+            terminal_os_override: None,
+            #[cfg(test)]
+            terminal_launch_log: Vec::new(),
             locale: crate::i18n::Locale::current(),
         };
         if !cfg!(test) {
             Self::probe_system_statuses(cx);
+            tree.local_docker_probing = true;
+            Self::refresh_local_docker(cx);
         }
         if local && start {
             tree.device = device_for(&tree.root_path);
@@ -1536,14 +2050,19 @@ impl Ruum {
         StorageDb::open(path).ok()
     }
 
-    fn ensure_cred_store(&self) -> Result<LazyCredentialStore, String> {
+    pub(crate) fn ensure_cred_store(
+        &mut self,
+    ) -> Result<LazyCredentialStore, String> {
         if let Some(ref store) = self.cred_store {
             return Ok(store.clone());
         }
         if let Some(ref db_path) = self.db_path
             && let Some(dir) = db_path.parent()
+            && !dir.as_os_str().is_empty()
         {
-            return Ok(LazyCredentialStore::platform(dir));
+            let store = LazyCredentialStore::platform(dir);
+            self.cred_store = Some(store.clone());
+            return Ok(store);
         }
         Err("no credential store configured".to_owned())
     }
@@ -1615,27 +2134,49 @@ impl Ruum {
         {
             return;
         }
+        if target == Screen::Docker && !self.has_local_docker_daemon() {
+            return;
+        }
+        if target != Screen::Docker {
+            self.pending_open_docker = false;
+        }
+        if self.screen != target {
+            self.notice = None;
+            self.toast_epoch += 1;
+        }
         self.crumb_menu = None;
         self.power_menu = None;
         self.show_help = false;
-        if target == Screen::Sources {
-            self.screen = Screen::Sources;
-            self.volumes_open = true;
-            self.picker_path = None;
-            self.reload_ssh_profiles();
-            self.focus_request = Some(FocusTarget::Dialog);
-            self.load_local_volumes(cx);
-            return;
-        }
-        if self.volumes_open || self.screen == Screen::Sources {
+        self.remote_docker_modal_open = false;
+        if target == Screen::Remote {
             self.volume_epoch += 1;
             self.volumes_loading = false;
             self.volumes_open = false;
+            self.volume_picker_remote_profile_id = None;
+            self.picker_error = None;
+            self.screen = Screen::Remote;
+            self.reload_ssh_profiles();
+            self.focus_request = Some(FocusTarget::Root);
+            cx.notify();
+            return;
+        }
+        if self.volumes_open || self.screen == Screen::Remote {
+            self.volume_epoch += 1;
+            self.volumes_loading = false;
+            self.volumes_open = false;
+            self.volume_picker_remote_profile_id = None;
+            self.picker_error = None;
             self.ssh_form_open = false;
             self.ssh_form_error = None;
         }
         self.screen = target;
-        if target == Screen::Settings {
+        if target == Screen::Docker {
+            self.ensure_local_docker_initialized();
+            if !cfg!(test) && !self.local_docker_probing {
+                self.local_docker_probing = true;
+                Self::refresh_local_docker(cx);
+            }
+        } else if target == Screen::Settings {
             self.reload_watchdog_config_and_prepare_settings();
             if !cfg!(test) {
                 Self::probe_system_statuses(cx);
@@ -1653,17 +2194,150 @@ impl Ruum {
         cx.notify();
     }
 
-    /// `V`: list every volume and let the scan move to one. The in-flight walk
-    /// is left alone until a volume is picked; picking calls [`set_root`],
-    /// which cancels it.
+    /// Apply an external screen-open request (`--open-screen`, menu, tray, or
+    /// notification), deferring `Screen::Docker` until a running local probe
+    /// resolves as `Available`.
+    pub(crate) fn apply_target_screen(
+        &mut self,
+        screen: Screen,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if screen == Screen::Docker && !self.has_local_docker_daemon() {
+            if self.local_docker_probing {
+                self.pending_open_docker = true;
+            }
+            return;
+        }
+        self.navigate_rail(screen, cx);
+        if screen == Screen::Watchdog {
+            self.reload_watchdog_state();
+        }
+    }
+
+    /// `V` / breadcrumb root click: open the directory & mount picker modal
+    /// in the current window aligned with the active host tab (local or SSH).
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        self.navigate_rail(Screen::Sources, cx);
+        if self.run.is_some()
+            || matches!(self.screen, Screen::Review | Screen::Running)
+        {
+            return;
+        }
+        self.remote_docker_modal_open = false;
+        match self.active_host_tab.clone() {
+            HostTabKey::Local => {
+                self.crumb_menu = None;
+                self.power_menu = None;
+                self.show_help = false;
+                self.volumes_open = true;
+                self.volume_picker_remote_profile_id = None;
+                self.picker_path = None;
+                self.picker_error = None;
+                self.focus_request = Some(FocusTarget::Dialog);
+                self.load_local_volumes(cx);
+            }
+            HostTabKey::Ssh(id) => {
+                self.open_remote_volumes_modal(&id, cx);
+            }
+        }
+    }
+
+    /// Open the directory & mount picker modal for a remote SSH profile using
+    /// read-only `RemoteRoots::discover_with_session` (without probing/scanning).
+    pub fn open_remote_volumes_modal(
+        &mut self,
+        id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.run.is_some()
+            || matches!(self.screen, Screen::Review | Screen::Running)
+        {
+            return;
+        }
+        let Some(profile) =
+            self.ssh_profiles.iter().find(|p| p.id == id).cloned()
+        else {
+            return;
+        };
+        self.crumb_menu = None;
+        self.power_menu = None;
+        self.show_help = false;
+        self.remote_docker_modal_open = false;
+        self.volumes_open = true;
+        self.volume_picker_remote_profile_id = Some(profile.id.clone());
+        self.picker_path = None;
+        self.picker_error = None;
+        self.volumes.clear();
+        self.volume_highlight = 0;
+        self.volumes_error = None;
+        self.volumes_loading = true;
+        self.volume_epoch += 1;
+        let epoch = self.volume_epoch;
+        self.focus_request = Some(FocusTarget::Dialog);
+        cx.notify();
+
+        let store = match self.ensure_cred_store() {
+            Ok(store) => store,
+            Err(err) => {
+                self.volumes_loading = false;
+                self.volumes_error = Some(err);
+                cx.notify();
+                return;
+            }
+        };
+        let existing_session = self.find_live_ssh_session(id);
+        let duration_minutes = self.app_settings.ssh_session_duration_minutes;
+        let profile_id = profile.id.clone();
+
+        let task = cx.background_executor().spawn(async move {
+            let session = match existing_session {
+                Some(s) if !s.is_closed() && !s.is_expired() => s,
+                _ => Arc::new(start_ssh_session_with_store(
+                    &profile,
+                    &store,
+                    duration_minutes,
+                )?),
+            };
+            let roots =
+                ruum_core::remote::RemoteRoots::discover_with_session(&session)
+                    .map_err(|err| err.to_string())?
+                    .wait()
+                    .map_err(|err| err.to_string())?;
+            Ok::<_, String>((session, roots))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.volumes_open
+                    || this.volume_epoch != epoch
+                    || this.volume_picker_remote_profile_id.as_deref()
+                        != Some(profile_id.as_str())
+                {
+                    return;
+                }
+                match res {
+                    Ok((session, roots)) => {
+                        this.store_live_ssh_session(&profile_id, &session);
+                        this.finish_volume_listing(
+                            Ok((roots.volumes, roots.home)),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        this.volumes_loading = false;
+                        this.volumes_error = Some(err);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Discover local mounts and volumes without probing or depending on any
     /// active remote SSH session.
     pub fn load_local_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        if !self.volumes_open && self.screen != Screen::Sources {
+        if !self.volumes_open {
             return;
         }
         self.volume_epoch += 1;
@@ -1680,9 +2354,7 @@ impl Ruum {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if (this.volumes_open || this.screen == Screen::Sources)
-                    && this.volume_epoch == epoch
-                {
+                if this.volumes_open && this.volume_epoch == epoch {
                     this.finish_volume_listing(result, cx);
                 }
             });
@@ -1734,7 +2406,7 @@ impl Ruum {
         if self.picker_path.is_none() {
             let path = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(
-                    crate::i18n::messages::placeholder_abs_path(locale),
+                    crate::i18n::messages::placeholder_path_or_tilde(locale),
                 )
             });
             cx.subscribe(&path, |this, _, event, cx| {
@@ -1779,7 +2451,7 @@ impl Ruum {
     }
 
     /// Probe OS background service and CLI registration statuses off the UI
-    /// thread.
+    /// thread. Local Docker is probed concurrently via [`Self::refresh_local_docker`].
     pub fn probe_system_statuses(cx: &Context<'_, Self>) {
         if cfg!(test) {
             return;
@@ -1804,6 +2476,283 @@ impl Ruum {
             });
         })
         .detach();
+    }
+
+    /// Refresh local Docker daemon & usage status off the UI thread.
+    pub fn refresh_local_docker(cx: &Context<'_, Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let task = cx.background_executor().spawn(async {
+            DockerFactory::create().probe(&DockerEnv::current())
+        });
+        cx.spawn(async move |this, cx| {
+            let status = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.local_docker_probing = false;
+                this.apply_local_docker_status(status);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Refresh local Docker status from `Screen::Docker` (uses mock runner
+    /// under tests).
+    pub fn refresh_local_docker_now(&mut self, cx: &mut Context<'_, Self>) {
+        if self.local_docker_probing {
+            return;
+        }
+        self.local_docker_probing = true;
+        cx.notify();
+        #[cfg(test)]
+        let runner = self.docker_runner.clone();
+        let task = cx.background_executor().spawn(async move {
+            #[cfg(test)]
+            {
+                runner.map(|mock| {
+                    DockerFactory::create()
+                        .probe_binary_with(Path::new("docker"), mock.as_ref())
+                })
+            }
+            #[cfg(not(test))]
+            {
+                Some(DockerFactory::create().probe(&DockerEnv::current()))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let fresh = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.local_docker_probing = false;
+                if let Some(status) = fresh {
+                    this.apply_local_docker_status(status);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Refresh Docker metrics for the active remote SSH tab via a remote scan.
+    pub fn refresh_remote_docker(&mut self, cx: &mut Context<'_, Self>) {
+        if self.remote.is_none() || self.docker_probing {
+            return;
+        }
+        self.docker_probing = true;
+        self.start_scan(cx);
+        if self.remote_scan.is_none() {
+            self.docker_probing = false;
+            if let Some(err) = self.scan_error.clone() {
+                self.push_toast(err, Status::Error, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Return whether the local Docker daemon is currently running and probed
+    /// as [`DockerProbeStatus::Available`].
+    #[must_use]
+    pub const fn has_local_docker_daemon(&self) -> bool {
+        matches!(self.local_docker, DockerProbeStatus::Available(_))
+    }
+
+    pub fn apply_local_docker_status(&mut self, status: DockerProbeStatus) {
+        self.local_docker = status;
+        self.sync_local_docker_defaults();
+        if self.has_local_docker_daemon() {
+            if std::mem::take(&mut self.pending_open_docker)
+                && self.run.is_none()
+                && !matches!(self.screen, Screen::Review | Screen::Running)
+            {
+                self.crumb_menu = None;
+                self.power_menu = None;
+                self.show_help = false;
+                self.remote_docker_modal_open = false;
+                self.volume_epoch += 1;
+                self.volumes_loading = false;
+                self.volumes_open = false;
+                self.volume_picker_remote_profile_id = None;
+                self.picker_error = None;
+                self.ssh_form_open = false;
+                self.ssh_form_error = None;
+                self.screen = Screen::Docker;
+                self.focus_request = Some(FocusTarget::Root);
+            }
+        } else {
+            self.pending_open_docker = false;
+            if self.screen == Screen::Docker {
+                self.screen = Screen::Explore;
+                self.focus_request = Some(FocusTarget::Root);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn local_docker_status(&self) -> DockerProbeStatus {
+        self.local_docker.clone()
+    }
+
+    /// Open the centered remote Docker inspection & script modal for the active
+    /// remote SSH tab.
+    pub fn open_remote_docker_modal(&mut self, cx: &mut Context<'_, Self>) {
+        if self.remote.is_none()
+            || !matches!(self.docker, DockerProbeStatus::Available(_))
+            || self.run.is_some()
+            || self.volumes_open
+            || matches!(self.screen, Screen::Review | Screen::Running)
+        {
+            return;
+        }
+        self.crumb_menu = None;
+        self.power_menu = None;
+        self.show_help = false;
+        self.ensure_review_docker_initialized();
+        self.remote_docker_modal_open = true;
+        self.focus_request = Some(FocusTarget::Dialog);
+        cx.notify();
+    }
+
+    /// Close the remote Docker modal and return focus to the root view.
+    pub fn close_remote_docker_modal(&mut self, cx: &mut Context<'_, Self>) {
+        if !self.remote_docker_modal_open {
+            return;
+        }
+        self.remote_docker_modal_open = false;
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    #[must_use]
+    pub fn local_docker_items(
+        &self,
+    ) -> (Vec<DockerConfirmItem>, Option<String>) {
+        build_docker_confirm_items(&self.local_docker, &[], self.locale)
+    }
+
+    pub fn sync_local_docker_defaults(&mut self) {
+        sync_docker_defaults_for(
+            &self.local_docker,
+            &mut self.local_docker_checked,
+            &mut self.local_docker_initialized,
+            self.locale,
+        );
+    }
+
+    pub fn ensure_local_docker_initialized(&mut self) {
+        if !self.local_docker_initialized {
+            self.sync_local_docker_defaults();
+        }
+    }
+
+    pub fn toggle_local_docker_target(&mut self, target: &DockerCleanTarget) {
+        self.ensure_local_docker_initialized();
+        toggle_docker_target_in(&mut self.local_docker_checked, target);
+    }
+
+    pub fn select_all_local_docker(&mut self) {
+        self.ensure_local_docker_initialized();
+        select_all_docker_in(
+            &self.local_docker,
+            &mut self.local_docker_checked,
+            self.locale,
+        );
+    }
+
+    pub fn select_none_local_docker(&mut self) {
+        self.local_docker_checked.clear();
+        self.local_docker_initialized = true;
+    }
+
+    pub fn toggle_local_docker_group(&mut self, group: DockerGroupKind) {
+        self.ensure_local_docker_initialized();
+        toggle_docker_group_in(
+            &self.local_docker,
+            &mut self.local_docker_checked,
+            group,
+            self.locale,
+        );
+    }
+
+    #[must_use]
+    pub fn selected_local_docker_targets(&self) -> Vec<DockerCleanTarget> {
+        selected_docker_targets_in(
+            &self.local_docker,
+            &self.local_docker_checked,
+        )
+    }
+
+    #[must_use]
+    pub fn selected_local_docker_bytes(&self) -> u64 {
+        selected_docker_bytes_in(
+            &self.local_docker,
+            &self.local_docker_checked,
+            self.locale,
+        )
+    }
+
+    #[must_use]
+    pub fn review_docker_items(
+        &self,
+    ) -> (Vec<DockerConfirmItem>, Option<String>) {
+        build_docker_confirm_items(&self.docker, &[], self.locale)
+    }
+
+    pub fn sync_review_docker_defaults(&mut self) {
+        sync_docker_defaults_for(
+            &self.docker,
+            &mut self.review_docker_checked,
+            &mut self.review_docker_initialized,
+            self.locale,
+        );
+    }
+
+    pub fn ensure_review_docker_initialized(&mut self) {
+        if !self.review_docker_initialized {
+            self.sync_review_docker_defaults();
+        }
+    }
+
+    pub fn toggle_review_docker_target(&mut self, target: &DockerCleanTarget) {
+        self.ensure_review_docker_initialized();
+        toggle_docker_target_in(&mut self.review_docker_checked, target);
+    }
+
+    pub fn select_all_review_docker(&mut self) {
+        self.ensure_review_docker_initialized();
+        select_all_docker_in(
+            &self.docker,
+            &mut self.review_docker_checked,
+            self.locale,
+        );
+    }
+
+    pub fn select_none_review_docker(&mut self) {
+        self.review_docker_checked.clear();
+        self.review_docker_initialized = true;
+    }
+
+    pub fn toggle_review_docker_group(&mut self, group: DockerGroupKind) {
+        self.ensure_review_docker_initialized();
+        toggle_docker_group_in(
+            &self.docker,
+            &mut self.review_docker_checked,
+            group,
+            self.locale,
+        );
+    }
+
+    #[must_use]
+    pub fn selected_review_docker_targets(&self) -> Vec<DockerCleanTarget> {
+        selected_docker_targets_in(&self.docker, &self.review_docker_checked)
+    }
+
+    #[must_use]
+    pub fn selected_review_docker_bytes(&self) -> u64 {
+        selected_docker_bytes_in(
+            &self.docker,
+            &self.review_docker_checked,
+            self.locale,
+        )
     }
 
     /// Re-read watchdog persistent state and latest AI proposal from `ruum.db`.
@@ -2416,8 +3365,7 @@ impl Ruum {
         self.locale = locale;
     }
 
-    /// Current resolved window title in tests.
-    #[cfg(test)]
+    /// Current resolved window title.
     pub fn window_title(&self) -> &str {
         &self.window_title
     }
@@ -3394,7 +4342,16 @@ impl Ruum {
                         {
                             let _ = db.save_ai_state(&ai_state);
                         }
-                        if proposal.items.is_empty() {
+                        if proposal.items.is_empty()
+                            && proposal.docker_targets.is_empty()
+                            && build_docker_confirm_items(
+                                &this.local_docker_status(),
+                                &[],
+                                locale,
+                            )
+                            .0
+                            .is_empty()
+                        {
                             this.push_toast(
                                 crate::i18n::messages::ai_found_no_files(
                                     locale,
@@ -3403,13 +4360,19 @@ impl Ruum {
                                 cx,
                             );
                         } else {
-                            let count = proposal.items.len();
-                            let request = proposal_confirm_request(
-                                home, &proposal, locale,
+                            let local_docker = this.local_docker_status();
+                            let request = proposal_confirm_request_with_docker(
+                                home,
+                                &proposal,
+                                &local_docker,
+                                locale,
                             );
+                            let count = request.items.len()
+                                + request.docker_items.len();
                             crate::open_local_confirm_window(
                                 request,
                                 this.db_path.clone(),
+                                local_docker,
                                 cx,
                             );
                             crate::refresh_tray_status(cx);
@@ -3445,8 +4408,19 @@ impl Ruum {
         let Some(home) = std::env::home_dir() else {
             return;
         };
-        let request = proposal_confirm_request(home, proposal, self.locale);
-        crate::open_local_confirm_window(request, self.db_path.clone(), cx);
+        let local_docker = self.local_docker_status();
+        let request = proposal_confirm_request_with_docker(
+            home,
+            proposal,
+            &local_docker,
+            self.locale,
+        );
+        crate::open_local_confirm_window(
+            request,
+            self.db_path.clone(),
+            local_docker,
+            cx,
+        );
         cx.notify();
     }
 
@@ -3456,7 +4430,7 @@ impl Ruum {
             proposal
                 .items
                 .retain(|item| !cleaned_paths.contains(&item.path));
-            if proposal.items.is_empty() {
+            if proposal.items.is_empty() && proposal.docker_targets.is_empty() {
                 self.ai_proposal = None;
             }
         }
@@ -3496,8 +4470,10 @@ impl Ruum {
         self.ssh_form_editing_id = None;
         self.ssh_form_error = None;
         self.ssh_form_needs_sync = false;
-        if self.volumes_open || self.screen == Screen::Sources {
+        if self.volumes_open {
             self.focus_request = Some(FocusTarget::Dialog);
+        } else if self.screen == Screen::Remote {
+            self.focus_request = Some(FocusTarget::Root);
         }
         cx.notify();
     }
@@ -3816,6 +4792,18 @@ impl Ruum {
             last_scanned_secs: existing
                 .as_ref()
                 .and_then(|p| p.last_scanned_secs),
+            pending_script_path: existing
+                .as_ref()
+                .and_then(|p| p.pending_script_path.clone()),
+            pending_script_items: existing
+                .as_ref()
+                .and_then(|p| p.pending_script_items),
+            pending_reclaim_bytes: existing
+                .as_ref()
+                .and_then(|p| p.pending_reclaim_bytes),
+            pending_created_secs: existing
+                .as_ref()
+                .and_then(|p| p.pending_created_secs),
         };
 
         let saved_profile = match if existing.is_some() {
@@ -3974,6 +4962,14 @@ impl Ruum {
             remote: self.remote.take(),
             remote_platform: std::mem::take(&mut self.remote_platform),
             remote_identity: self.remote_identity.take(),
+            remote_header: self.remote_header.take(),
+            docker: std::mem::take(&mut self.docker),
+            review_docker_checked: std::mem::take(
+                &mut self.review_docker_checked,
+            ),
+            review_docker_initialized: std::mem::take(
+                &mut self.review_docker_initialized,
+            ),
             insights: std::mem::take(&mut self.insights),
             git: std::mem::take(&mut self.git),
             git_pending: std::mem::take(&mut self.git_pending),
@@ -4025,6 +5021,11 @@ impl Ruum {
         self.remote = None;
         self.remote_platform.clear();
         self.remote_identity = None;
+        self.remote_header = None;
+        self.docker = DockerProbeStatus::default();
+        self.docker_probing = false;
+        self.review_docker_checked.clear();
+        self.review_docker_initialized = false;
         self.insights.clear();
         self.git.clear();
         self.git_pending.clear();
@@ -4078,6 +5079,11 @@ impl Ruum {
         self.remote = snap.remote;
         self.remote_platform = snap.remote_platform;
         self.remote_identity = snap.remote_identity;
+        self.remote_header = snap.remote_header;
+        self.docker = snap.docker;
+        self.docker_probing = false;
+        self.review_docker_checked = snap.review_docker_checked;
+        self.review_docker_initialized = snap.review_docker_initialized;
         self.insights = snap.insights;
         self.git = snap.git;
         self.git_pending = snap.git_pending;
@@ -4122,7 +5128,9 @@ impl Ruum {
             return;
         };
         self.screen = Screen::Explore;
+        self.remote_docker_modal_open = false;
         self.volumes_open = false;
+        self.volume_picker_remote_profile_id = None;
         self.ssh_form_open = false;
         self.ssh_form_error = None;
         if self.active_host_tab != key {
@@ -4158,6 +5166,7 @@ impl Ruum {
         else {
             return;
         };
+        self.remote_docker_modal_open = false;
         if self.active_host_tab == *key {
             if let Some(scan) = self.scan.take() {
                 scan.cancel();
@@ -4237,37 +5246,6 @@ impl Ruum {
         }
     }
 
-    fn cached_ssh_header(&self, id: &str) -> Option<ruum_core::remote::Header> {
-        if self.active_ssh_profile_id.as_deref() == Some(id)
-            && let Some(identity) = &self.remote_identity
-            && !self.root_path.as_os_str().is_empty()
-        {
-            return Some(ruum_core::remote::Header::new(
-                self.root_path.clone(),
-                self.home.clone(),
-                self.remote_platform.clone(),
-                Some(identity.clone()),
-            ));
-        }
-        let key = HostTabKey::Ssh(id.to_owned());
-        self.host_tabs
-            .iter()
-            .find(|t| t.key == key)
-            .and_then(|t| t.session.as_ref())
-            .and_then(|snap| {
-                let identity = snap.remote_identity.as_ref()?;
-                if snap.root_path.as_os_str().is_empty() {
-                    return None;
-                }
-                Some(ruum_core::remote::Header::new(
-                    snap.root_path.clone(),
-                    snap.home.clone(),
-                    snap.remote_platform.clone(),
-                    Some(identity.clone()),
-                ))
-            })
-    }
-
     fn ensure_active_ssh_session(
         &mut self,
         profile_id: &str,
@@ -4290,7 +5268,7 @@ impl Ruum {
     }
 
     fn start_profile_ssh_session(
-        &self,
+        &mut self,
         profile: &ruum_core::storage::SshProfile,
     ) -> Result<ruum_core::ssh_session::SshSession, String> {
         let store = self.ensure_cred_store()?;
@@ -4308,14 +5286,27 @@ impl Ruum {
         id: &str,
         cx: &mut Context<'_, Self>,
     ) {
+        self.connect_ssh_profile_at(id, None, cx);
+    }
+
+    /// Connect to a saved SSH profile at `override_root` (or the profile's
+    /// configured `default_path`, defaulting to `~`), switching to
+    /// `Screen::Explore` and starting the scan.
+    pub fn connect_ssh_profile_at(
+        &mut self,
+        id: &str,
+        override_root: Option<PathBuf>,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(profile) =
             self.ssh_profiles.iter().find(|p| p.id == id).cloned()
         else {
             return;
         };
         let target_key = HostTabKey::Ssh(profile.id.clone());
-        if let Some(existing_idx) =
-            self.host_tabs.iter().position(|t| t.key == target_key)
+        if override_root.is_none()
+            && let Some(existing_idx) =
+                self.host_tabs.iter().position(|t| t.key == target_key)
         {
             let has_live_state =
                 if self.active_host_tab == target_key {
@@ -4351,18 +5342,23 @@ impl Ruum {
             }
         };
 
-        let root_path = profile
-            .default_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| PathBuf::from("~"), PathBuf::from);
+        let root_path = override_root
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| {
+                profile
+                    .default_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| PathBuf::from("~"), PathBuf::from)
+            });
 
         if self.active_host_tab == target_key {
             self.marks.clear();
             self.history = History::default();
             self.remote_identity = None;
             self.remote_platform.clear();
+            self.docker = DockerProbeStatus::default();
             self.git.clear();
             self.git_pending.clear();
             self.space = None;
@@ -4390,6 +5386,8 @@ impl Ruum {
             self.reset_active_explore_session();
         }
 
+        self.screen = Screen::Explore;
+        self.remote_docker_modal_open = false;
         self.remote = Some(profile.alias);
         self.active_ssh_profile_id = Some(profile.id);
         self.active_ssh_session = Some(session);
@@ -4451,11 +5449,12 @@ impl Ruum {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let info = ruum_core::remote::check_remote_space_with_session(
+            let report = ruum_core::remote::RemoteSpace::check_with_session(
                 &session,
-                target_path,
-            )?;
-            Ok::<_, String>((session, info))
+                target_path.map(Path::new),
+            )
+            .map_err(|err| err.to_string())?;
+            Ok::<_, String>((session, report.space))
         });
 
         cx.spawn(async move |this, cx| {
@@ -4526,9 +5525,9 @@ impl Ruum {
         .detach();
     }
 
-    /// Run remote AI analysis for a saved SSH profile off the UI thread and
-    /// open a remote-targeted cleanup confirmation modal without touching
-    /// local Watchdog `ai_proposal`.
+    /// Run remote AI analysis by pulling an in-memory [`Snapshot`] via
+    /// `RemoteScan::spawn_with_session` and running local AI CLI + pure-memory
+    /// tree validation (zero remote AI CLI requirement).
     pub fn analyze_ssh_profile(
         &mut self,
         id: &str,
@@ -4557,12 +5556,25 @@ impl Ruum {
                 return;
             }
         };
+
         let existing_session = self.find_live_ssh_session(id);
-        let cached_header = self.cached_ssh_header(id);
         let duration_minutes = self.app_settings.ssh_session_duration_minutes;
+        let ai_cfg = self.snapshot_ai_config(cx);
+        let provider_label = ai_cfg.provider.label_in(self.locale);
+        let options = self.options.clone();
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
         let profile_id = profile.id.clone();
         let alias = profile.alias.clone();
+
         self.ssh_analyzing_profiles.insert(profile_id.clone());
+        self.push_toast(
+            crate::i18n::messages::running_ai_analysis(
+                provider_label,
+                self.locale,
+            ),
+            Status::Neutral,
+            cx,
+        );
         cx.notify();
 
         let task = cx.background_executor().spawn(async move {
@@ -4574,27 +5586,26 @@ impl Ruum {
                     duration_minutes,
                 )?),
             };
-            let target_path = profile
-                .default_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            let proposal = ruum_core::remote::run_remote_analyze_with_session(
-                &session,
-                target_path.as_deref(),
-            )?;
-            let header = if proposal.items.is_empty() {
-                None
-            } else {
-                Some(resolve_remote_proposal_header(
-                    &session,
-                    cached_header,
-                    target_path.as_deref(),
-                    &proposal.items,
-                )?)
+            let request = ruum_core::remote::Request {
+                root: profile
+                    .default_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from),
+                disk: false,
+                options,
             };
-            Ok::<_, String>((session, proposal, header))
+            let scan = ruum_core::remote::RemoteScan::spawn_with_session(
+                &session, &request,
+            )
+            .map_err(|err| err.to_string())?;
+            let snapshot = scan.wait().map_err(|err| err.to_string())?;
+            let runner = ruum_core::ai_cli::DefaultCommandRunner;
+            let proposal = analyze_remote_snapshot_with_runner(
+                &ai_cfg, &snapshot, now_secs, &runner,
+            )?;
+            Ok::<_, String>((session, snapshot.header, proposal))
         });
 
         cx.spawn(async move |this, cx| {
@@ -4603,9 +5614,30 @@ impl Ruum {
                 this.ssh_analyzing_profiles.remove(&profile_id);
                 let locale = this.locale;
                 match res {
-                    Ok((session, proposal, header)) => {
+                    Ok((session, header, proposal)) => {
                         this.store_live_ssh_session(&profile_id, &session);
-                        if proposal.items.is_empty() {
+                        if let Some(info) = header.space
+                            && this.db_path.is_some()
+                            && let Ok(db) = this.open_db()
+                        {
+                            let _ = db.update_ssh_profile_scan_summary(
+                                &profile_id,
+                                info.total,
+                                info.available,
+                                now_secs,
+                            );
+                            this.reload_ssh_profiles();
+                        }
+                        if proposal.items.is_empty()
+                            && proposal.docker_targets.is_empty()
+                            && build_docker_confirm_items(
+                                &header.docker,
+                                &[],
+                                locale,
+                            )
+                            .0
+                            .is_empty()
+                        {
                             this.push_toast(
                                 crate::i18n::messages::ai_found_no_files(
                                     locale,
@@ -4613,19 +5645,23 @@ impl Ruum {
                                 Status::Success,
                                 cx,
                             );
-                        } else if let Some(header) = header {
-                            let count = proposal.items.len();
-                            let request = remote_proposal_confirm_request(
-                                header.root.clone(),
-                                &alias,
-                                &proposal,
-                                locale,
-                            );
+                        } else {
+                            let request =
+                                remote_proposal_confirm_request_with_docker(
+                                    header.root.clone(),
+                                    &alias,
+                                    &proposal,
+                                    &header.docker,
+                                    locale,
+                                );
+                            let count = request.items.len()
+                                + request.docker_items.len();
                             crate::open_remote_confirm_window(
                                 request,
-                                profile_id.clone(),
+                                profile_id,
                                 session,
                                 header,
+                                this.db_path.clone(),
                                 cx,
                             );
                             this.push_toast(
@@ -4654,13 +5690,47 @@ impl Ruum {
     }
 
     pub fn choose_picker_path(&mut self, cx: &mut Context<'_, Self>) {
-        let path = self
+        let raw = self
             .picker_path
             .as_ref()
-            .map(|input| PathBuf::from(input.read(cx).value().as_str()));
-        if let Some(path) = path {
-            self.choose_source_root(path, cx);
+            .map(|input| input.read(cx).value().as_str().trim().to_owned());
+        let Some(raw) = raw else {
+            return;
+        };
+        if let Some(profile_id) = self.volume_picker_remote_profile_id.clone() {
+            self.choose_remote_root(&profile_id, Path::new(&raw), cx);
+            return;
         }
+        let expanded = expand_local_tilde_path(&raw);
+        self.choose_source_root(expanded, cx);
+    }
+
+    /// Pick a remote directory or mount for an SSH profile and start scanning.
+    pub fn choose_remote_root(
+        &mut self,
+        profile_id: &str,
+        path: &Path,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.volumes_open || self.volumes_loading {
+            return;
+        }
+        let raw = path.to_string_lossy().trim().to_owned();
+        let valid_tilde =
+            raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\");
+        if raw.is_empty()
+            || (!valid_tilde
+                && !ruum_core::remote::is_remote_absolute(Path::new(&raw)))
+        {
+            self.picker_error = Some(
+                crate::i18n::messages::picker_remote_abs_path(self.locale)
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.picker_error = None;
+        self.connect_ssh_profile_at(profile_id, Some(PathBuf::from(raw)), cx);
     }
 
     /// Pick a local directory or mount and activate the Local Explore tab.
@@ -4669,7 +5739,7 @@ impl Ruum {
         mut path: PathBuf,
         cx: &mut Context<'_, Self>,
     ) {
-        if (!self.volumes_open && self.screen != Screen::Sources)
+        if !self.volumes_open
             || self.volumes_loading
             || self.volumes_error.is_some()
         {
@@ -4703,6 +5773,7 @@ impl Ruum {
             self.history = History::default();
             self.remote_identity = None;
             self.remote_platform.clear();
+            self.docker = DockerProbeStatus::default();
             self.git.clear();
             self.git_pending.clear();
             self.space = None;
@@ -4712,6 +5783,8 @@ impl Ruum {
             self.full_disk_access = None;
             self.file_table = false;
         }
+        self.screen = Screen::Explore;
+        self.remote_docker_modal_open = false;
         self.remote = None;
         self.active_ssh_profile_id = None;
         self.active_ssh_session = None;
@@ -4726,11 +5799,10 @@ impl Ruum {
         self.volume_epoch += 1;
         self.volumes_loading = false;
         self.volumes_open = false;
+        self.volume_picker_remote_profile_id = None;
+        self.picker_error = None;
         self.ssh_form_open = false;
         self.ssh_form_error = None;
-        if self.screen == Screen::Sources {
-            self.screen = Screen::Explore;
-        }
         self.focus_request = Some(FocusTarget::Root);
         cx.notify();
     }
@@ -4741,7 +5813,13 @@ impl Ruum {
             .get(self.volume_highlight)
             .map(|volume| volume.point.clone())
         {
-            self.choose_source_root(point, cx);
+            if let Some(profile_id) =
+                self.volume_picker_remote_profile_id.clone()
+            {
+                self.choose_remote_root(&profile_id, &point, cx);
+            } else {
+                self.choose_source_root(point, cx);
+            }
         }
     }
 
@@ -5034,6 +6112,10 @@ impl Ruum {
             self.root_path.clone(),
             self.options.clone(),
         ));
+        if !cfg!(test) && !self.local_docker_probing {
+            self.local_docker_probing = true;
+            Self::refresh_local_docker(cx);
+        }
         Self::poll_scan(epoch, cx);
         cx.notify();
     }
@@ -5097,12 +6179,18 @@ impl Ruum {
             };
             match outcome {
                 Ok(snapshot) => {
-                    self.root_path = snapshot.header.root;
-                    self.home = snapshot.header.home;
-                    self.disk_root = snapshot.header.disk_root;
+                    self.root_path.clone_from(&snapshot.header.root);
+                    self.home.clone_from(&snapshot.header.home);
+                    self.disk_root.clone_from(&snapshot.header.disk_root);
                     self.space = snapshot.header.space;
-                    self.remote_platform = snapshot.header.platform;
-                    self.update_remote_identity(snapshot.header.identity);
+                    self.remote_platform.clone_from(&snapshot.header.platform);
+                    self.update_remote_identity(
+                        snapshot.header.identity.clone(),
+                    );
+                    self.docker = snapshot.docker.clone();
+                    self.remote_header = Some(snapshot.header);
+                    self.sync_review_docker_defaults();
+                    self.docker_probing = false;
                     self.device = self.remote.as_ref().map(|host| {
                         crate::i18n::messages::device_remote_read_only(
                             host,
@@ -5136,7 +6224,12 @@ impl Ruum {
                     self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
                 }
                 Err(error) => {
-                    self.scan_error = Some(error.to_string());
+                    let err_msg = error.to_string();
+                    self.scan_error = Some(err_msg.clone());
+                    self.docker_probing = false;
+                    if self.remote_docker_modal_open {
+                        self.push_toast(err_msg, Status::Error, cx);
+                    }
                 }
             }
             self.remote_scan = None;
@@ -6351,18 +7444,23 @@ impl Ruum {
     // ── removal ─────────────────────────────────────────────────────────
 
     /// The review screen's commit: move to the trash at once, or ask first for
-    /// a permanent deletion, which cannot be undone.
+    /// a permanent deletion, which cannot be undone. On remote tabs, generates
+    /// a deterministic `.sh` script for marked file targets.
     pub fn commit(&mut self, cx: &mut Context<'_, Self>) {
-        if self.remote.is_some() || self.plan().is_empty() {
+        if self.remote.is_some() {
+            self.generate_remote_cleanup_script(cx);
             return;
         }
-        match self.removal_mode {
-            RemovalMode::Trash => self.begin_removal(cx),
-            RemovalMode::Permanent => {
-                self.confirm_open = true;
-                self.focus_request = Some(FocusTarget::Dialog);
-                cx.notify();
-            }
+        let plan = self.plan();
+        if plan.is_empty() {
+            return;
+        }
+        if self.removal_mode == RemovalMode::Permanent {
+            self.confirm_open = true;
+            self.focus_request = Some(FocusTarget::Dialog);
+            cx.notify();
+        } else {
+            self.begin_removal(cx);
         }
     }
 
@@ -6470,14 +7568,320 @@ impl Ruum {
         self.space_baseline = self.space.or(self.space_baseline);
         self.run_epoch += 1;
         let epoch = self.run_epoch;
+        self.run_stage = None;
         self.run_summary = RunSummary {
             total: plan.targets.len(),
             ..RunSummary::default()
         };
         self.run_log.clear();
+        self.done_return_screen = Screen::Explore;
+        self.focus_request = Some(FocusTarget::Root);
         self.screen = Screen::Running;
         self.run = Some(self.spawn_removal(plan));
         Self::poll_removal(epoch, cx);
+        cx.notify();
+    }
+
+    /// Execute selected local Docker cleanup targets from `Screen::Docker`.
+    pub fn commit_docker_cleanup(&mut self, cx: &mut Context<'_, Self>) {
+        let targets = self.selected_local_docker_targets();
+        if targets.is_empty() {
+            return;
+        }
+        if self.restarting {
+            self.notice = Some((
+                crate::i18n::messages::not_while_restarting(self.locale).into(),
+                Status::Warning,
+            ));
+            cx.notify();
+            return;
+        }
+        let local_space = if self.active_host_tab == HostTabKey::Local {
+            self.space
+        } else {
+            self.host_tabs
+                .iter()
+                .find(|t| t.key == HostTabKey::Local)
+                .and_then(|t| t.session.as_ref())
+                .and_then(|s| s.space)
+        };
+        self.space_baseline = local_space.or(self.space_baseline);
+        self.run_epoch += 1;
+        let epoch = self.run_epoch;
+        self.run_stage = None;
+        self.run_summary = RunSummary {
+            total: targets.len(),
+            ..RunSummary::default()
+        };
+        self.run_log.clear();
+        self.done_return_screen = Screen::Docker;
+        self.focus_request = Some(FocusTarget::Root);
+        self.screen = Screen::Running;
+        self.begin_docker_cleanup(epoch, targets, cx);
+        cx.notify();
+    }
+
+    fn begin_docker_cleanup(
+        &mut self,
+        epoch: u64,
+        targets: Vec<DockerCleanTarget>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let DockerProbeStatus::Available(summary) = self.local_docker.clone()
+        else {
+            self.finish_removal_run(false, cx);
+            return;
+        };
+        let (docker_items, _) = self.local_docker_items();
+        let estimated_map: Vec<(DockerCleanTarget, u64)> = docker_items
+            .into_iter()
+            .map(|i| (i.target, i.reclaimable_bytes))
+            .collect();
+
+        let mut containers = Vec::new();
+        let mut images = Vec::new();
+        let mut build_cache = Vec::new();
+        for target in targets {
+            match target {
+                DockerCleanTarget::Container { .. } => containers.push(target),
+                DockerCleanTarget::Image { .. } => images.push(target),
+                DockerCleanTarget::BuildCache => build_cache.push(target),
+            }
+        }
+        let mut phases: Vec<(&'static str, Vec<DockerCleanTarget>)> =
+            Vec::new();
+        if !containers.is_empty() {
+            phases.push((
+                crate::i18n::pages::docker_stage_containers(self.locale),
+                containers,
+            ));
+        }
+        if !images.is_empty() {
+            phases.push((
+                crate::i18n::pages::docker_stage_images(self.locale),
+                images,
+            ));
+        }
+        if !build_cache.is_empty() {
+            phases.push((
+                crate::i18n::pages::docker_stage_build_cache(self.locale),
+                build_cache,
+            ));
+        }
+
+        let local_root = if self.active_host_tab == HostTabKey::Local {
+            self.root_path.clone()
+        } else {
+            self.host_tabs
+                .iter()
+                .find(|t| t.key == HostTabKey::Local)
+                .and_then(|t| t.session.as_ref())
+                .map(|s| s.root_path.clone())
+                .or_else(std::env::home_dir)
+                .unwrap_or_default()
+        };
+        let refreshing_stage =
+            crate::i18n::pages::docker_stage_refreshing(self.locale);
+        #[cfg(test)]
+        let test_runner = self.docker_runner.clone();
+
+        cx.spawn(async move |this, cx| {
+            for (stage_label, phase_targets) in phases {
+                let still_active = this
+                    .update(cx, |this, cx| {
+                        if this.run_epoch != epoch {
+                            return false;
+                        }
+                        this.run_stage = Some(stage_label.to_owned());
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !still_active {
+                    return;
+                }
+
+                let summary_for_phase = summary.clone();
+                #[cfg(test)]
+                let runner_for_phase = test_runner.clone();
+                let phase_outcomes = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let adapter = DockerFactory::create();
+                        #[cfg(test)]
+                        {
+                            if let Some(runner) = runner_for_phase {
+                                adapter.run_clean_targets_with(
+                                    Path::new("docker"),
+                                    &summary_for_phase,
+                                    &phase_targets,
+                                    runner.as_ref(),
+                                )
+                            } else {
+                                phase_targets
+                                    .into_iter()
+                                    .map(|target| DockerCleanOutcome {
+                                        target,
+                                        result: Err(
+                                            "no mock docker runner configured"
+                                                .to_owned(),
+                                        ),
+                                    })
+                                    .collect()
+                            }
+                        }
+                        #[cfg(not(test))]
+                        {
+                            let env = DockerEnv::current();
+                            adapter.run_clean_targets(
+                                &env,
+                                &summary_for_phase,
+                                &phase_targets,
+                            )
+                        }
+                    })
+                    .await;
+
+                let ok = this
+                    .update(cx, |this, cx| {
+                        if this.run_epoch != epoch {
+                            return false;
+                        }
+                        this.record_docker_clean_outcomes(
+                            phase_outcomes,
+                            &estimated_map,
+                        );
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !ok {
+                    return;
+                }
+            }
+
+            let _ = this.update(cx, |this, cx| {
+                if this.run_epoch == epoch {
+                    this.run_stage = Some(refreshing_stage.to_owned());
+                    cx.notify();
+                }
+            });
+
+            #[cfg(test)]
+            let runner_for_probe = test_runner;
+            let (refreshed_docker, refreshed_space) = cx
+                .background_executor()
+                .spawn(async move {
+                    let adapter = DockerFactory::create();
+                    #[cfg(test)]
+                    let fresh_docker = runner_for_probe.map(|runner| {
+                        adapter.probe_binary_with(
+                            Path::new("docker"),
+                            runner.as_ref(),
+                        )
+                    });
+                    #[cfg(not(test))]
+                    let fresh_docker =
+                        Some(adapter.probe(&DockerEnv::current()));
+                    let fresh_space = if local_root.as_os_str().is_empty() {
+                        None
+                    } else {
+                        space_info(&local_root).ok()
+                    };
+                    (fresh_docker, fresh_space)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                if this.run_epoch != epoch {
+                    return;
+                }
+                if let Some(fresh_docker) = refreshed_docker {
+                    this.apply_local_docker_status(fresh_docker);
+                }
+                if let Some(sp) = refreshed_space {
+                    if this.active_host_tab == HostTabKey::Local {
+                        this.space = Some(sp);
+                    } else if let Some(local_tab) = this
+                        .host_tabs
+                        .iter_mut()
+                        .find(|t| t.key == HostTabKey::Local)
+                        && let Some(snap) = &mut local_tab.session
+                    {
+                        snap.space = Some(sp);
+                    }
+                }
+                this.finish_removal_run(false, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn record_docker_clean_outcomes(
+        &mut self,
+        outcomes: Vec<DockerCleanOutcome>,
+        estimated_map: &[(DockerCleanTarget, u64)],
+    ) {
+        for outcome in outcomes {
+            let label = match &outcome.target {
+                DockerCleanTarget::BuildCache => {
+                    "docker: build cache".to_owned()
+                }
+                DockerCleanTarget::Image { id, reference, .. } => {
+                    let name = reference.as_deref().unwrap_or(id.as_str());
+                    format!("docker: image {name}")
+                }
+                DockerCleanTarget::Container { name, id } => {
+                    let label = if name.is_empty() { id } else { name };
+                    format!("docker: container {label}")
+                }
+            };
+            let bytes = estimated_map
+                .iter()
+                .find(|(t, _)| *t == outcome.target)
+                .map_or(0, |(_, b)| *b);
+            if outcome.result.is_ok() {
+                self.run_summary.removed += 1;
+                self.run_summary.bytes =
+                    self.run_summary.bytes.saturating_add(bytes);
+            } else {
+                self.run_summary.failed += 1;
+            }
+            self.run_log.push((PathBuf::from(label), outcome.result));
+        }
+    }
+
+    fn finish_removal_run(
+        &mut self,
+        had_files: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run = None;
+        self.run_stage = None;
+        if had_files {
+            self.marks.clear();
+        }
+        self.focus_request = Some(FocusTarget::Root);
+        self.screen = Screen::Done;
+        if had_files {
+            // The tree on screen is now wrong; start over rather than leaving
+            // numbers that include what was just removed.
+            self.start_scan(cx);
+        }
+        cx.notify();
+    }
+
+    /// Leave [`Screen::Done`] back to its originating screen and reset the
+    /// return target to [`Screen::Explore`].
+    pub fn finish_done_screen(&mut self, cx: &mut Context<'_, Self>) {
+        let mut target = self.done_return_screen;
+        if target == Screen::Docker && !self.has_local_docker_daemon() {
+            target = Screen::Explore;
+        }
+        self.done_return_screen = Screen::Explore;
+        self.run_stage = None;
+        self.screen = target;
+        self.focus_request = Some(FocusTarget::Root);
         cx.notify();
     }
 
@@ -6543,14 +7947,453 @@ impl Ruum {
         }
         if finished {
             self.run = None;
-            self.marks.clear();
-            self.screen = Screen::Done;
-            // The tree on screen is now wrong; start over rather than leaving
-            // numbers that include what was just removed.
-            self.start_scan(cx);
+            self.finish_removal_run(true, cx);
+            return false;
         }
         cx.notify();
         !finished
+    }
+
+    fn current_remote_header(&self) -> ruum_core::remote::Header {
+        if let Some(header) = &self.remote_header {
+            let mut merged = header.clone();
+            merged.docker = self.docker.clone();
+            return merged;
+        }
+        let platform = if self.remote_platform.is_empty() {
+            "linux"
+        } else {
+            self.remote_platform.as_str()
+        };
+        let mut header = ruum_core::remote::Header::new(
+            self.root_path.clone(),
+            self.home.clone(),
+            platform,
+            self.remote_identity.clone(),
+        );
+        header.disk_root.clone_from(&self.disk_root);
+        header.space = self.space;
+        header.docker = self.docker.clone();
+        header
+    }
+
+    pub fn app_data_dir_for_scripts(&self) -> Option<PathBuf> {
+        self.db_path
+            .as_deref()
+            .and_then(|p| p.parent().filter(|d| !d.as_os_str().is_empty()))
+            .map(Path::to_path_buf)
+            .or_else(ruum_watchdog::config::config_dir)
+    }
+
+    /// Generate and atomically write a deterministic `.sh` cleanup script from
+    /// the current remote Review file selection, persist pending script metadata
+    /// on the SSH card, and show the generated-script action dialog.
+    pub fn generate_remote_cleanup_script(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let plan = self.plan();
+        if plan.is_empty() {
+            return;
+        }
+        let reclaim_bytes = plan.bytes();
+        self.generate_remote_script_for_targets(
+            plan.targets,
+            reclaim_bytes,
+            Vec::new(),
+            cx,
+        );
+    }
+
+    /// Generate and atomically write a deterministic `.sh` cleanup script for
+    /// selected Docker items on the active SSH server from the remote Docker
+    /// modal.
+    pub fn generate_remote_docker_script(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let docker_targets = self.selected_review_docker_targets();
+        if docker_targets.is_empty() {
+            return;
+        }
+        let reclaim_bytes = self.selected_review_docker_bytes();
+        self.remote_docker_modal_open = false;
+        self.generate_remote_script_for_targets(
+            Vec::new(),
+            reclaim_bytes,
+            docker_targets,
+            cx,
+        );
+    }
+
+    fn generate_remote_script_for_targets(
+        &mut self,
+        targets: Vec<Target>,
+        reclaim_bytes: u64,
+        docker_targets: Vec<DockerCleanTarget>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.remote.is_none()
+            || (targets.is_empty() && docker_targets.is_empty())
+        {
+            return;
+        }
+        let locale = self.locale;
+        let Some(profile_id) = self.active_ssh_profile_id.clone() else {
+            self.push_toast(
+                crate::i18n::messages::script_generate_failed(
+                    "missing active SSH profile",
+                    locale,
+                ),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned()
+        else {
+            self.push_toast(
+                crate::i18n::messages::script_generate_failed(
+                    "SSH profile not found in storage",
+                    locale,
+                ),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+
+        let header = self.current_remote_header();
+        let item_count = targets.len() + docker_targets.len();
+        let spec = RemoteCleanupScriptSpec {
+            profile_alias: profile.alias.clone(),
+            host: profile.host,
+            port: profile.port,
+            username: profile.username,
+            header,
+            targets,
+            docker_targets,
+        };
+        let script_content = match build_remote_cleanup_script(&spec) {
+            Ok(content) => content,
+            Err(err) => {
+                self.push_toast(
+                    crate::i18n::messages::script_generate_failed(&err, locale),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+        let Some(app_data_dir) = self.app_data_dir_for_scripts() else {
+            self.push_toast(
+                crate::i18n::messages::script_generate_failed(
+                    "cannot resolve application data directory",
+                    locale,
+                ),
+                Status::Error,
+                cx,
+            );
+            return;
+        };
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        let script_path = match write_cleanup_script_atomic(
+            &app_data_dir,
+            &profile.alias,
+            now_secs,
+            &script_content,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                self.push_toast(
+                    crate::i18n::messages::script_generate_failed(
+                        &err.to_string(),
+                        locale,
+                    ),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+
+        if let Ok(db) = self.open_db() {
+            let _ = db.set_ssh_profile_pending_script(
+                &profile.id,
+                &script_path,
+                item_count as u64,
+                reclaim_bytes,
+                now_secs,
+            );
+        }
+        self.present_generated_remote_script(
+            profile.id,
+            profile.alias,
+            script_path,
+            item_count,
+            reclaim_bytes,
+            cx,
+        );
+    }
+
+    pub fn present_generated_remote_script(
+        &mut self,
+        profile_id: String,
+        alias: String,
+        script_path: PathBuf,
+        item_count: usize,
+        reclaim_bytes: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.reload_ssh_profiles();
+        self.generated_script_dialog = Some(GeneratedScriptDialog {
+            profile_id,
+            alias,
+            script_path,
+            item_count,
+            reclaim_bytes,
+        });
+        self.focus_request = Some(FocusTarget::Dialog);
+        cx.notify();
+    }
+
+    pub fn close_generated_script_dialog(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.generated_script_dialog = None;
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            clippy::unused_self,
+            reason = "reads terminal override fields on Ruum under cfg(test)"
+        )
+    )]
+    fn terminal_adapter_and_env(
+        &self,
+    ) -> (
+        Box<dyn ruum_core::terminal_launcher::TerminalAdapter>,
+        TerminalEnv,
+    ) {
+        #[cfg(test)]
+        let adapter = TerminalFactory::create_for(
+            self.terminal_os_override
+                .unwrap_or_else(TerminalFactory::current_os),
+        );
+        #[cfg(not(test))]
+        let adapter = TerminalFactory::create();
+
+        #[cfg(test)]
+        let env = self
+            .terminal_env_override
+            .clone()
+            .unwrap_or_else(TerminalEnv::current);
+        #[cfg(not(test))]
+        let env = TerminalEnv::current();
+
+        (adapter, env)
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            clippy::needless_pass_by_ref_mut,
+            reason = "cfg(test) synchronously updates toast via &mut Context"
+        )
+    )]
+    pub fn execute_cleanup_script_in_terminal(
+        &mut self,
+        profile_id: &str,
+        script_path: &Path,
+        cx: &mut Context<'_, Self>,
+    ) {
+        #[cfg(test)]
+        let locale = self.locale;
+        let alias = self
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map_or_else(|| profile_id.to_owned(), |p| p.alias.clone());
+        self.generated_script_dialog = None;
+        self.focus_request = Some(FocusTarget::Root);
+
+        let (adapter, env) = self.terminal_adapter_and_env();
+        #[cfg(test)]
+        {
+            match adapter.build_run_script_plan(
+                &env,
+                script_path,
+                Some(profile_id),
+                true,
+            ) {
+                Ok(plan) => {
+                    self.terminal_launch_log
+                        .push(("run-script".to_owned(), plan));
+                    self.push_toast(
+                        crate::i18n::messages::script_launched_in_terminal(
+                            &alias, locale,
+                        ),
+                        Status::Success,
+                        cx,
+                    );
+                }
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::script_launch_failed(
+                            &err.to_string(),
+                            locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                }
+            }
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        {
+            let script = script_path.to_path_buf();
+            let pid = profile_id.to_owned();
+            let task = cx.background_executor().spawn(async move {
+                adapter.launch_run_script(&env, &script, Some(&pid), true)
+            });
+            cx.spawn(async move |this, cx| {
+                let res = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    match res {
+                        Ok(_) => this.push_toast(
+                            crate::i18n::messages::script_launched_in_terminal(
+                                &alias,
+                                this.locale,
+                            ),
+                            Status::Success,
+                            cx,
+                        ),
+                        Err(err) => this.push_toast(
+                            crate::i18n::messages::script_launch_failed(
+                                &err.to_string(),
+                                this.locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        ),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            clippy::needless_pass_by_ref_mut,
+            reason = "cfg(test) records terminal_launch_log on &mut self"
+        )
+    )]
+    pub fn reveal_cleanup_script(
+        &mut self,
+        script_path: &Path,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let locale = self.locale;
+        let (adapter, env) = self.terminal_adapter_and_env();
+        #[cfg(test)]
+        {
+            match adapter.build_reveal_plan(&env, script_path) {
+                Ok(plan) => {
+                    self.terminal_launch_log.push(("reveal".to_owned(), plan));
+                }
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::script_reveal_failed(
+                            &err.to_string(),
+                            locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                }
+            }
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        {
+            let script = script_path.to_path_buf();
+            let task = cx
+                .background_executor()
+                .spawn(async move { adapter.reveal_script(&env, &script) });
+            cx.spawn(async move |this, cx| {
+                let res = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Err(err) = res {
+                        this.push_toast(
+                            crate::i18n::messages::script_reveal_failed(
+                                &err.to_string(),
+                                locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    pub fn discard_ssh_pending_script(
+        &mut self,
+        profile_id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let locale = self.locale;
+        let profile = self
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned();
+        let alias = profile
+            .as_ref()
+            .map_or_else(|| profile_id.to_owned(), |p| p.alias.clone());
+        if let Some(ref prof) = profile
+            && let Some(ref script_str) = prof.pending_script_path
+        {
+            let p = Path::new(script_str);
+            if p.parent().is_some_and(|dir| {
+                dir.file_name().is_some_and(|n| n == "cleanup-scripts")
+            }) {
+                let _ = std::fs::remove_file(p);
+                let _ = std::fs::remove_file(p.with_extension("command"));
+            }
+        }
+        if let Ok(db) = self.open_db() {
+            let _ = db.clear_ssh_profile_pending_script(profile_id);
+        }
+        if self
+            .generated_script_dialog
+            .as_ref()
+            .is_some_and(|d| d.profile_id == profile_id)
+        {
+            self.generated_script_dialog = None;
+        }
+        self.reload_ssh_profiles();
+        self.push_toast(
+            crate::i18n::messages::script_discarded(&alias, locale),
+            Status::Neutral,
+            cx,
+        );
+        cx.notify();
     }
 
     /// Descend to a path found by the search field.
@@ -6669,6 +8512,7 @@ impl Ruum {
         self.screen == Screen::Explore
             && !self.confirm_open
             && !self.volumes_open
+            && !self.remote_docker_modal_open
     }
 
     /// Ask for a directory and scan it: an app opened from the Dock has no
@@ -6771,15 +8615,26 @@ impl Ruum {
     }
 
     fn delete_script(&self, targets: &[Target]) -> String {
-        let identity = if self.remote.is_some() {
-            self.remote_identity.clone()
+        let (identity, platform) = if self.remote.is_some() {
+            let platform = if self.remote_platform.is_empty() {
+                "linux"
+            } else {
+                self.remote_platform.as_str()
+            };
+            (self.remote_identity.clone(), platform)
         } else {
-            ruum_core::identity::HostIdentity::current()
+            let local_platform = if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "linux"
+            };
+            (ruum_core::identity::HostIdentity::current(), local_platform)
         };
-        ruum_core::export::delete_script_for(
+        ruum_core::export::delete_script_for_platform(
             targets,
             &self.root_path,
             self.remote.as_deref(),
+            platform,
             identity.as_ref(),
         )
     }
@@ -6892,6 +8747,12 @@ impl Ruum {
         if self.confirm_open {
             return;
         }
+        if self.generated_script_dialog.is_some() {
+            if key == "escape" {
+                self.close_generated_script_dialog(cx);
+            }
+            return;
+        }
         if self.remote_connect_confirm.is_some() {
             match key {
                 "enter" => self.approve_remote_connect(cx),
@@ -6901,15 +8762,9 @@ impl Ruum {
             return;
         }
 
-        // The volume picker owns its keys while open: arrows move, Enter
-        // picks, Escape closes, and nothing behind it acts.
-        if self.volumes_open || self.screen == Screen::Sources {
-            if self.ssh_form_open {
-                if key == "escape" {
-                    self.close_ssh_form(cx);
-                }
-                return;
-            }
+        // The volume picker modal owns its keys while open: arrows move, Enter
+        // picks, Escape closes, and nothing behind acts.
+        if self.volumes_open {
             match key {
                 "escape" => self.close_volumes(cx),
                 "enter" => self.choose_volume(cx),
@@ -6923,10 +8778,32 @@ impl Ruum {
             }
             return;
         }
+        if self.remote_docker_modal_open {
+            if key == "escape" {
+                self.close_remote_docker_modal(cx);
+            }
+            return;
+        }
+        if self.screen == Screen::Remote {
+            if self.ssh_form_open {
+                if key == "escape" {
+                    self.close_ssh_form(cx);
+                }
+                return;
+            }
+            if key == "escape" {
+                self.screen = Screen::Explore;
+                self.focus_request = Some(FocusTarget::Root);
+                cx.notify();
+            }
+            return;
+        }
 
-        // Escape on Watchdog or Settings returns to Explore:
-        if (self.screen == Screen::Watchdog || self.screen == Screen::Settings)
-            && key == "escape"
+        // Escape on Docker, Watchdog, or Settings returns to Explore:
+        if matches!(
+            self.screen,
+            Screen::Docker | Screen::Watchdog | Screen::Settings
+        ) && key == "escape"
         {
             self.screen = Screen::Explore;
             cx.notify();
@@ -6991,11 +8868,16 @@ impl Ruum {
             Screen::Explore if alt && key == "left" => self.go_back(cx),
             Screen::Explore if alt && key == "right" => self.go_forward(cx),
             Screen::Explore => self.on_explore_key(key, control, shift, cx),
-            Screen::Watchdog | Screen::Settings if key == "escape" => {
+            Screen::Docker | Screen::Watchdog | Screen::Settings
+                if key == "escape" =>
+            {
                 self.screen = Screen::Explore;
                 cx.notify();
             }
-            Screen::Sources | Screen::Watchdog | Screen::Settings => {}
+            Screen::Docker
+            | Screen::Remote
+            | Screen::Watchdog
+            | Screen::Settings => {}
             Screen::Review => self.on_review_key(key, cx),
             Screen::Running => {
                 if key == "escape"
@@ -7014,8 +8896,7 @@ impl Ruum {
             }
             Screen::Done => {
                 if matches!(key, "escape" | "enter") {
-                    self.screen = Screen::Explore;
-                    cx.notify();
+                    self.finish_done_screen(cx);
                 }
             }
         }
@@ -7144,7 +9025,7 @@ impl Ruum {
     }
 
     fn on_review_key(&mut self, key: &str, cx: &mut Context<'_, Self>) {
-        if self.remote.is_some() && matches!(key, "m" | "p" | "enter") {
+        if self.remote.is_some() && matches!(key, "m" | "p") {
             return;
         }
         if key == "e" {
@@ -7574,6 +9455,28 @@ impl Render for Ruum {
     }
 }
 
+/// Run local AI analysis on an already-fetched remote [`Snapshot`] using pure
+/// in-memory tree + Docker whitelist validation.
+pub fn analyze_remote_snapshot_with_runner(
+    ai_cfg: &ruum_core::storage::AiConfig,
+    snapshot: &ruum_core::remote::Snapshot,
+    now_secs: u64,
+    runner: &dyn ruum_core::ai_cli::CommandRunner,
+) -> Result<CleanupProposal, String> {
+    let target_os =
+        ruum_core::removal::trash_os_for_platform(&snapshot.header.platform);
+    ruum_core::ai_cli::run_tree_analysis_for_config(
+        ai_cfg,
+        &snapshot.header.root,
+        snapshot.header.home.as_deref(),
+        &snapshot.tree,
+        &snapshot.docker,
+        target_os,
+        now_secs,
+        runner,
+    )
+}
+
 fn start_ssh_session_with_store(
     profile: &ruum_core::storage::SshProfile,
     store: &ruum_core::credentials::LazyCredentialStore,
@@ -7586,65 +9489,31 @@ fn start_ssh_session_with_store(
     ruum_core::ssh_session::SshSession::start(endpoint, auth, duration_minutes)
 }
 
-fn resolve_remote_proposal_root(
-    target_path: Option<&str>,
-    home: Option<&Path>,
-    items: &[ruum_core::watchdog_config::ProposalItem],
-) -> PathBuf {
-    let raw = target_path
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("~");
-    let candidate = if raw == "~" {
-        home.map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        home.map_or_else(|| PathBuf::from("/"), |h| h.join(rest))
-    } else {
-        PathBuf::from(raw)
+fn expand_local_tilde_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    let Some(home) = std::env::home_dir() else {
+        return PathBuf::from(trimmed);
     };
-    if items.iter().all(|item| item.path.starts_with(&candidate)) {
-        return candidate;
+    if trimmed == "~" {
+        return home;
     }
-    if let Some(first) = items.first()
-        && let Some(parent) = first.path.parent()
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        };
+    }
+    if cfg!(windows)
+        && let Some(rest) = trimmed.strip_prefix("~\\")
     {
-        return parent.to_path_buf();
+        return if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        };
     }
-    candidate
-}
-
-fn resolve_remote_proposal_header(
-    session: &ruum_core::ssh_session::SshSession,
-    cached: Option<ruum_core::remote::Header>,
-    target_path: Option<&str>,
-    items: &[ruum_core::watchdog_config::ProposalItem],
-) -> Result<ruum_core::remote::Header, String> {
-    if let Some(mut header) = cached
-        && header.identity.is_some()
-    {
-        if !items.iter().all(|item| item.path.starts_with(&header.root)) {
-            header.root = resolve_remote_proposal_root(
-                target_path,
-                header.home.as_deref(),
-                items,
-            );
-        }
-        return Ok(header);
-    }
-    let job = ruum_core::remote::RemoteRoots::discover_with_session(session)
-        .map_err(|err| err.to_string())?;
-    let roots = job.wait().map_err(|err| err.to_string())?;
-    if roots.identity.is_none() {
-        return Err("remote host did not report a host identity".to_owned());
-    }
-    let root =
-        resolve_remote_proposal_root(target_path, roots.home.as_deref(), items);
-    Ok(ruum_core::remote::Header::new(
-        root,
-        roots.home,
-        roots.platform,
-        roots.identity,
-    ))
+    PathBuf::from(trimmed)
 }
 
 #[cfg(test)]

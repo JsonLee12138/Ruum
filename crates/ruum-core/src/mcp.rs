@@ -29,12 +29,9 @@ use crate::insights::{Finding, worth_a_look};
 use crate::remote::{
     Header, RemoteRoots, RemoteScan, Request, Roots, Snapshot, validate_host,
 };
-use crate::remote_trash::{
-    execute_remote_trash, execute_remote_trash_with_session, plan_remote,
-};
 use crate::removal::{
     Blocked, Plan, RemovalEvent, RemovalMode, Target, TrashBackend,
-    detect_trash_backend, normalize, plan_for_mode, spawn,
+    detect_trash_backend, normalize, plan_for_mode, plan_remote, spawn,
 };
 use crate::scan::{ScanOptions, scan};
 use crate::size::human_bytes;
@@ -97,18 +94,6 @@ pub trait RemoteExecutor: Send + Sync + fmt::Debug {
         request: &Request,
     ) -> io::Result<Snapshot>;
     fn scan_raw(&self, host: &str, request: &Request) -> io::Result<Snapshot>;
-    fn trash_with_session(
-        &self,
-        session: &SshSession,
-        targets: &[Target],
-        header: &Header,
-    ) -> io::Result<()>;
-    fn trash_raw(
-        &self,
-        host: &str,
-        targets: &[Target],
-        header: &Header,
-    ) -> io::Result<()>;
 }
 
 /// Production [`RemoteExecutor`] backed by `ssh` subprocesses and [`SshSession`].
@@ -138,24 +123,6 @@ impl RemoteExecutor for SystemRemoteExecutor {
 
     fn scan_raw(&self, host: &str, request: &Request) -> io::Result<Snapshot> {
         RemoteScan::spawn(host, request).and_then(RemoteScan::wait)
-    }
-
-    fn trash_with_session(
-        &self,
-        session: &SshSession,
-        targets: &[Target],
-        header: &Header,
-    ) -> io::Result<()> {
-        execute_remote_trash_with_session(session, targets, header)
-    }
-
-    fn trash_raw(
-        &self,
-        host: &str,
-        targets: &[Target],
-        header: &Header,
-    ) -> io::Result<()> {
-        execute_remote_trash(host, targets, header)
     }
 }
 
@@ -1171,131 +1138,13 @@ impl McpServer {
         let root_str = required_str(args, "root")?;
         let raw_targets = required_string_array(args, "targets")?;
         if let Some(target) = remote {
-            let root_path = normalize_remote_path(Path::new(root_str));
-            let cache_host = target.cache_key().to_owned();
-            let key = (Some(cache_host.clone()), root_path.clone());
-            let cached = self.cache.get(&key).ok_or_else(|| {
-                format!(
-                    "No cached remote scan for {}:{}; run scan_directory \
-                     first.",
-                    target.display_label(),
-                    root_path.display()
-                )
-            })?;
-            let targets = build_targets(
-                &raw_targets,
-                &root_path,
-                Some(&cached.tree),
-                true,
-            );
-            let header = cached.to_remote_header(&root_path);
-            let remote_plan = plan_remote(&targets, &header);
-            if remote_plan.targets.is_empty() || !remote_plan.blocked.is_empty()
-            {
-                return Err(format_plan_rejection(
-                    "trash_paths",
-                    &remote_plan.root,
-                    &remote_plan.blocked,
-                ));
-            }
-
-            // Require an active remote SSH authorization lease (or explicit
-            // user confirmation) before proceeding to item confirmation / trash.
-            let lease_key =
-                self.ensure_remote_authorized(&target, "trash_paths")?;
-
-            let confirm_items: Vec<CleanupConfirmItem> = remote_plan
-                .targets
-                .iter()
-                .map(|t| CleanupConfirmItem {
-                    path: t.path.clone(),
-                    bytes: t.bytes,
-                    mode: RemovalMode::Trash,
-                    reason: None,
-                    git_warning: None,
-                })
-                .collect();
-            let req = CleanupConfirmRequest {
-                root: remote_plan.root.clone(),
-                title: format!("Trash items on {}", target.display_label()),
-                summary: Some(format!(
-                    "Moving {} items ({}) to Trash",
-                    remote_plan.targets.len(),
-                    human_bytes(remote_plan.reclaim())
-                )),
-                items: confirm_items,
-            };
-            let decision = self
-                .confirm
-                .confirm(&req)
-                .map_err(|err| format!("Cleanup confirmation failed: {err}"))?;
-            let selected_paths = match decision {
-                CleanupConfirmDecision::Confirmed { selected_paths } => {
-                    selected_paths
-                }
-                CleanupConfirmDecision::Cancelled => {
-                    return Err("cleanup cancelled by user".to_owned());
-                }
-            };
-            let approved_targets: Vec<Target> = remote_plan
-                .targets
-                .into_iter()
-                .filter(|t| selected_paths.contains(&t.path))
-                .collect();
-            if approved_targets.is_empty() {
-                return Err("cleanup cancelled by user".to_owned());
-            }
-
-            // Re-verify the authorization lease has not expired while the
-            // user was reviewing items.
-            if !self.has_valid_lease(&lease_key) {
-                self.remote_connect_leases.remove(&lease_key);
-                return Err(
-                    "remote SSH authorization lease expired before deletion; \
-                     re-authorize connection before trashing"
-                        .to_owned(),
-                );
-            }
-
-            match &target {
-                RemoteTarget::Profile {
-                    profile, endpoint, ..
-                } => {
-                    self.ensure_profile_session(&lease_key, profile, endpoint)?;
-                    let session = self
-                        .remote_connect_leases
-                        .get(&lease_key)
-                        .and_then(|l| l.session.as_ref())
-                        .ok_or_else(|| "SSH session missing".to_owned())?;
-                    self.remote_executor
-                        .trash_with_session(session, &approved_targets, &header)
-                        .map_err(|err| err.to_string())?;
-                }
-                RemoteTarget::RawHost { raw_host, .. } => {
-                    self.remote_executor
-                        .trash_raw(raw_host, &approved_targets, &header)
-                        .map_err(|err| err.to_string())?;
-                }
-            }
-            self.invalidate_overlapping(Some(&cache_host), &root_path);
-            let reclaim: u64 = approved_targets.iter().map(|t| t.bytes).sum();
-            let skipped_by_user: Vec<String> = targets
-                .iter()
-                .filter(|t| !selected_paths.contains(&t.path))
-                .map(|t| t.path.display().to_string())
-                .collect();
-            return Ok(json!({
-                "mode": "trash",
-                "target": target.display_label(),
-                "profile": target.profile_alias(),
-                "ssh_host": target.raw_ssh_host(),
-                "root": remote_plan.root.display().to_string(),
-                "removed_count": approved_targets.len(),
-                "reclaim_bytes": reclaim,
-                "human_reclaim": human_bytes(reclaim),
-                "skipped_count": skipped_by_user.len(),
-                "skipped_by_user": skipped_by_user,
-            }));
+            return Err(format!(
+                "Remote background trash over SSH on {} is disabled for \
+                 safety; use plan_removal for read-only planning and generate \
+                 a cleanup script in the GUI to review and execute in a \
+                 visible terminal.",
+                target.display_label()
+            ));
         }
 
         let root_path = resolve_local_path(root_str)?;
@@ -1341,13 +1190,15 @@ impl McpServer {
                 human_bytes(local_plan.reclaim())
             )),
             items: confirm_items,
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
         let decision = self
             .confirm
             .confirm(&req)
             .map_err(|err| format!("Cleanup confirmation failed: {err}"))?;
         let selected_paths = match decision {
-            CleanupConfirmDecision::Confirmed { selected_paths } => {
+            CleanupConfirmDecision::Confirmed { selected_paths, .. } => {
                 selected_paths
             }
             CleanupConfirmDecision::Cancelled => {
@@ -1413,8 +1264,8 @@ impl McpServer {
             || has_non_null_arg(args, "profile")
         {
             return Err(
-                "Permanent deletion over SSH is forbidden; use trash_paths \
-                 instead."
+                "Permanent deletion over SSH is forbidden; use plan_removal for \
+                 read-only planning and generate a cleanup script in the GUI."
                     .to_owned(),
             );
         }
@@ -1464,13 +1315,15 @@ impl McpServer {
                 human_bytes(local_plan.reclaim())
             )),
             items: confirm_items,
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
         let decision = self
             .confirm
             .confirm(&req)
             .map_err(|err| format!("Cleanup confirmation failed: {err}"))?;
         let selected_paths = match decision {
-            CleanupConfirmDecision::Confirmed { selected_paths } => {
+            CleanupConfirmDecision::Confirmed { selected_paths, .. } => {
                 selected_paths
             }
             CleanupConfirmDecision::Cancelled => {
@@ -2444,7 +2297,7 @@ fn tool_definitions(read_only: bool) -> Vec<Value> {
     if !read_only {
         tools.push(json!({
             "name": "trash_paths",
-            "description": "Move validated paths under a scanned root to the system Trash (local or guarded remote SSH).",
+            "description": "Move validated local paths under a scanned root to the system Trash (remote SSH background trash is disabled; use plan_removal and the GUI cleanup script flow).",
             "inputSchema": {
                 "type": "object",
                 "required": ["root", "targets"],
@@ -2519,6 +2372,7 @@ mod tests {
                     .iter()
                     .map(|i| i.path.clone())
                     .collect(),
+                selected_docker_targets: Vec::new(),
             })
         }
     }
@@ -3285,13 +3139,8 @@ mod tests {
         );
 
         let (err2, payload2) = parse_tool_payload(&responses[1]);
-        assert!(err2, "trash_paths on uncached remote host must fail");
-        assert!(
-            payload2
-                .as_str()
-                .unwrap_or_default()
-                .contains("No cached remote scan")
-        );
+        assert!(err2, "trash_paths on remote host must fail");
+        assert!(payload2.as_str().unwrap_or_default().contains("disabled"));
     }
 
     #[test]
@@ -3371,6 +3220,7 @@ mod tests {
         let confirm = MockDecisionConfirm {
             decision: CleanupConfirmDecision::Confirmed {
                 selected_paths: vec![file1.clone()],
+                selected_docker_targets: Vec::new(),
             },
         };
         let mut server =
@@ -3468,6 +3318,7 @@ mod tests {
         let confirm = MockDecisionConfirm {
             decision: CleanupConfirmDecision::Confirmed {
                 selected_paths: vec![target_a.clone(), target_b.clone()],
+                selected_docker_targets: Vec::new(),
             },
         };
         let mut server = McpServer::with_confirm(
@@ -3755,7 +3606,6 @@ mod tests {
     struct MockRemoteExecutor {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        trashed_paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
         session_ptrs: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
@@ -3810,7 +3660,12 @@ mod tests {
                 free: 20_000_000,
                 available: 15_000_000,
             });
-            Snapshot { header, tree }
+            let docker = header.docker.clone();
+            Snapshot {
+                header,
+                tree,
+                docker,
+            }
         }
     }
 
@@ -3870,40 +3725,6 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/home/deploy"));
             Ok(Self::sample_snapshot(&root))
-        }
-
-        fn trash_with_session(
-            &self,
-            session: &SshSession,
-            targets: &[Target],
-            _header: &Header,
-        ) -> io::Result<()> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.ops.lock().unwrap().push("trash_session".to_owned());
-            self.session_ptrs
-                .lock()
-                .unwrap()
-                .push(std::ptr::from_ref(session) as usize);
-            self.trashed_paths
-                .lock()
-                .unwrap()
-                .extend(targets.iter().map(|t| t.path.clone()));
-            Ok(())
-        }
-
-        fn trash_raw(
-            &self,
-            host: &str,
-            targets: &[Target],
-            _header: &Header,
-        ) -> io::Result<()> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.ops.lock().unwrap().push(format!("trash_raw:{host}"));
-            self.trashed_paths
-                .lock()
-                .unwrap()
-                .extend(targets.iter().map(|t| t.path.clone()));
-            Ok(())
         }
     }
 
@@ -4279,7 +4100,8 @@ mod tests {
             let (is_err, payload) = parse_tool_payload(resp);
             assert!(is_err, "denied/headless call #{idx} must fail: {payload}");
         }
-        assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+        // Remote trash_paths (#5) is disabled upfront before touching confirm/keychain.
+        assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 5);
         assert_eq!(
             kc_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -4321,7 +4143,6 @@ mod tests {
         let exec = MockRemoteExecutor::default();
         let exec_calls = std::sync::Arc::clone(&exec.calls);
         let session_ptrs = std::sync::Arc::clone(&exec.session_ptrs);
-        let trashed_paths = std::sync::Arc::clone(&exec.trashed_paths);
 
         let mut server = McpServer::with_confirm(
             Box::new(DenyAuth),
@@ -4384,10 +4205,23 @@ mod tests {
         )
         .unwrap();
 
-        for (idx, resp) in responses.iter().enumerate() {
+        for (idx, resp) in responses.iter().take(3).enumerate() {
             let (is_err, payload) = parse_tool_payload(resp);
             assert!(!is_err, "approved call #{idx} failed: {payload}");
         }
+        let (trash_err, trash_payload) = parse_tool_payload(&responses[3]);
+        assert!(
+            trash_err,
+            "remote trash_paths must disable background SSH deletion: {trash_payload}"
+        );
+        assert!(
+            trash_payload
+                .as_str()
+                .unwrap_or_default()
+                .contains("disabled"),
+            "unexpected error: {trash_payload}"
+        );
+
         let scan_payload = parse_tool_payload(&responses[1]).1;
         assert_eq!(scan_payload["profile"], "prod-web");
         assert_eq!(scan_payload["root"], "/var/log");
@@ -4395,7 +4229,7 @@ mod tests {
         // Confirm prompted only once; keychain loaded only once; SshSession reused.
         assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(kc_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         let reqs = confirm_reqs.lock().unwrap().clone();
         assert_eq!(reqs[0].alias.as_deref(), Some("prod-web"));
         assert_eq!(reqs[0].host, "10.0.1.25");
@@ -4404,13 +4238,8 @@ mod tests {
         assert_eq!(reqs[0].auth_mode, "private_key");
         assert_eq!(reqs[0].tool_name, "list_volumes");
         let ptrs = session_ptrs.lock().unwrap().clone();
-        assert_eq!(ptrs.len(), 3);
+        assert_eq!(ptrs.len(), 2);
         assert_eq!(ptrs[0], ptrs[1]);
-        assert_eq!(ptrs[1], ptrs[2]);
-        assert_eq!(
-            *trashed_paths.lock().unwrap(),
-            vec![PathBuf::from("/var/log/old")]
-        );
 
         // Expire lease -> next call must re-prompt and fail closed when denied.
         server.expire_remote_leases_for_test();
@@ -4438,7 +4267,7 @@ mod tests {
         assert_eq!(confirm_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             exec_calls.load(std::sync::atomic::Ordering::SeqCst),
-            3,
+            2,
             "expired and denied session must not run SSH transport"
         );
     }

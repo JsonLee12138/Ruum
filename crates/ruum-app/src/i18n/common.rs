@@ -106,14 +106,12 @@ pub const fn menu_explore(locale: Locale) -> &'static str {
     pick(locale, "Explore", "探索", "探索", "탐색")
 }
 
-pub const fn menu_sources_and_drives(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Sources & Drives",
-        "来源与驱动器",
-        "ソースとドライブ",
-        "소스 및 드라이브",
-    )
+pub const fn menu_docker(locale: Locale) -> &'static str {
+    pick(locale, "Docker", "Docker", "Docker", "Docker")
+}
+
+pub const fn menu_remote(locale: Locale) -> &'static str {
+    pick(locale, "Remote", "远程", "リモート", "원격")
 }
 
 pub const fn menu_watchdog(locale: Locale) -> &'static str {
@@ -148,19 +146,9 @@ pub const fn tray_open_ruum(locale: Locale) -> &'static str {
     pick(locale, "Open Ruum", "打开 Ruum", "Ruum を開く", "Ruum 열기")
 }
 
-/// Tray label for Sources & Drives.
-///
-/// `muda` interprets a single `&` as a mnemonic marker on Windows/GTK and
-/// strips it on macOS; `&&` renders a literal `&` in English while CJK
-/// translations contain no `&`.
-pub const fn tray_sources_and_drives(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Sources && Drives\u{2026}",
-        "来源与驱动器\u{2026}",
-        "ソースとドライブ\u{2026}",
-        "소스 및 드라이브\u{2026}",
-    )
+/// Tray label for the Remote SSH servers page.
+pub const fn tray_remote(locale: Locale) -> &'static str {
+    menu_remote(locale)
 }
 
 pub const fn tray_watchdog(locale: Locale) -> &'static str {

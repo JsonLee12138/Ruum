@@ -25,10 +25,15 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use crate::i18n::Locale;
+use crate::identity::HostIdentity;
+use crate::remote::Header;
 use crate::trash_adapter::{
     ALREADY_IN_TRASH_REASON, TrashAdapter, TrashAdapterFactory,
-    TrashDisposition, TrashEnv,
+    TrashDisposition, TrashEnv, TrashOs,
 };
+
+/// Guard reason when a target touches or contains container runtime storage.
+pub const CONTAINER_STORAGE_REASON: &str = "Docker/容器底层存储文件由守护进程管理，直接删除会丢失所有容器与数据卷；请使用 Docker 专项清理";
 
 /// One path the user asked to remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,6 +555,12 @@ fn refuse(
     if !key.starts_with(&root_key) && !path.starts_with(root) {
         return Some("outside the scanned root".into());
     }
+    let container_roots = local_container_storage_roots(home_key);
+    if container_roots.iter().any(|base| key.starts_with(base))
+        || (cfg!(windows) && is_windows_docker_vhdx(&key.to_string_lossy()))
+    {
+        return Some(CONTAINER_STORAGE_REASON.to_owned());
+    }
     if let Some(system) = system_tree(&key, home_key)
         && !(system == "/run"
             && on_media(&key, mounts, media)
@@ -563,6 +574,12 @@ fn refuse(
         return Some(format!(
             "it contains {system}, which is part of the system"
         ));
+    }
+    if container_roots
+        .iter()
+        .any(|base| base != &key && base.starts_with(&key))
+    {
+        return Some(CONTAINER_STORAGE_REASON.to_owned());
     }
     if mounts.contains(&key) || is_mount_point(path) {
         return Some(
@@ -578,6 +595,48 @@ fn refuse(
         ));
     }
     None
+}
+
+fn local_container_storage_roots(home_key: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if cfg!(target_os = "macos") {
+        if let Some(home) = home_key {
+            roots.push(
+                home.join("library/containers/com.docker.docker/data/vms"),
+            );
+            roots.push(home.join("orbstack"));
+            roots.push(home.join(".colima"));
+            roots.push(home.join(".lima"));
+        }
+    } else if cfg!(windows) {
+        if let Some(home) = home_key {
+            roots.push(home.join(r"appdata\local\docker\wsl\data"));
+            roots.push(home.join(r"appdata\local\docker\wsl\disk"));
+        }
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            let base = PathBuf::from(local_appdata);
+            if base.is_absolute() {
+                roots.push(guard_key(&base.join(r"Docker\wsl\data")));
+                roots.push(guard_key(&base.join(r"Docker\wsl\disk")));
+            }
+        }
+    } else {
+        roots.push(PathBuf::from("/var/lib/docker"));
+        roots.push(PathBuf::from("/var/lib/containerd"));
+        if let Some(home) = home_key {
+            roots.push(home.join(".local/share/docker"));
+            roots.push(home.join(".local/share/containers/storage"));
+        }
+    }
+    roots
+}
+
+fn is_windows_docker_vhdx(key_lower: &str) -> bool {
+    let lower = key_lower.to_ascii_lowercase();
+    Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("vhdx"))
+        && lower.contains(r"\docker\wsl\")
 }
 
 /// A name Win32 reads as some other one. It strips trailing dots and
@@ -2006,6 +2065,550 @@ fn deletion_date() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
+const REMOTE_SYSTEM_TREES: [&str; 24] = [
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/lib32",
+    "/libx32",
+    "/nix/store",
+    "/gnu/store",
+    "/proc",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/var/lib",
+    "/efi",
+    "/home/linuxbrew/.linuxbrew",
+    "/System",
+    "/Library",
+    "/private",
+    "/cores",
+    "/opt/homebrew",
+    "/Network",
+];
+
+const WINDOWS_REMOTE_SYSTEM_NAMES: [&str; 11] = [
+    "Windows",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "System Volume Information",
+    "Recovery",
+    "Boot",
+    "bootmgr",
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+];
+
+/// Outcome of planning a remote cleanup against a captured [`Header`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemotePlan {
+    pub targets: Vec<Target>,
+    pub covered: Vec<Target>,
+    pub blocked: Vec<Blocked>,
+    pub root: PathBuf,
+    pub reclaim: u64,
+}
+
+impl RemotePlan {
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.targets.iter().map(|target| target.bytes).sum()
+    }
+
+    #[must_use]
+    pub const fn reclaim(&self) -> u64 {
+        self.reclaim
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+/// Map a remote `Header.platform` string onto [`TrashOs`].
+#[must_use]
+pub const fn trash_os_for_platform(platform: &str) -> TrashOs {
+    if platform.eq_ignore_ascii_case("macos") {
+        TrashOs::MacOs
+    } else if platform.eq_ignore_ascii_case("windows") {
+        TrashOs::Windows
+    } else {
+        TrashOs::Linux
+    }
+}
+
+/// Validate that a remote [`Header`] has a usable [`HostIdentity`] and root.
+pub fn validate_header(header: &Header) -> io::Result<&HostIdentity> {
+    let identity = validate_identity(header.identity.as_ref())
+        .map_err(io::Error::other)?;
+    let os = trash_os_for_platform(&header.platform);
+    normalize_remote(&header.root, os).map_err(io::Error::other)?;
+    if let Some(home) = &header.home {
+        normalize_remote(home, os).map_err(io::Error::other)?;
+    }
+    Ok(identity)
+}
+
+/// Plan remote cleanup targets against a captured scan [`Header`].
+#[must_use]
+pub fn plan_remote(targets: &[Target], header: &Header) -> RemotePlan {
+    plan_remote_for_os(targets, header, trash_os_for_platform(&header.platform))
+}
+
+/// Pure in-memory remote cleanup planning for an explicit target [`TrashOs`].
+#[must_use]
+pub fn plan_remote_for_os(
+    targets: &[Target],
+    header: &Header,
+    os: TrashOs,
+) -> RemotePlan {
+    let root_norm = normalize_remote(&header.root, os).ok();
+    let root_path = root_norm
+        .as_deref()
+        .map_or_else(|| header.root.clone(), PathBuf::from);
+    let mut plan = RemotePlan {
+        root: root_path,
+        ..RemotePlan::default()
+    };
+    if targets.is_empty() {
+        return plan;
+    }
+
+    if let Err(reason) = validate_identity(header.identity.as_ref()) {
+        for target in targets {
+            plan.blocked.push(Blocked {
+                path: target.path.clone(),
+                reason: reason.to_owned(),
+            });
+        }
+        return plan;
+    }
+
+    let Some(root_norm) = root_norm else {
+        for target in targets {
+            plan.blocked.push(Blocked {
+                path: target.path.clone(),
+                reason: "remote scan root is not a valid absolute path".into(),
+            });
+        }
+        return plan;
+    };
+
+    let root_key = remote_key(&root_norm, os);
+    let home_key = header
+        .home
+        .as_deref()
+        .and_then(|home| normalize_remote(home, os).ok())
+        .map(|home| remote_key(&home, os));
+    let trash_adapter = TrashAdapterFactory::create_for(os);
+    let trash_env = TrashEnv {
+        home: header.home.clone(),
+        xdg_data_home: None,
+        uid: None,
+    };
+    let remote_mounts =
+        remote_mount_roots(&root_norm, header.disk_root.as_deref(), os);
+
+    let mut accepted: Vec<(String, Target)> = Vec::new();
+    for target in targets {
+        let norm = match normalize_remote(&target.path, os) {
+            Ok(norm) => norm,
+            Err(reason) => {
+                plan.blocked.push(Blocked {
+                    path: target.path.clone(),
+                    reason: reason.to_owned(),
+                });
+                continue;
+            }
+        };
+        let key = remote_key(&norm, os);
+        if let Some(reason) = refuse_remote(
+            &norm,
+            &key,
+            &root_norm,
+            &root_key,
+            home_key.as_deref(),
+            os,
+            trash_adapter.as_ref(),
+            &trash_env,
+            &remote_mounts,
+        ) {
+            plan.blocked.push(Blocked {
+                path: target.path.clone(),
+                reason,
+            });
+            continue;
+        }
+        accepted.push((
+            key,
+            Target {
+                path: PathBuf::from(norm),
+                ..target.clone()
+            },
+        ));
+    }
+
+    accepted.sort_by(|left, right| left.1.path.cmp(&right.1.path));
+    let mut outer: Vec<(String, Target)> = Vec::new();
+    for (key, target) in accepted {
+        if outer
+            .iter()
+            .any(|(candidate_key, _)| within_remote(&key, candidate_key, os))
+        {
+            plan.covered.push(target);
+        } else {
+            outer.push((key, target));
+        }
+    }
+    plan.targets = outer.into_iter().map(|(_, target)| target).collect();
+    plan.reclaim = plan.targets.iter().map(|target| target.bytes).sum();
+    plan
+}
+
+fn validate_identity(
+    identity: Option<&HostIdentity>,
+) -> Result<&HostIdentity, &'static str> {
+    let Some(identity) = identity else {
+        return Err("remote scan has no host identity");
+    };
+    if identity.hostname.is_empty()
+        || !identity
+            .hostname
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+    {
+        return Err("remote scan has an invalid hostname");
+    }
+    if let Some(id) = &identity.machine_id
+        && (id.len() != 32 || !id.bytes().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err("remote scan has an invalid machine ID");
+    }
+    Ok(identity)
+}
+
+fn normalize_remote(path: &Path, os: TrashOs) -> Result<String, &'static str> {
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => normalize_unix(path),
+        TrashOs::Windows => normalize_windows_remote(path),
+    }
+}
+
+fn normalize_unix(path: &Path) -> Result<String, &'static str> {
+    let Some(text) = path.to_str() else {
+        return Err("path is not valid UTF-8");
+    };
+    if text.is_empty() || !text.starts_with('/') {
+        return Err("relative path cannot be removed");
+    }
+    if text.chars().any(char::is_control) {
+        return Err("path contains control characters");
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        Ok("/".to_owned())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+fn normalize_windows_remote(path: &Path) -> Result<String, &'static str> {
+    let Some(text) = path.to_str() else {
+        return Err("path is not valid UTF-8");
+    };
+    if text.chars().any(char::is_control) {
+        return Err("path contains control characters");
+    }
+    let stripped = text.strip_prefix(r"\\?\").unwrap_or(text);
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return Err("relative path cannot be removed");
+    }
+    let drive = bytes[0].to_ascii_uppercase() as char;
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in stripped[3..].split(['\\', '/']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        Ok(format!("{drive}:\\"))
+    } else {
+        Ok(format!("{drive}:\\{}", parts.join("\\")))
+    }
+}
+
+fn remote_key(norm: &str, os: TrashOs) -> String {
+    match os {
+        TrashOs::Linux => norm.to_owned(),
+        TrashOs::MacOs => {
+            let folded = match norm.strip_prefix("/System/Volumes/Data/") {
+                Some(rest) if !rest.is_empty() => format!("/{rest}"),
+                _ => norm.to_owned(),
+            };
+            folded.to_ascii_lowercase()
+        }
+        TrashOs::Windows => {
+            let stripped = norm.strip_prefix(r"\\?\").unwrap_or(norm);
+            stripped.replace('/', "\\").to_ascii_lowercase()
+        }
+    }
+}
+
+fn is_remote_fs_root(norm: &str, key: &str, os: TrashOs) -> bool {
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => norm == "/" || key == "/",
+        TrashOs::Windows => {
+            let bytes = key.as_bytes();
+            bytes.len() == 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+        }
+    }
+}
+
+fn within_remote(path: &str, base: &str, os: TrashOs) -> bool {
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => within_unix(path, base),
+        TrashOs::Windows => {
+            if path == base {
+                return true;
+            }
+            if is_remote_fs_root(base, base, TrashOs::Windows) {
+                return path
+                    .get(..3)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base));
+            }
+            path.strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with('\\'))
+        }
+    }
+}
+
+fn within_unix(path: &str, base: &str) -> bool {
+    if base == "/" {
+        return path.starts_with('/');
+    }
+    path == base
+        || path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn remote_mount_roots(
+    root_norm: &str,
+    disk_root: Option<&Path>,
+    os: TrashOs,
+) -> Vec<PathBuf> {
+    let mut mounts = vec![PathBuf::from(root_norm)];
+    if let Some(disk_root) = disk_root
+        .and_then(|dir| normalize_remote(dir, os).ok())
+        .map(PathBuf::from)
+        && !mounts.contains(&disk_root)
+    {
+        mounts.push(disk_root);
+    }
+    let fs_root = match os {
+        TrashOs::Linux | TrashOs::MacOs => PathBuf::from("/"),
+        TrashOs::Windows => {
+            let drive = root_norm
+                .as_bytes()
+                .first()
+                .filter(|b| b.is_ascii_alphabetic())
+                .map_or('C', |b| (*b as char).to_ascii_uppercase());
+            PathBuf::from(format!("{drive}:\\"))
+        }
+    };
+    if !mounts.contains(&fs_root) {
+        mounts.push(fs_root);
+    }
+    mounts
+}
+
+fn windows_drive_prefix(norm: &str) -> Option<String> {
+    let bytes = norm.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| format!("{}:\\", bytes[0].to_ascii_uppercase() as char))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "remote guard checks pass pre-normalized keys and reused trash adapter state"
+)]
+fn refuse_remote(
+    norm: &str,
+    key: &str,
+    root_norm: &str,
+    root_key: &str,
+    home_key: Option<&str>,
+    os: TrashOs,
+    trash_adapter: &dyn TrashAdapter,
+    trash_env: &TrashEnv,
+    remote_mounts: &[PathBuf],
+) -> Option<String> {
+    if is_remote_fs_root(norm, key, os) {
+        return Some("the filesystem root cannot be removed".into());
+    }
+    if key == root_key || norm == root_norm {
+        return Some("the scanned root cannot be removed".into());
+    }
+    if os == TrashOs::Windows
+        && let Some(bad) = norm
+            .split('\\')
+            .skip(1)
+            .find(|seg| !seg.is_empty() && misread_by_win32(seg))
+    {
+        return Some(format!(
+            "Windows would read {bad} as a different name, and remove that"
+        ));
+    }
+    if let Some(home) = home_key {
+        if key == home {
+            return Some("the home directory cannot be removed".into());
+        }
+        if within_remote(home, key, os) {
+            return Some("it contains the home directory".into());
+        }
+    }
+    if !within_remote(key, root_key, os) && !within_remote(norm, root_norm, os)
+    {
+        return Some("outside the scanned root".into());
+    }
+    let container_roots = remote_container_storage_roots(home_key, os);
+    if container_roots
+        .iter()
+        .any(|base| within_remote(key, base, os))
+        || (os == TrashOs::Windows && is_windows_docker_vhdx(key))
+    {
+        return Some(CONTAINER_STORAGE_REASON.to_owned());
+    }
+    let in_home = home_key.is_some_and(|home| within_remote(key, home, os));
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => {
+            if !in_home {
+                for tree in REMOTE_SYSTEM_TREES {
+                    let tree_key = remote_key(tree, os);
+                    if within_remote(key, &tree_key, os) {
+                        return Some(format!(
+                            "part of the system under {tree}: \
+                             remove it with the tool that installed it"
+                        ));
+                    }
+                }
+            }
+            for tree in REMOTE_SYSTEM_TREES {
+                let tree_key = remote_key(tree, os);
+                if tree_key != key && within_remote(&tree_key, key, os) {
+                    return Some(format!(
+                        "it contains {tree}, which is part of the system"
+                    ));
+                }
+            }
+        }
+        TrashOs::Windows => {
+            if let Some(drive) = windows_drive_prefix(norm) {
+                if !in_home {
+                    for name in WINDOWS_REMOTE_SYSTEM_NAMES {
+                        let tree = format!("{drive}{name}");
+                        let tree_key = remote_key(&tree, os);
+                        if within_remote(key, &tree_key, os) {
+                            return Some(format!(
+                                "part of the system under {tree}: use Settings, \
+                                 or the program's own uninstaller"
+                            ));
+                        }
+                    }
+                }
+                for name in WINDOWS_REMOTE_SYSTEM_NAMES {
+                    let tree = format!("{drive}{name}");
+                    let tree_key = remote_key(&tree, os);
+                    if tree_key != key && within_remote(&tree_key, key, os) {
+                        return Some(format!(
+                            "it contains {tree}, which is part of the system"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if container_roots
+        .iter()
+        .any(|base| base != key && within_remote(base, key, os))
+    {
+        return Some(CONTAINER_STORAGE_REASON.to_owned());
+    }
+    match trash_adapter.classify(Path::new(norm), trash_env, remote_mounts) {
+        TrashDisposition::NotTrash => None,
+        TrashDisposition::BlockedAlways(reason) => Some(reason.to_owned()),
+        TrashDisposition::Container(_) | TrashDisposition::Entry { .. } => {
+            Some(ALREADY_IN_TRASH_REASON.to_owned())
+        }
+    }
+}
+
+fn remote_container_storage_roots(
+    home_key: Option<&str>,
+    os: TrashOs,
+) -> Vec<String> {
+    let mut roots = Vec::new();
+    match os {
+        TrashOs::MacOs => {
+            if let Some(home) = home_key {
+                let prefix = if home == "/" { "" } else { home };
+                roots.push(format!(
+                    "{prefix}/library/containers/com.docker.docker/data/vms"
+                ));
+                roots.push(format!("{prefix}/orbstack"));
+                roots.push(format!("{prefix}/.colima"));
+                roots.push(format!("{prefix}/.lima"));
+            }
+        }
+        TrashOs::Linux => {
+            roots.push("/var/lib/docker".to_owned());
+            roots.push("/var/lib/containerd".to_owned());
+            if let Some(home) = home_key {
+                let prefix = if home == "/" { "" } else { home };
+                roots.push(format!("{prefix}/.local/share/docker"));
+                roots.push(format!("{prefix}/.local/share/containers/storage"));
+            }
+        }
+        TrashOs::Windows => {
+            if let Some(home) = home_key {
+                let prefix = home.trim_end_matches('\\');
+                roots.push(format!(r"{prefix}\appdata\local\docker\wsl\data"));
+                roots.push(format!(r"{prefix}\appdata\local\docker\wsl\disk"));
+            }
+        }
+    }
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3288,5 +3891,405 @@ mod tests {
         }
         let err = item_outcome.expect("item event").expect_err("must block");
         assert_eq!(err, ALREADY_IN_TRASH_REASON);
+    }
+
+    fn remote_target(path: &str, bytes: u64, is_dir: bool) -> Target {
+        Target {
+            path: PathBuf::from(path),
+            bytes,
+            is_dir,
+            hidden: false,
+        }
+    }
+
+    fn linux_remote_header(root: &str, home: Option<&str>) -> Header {
+        Header::new(
+            PathBuf::from(root),
+            home.map(PathBuf::from),
+            "linux",
+            Some(HostIdentity {
+                hostname: "prod-box-01".into(),
+                machine_id: Some("0123456789abcdef0123456789abcdef".into()),
+            }),
+        )
+    }
+
+    fn macos_remote_header(root: &str, home: Option<&str>) -> Header {
+        Header::new(
+            PathBuf::from(root),
+            home.map(PathBuf::from),
+            "macos",
+            Some(HostIdentity {
+                hostname: "mac-studio.local".into(),
+                machine_id: None,
+            }),
+        )
+    }
+
+    fn windows_remote_header(root: &str, home: Option<&str>) -> Header {
+        Header::new(
+            PathBuf::from(root),
+            home.map(PathBuf::from),
+            "windows",
+            Some(HostIdentity {
+                hostname: "win-box-01".into(),
+                machine_id: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn plan_remote_blocks_missing_or_invalid_identity() {
+        let mut header = linux_remote_header("/home/me", Some("/home/me"));
+        header.identity = None;
+        let plan = plan_remote(
+            &[remote_target("/home/me/cache", 1024, true)],
+            &header,
+        );
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert!(
+            plan.blocked[0].reason.contains("identity"),
+            "{}",
+            plan.blocked[0].reason
+        );
+        assert!(validate_header(&header).is_err());
+
+        let mut bad_host = linux_remote_header("/home/me", Some("/home/me"));
+        bad_host.identity = Some(HostIdentity {
+            hostname: "bad host; rm".into(),
+            machine_id: None,
+        });
+        assert!(validate_header(&bad_host).is_err());
+
+        let mut bad_id = linux_remote_header("/home/me", Some("/home/me"));
+        bad_id.identity = Some(HostIdentity {
+            hostname: "valid-host".into(),
+            machine_id: Some("short".into()),
+        });
+        assert!(validate_header(&bad_id).is_err());
+    }
+
+    #[test]
+    fn plan_remote_blocks_outside_root_home_system_trees_and_control_chars() {
+        let header = linux_remote_header("/", Some("/home/me"));
+        let targets = [
+            remote_target("/", 100, true),
+            remote_target("/home/me", 100, true),
+            remote_target("/home", 100, true),
+            remote_target("/usr/local", 100, true),
+            remote_target("/var", 100, true),
+            remote_target("/home/me/bad\nname", 100, false),
+            remote_target("/home/me/cache", 500, true),
+            remote_target("/home/me/cache/nested", 200, false),
+        ];
+        let plan = plan_remote(&targets, &header);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].path, PathBuf::from("/home/me/cache"));
+        assert_eq!(plan.reclaim(), 500);
+        assert_eq!(plan.bytes(), 500);
+        assert_eq!(plan.covered.len(), 1);
+        assert_eq!(
+            plan.covered[0].path,
+            PathBuf::from("/home/me/cache/nested")
+        );
+        assert_eq!(plan.blocked.len(), 6);
+
+        let sub_header = linux_remote_header("/home/me/work", Some("/home/me"));
+        let sub_plan = plan_remote(
+            &[
+                remote_target("/home/me/work", 100, true),
+                remote_target("/home/me/other", 100, true),
+                remote_target("/home/me/work/../other", 100, true),
+            ],
+            &sub_header,
+        );
+        assert!(sub_plan.targets.is_empty());
+        assert_eq!(sub_plan.blocked.len(), 3);
+    }
+
+    #[test]
+    fn plan_remote_folds_macos_case_and_data_volume_prefix() {
+        let header = macos_remote_header("/Users/me", Some("/Users/me"));
+        let plan = plan_remote(
+            &[
+                remote_target("/Users/me", 100, true),
+                remote_target("/System/Volumes/Data/Users/me", 100, true),
+                remote_target("/System/Volumes/Data/Library/Caches", 100, true),
+                remote_target("/Users/me/Library/Caches/pip", 4096, true),
+            ],
+            &header,
+        );
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(
+            plan.targets[0].path,
+            PathBuf::from("/Users/me/Library/Caches/pip")
+        );
+        assert_eq!(plan.blocked.len(), 3);
+    }
+
+    #[test]
+    fn plan_remote_blocks_macos_and_linux_trash_containers_and_other_users() {
+        use crate::trash_adapter::{
+            ALREADY_IN_TRASH_REASON, OTHER_USER_TRASH_REASON,
+        };
+
+        let mac = macos_remote_header("/Users/me", Some("/Users/me"));
+        let mac_plan = plan_remote(
+            &[
+                remote_target("/Users/me/.Trash", 100, true),
+                remote_target("/Users/me/.Trash/old.zip", 50, false),
+                remote_target(
+                    "/System/Volumes/Data/Users/me/.Trash/alias.bin",
+                    25,
+                    false,
+                ),
+                remote_target("/Users/me/Library/Caches/pip", 4096, true),
+            ],
+            &mac,
+        );
+        assert_eq!(mac_plan.targets.len(), 1);
+        assert_eq!(
+            mac_plan.targets[0].path,
+            PathBuf::from("/Users/me/Library/Caches/pip")
+        );
+        assert_eq!(mac_plan.blocked.len(), 3);
+        for blocked in &mac_plan.blocked {
+            assert_eq!(blocked.reason, ALREADY_IN_TRASH_REASON);
+        }
+
+        let mut mac_vol =
+            macos_remote_header("/Volumes/USB", Some("/Users/me"));
+        mac_vol.disk_root = Some(PathBuf::from("/Volumes/USB"));
+        let mac_vol_plan = plan_remote(
+            &[
+                remote_target("/Volumes/USB/.Trashes", 100, true),
+                remote_target("/Volumes/USB/.Trashes/502", 100, true),
+            ],
+            &mac_vol,
+        );
+        assert!(mac_vol_plan.targets.is_empty());
+        assert_eq!(mac_vol_plan.blocked.len(), 2);
+        assert_eq!(mac_vol_plan.blocked[0].reason, ALREADY_IN_TRASH_REASON);
+        assert_eq!(mac_vol_plan.blocked[1].reason, OTHER_USER_TRASH_REASON);
+
+        let linux = linux_remote_header("/home/me", Some("/home/me"));
+        let linux_plan = plan_remote(
+            &[
+                remote_target("/home/me/.local/share/Trash", 100, true),
+                remote_target(
+                    "/home/me/.local/share/Trash/files/old.iso",
+                    50,
+                    false,
+                ),
+                remote_target("/home/me/.cache/pip", 2048, true),
+            ],
+            &linux,
+        );
+        assert_eq!(linux_plan.targets.len(), 1);
+        assert_eq!(
+            linux_plan.targets[0].path,
+            PathBuf::from("/home/me/.cache/pip")
+        );
+        assert_eq!(linux_plan.blocked.len(), 2);
+        for blocked in &linux_plan.blocked {
+            assert_eq!(blocked.reason, ALREADY_IN_TRASH_REASON);
+        }
+
+        let mut linux_vol = linux_remote_header("/mnt/disk", Some("/home/me"));
+        linux_vol.disk_root = Some(PathBuf::from("/mnt/disk"));
+        let linux_vol_plan = plan_remote(
+            &[
+                remote_target("/mnt/disk/.Trash", 100, true),
+                remote_target("/mnt/disk/.Trash/1000", 100, true),
+                remote_target("/mnt/disk/.Trash-1000", 100, true),
+            ],
+            &linux_vol,
+        );
+        assert!(linux_vol_plan.targets.is_empty());
+        assert_eq!(linux_vol_plan.blocked.len(), 3);
+        assert_eq!(linux_vol_plan.blocked[0].reason, ALREADY_IN_TRASH_REASON);
+        assert_eq!(linux_vol_plan.blocked[1].reason, OTHER_USER_TRASH_REASON);
+        assert_eq!(linux_vol_plan.blocked[2].reason, OTHER_USER_TRASH_REASON);
+    }
+
+    #[test]
+    fn plan_remote_for_explicit_trash_os_supports_windows_paths_anywhere() {
+        let header = windows_remote_header(r"C:\", Some(r"C:\Users\me"));
+        let plan = plan_remote_for_os(
+            &[
+                remote_target(r"C:\", 100, true),
+                remote_target(r"C:\Users\me", 100, true),
+                remote_target(r"C:\Users", 100, true),
+                remote_target(r"C:\Windows\Temp", 100, true),
+                remote_target(r"C:\$Recycle.Bin\S-1-5-21\old", 100, true),
+                remote_target(r"C:\Users\me\nul.txt", 100, false),
+                remote_target(r"C:\Users\me\AppData\Local\Temp", 4096, true),
+            ],
+            &header,
+            TrashOs::Windows,
+        );
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(
+            plan.targets[0].path,
+            PathBuf::from(r"C:\Users\me\AppData\Local\Temp")
+        );
+        assert_eq!(plan.blocked.len(), 6);
+        assert_eq!(
+            plan.blocked[4].reason,
+            crate::trash_adapter::ALREADY_IN_TRASH_REASON
+        );
+    }
+
+    #[test]
+    fn plan_remote_blocks_container_storage_and_ancestors_across_all_oses() {
+        let mac = macos_remote_header("/", Some("/Users/me"));
+        let mac_plan = plan_remote(
+            &[
+                remote_target(
+                    "/Users/me/Library/Containers/com.docker.docker/Data/vms/0/Docker.raw",
+                    100,
+                    false,
+                ),
+                remote_target(
+                    "/Users/me/Library/Containers/com.docker.docker/Data/vms",
+                    100,
+                    true,
+                ),
+                remote_target(
+                    "/Users/me/Library/Containers/com.docker.docker",
+                    100,
+                    true,
+                ),
+                remote_target("/Users/me/Library/Containers", 100, true),
+                remote_target("/Users/me/Library", 100, true),
+                remote_target("/Users/me/OrbStack", 100, true),
+                remote_target("/Users/me/.colima", 100, true),
+                remote_target("/Users/me/.lima/default", 100, true),
+                remote_target("/Users/me/Library/Caches/pip", 100, true),
+            ],
+            &mac,
+        );
+        assert_eq!(mac_plan.targets.len(), 1);
+        assert_eq!(
+            mac_plan.targets[0].path,
+            PathBuf::from("/Users/me/Library/Caches/pip")
+        );
+        assert_eq!(mac_plan.blocked.len(), 8);
+        for blocked in &mac_plan.blocked {
+            assert_eq!(blocked.reason, CONTAINER_STORAGE_REASON);
+        }
+
+        let linux = linux_remote_header("/", Some("/home/me"));
+        let linux_plan = plan_remote(
+            &[
+                remote_target("/var/lib/docker", 100, true),
+                remote_target("/var/lib/docker/overlay2", 100, true),
+                remote_target("/var/lib/containerd", 100, true),
+                remote_target("/home/me/.local/share/docker", 100, true),
+                remote_target(
+                    "/home/me/.local/share/containers/storage",
+                    100,
+                    true,
+                ),
+                remote_target("/home/me/.local/share", 100, true),
+                remote_target("/home/me/.local", 100, true),
+                remote_target(
+                    "/home/me/.local/share/Trash/files/x",
+                    100,
+                    false,
+                ),
+                remote_target("/home/me/.cache/pip", 100, true),
+            ],
+            &linux,
+        );
+        assert_eq!(linux_plan.targets.len(), 1);
+        assert_eq!(
+            linux_plan.targets[0].path,
+            PathBuf::from("/home/me/.cache/pip")
+        );
+        assert_eq!(linux_plan.blocked.len(), 8);
+        for blocked in &linux_plan.blocked[..7] {
+            assert_eq!(blocked.reason, CONTAINER_STORAGE_REASON);
+        }
+
+        let win = windows_remote_header(r"C:\", Some(r"C:\Users\me"));
+        let win_plan = plan_remote_for_os(
+            &[
+                remote_target(
+                    r"C:\Users\me\AppData\Local\Docker\wsl\data\ext4.vhdx",
+                    100,
+                    false,
+                ),
+                remote_target(
+                    r"C:\Users\me\AppData\Local\Docker\wsl\disk\docker_data.vhdx",
+                    100,
+                    false,
+                ),
+                remote_target(
+                    r"C:\Users\me\AppData\Local\Docker\wsl",
+                    100,
+                    true,
+                ),
+                remote_target(r"C:\Users\me\AppData\Local\Docker", 100, true),
+                remote_target(r"C:\Users\me\AppData\Local", 100, true),
+                remote_target(r"C:\Users\me\AppData", 100, true),
+                remote_target(r"C:\Users\me\AppData\Local\Temp", 100, true),
+            ],
+            &win,
+            TrashOs::Windows,
+        );
+        assert_eq!(win_plan.targets.len(), 1);
+        assert_eq!(
+            win_plan.targets[0].path,
+            PathBuf::from(r"C:\Users\me\AppData\Local\Temp")
+        );
+        assert_eq!(win_plan.blocked.len(), 6);
+        for blocked in &win_plan.blocked {
+            assert_eq!(blocked.reason, CONTAINER_STORAGE_REASON);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn local_refuse_blocks_container_storage_and_ancestors() {
+        let home_dir = Path::new("/tmp/ruum-test-home");
+        let home = Home::of(home_dir);
+        let root = Path::new("/");
+        let blocked_paths: Vec<PathBuf> = if cfg!(target_os = "macos") {
+            vec![
+                home_dir.join("Library/Containers/com.docker.docker/Data/vms"),
+                home_dir.join("Library/Containers/com.docker.docker"),
+                home_dir.join("Library/Containers"),
+                home_dir.join("OrbStack/data"),
+                home_dir.join(".colima"),
+                home_dir.join(".lima"),
+            ]
+        } else {
+            vec![
+                PathBuf::from("/var/lib/docker"),
+                PathBuf::from("/var/lib/containerd"),
+                home_dir.join(".local/share/docker"),
+                home_dir.join(".local/share/containers/storage"),
+                home_dir.join(".local/share"),
+            ]
+        };
+        for path in blocked_paths {
+            let reason = refuse(&path, root, Some(&home), &[], &[])
+                .unwrap_or_else(|| {
+                    panic!("expected block for {}", path.display())
+                });
+            assert_eq!(reason, CONTAINER_STORAGE_REASON, "{}", path.display());
+        }
+        assert_eq!(
+            refuse(
+                &home_dir.join("Library/Caches/pip"),
+                root,
+                Some(&home),
+                &[],
+                &[],
+            ),
+            None
+        );
     }
 }

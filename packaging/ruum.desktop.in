@@ -14,9 +14,9 @@ StartupWMClass=ruum
 # Registered for directories, so a file manager can offer "Open with ruum".
 # This adds a handler; it does not become the default.
 MimeType=inode/directory;
-Actions=sources;
+Actions=remote;
 X-AppVersion=@VERSION@
 
-[Desktop Action sources]
-Name=Choose a source or disk
-Exec=@BINDIR@/ruum-gui --open-screen sources
+[Desktop Action remote]
+Name=Remote SSH servers
+Exec=@BINDIR@/ruum-gui --open-screen remote

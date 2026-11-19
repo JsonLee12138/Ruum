@@ -1,8 +1,8 @@
 //! Tri-platform Trash & Recycle Bin classification and empty-in-place
 //! execution.
 //!
-//! Mirrors [`crate::auth`]'s Factory + Adapter pattern so `removal.rs`,
-//! `remote_trash.rs`, and cross-OS unit tests share one authoritative set of
+//! Mirrors [`crate::auth`]'s Factory + Adapter pattern so `removal.rs`
+//! and cross-OS unit tests share one authoritative set of
 //! rules for macOS, Linux (`FreeDesktop` XDG Trash), and Windows (`$Recycle.Bin`).
 
 use std::ffi::OsStr;

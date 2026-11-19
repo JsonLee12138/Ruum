@@ -1,9 +1,11 @@
-//! Localized copy for the Icon Rail, Sources & Drives, Watchdog, Settings, and
+//! Localized copy for the Icon Rail, Remote, Watchdog, Settings, and
 //! standalone cleanup confirmation window.
 
+mod docker;
 mod settings;
 mod watchdog;
 
+pub use docker::*;
 pub use settings::*;
 pub use watchdog::*;
 
@@ -21,13 +23,13 @@ pub const fn rail_explore(locale: Locale) -> &'static str {
     )
 }
 
-pub const fn rail_sources(locale: Locale) -> &'static str {
+pub const fn rail_remote(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Sources & Drives \u{00b7} v",
-        "\u{6765}\u{6e90}\u{4e0e}\u{9a71}\u{52a8}\u{5668} \u{00b7} v",
-        "\u{30bd}\u{30fc}\u{30b9}\u{3068}\u{30c9}\u{30e9}\u{30a4}\u{30d6} \u{00b7} v",
-        "\u{c18c}\u{c2a4} \u{bc0f} \u{b4dc}\u{b77c}\u{c774}\u{be0c} \u{00b7} v",
+        "Remote",
+        "\u{8fdc}\u{7a0b}",
+        "\u{30ea}\u{30e2}\u{30fc}\u{30c8}",
+        "\u{c6d0}\u{aca9}",
     )
 }
 
@@ -61,35 +63,26 @@ pub const fn rail_settings(is_macos: bool, locale: Locale) -> &'static str {
     }
 }
 
-// ── sources & drives ────────────────────────────────────────────────────
+// ── remote ──────────────────────────────────────────────────────────────
 
-pub const fn sources_title(locale: Locale) -> &'static str {
+pub const fn remote_title(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Sources & Drives",
-        "\u{6765}\u{6e90}\u{4e0e}\u{9a71}\u{52a8}\u{5668}",
-        "\u{30bd}\u{30fc}\u{30b9}\u{3068}\u{30c9}\u{30e9}\u{30a4}\u{30d6}",
-        "\u{c18c}\u{c2a4} \u{bc0f} \u{b4dc}\u{b77c}\u{c774}\u{be0c}",
+        "Remote",
+        "\u{8fdc}\u{7a0b}",
+        "\u{30ea}\u{30e2}\u{30fc}\u{30c8}",
+        "\u{c6d0}\u{aca9}",
     )
 }
 
-pub const fn sources_subtitle_awaiting(locale: Locale) -> &'static str {
+pub const fn remote_subtitle(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Choose a source. Then choose a root to start scanning.",
-        "\u{5148}\u{9009}\u{62e9}\u{6765}\u{6e90}\u{ff0c}\u{518d}\u{9009}\u{62e9}\u{8981}\u{5f00}\u{59cb}\u{626b}\u{63cf}\u{7684}\u{6839}\u{76ee}\u{5f55}\u{3002}",
-        "\u{30bd}\u{30fc}\u{30b9}\u{3092}\u{9078}\u{629e}\u{3057}\u{3001}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{3092}\u{958b}\u{59cb}\u{3059}\u{308b}\u{30eb}\u{30fc}\u{30c8}\u{3092}\u{9078}\u{629e}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
-        "\u{c18c}\u{c2a4}\u{b97c} \u{c120}\u{d0dd}\u{d55c} \u{b2e4}\u{c74c} \u{c2a4}\u{ce94}\u{d560} \u{b8e8}\u{d2b8}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{c138}\u{c694}.",
-    )
-}
-
-pub const fn sources_subtitle_ready(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Connect to an SSH server card, or pick a local mount or directory.",
-        "\u{8fde}\u{63a5} SSH \u{670d}\u{52a1}\u{5668}\u{5361}\u{7247}\u{ff0c}\u{6216}\u{9009}\u{62e9}\u{672c}\u{673a}\u{6302}\u{8f7d}\u{70b9}\u{4e0e}\u{76ee}\u{5f55}\u{3002}",
-        "SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{30ab}\u{30fc}\u{30c9}\u{306b}\u{63a5}\u{7d9a}\u{3059}\u{308b}\u{304b}\u{3001}\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{306e}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{307e}\u{305f}\u{306f}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}\u{3092}\u{9078}\u{629e}\u{3057}\u{307e}\u{3059}\u{3002}",
-        "SSH \u{c11c}\u{bc84} \u{ce74}\u{b4dc}\u{c5d0} \u{c5f0}\u{acb0}\u{d558}\u{ac70}\u{b098} \u{b85c}\u{ceec} \u{b9c8}\u{c6b4}\u{d2b8} \u{b610}\u{b294} \u{b514}\u{b809}\u{d130}\u{b9ac}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{c138}\u{c694}.",
+        "Manage saved SSH server configurations, inspect remote capacity, \
+         and launch scans or cleanup scripts.",
+        "\u{7ba1}\u{7406}\u{5df2}\u{4fdd}\u{5b58}\u{7684} SSH \u{670d}\u{52a1}\u{5668}\u{914d}\u{7f6e}\u{ff0c}\u{68c0}\u{67e5}\u{8fdc}\u{7a0b}\u{7a7a}\u{95f4}\u{3001}\u{53d1}\u{8d77}\u{626b}\u{63cf}\u{6216}\u{6267}\u{884c}\u{6e05}\u{7406}\u{811a}\u{672c}\u{3002}",
+        "\u{4fdd}\u{5b58}\u{6e08}\u{307f} SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{8a2d}\u{5b9a}\u{306e}\u{7ba1}\u{7406}\u{3001}\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{5bb9}\u{91cf}\u{306e}\u{78ba}\u{8a8d}\u{3001}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{3084}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{306e}\u{5b9f}\u{884c}\u{3092}\u{884c}\u{3044}\u{307e}\u{3059}\u{3002}",
+        "\u{c800}\u{c7a5}\u{b41c} SSH \u{c11c}\u{bc84} \u{ad6c}\u{c131}\u{c744} \u{ad00}\u{b9ac}\u{d558}\u{ace0} \u{c6d0}\u{aca9} \u{c6a9}\u{b7c9}\u{c744} \u{d655}\u{c778}\u{d558}\u{ba70} \u{c2a4}\u{ce94} \u{bc0f} \u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8}\u{b97c} \u{c2e4}\u{d589}\u{d569}\u{b2c8}\u{b2e4}.",
     )
 }
 
@@ -133,27 +126,6 @@ pub const fn mounted_volume(locale: Locale) -> &'static str {
     )
 }
 
-pub const fn card_mounts_title(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Local Mounts & Root Directory",
-        "\u{672c}\u{673a}\u{6302}\u{8f7d}\u{70b9}\u{4e0e}\u{6839}\u{76ee}\u{5f55}",
-        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{3068}\u{30eb}\u{30fc}\u{30c8}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}",
-        "\u{b85c}\u{ceec} \u{b9c8}\u{c6b4}\u{d2b8} \u{bc0f} \u{b8e8}\u{d2b8} \u{b514}\u{b809}\u{d130}\u{b9ac}",
-    )
-}
-
-pub const fn card_mounts_desc(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Select a local mount or enter an absolute local directory path. \
-         Opens in the Local Explore tab.",
-        "\u{9009}\u{62e9}\u{4e00}\u{4e2a}\u{672c}\u{673a}\u{6302}\u{8f7d}\u{70b9}\u{6216}\u{8f93}\u{5165}\u{672c}\u{5730}\u{7edd}\u{5bf9}\u{8def}\u{5f84}\u{ff0c}\u{5c06}\u{5728}\u{201c}\u{672c}\u{673a}\u{201d}\u{6807}\u{7b7e}\u{9875}\u{626b}\u{63cf}\u{5e76}\u{6253}\u{5f00}\u{3002}",
-        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{307e}\u{305f}\u{306f}\u{7d76}\u{5bfe}\u{30d1}\u{30b9}\u{3092}\u{9078}\u{629e}\u{3057}\u{307e}\u{3059}\u{3002}\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{30bf}\u{30d6}\u{3067}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{3092}\u{958b}\u{59cb}\u{3057}\u{307e}\u{3059}\u{3002}",
-        "\u{b85c}\u{ceec} \u{b9c8}\u{c6b4}\u{d2b8} \u{b610}\u{b294} \u{c808}\u{b300} \u{b85c}\u{ceec} \u{acbd}\u{b85c}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{ba74} \u{b85c}\u{ceec} \u{d0d0}\u{c0c9} \u{d0ed}\u{c5d0}\u{c11c} \u{c2a4}\u{ce94}\u{c744} \u{c2dc}\u{c791}\u{d569}\u{b2c8}\u{b2e4}.",
-    )
-}
-
 pub const fn scan_directory(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -183,16 +155,6 @@ pub const fn ssh_servers_title(locale: Locale) -> &'static str {
         "\u{5df2}\u{4fdd}\u{5b58}\u{7684} SSH \u{670d}\u{52a1}\u{5668}",
         "\u{4fdd}\u{5b58}\u{6e08}\u{307f} SSH \u{30b5}\u{30fc}\u{30d0}\u{30fc}",
         "\u{c800}\u{c7a5}\u{b41c} SSH \u{c11c}\u{bc84}",
-    )
-}
-
-pub const fn ssh_servers_desc(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Metadata lives in SQLite; secrets stay encrypted until you connect.",
-        "\u{5143}\u{6570}\u{636e}\u{4fdd}\u{5b58}\u{5728} SQLite \u{4e2d}\u{ff0c}\u{5bc6}\u{94a5}\u{4ec5}\u{5728}\u{8fde}\u{63a5}\u{6216}\u{4fdd}\u{5b58}\u{65f6}\u{6309}\u{9700}\u{8bbf}\u{95ee}\u{94a5}\u{5319}\u{4e32}\u{3002}",
-        "\u{30e1}\u{30bf}\u{30c7}\u{30fc}\u{30bf}\u{306f} SQLite \u{306b}\u{4fdd}\u{5b58}\u{3055}\u{308c}\u{3001}\u{8a8d}\u{8a3c}\u{60c5}\u{5831}\u{306f}\u{63a5}\u{7d9a}\u{6642}\u{306b}\u{306e}\u{307f}\u{5fa9}\u{53f7}\u{3055}\u{308c}\u{307e}\u{3059}\u{3002}",
-        "\u{ba54}\u{d0c0}\u{b370}\u{c774}\u{d130}\u{b294} SQLite\u{c5d0} \u{c800}\u{c7a5}\u{b418}\u{ba70}, \u{c790}\u{aca9} \u{c99d}\u{ba85}\u{c740} \u{c5f0}\u{acb0} \u{c2dc}\u{c5d0}\u{b9cc} \u{bcf5}\u{d638}\u{d654}\u{b429}\u{b2c8}\u{b2e4}.",
     )
 }
 
@@ -253,6 +215,85 @@ pub const fn ssh_ai_analyze_tooltip(locale: Locale) -> &'static str {
         "\u{8fd0}\u{884c}\u{8fdc}\u{7a0b} AI \u{6e05}\u{7406}\u{5206}\u{6790}",
         "\u{30ea}\u{30e2}\u{30fc}\u{30c8} AI \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{5206}\u{6790}\u{3092}\u{5b9f}\u{884c}",
         "\u{c6d0}\u{aca9} AI \u{c815}\u{b9ac} \u{bd84}\u{c11d} \u{c2e4}\u{d589}",
+    )
+}
+
+pub const fn ssh_browse_dirs_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Choose remote directory or mount point",
+        "\u{9009}\u{62e9}\u{8fdc}\u{7a0b}\u{76ee}\u{5f55}\u{6216}\u{6302}\u{8f7d}\u{70b9}",
+        "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}\u{307e}\u{305f}\u{306f}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{3092}\u{9078}\u{629e}",
+        "\u{c6d0}\u{aca9} \u{b514}\u{b809}\u{d130}\u{b9ac} \u{b610}\u{b294} \u{b9c8}\u{c6b4}\u{d2b8} \u{c120}\u{d0dd}",
+    )
+}
+
+pub const fn modal_mounts_local_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Select Scan Directory / Mount Point",
+        "\u{9009}\u{62e9}\u{626b}\u{63cf}\u{76ee}\u{5f55} / \u{6302}\u{8f7d}\u{70b9}",
+        "\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea} / \u{30de}\u{30a6}\u{30f3}\u{30c8}\u{3092}\u{9078}\u{629e}",
+        "\u{c2a4}\u{ce94} \u{b514}\u{b809}\u{d130}\u{b9ac} / \u{b9c8}\u{c6b4}\u{d2b8} \u{c120}\u{d0dd}",
+    )
+}
+
+pub const fn modal_mounts_local_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Pick a local mount point or enter an absolute or ~ path to switch \
+         the scan root.",
+        "\u{9009}\u{62e9}\u{672c}\u{673a}\u{6302}\u{8f7d}\u{70b9}\u{ff0c}\u{6216}\u{8f93}\u{5165}\u{7edd}\u{5bf9}\u{8def}\u{5f84} / ~ \u{5207}\u{6362}\u{626b}\u{63cf}\u{6839}\u{76ee}\u{5f55}\u{3002}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{3092}\u{9078}\u{629e}\u{3059}\u{308b}\u{304b}\u{3001}\u{7d76}\u{5bfe}\u{30d1}\u{30b9}\u{307e}\u{305f}\u{306f} ~ \u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{30eb}\u{30fc}\u{30c8}\u{3092}\u{5207}\u{308a}\u{66ff}\u{3048}\u{307e}\u{3059}\u{3002}",
+        "\u{b85c}\u{ceec} \u{b9c8}\u{c6b4}\u{d2b8}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{ac70}\u{b098} \u{c808}\u{b300} \u{acbd}\u{b85c} \u{b610}\u{b294} ~ \u{b97c} \u{c785}\u{b825}\u{d558}\u{c5ec} \u{c2a4}\u{ce94} \u{b8e8}\u{d2b8}\u{b97c} \u{c804}\u{d658}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub fn modal_mounts_remote_title(alias: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => {
+            format!("Select Remote Directory / Mount \u{00b7} {alias}")
+        }
+        Locale::Zh => format!(
+            "\u{9009}\u{62e9}\u{8fdc}\u{7a0b}\u{76ee}\u{5f55} / \u{6302}\u{8f7d}\u{70b9} \u{00b7} {alias}"
+        ),
+        Locale::Ja => format!(
+            "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea} / \u{30de}\u{30a6}\u{30f3}\u{30c8}\u{3092}\u{9078}\u{629e} \u{00b7} {alias}"
+        ),
+        Locale::Ko => format!(
+            "\u{c6d0}\u{aca9} \u{b514}\u{b809}\u{d130}\u{b9ac} / \u{b9c8}\u{c6b4}\u{d2b8} \u{c120}\u{d0dd} \u{00b7} {alias}"
+        ),
+    }
+}
+
+pub const fn modal_mounts_remote_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Pick a remote mount point or enter a remote absolute or ~ path. \
+         Reads mount metadata only without scanning.",
+        "\u{9009}\u{62e9}\u{8fdc}\u{7a0b}\u{6302}\u{8f7d}\u{70b9}\u{ff0c}\u{6216}\u{8f93}\u{5165}\u{8fdc}\u{7a0b}\u{7edd}\u{5bf9}\u{8def}\u{5f84} / ~\u{3002}\u{4ec5}\u{53ea}\u{8bfb}\u{8bfb}\u{53d6}\u{6302}\u{8f7d}\u{8868}\u{ff0c}\u{4e0d}\u{626b}\u{63cf}\u{6587}\u{4ef6}\u{3002}",
+        "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{3092}\u{9078}\u{629e}\u{3059}\u{308b}\u{304b}\u{3001}\u{7d76}\u{5bfe}\u{30d1}\u{30b9}\u{307e}\u{305f}\u{306f} ~ \u{3092}\u{5165}\u{529b}\u{3057}\u{307e}\u{3059}\u{ff08}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{8868}\u{306e}\u{8aad}\u{307f}\u{53d6}\u{308a}\u{306e}\u{307f}\u{ff09}\u{3002}",
+        "\u{c6d0}\u{aca9} \u{b9c8}\u{c6b4}\u{d2b8}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{ac70}\u{b098} \u{c808}\u{b300} \u{acbd}\u{b85c} \u{b610}\u{b294} ~ \u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}(\u{c77d}\u{ae30} \u{c804}\u{c6a9} \u{b9c8}\u{c6b4}\u{d2b8} \u{c870}\u{d68c}).",
+    )
+}
+
+pub const fn listing_remote_mounts(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Listing remote mounts, not scanning files\u{2026}",
+        "\u{6b63}\u{5728}\u{5217}\u{51fa}\u{8fdc}\u{7a0b}\u{6302}\u{8f7d}\u{70b9}\u{ff0c}\u{5c1a}\u{672a}\u{626b}\u{63cf}\u{6587}\u{4ef6}\u{2026}",
+        "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{4e00}\u{89a7}\u{3092}\u{53d6}\u{5f97}\u{4e2d}\u{ff08}\u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{306f}\u{672a}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{ff09}\u{2026}",
+        "\u{c6d0}\u{aca9} \u{b9c8}\u{c6b4}\u{d2b8} \u{baa9}\u{b85d} \u{bd88}\u{b7ec}\u{c624}\u{b294} \u{c911}(\u{d30c}\u{c77c}\u{c740} \u{c2a4}\u{ce94}\u{d558}\u{c9c0} \u{c54a}\u{c74c})\u{2026}",
+    )
+}
+
+pub const fn no_remote_mounts_listed(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "No remote mounts listed. Enter ~ or an absolute path below.",
+        "\u{672a}\u{5217}\u{51fa}\u{8fdc}\u{7a0b}\u{6302}\u{8f7d}\u{70b9}\u{ff0c}\u{8bf7}\u{5728}\u{4e0b}\u{65b9}\u{8f93}\u{5165} ~ \u{6216}\u{7edd}\u{5bf9}\u{8def}\u{5f84}\u{3002}",
+        "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30de}\u{30a6}\u{30f3}\u{30c8}\u{304c}\u{898b}\u{3064}\u{304b}\u{308a}\u{307e}\u{305b}\u{3093}\u{3002}\u{4e0b}\u{306b} ~ \u{307e}\u{305f}\u{306f}\u{7d76}\u{5bfe}\u{30d1}\u{30b9}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{d45c}\u{c2dc}\u{b41c} \u{c6d0}\u{aca9} \u{b9c8}\u{c6b4}\u{d2b8}\u{ac00} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \u{c544}\u{b798}\u{c5d0} ~ \u{b610}\u{b294} \u{c808}\u{b300} \u{acbd}\u{b85c}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}.",
     )
 }
 
@@ -598,5 +639,122 @@ pub const fn remote_connect_deny(locale: Locale) -> &'static str {
         "\u{62d2}\u{7edd}",
         "\u{62d2}\u{5426}",
         "\u{ac70}\u{bd80}",
+    )
+}
+
+// ── generated remote cleanup script dialog & pending card banner ─────────
+
+pub const fn script_generated_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Cleanup Script Generated",
+        "\u{6e05}\u{7406}\u{811a}\u{672c}\u{5df2}\u{751f}\u{6210}",
+        "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{4f5c}\u{6210}\u{3057}\u{307e}\u{3057}\u{305f}",
+        "\u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8} \u{c0dd}\u{c131} \u{c644}\u{b8cc}",
+    )
+}
+
+pub fn script_generated_desc(
+    alias: &str,
+    count: usize,
+    bytes: &str,
+    path: &str,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "Saved deterministic cleanup script for `{alias}` ({count} items, \
+             est. {bytes}): {path}"
+        ),
+        Locale::Zh => format!(
+            "\u{5df2}\u{4e3a}\u{300c}{alias}\u{300d}\u{751f}\u{6210}\u{5e76}\u{4fdd}\u{5b58}\u{786e}\u{5b9a}\u{6027}\u{6e05}\u{7406}\u{811a}\u{672c}\u{ff08}{count} \u{9879} \u{00b7} \u{9884}\u{8ba1}\u{91ca}\u{653e} {bytes}\u{ff09}\u{ff1a}{path}"
+        ),
+        Locale::Ja => format!(
+            "`{alias}` \u{5411}\u{3051}\u{306e}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{4fdd}\u{5b58}\u{3057}\u{307e}\u{3057}\u{305f}\u{ff08}{count} \u{4ef6} \u{00b7} \u{7d04} {bytes}\u{ff09}: {path}"
+        ),
+        Locale::Ko => format!(
+            "`{alias}`\u{c6a9} \u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8}\u{b97c} \u{c800}\u{c7a5}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}({count}\u{ac1c} \u{00b7} \u{c608}\u{c0c1} {bytes}): {path}"
+        ),
+    }
+}
+
+pub const fn script_run_in_terminal(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run in Terminal Now",
+        "\u{7acb}\u{5373}\u{5728}\u{7ec8}\u{7aef}\u{6267}\u{884c}",
+        "\u{4eca}\u{3059}\u{3050}\u{7aef}\u{672b}\u{3067}\u{5b9f}\u{884c}",
+        "\u{c9c0}\u{ae08} \u{d130}\u{bbf8}\u{b110}\u{c5d0}\u{c11c} \u{c2e4}\u{d589}",
+    )
+}
+
+pub const fn script_reveal_file(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "View Script File",
+        "\u{67e5}\u{770b}\u{811a}\u{672c}\u{6587}\u{4ef6}",
+        "\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{8868}\u{793a}",
+        "\u{c2a4}\u{d06c}\u{b9bd}\u{d2b8} \u{d30c}\u{c77c} \u{bcf4}\u{ae30}",
+    )
+}
+
+pub const fn script_run_later(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run Later",
+        "\u{7a0d}\u{540e}\u{6267}\u{884c}",
+        "\u{5f8c}\u{3067}\u{5b9f}\u{884c}",
+        "\u{b098}\u{c911}\u{c5d0} \u{c2e4}\u{d589}",
+    )
+}
+
+pub fn ssh_pending_script_banner(
+    count: u64,
+    bytes: &str,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "Pending cleanup script ({count} items \u{00b7} est. {bytes})"
+        ),
+        Locale::Zh => format!(
+            "\u{5f85}\u{6267}\u{884c}\u{6e05}\u{7406}\u{811a}\u{672c}\u{ff08}{count} \u{9879} \u{00b7} \u{9884}\u{8ba1} {bytes}\u{ff09}"
+        ),
+        Locale::Ja => format!(
+            "\u{672a}\u{5b9f}\u{884c}\u{306e}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{ff08}{count} \u{4ef6} \u{00b7} \u{7d04} {bytes}\u{ff09}"
+        ),
+        Locale::Ko => format!(
+            "\u{b300}\u{ae30} \u{c911}\u{c778} \u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8}({count}\u{ac1c} \u{00b7} \u{c608}\u{c0c1} {bytes})"
+        ),
+    }
+}
+
+pub const fn ssh_pending_run(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run",
+        "\u{6267}\u{884c}",
+        "\u{5b9f}\u{884c}",
+        "\u{c2e4}\u{d589}",
+    )
+}
+
+pub const fn ssh_pending_view(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "View",
+        "\u{67e5}\u{770b}",
+        "\u{8868}\u{793a}",
+        "\u{bcf4}\u{ae30}",
+    )
+}
+
+pub const fn ssh_pending_discard(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Discard",
+        "\u{4f5c}\u{5e9f}",
+        "\u{7834}\u{68c4}",
+        "\u{d3d0}\u{ae30}",
     )
 }

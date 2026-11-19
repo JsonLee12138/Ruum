@@ -19,6 +19,9 @@ install -d "$BINDIR" "$APPDIR" "$ICONDIR"
 install -m755 "$here/ruum" "$BINDIR/ruum"
 install -m755 "$here/ruum-gui" "$BINDIR/ruum-gui"
 install -m644 "$here/ruum.svg" "$ICONDIR/ruum.svg"
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
 sed -e "s|@BINDIR@|$BINDIR|" -e "s|@VERSION@|$VERSION|" \
     "$here/ruum.desktop.in" > "$APPDIR/ruum.desktop"
 chmod 644 "$APPDIR/ruum.desktop"

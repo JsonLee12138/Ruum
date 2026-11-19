@@ -4,8 +4,7 @@
 //! `ruum_core::notify`; this module retains only the bundle identity probe
 //! needed by GPUI window notifications.
 
-pub const RUUM_APP_ID: &str = "io.github.tobi.ruum";
-pub const RUUM_APP_NAME: &str = "ruum";
+pub use ruum_core::notify::{RUUM_APP_ID, RUUM_APP_NAME};
 
 /// Returns whether the current process has native system notification
 /// identity (on macOS, requires running inside an app bundle with a bundle

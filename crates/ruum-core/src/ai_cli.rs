@@ -12,11 +12,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::classify::Category;
+use crate::docker_adapter::{
+    DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
+    validate_targets_against_summary,
+};
+use crate::identity::HostIdentity;
 use crate::insights::{self, Finding};
+use crate::remote::Header;
 use crate::removal::RemovalMode;
 use crate::size::human_bytes;
 use crate::storage::AiConfig;
-use crate::tree::{Node, path_of};
+use crate::trash_adapter::TrashOs;
+use crate::tree::{Node, NodeKind, path_of};
 use crate::watchdog_config::{
     AiCliProvider, CleanupProposal, ProposalItem, WatchdogConfig,
 };
@@ -1484,7 +1492,10 @@ pub fn benchmark_model(
 fn parse_raw_proposal_candidate(slice: &str) -> Option<RawProposal> {
     let val: serde_json::Value = serde_json::from_str(slice).ok()?;
     let obj = val.as_object()?;
-    if !obj.contains_key("items") && !obj.contains_key("summary") {
+    if !obj.contains_key("items")
+        && !obj.contains_key("summary")
+        && !obj.contains_key("docker_targets")
+    {
         return None;
     }
     serde_json::from_value(val).ok()
@@ -1643,6 +1654,8 @@ struct RawProposal {
     summary: Option<String>,
     #[serde(default)]
     items: Vec<RawItem>,
+    #[serde(default)]
+    docker_targets: Vec<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1650,6 +1663,709 @@ struct RawItem {
     path: String,
     mode: Option<String>,
     reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RawDockerTarget {
+    BuildCache,
+    Image {
+        id: String,
+        #[serde(default)]
+        reference: Option<String>,
+        #[serde(default)]
+        dangling: bool,
+    },
+    Container {
+        id: String,
+        #[serde(default)]
+        name: String,
+    },
+}
+
+impl From<RawDockerTarget> for DockerCleanTarget {
+    fn from(raw: RawDockerTarget) -> Self {
+        match raw {
+            RawDockerTarget::BuildCache => Self::BuildCache,
+            RawDockerTarget::Image {
+                id,
+                reference,
+                dangling,
+            } => Self::Image {
+                id,
+                reference,
+                dangling,
+            },
+            RawDockerTarget::Container { id, name } => {
+                Self::Container { id, name }
+            }
+        }
+    }
+}
+
+/// One high-usage or reclaimable candidate collected purely from an in-memory
+/// [`Node`] tree without touching the host filesystem.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeCandidate {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub is_dir: bool,
+    pub category: &'static str,
+    pub finding: String,
+}
+
+/// Combined memory-tree candidates and Docker snapshot summary for AI prompts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TreeCandidates {
+    pub items: Vec<TreeCandidate>,
+    pub docker: Option<DockerUsageSummary>,
+}
+
+const fn sep_for_os(os: TrashOs) -> char {
+    match os {
+        TrashOs::Windows => '\\',
+        TrashOs::MacOs | TrashOs::Linux => '/',
+    }
+}
+
+const fn platform_for_os(os: TrashOs) -> &'static str {
+    match os {
+        TrashOs::MacOs => "macos",
+        TrashOs::Windows => "windows",
+        TrashOs::Linux => "linux",
+    }
+}
+
+fn infer_os_from_root(root_path: &Path) -> TrashOs {
+    let raw = root_path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let bytes = stripped.as_bytes();
+    if (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || raw.starts_with(r"\\")
+    {
+        TrashOs::Windows
+    } else {
+        TrashOs::Linux
+    }
+}
+
+fn join_lexical_for_os(base: &str, seg: &str, os: TrashOs) -> String {
+    let sep = sep_for_os(os);
+    if base.ends_with(sep) {
+        format!("{base}{seg}")
+    } else {
+        format!("{base}{sep}{seg}")
+    }
+}
+
+fn is_lexical_absolute(raw: &str, os: TrashOs) -> bool {
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => raw.starts_with('/'),
+        TrashOs::Windows => {
+            let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+            let bytes = stripped.as_bytes();
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')
+        }
+    }
+}
+
+fn normalize_lexical_for_os(
+    raw: &str,
+    os: TrashOs,
+) -> Result<String, &'static str> {
+    if raw.is_empty() || raw.chars().any(char::is_control) {
+        return Err("empty or invalid control characters in path");
+    }
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => {
+            if !raw.starts_with('/') {
+                return Err("path is not absolute for Unix");
+            }
+            let mut parts: Vec<&str> = Vec::new();
+            for seg in raw.split('/') {
+                match seg {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop();
+                    }
+                    other => parts.push(other),
+                }
+            }
+            if parts.is_empty() {
+                Ok("/".to_owned())
+            } else {
+                Ok(format!("/{}", parts.join("/")))
+            }
+        }
+        TrashOs::Windows => {
+            let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+            let bytes = stripped.as_bytes();
+            if bytes.len() < 3
+                || !bytes[0].is_ascii_alphabetic()
+                || bytes[1] != b':'
+                || !matches!(bytes[2], b'\\' | b'/')
+            {
+                return Err("path is not absolute for Windows");
+            }
+            let drive = bytes[0].to_ascii_uppercase() as char;
+            let mut parts: Vec<&str> = Vec::new();
+            for seg in stripped[3..].split(['\\', '/']) {
+                match seg {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop();
+                    }
+                    other => parts.push(other),
+                }
+            }
+            if parts.is_empty() {
+                Ok(format!("{drive}:\\"))
+            } else {
+                Ok(format!("{drive}:\\{}", parts.join("\\")))
+            }
+        }
+    }
+}
+
+fn relative_segments_for_os<'a>(
+    resolved_norm: &'a str,
+    root_norm: &str,
+    os: TrashOs,
+) -> Option<Vec<&'a str>> {
+    match os {
+        TrashOs::Linux | TrashOs::MacOs => {
+            if resolved_norm == root_norm {
+                return Some(Vec::new());
+            }
+            if root_norm == "/" {
+                let tail = resolved_norm.strip_prefix('/')?;
+                return Some(
+                    tail.split('/').filter(|s| !s.is_empty()).collect(),
+                );
+            }
+            let prefix = format!("{root_norm}/");
+            let rest = if os == TrashOs::MacOs {
+                let rest = resolved_norm.get(root_norm.len()..)?;
+                if !resolved_norm
+                    .get(..root_norm.len())?
+                    .eq_ignore_ascii_case(root_norm)
+                    || !rest.starts_with('/')
+                {
+                    return None;
+                }
+                &rest[1..]
+            } else {
+                resolved_norm.strip_prefix(&prefix)?
+            };
+            Some(rest.split('/').filter(|s| !s.is_empty()).collect())
+        }
+        TrashOs::Windows => {
+            if resolved_norm.eq_ignore_ascii_case(root_norm) {
+                return Some(Vec::new());
+            }
+            if root_norm.len() == 3 && root_norm.ends_with(":\\") {
+                if !resolved_norm
+                    .get(..3)
+                    .is_some_and(|p| p.eq_ignore_ascii_case(root_norm))
+                {
+                    return None;
+                }
+                let tail = &resolved_norm[3..];
+                return Some(
+                    tail.split('\\').filter(|s| !s.is_empty()).collect(),
+                );
+            }
+            if !resolved_norm
+                .get(..root_norm.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(root_norm))
+            {
+                return None;
+            }
+            let tail =
+                resolved_norm.get(root_norm.len()..)?.strip_prefix('\\')?;
+            Some(tail.split('\\').filter(|s| !s.is_empty()).collect())
+        }
+    }
+}
+
+fn find_child_for_os<'a>(
+    parent: &'a Node,
+    segment: &str,
+    os: TrashOs,
+) -> Option<&'a Node> {
+    if let Some(exact) = parent.children.iter().find(|c| &*c.name == segment) {
+        return Some(exact);
+    }
+    match os {
+        TrashOs::Linux => None,
+        TrashOs::MacOs | TrashOs::Windows => parent
+            .children
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(segment)),
+    }
+}
+
+fn resolve_node_in_tree<'a>(
+    tree: &'a Node,
+    root_norm: &str,
+    segments: &[&str],
+    os: TrashOs,
+) -> Option<(String, &'a Node)> {
+    if segments.is_empty() || tree.kind == NodeKind::Symlink {
+        return None;
+    }
+    let mut current = tree;
+    let mut canonical = root_norm.to_owned();
+    for (idx, seg) in segments.iter().enumerate() {
+        if !current.is_dir() {
+            return None;
+        }
+        let child = find_child_for_os(current, seg, os)?;
+        if child.kind == NodeKind::Symlink || child.kind == NodeKind::Other {
+            return None;
+        }
+        canonical = join_lexical_for_os(&canonical, &child.name, os);
+        if idx + 1 < segments.len() && !child.is_dir() {
+            return None;
+        }
+        current = child;
+    }
+    Some((canonical, current))
+}
+
+fn path_from_crumbs_for_os<'a>(
+    root_norm: &str,
+    tree: &'a Node,
+    crumbs: &[usize],
+    os: TrashOs,
+) -> Option<(String, &'a Node)> {
+    let mut current = tree;
+    let mut full = root_norm.to_owned();
+    for &idx in crumbs {
+        let child = current.children.get(idx)?;
+        if child.kind == NodeKind::Symlink
+            || child.kind == NodeKind::Other
+            || child.category == Category::Container
+        {
+            return None;
+        }
+        full = join_lexical_for_os(&full, &child.name, os);
+        current = child;
+    }
+    Some((full, current))
+}
+
+fn collect_bounded_tree_nodes(
+    root_norm: &str,
+    tree: &Node,
+    os: TrashOs,
+    out: &mut Vec<TreeCandidate>,
+    seen: &mut HashSet<String>,
+) {
+    let mut stack: Vec<(String, &Node, usize)> =
+        vec![(root_norm.to_owned(), tree, 0)];
+    let mut visited = 0_usize;
+
+    while let Some((path_str, node, depth)) = stack.pop() {
+        if visited >= 4_000 || depth > 4 {
+            continue;
+        }
+        for child in &node.children {
+            visited += 1;
+            if child.kind == NodeKind::Symlink
+                || child.kind == NodeKind::Other
+                || child.category == Category::Container
+                || child.bytes == 0
+            {
+                continue;
+            }
+            let child_path = join_lexical_for_os(&path_str, &child.name, os);
+            if let Some(reclaim) = child.reclaim {
+                if seen.insert(child_path.clone()) {
+                    out.push(TreeCandidate {
+                        path: PathBuf::from(&child_path),
+                        bytes: child.bytes,
+                        is_dir: child.is_dir(),
+                        category: child.category.label(),
+                        finding: reclaim.label().to_owned(),
+                    });
+                }
+                continue;
+            }
+            if depth <= 2 && seen.insert(child_path.clone()) {
+                let kind_label = if child.is_dir() {
+                    "Large directory"
+                } else {
+                    "Large file"
+                };
+                out.push(TreeCandidate {
+                    path: PathBuf::from(&child_path),
+                    bytes: child.bytes,
+                    is_dir: child.is_dir(),
+                    category: child.category.label(),
+                    finding: kind_label.to_owned(),
+                });
+            }
+            if child.is_dir() && depth < 4 {
+                stack.push((child_path, child, depth + 1));
+            }
+        }
+    }
+}
+
+/// Collect high-usage / reclaimable candidates and Docker usage summary purely
+/// from an in-memory [`Node`] tree and [`DockerProbeStatus`] without touching
+/// the host filesystem.
+#[must_use]
+pub fn collect_tree_candidates(
+    root_path: &Path,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+) -> TreeCandidates {
+    let os = infer_os_from_root(root_path);
+    let root_raw = root_path.to_string_lossy();
+    let root_norm = normalize_lexical_for_os(&root_raw, os)
+        .unwrap_or_else(|_| root_raw.into_owned());
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let now_i64 = i64::try_from(now_secs).unwrap_or(0);
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in insights::worth_a_look(tree, now_i64, 25) {
+        let Some((path_str, node)) =
+            path_from_crumbs_for_os(&root_norm, tree, &candidate.crumbs, os)
+        else {
+            continue;
+        };
+        if seen.insert(path_str.clone()) {
+            items.push(TreeCandidate {
+                path: PathBuf::from(path_str),
+                bytes: candidate.bytes,
+                is_dir: node.is_dir(),
+                category: node.category.label(),
+                finding: format_finding_label(&candidate.finding),
+            });
+        }
+    }
+
+    collect_bounded_tree_nodes(&root_norm, tree, os, &mut items, &mut seen);
+    items.sort_by_key(|item| std::cmp::Reverse(item.bytes));
+    items.truncate(25);
+
+    let docker_summary = match docker {
+        DockerProbeStatus::Available(summary) => Some(summary.clone()),
+        DockerProbeStatus::NotInstalled
+        | DockerProbeStatus::DaemonStopped
+        | DockerProbeStatus::PermissionDenied { .. } => None,
+    };
+
+    TreeCandidates {
+        items,
+        docker: docker_summary,
+    }
+}
+
+/// Build an offline/in-memory diagnostic prompt from [`TreeCandidates`] for the
+/// target OS (no remote AI CLI or host filesystem probing required).
+#[must_use]
+pub fn build_tree_analysis_prompt(
+    root_path: &Path,
+    target_os: TrashOs,
+    candidates: &TreeCandidates,
+) -> String {
+    use std::fmt::Write as _;
+
+    let os_label = match target_os {
+        TrashOs::MacOs => "macOS",
+        TrashOs::Linux => "Linux",
+        TrashOs::Windows => "Windows",
+    };
+
+    let mut cand_block = String::new();
+    if candidates.items.is_empty() {
+        cand_block.push_str(
+            "Pre-scanned file/directory candidates: none detected.\n",
+        );
+    } else {
+        cand_block.push_str(
+            "PRE-SCANNED FILE/DIRECTORY CANDIDATES (verified in memory snapshot):\n",
+        );
+        for (idx, item) in candidates.items.iter().enumerate() {
+            let kind = if item.is_dir { "dir" } else { "file" };
+            let _ = writeln!(
+                cand_block,
+                "{}. {} ({}, {}, {}, {})",
+                idx + 1,
+                item.path.display(),
+                human_bytes(item.bytes),
+                kind,
+                item.category,
+                item.finding,
+            );
+        }
+        cand_block.push('\n');
+    }
+
+    if let Some(summary) = &candidates.docker {
+        cand_block.push_str("DOCKER RECLAIMABLE SNAPSHOT:\n");
+        let _ = writeln!(
+            cand_block,
+            "- Build cache reclaimable: {}",
+            human_bytes(summary.build_cache_reclaimable_bytes)
+        );
+        for img in &summary.removable_images {
+            let label = if img.dangling {
+                "<none>:<none>".to_owned()
+            } else {
+                format!("{}:{}", img.repository, img.tag)
+            };
+            let _ = writeln!(
+                cand_block,
+                "- Unused image: id={}, ref={}, unique={}, dangling={}",
+                img.id,
+                label,
+                human_bytes(img.unique_bytes),
+                img.dangling
+            );
+        }
+        for ctr in &summary.stopped_containers {
+            let _ = writeln!(
+                cand_block,
+                "- Stopped container: id={}, name={}, image={}, state={}, size={}",
+                ctr.id,
+                ctr.name,
+                ctr.image,
+                ctr.state,
+                human_bytes(ctr.size_bytes)
+            );
+        }
+        cand_block.push('\n');
+    }
+
+    format!(
+        "You are an automated disk cleanup advisor for Ruum.\n\
+         Target OS: {os_label}\n\
+         Scanned root: {root}\n\n\
+         CRITICAL SAFETY CONSTRAINTS:\n\
+         - Analyze ONLY the pre-scanned in-memory candidates and Docker snapshot below.\n\
+         - Do NOT execute any shell commands or delete anything.\n\
+         - Never suggest system directories, home root, container backing storage, or Docker volumes.\n\
+         - For Docker cleanup, reference ONLY exact IDs from the Docker snapshot above.\n\n\
+         {cand_block}\
+         You MUST output ONLY a valid JSON object matching this schema:\n\
+         {{\n  \
+           \"summary\": \"Brief explanation of reclaimable space found\",\n  \
+           \"items\": [\n    \
+             {{\n      \
+               \"path\": \"/exact/path/from/candidates\",\n      \
+               \"mode\": \"trash\" or \"permanent\",\n      \
+               \"reason\": \"Why this item is safe to clean up\"\n    \
+             }}\n  \
+           ],\n  \
+           \"docker_targets\": [\n    \
+             {{\"kind\": \"build_cache\"}},\n    \
+             {{\"kind\": \"image\", \"id\": \"sha256:...\"}},\n    \
+             {{\"kind\": \"container\", \"id\": \"...\"}}\n  \
+           ]\n\
+         }}\n\
+         Do not include conversational filler outside the JSON.",
+        root = root_path.display(),
+    )
+}
+
+/// Validate an AI proposal purely in memory against a scanned [`Node`] tree,
+/// [`DockerProbeStatus`], and explicit target [`TrashOs`] without touching the
+/// host filesystem.
+pub fn validate_proposal_against_tree(
+    raw_output: &str,
+    root_path: &Path,
+    home_path: Option<&Path>,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+    target_os: TrashOs,
+    now_secs: u64,
+) -> Result<CleanupProposal, String> {
+    let parsed = extract_proposal_from_output(raw_output)?;
+
+    let root_raw = root_path
+        .to_str()
+        .ok_or_else(|| "root path is not valid UTF-8".to_owned())?;
+    let root_norm = normalize_lexical_for_os(root_raw, target_os)
+        .map_err(|err| format!("invalid root path: {err}"))?;
+    let home_norm = home_path
+        .and_then(Path::to_str)
+        .and_then(|s| normalize_lexical_for_os(s, target_os).ok());
+
+    let mut candidate_targets = Vec::new();
+    let mut item_meta: Vec<(String, RemovalMode, Option<String>)> = Vec::new();
+
+    for item in parsed.items {
+        let raw_item = item.path.trim();
+        if raw_item.is_empty() || raw_item.chars().any(char::is_control) {
+            continue;
+        }
+        let resolved_input = if is_lexical_absolute(raw_item, target_os) {
+            raw_item.to_owned()
+        } else {
+            join_lexical_for_os(&root_norm, raw_item, target_os)
+        };
+        let Ok(resolved_norm) =
+            normalize_lexical_for_os(&resolved_input, target_os)
+        else {
+            continue;
+        };
+        let Some(segments) =
+            relative_segments_for_os(&resolved_norm, &root_norm, target_os)
+        else {
+            continue;
+        };
+        let Some((canonical_path, node)) =
+            resolve_node_in_tree(tree, &root_norm, &segments, target_os)
+        else {
+            continue;
+        };
+
+        let mode = match item.mode.as_deref() {
+            Some("permanent") => RemovalMode::Permanent,
+            _ => RemovalMode::Trash,
+        };
+        let hidden = node.name.starts_with('.');
+        candidate_targets.push(crate::removal::Target {
+            path: PathBuf::from(&canonical_path),
+            bytes: node.bytes,
+            is_dir: node.is_dir(),
+            hidden,
+        });
+        item_meta.push((canonical_path, mode, item.reason));
+    }
+
+    let synthetic_header = Header::new(
+        PathBuf::from(&root_norm),
+        home_norm.map(PathBuf::from),
+        platform_for_os(target_os),
+        Some(HostIdentity {
+            hostname: "ruum-tree".to_owned(),
+            machine_id: None,
+        }),
+    );
+    let safe_plan = crate::removal::plan_remote_for_os(
+        &candidate_targets,
+        &synthetic_header,
+        target_os,
+    );
+
+    let mut proposal_items = Vec::new();
+    for target in safe_plan.targets {
+        let target_str = target.path.to_string_lossy();
+        let meta_opt = item_meta.iter().find(|(p, ..)| {
+            if target_os == TrashOs::Linux {
+                p == target_str.as_ref()
+            } else {
+                p.eq_ignore_ascii_case(target_str.as_ref())
+            }
+        });
+        let mode = meta_opt.map_or(RemovalMode::Trash, |(_, m, _)| *m);
+        let reason = meta_opt.and_then(|(.., r)| r.clone());
+        proposal_items.push(ProposalItem::new(
+            target.path,
+            target.bytes,
+            mode,
+            reason,
+            None,
+        ));
+    }
+
+    let raw_docker_targets: Vec<DockerCleanTarget> = parsed
+        .docker_targets
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<RawDockerTarget>(v).ok())
+        .map(DockerCleanTarget::from)
+        .collect();
+    let docker_targets = match docker {
+        DockerProbeStatus::Available(summary) => {
+            validate_targets_against_summary(&raw_docker_targets, summary)
+        }
+        DockerProbeStatus::NotInstalled
+        | DockerProbeStatus::DaemonStopped
+        | DockerProbeStatus::PermissionDenied { .. } => Vec::new(),
+    };
+
+    Ok(CleanupProposal {
+        timestamp_secs: now_secs,
+        summary: parsed.summary.unwrap_or_else(|| {
+            format!(
+                "AI proposed {} items for cleanup",
+                proposal_items.len() + docker_targets.len()
+            )
+        }),
+        items: proposal_items,
+        docker_targets,
+    })
+}
+
+/// Run AI analysis locally against an in-memory scanned [`Node`] tree and
+/// [`DockerProbeStatus`] without requiring AI CLI installation on the remote
+/// host or touching the host filesystem for validation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "in-memory tree analysis needs explicit root, home, tree, docker, and target OS"
+)]
+pub fn run_tree_analysis_for_config(
+    config: &AiConfig,
+    root_path: &Path,
+    home_path: Option<&Path>,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+    target_os: TrashOs,
+    now_secs: u64,
+    runner: &dyn CommandRunner,
+) -> Result<CleanupProposal, String> {
+    let candidates = collect_tree_candidates(root_path, tree, docker);
+    let prompt = build_tree_analysis_prompt(root_path, target_os, &candidates);
+    let invocation = build_invocation_for_config(config, &prompt)?;
+    let path_env = enriched_path_var();
+    let envs = [("PATH", path_env.as_str())];
+
+    let arg_refs: Vec<&str> =
+        invocation.args.iter().map(String::as_str).collect();
+    let output =
+        runner
+            .run(&invocation.program, &arg_refs, &envs)
+            .map_err(|e| {
+                format!(
+                    "failed to execute `{}`: {e}",
+                    invocation.program.display()
+                )
+            })?;
+
+    if !output.success() {
+        let stderr = output.stderr.trim();
+        let detail = if stderr.is_empty() {
+            first_line_snippet(&output.stdout, 140)
+        } else {
+            stderr.to_string()
+        };
+        return Err(format!(
+            "AI CLI exited with code {}: {detail}",
+            output.status_code,
+        ));
+    }
+
+    let raw = if output.stdout.trim().is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    validate_proposal_against_tree(
+        raw, root_path, home_path, tree, docker, target_os, now_secs,
+    )
 }
 
 /// Parse an AI response, enforcing [`crate::removal::plan`] and Git checks.
@@ -1755,6 +2471,7 @@ fn parse_and_validate_proposal_with(
             format!("AI proposed {} items for cleanup", proposal_items.len())
         }),
         items: proposal_items,
+        docker_targets: Vec::new(),
     })
 }
 
@@ -2666,5 +3383,413 @@ mod tests {
             "stdout: {}",
             output.stdout
         );
+    }
+
+    fn build_sample_docker_summary() -> crate::docker_adapter::DockerUsageSummary
+    {
+        use crate::docker_adapter::{
+            DockerContainerEntry, DockerImageEntry, DockerUsageSummary,
+        };
+        DockerUsageSummary {
+            build_cache_reclaimable_bytes: 512 * 1024 * 1024,
+            removable_images: vec![
+                DockerImageEntry {
+                    id: "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+                    repository: "old-app".to_owned(),
+                    tag: "v1".to_owned(),
+                    created_since: "2 weeks ago".to_owned(),
+                    size_bytes: 300_000_000,
+                    unique_bytes: 200_000_000,
+                    dangling: false,
+                },
+                DockerImageEntry {
+                    id: "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                    repository: "<none>".to_owned(),
+                    tag: "<none>".to_owned(),
+                    created_since: "3 weeks ago".to_owned(),
+                    size_bytes: 100_000_000,
+                    unique_bytes: 100_000_000,
+                    dangling: true,
+                },
+            ],
+            stopped_containers: vec![DockerContainerEntry {
+                id: "abcdef012345".to_owned(),
+                name: "old-worker".to_owned(),
+                image: "old-app:v1".to_owned(),
+                state: "exited".to_owned(),
+                status: "Exited (0)".to_owned(),
+                size_bytes: 50_000_000,
+            }],
+            detailed: true,
+            ..DockerUsageSummary::default()
+        }
+    }
+
+    fn make_tree_dir(name: &str, children: Vec<Node>) -> Node {
+        let mut dir = Node::directory(name);
+        dir.children = children;
+        dir
+    }
+
+    #[test]
+    fn collect_tree_candidates_uses_memory_tree_and_docker_summary_without_fs()
+    {
+        let mut root = make_tree_dir(
+            "deploy",
+            vec![
+                make_tree_dir(
+                    ".cache",
+                    vec![make_tree_dir(
+                        "pip",
+                        vec![Node::entry(
+                            "wheel.whl",
+                            NodeKind::File,
+                            90 << 20,
+                        )],
+                    )],
+                ),
+                make_tree_dir(
+                    ".local",
+                    vec![make_tree_dir(
+                        "share",
+                        vec![make_tree_dir(
+                            "docker",
+                            vec![Node::entry(
+                                "overlay",
+                                NodeKind::File,
+                                500 << 20,
+                            )],
+                        )],
+                    )],
+                ),
+                Node::entry("sym_cache", NodeKind::Symlink, 200 << 20),
+                Node::entry("huge.log", NodeKind::File, 40 << 20),
+            ],
+        );
+        crate::tree::aggregate(&mut root, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut root);
+
+        let summary = build_sample_docker_summary();
+        let docker = DockerProbeStatus::Available(summary.clone());
+        let candidates =
+            collect_tree_candidates(Path::new("/srv/deploy"), &root, &docker);
+
+        assert_eq!(candidates.docker, Some(summary));
+        assert!(
+            candidates
+                .items
+                .iter()
+                .any(|c| c.path == Path::new("/srv/deploy/.cache"))
+        );
+        assert!(
+            candidates
+                .items
+                .iter()
+                .any(|c| c.path == Path::new("/srv/deploy/huge.log"))
+        );
+        assert!(
+            !candidates
+                .items
+                .iter()
+                .any(|c| c.path.to_string_lossy().contains("sym_cache")),
+            "symlinks must not be proposed"
+        );
+        assert!(
+            !candidates
+                .items
+                .iter()
+                .any(|c| c.path.to_string_lossy().contains("docker")),
+            "container storage must not be proposed"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_against_tree_enforces_tree_truth_symlinks_docker_and_cross_os_guards()
+     {
+        // 1. Linux remote tree validation (using paths that do not exist on host).
+        let mut linux_root = make_tree_dir(
+            "/",
+            vec![
+                make_tree_dir(
+                    "etc",
+                    vec![Node::entry("passwd", NodeKind::File, 1024)],
+                ),
+                make_tree_dir(
+                    "home",
+                    vec![make_tree_dir(
+                        "deploy",
+                        vec![
+                            make_tree_dir(
+                                ".cache",
+                                vec![make_tree_dir(
+                                    "pip",
+                                    vec![Node::entry(
+                                        "pkg.whl",
+                                        NodeKind::File,
+                                        123_456,
+                                    )],
+                                )],
+                            ),
+                            make_tree_dir(
+                                ".local",
+                                vec![make_tree_dir(
+                                    "share",
+                                    vec![make_tree_dir(
+                                        "docker",
+                                        vec![Node::entry(
+                                            "layer",
+                                            NodeKind::File,
+                                            999_999,
+                                        )],
+                                    )],
+                                )],
+                            ),
+                            Node::entry("link_dir", NodeKind::Symlink, 50_000),
+                            Node::entry("stale.log", NodeKind::File, 77_777),
+                        ],
+                    )],
+                ),
+            ],
+        );
+        crate::tree::aggregate(&mut linux_root, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut linux_root);
+
+        let docker =
+            DockerProbeStatus::Available(build_sample_docker_summary());
+        let raw_json = r#"{
+            "summary": "Safe + unsafe mix",
+            "items": [
+                {"path": "/home/deploy/.cache/pip", "mode": "permanent", "reason": "pip cache"},
+                {"path": "home/deploy/stale.log", "mode": "trash", "reason": "relative under root"},
+                {"path": "/home/deploy/link_dir", "mode": "permanent", "reason": "symlink must be dropped"},
+                {"path": "/home/deploy/nonexistent", "mode": "permanent", "reason": "hallucinated"},
+                {"path": "/home/deploy/../etc/passwd", "mode": "permanent", "reason": "system path"},
+                {"path": "/home", "mode": "permanent", "reason": "home ancestor"},
+                {"path": "/home/deploy/.local/share", "mode": "permanent", "reason": "container storage ancestor"},
+                {"path": "/home/deploy/.local/share/docker", "mode": "permanent", "reason": "container storage"}
+            ],
+            "docker_targets": [
+                {"kind": "build_cache"},
+                {"kind": "image", "id": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "reference": "--force-evil"},
+                {"kind": "image", "id": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+                {"kind": "image", "id": "sha256:9999999999999999999999999999999999999999999999999999999999999999"},
+                {"kind": "container", "id": "abcdef012345", "name": "--injected"},
+                {"kind": "container", "id": "deadbeef0000", "name": "running-prod"},
+                {"kind": "volume", "id": "vol1"}
+            ]
+        }"#;
+
+        let proposal = validate_proposal_against_tree(
+            raw_json,
+            Path::new("/"),
+            Some(Path::new("/home/deploy")),
+            &linux_root,
+            &docker,
+            TrashOs::Linux,
+            1_700_000_000,
+        )
+        .expect("valid proposal");
+
+        assert_eq!(proposal.items.len(), 2);
+        assert_eq!(
+            proposal.items[0].path,
+            PathBuf::from("/home/deploy/.cache/pip")
+        );
+        assert_eq!(proposal.items[0].bytes, 123_456);
+        assert_eq!(proposal.items[0].mode, RemovalMode::Permanent);
+        assert_eq!(
+            proposal.items[1].path,
+            PathBuf::from("/home/deploy/stale.log")
+        );
+        assert_eq!(proposal.items[1].bytes, 77_777);
+
+        // Docker targets: deduplicated, snapshot-reconstructed, ordered Container -> Image -> BuildCache.
+        assert_eq!(
+            proposal.docker_targets,
+            vec![
+                DockerCleanTarget::Container {
+                    id: "abcdef012345".to_owned(),
+                    name: "old-worker".to_owned(),
+                },
+                DockerCleanTarget::Image {
+                    id: "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+                    reference: Some("old-app:v1".to_owned()),
+                    dangling: false,
+                },
+                DockerCleanTarget::BuildCache,
+            ]
+        );
+
+        // PermissionDenied docker drops all docker_targets.
+        let denied_prop = validate_proposal_against_tree(
+            raw_json,
+            Path::new("/"),
+            Some(Path::new("/home/deploy")),
+            &linux_root,
+            &DockerProbeStatus::PermissionDenied {
+                socket_hint: "/var/run/docker.sock".to_owned(),
+            },
+            TrashOs::Linux,
+            1_700_000_000,
+        )
+        .expect("valid proposal without docker");
+        assert!(denied_prop.docker_targets.is_empty());
+
+        // 2. macOS cross-OS validation: blocks container storage ancestors.
+        let mut mac_root = make_tree_dir(
+            "alice",
+            vec![make_tree_dir(
+                "Library",
+                vec![
+                    make_tree_dir(
+                        "Caches",
+                        vec![Node::entry("app.bin", NodeKind::File, 4096)],
+                    ),
+                    make_tree_dir(
+                        "Containers",
+                        vec![make_tree_dir(
+                            "com.docker.docker",
+                            vec![make_tree_dir(
+                                "Data",
+                                vec![make_tree_dir(
+                                    "vms",
+                                    vec![Node::entry(
+                                        "Docker.raw",
+                                        NodeKind::File,
+                                        10_000_000,
+                                    )],
+                                )],
+                            )],
+                        )],
+                    ),
+                ],
+            )],
+        );
+        crate::tree::aggregate(&mut mac_root, crate::tree::Metric::Bytes);
+        let mac_json = r#"{
+            "summary": "mac test",
+            "items": [
+                {"path": "/Users/alice/Library/Caches/app.bin"},
+                {"path": "/Users/alice/Library/Containers/com.docker.docker"},
+                {"path": "/Users/alice/Library"}
+            ]
+        }"#;
+        let mac_prop = validate_proposal_against_tree(
+            mac_json,
+            Path::new("/Users/alice"),
+            Some(Path::new("/Users/alice")),
+            &mac_root,
+            &DockerProbeStatus::NotInstalled,
+            TrashOs::MacOs,
+            123,
+        )
+        .expect("mac proposal");
+        assert_eq!(mac_prop.items.len(), 1);
+        assert_eq!(
+            mac_prop.items[0].path,
+            PathBuf::from("/Users/alice/Library/Caches/app.bin")
+        );
+
+        // 3. Windows pure lexical validation (even when tests run on Unix).
+        let mut win_root = make_tree_dir(
+            "alice",
+            vec![make_tree_dir(
+                "AppData",
+                vec![make_tree_dir(
+                    "Local",
+                    vec![
+                        make_tree_dir(
+                            "Temp",
+                            vec![Node::entry("junk.tmp", NodeKind::File, 8192)],
+                        ),
+                        make_tree_dir(
+                            "Docker",
+                            vec![make_tree_dir(
+                                "wsl",
+                                vec![make_tree_dir(
+                                    "data",
+                                    vec![Node::entry(
+                                        "ext4.vhdx",
+                                        NodeKind::File,
+                                        9_999_999,
+                                    )],
+                                )],
+                            )],
+                        ),
+                    ],
+                )],
+            )],
+        );
+        crate::tree::aggregate(&mut win_root, crate::tree::Metric::Bytes);
+        let win_json = r#"{
+            "summary": "win test",
+            "items": [
+                {"path": "C:\\Users\\alice\\AppData\\Local\\Temp\\junk.tmp"},
+                {"path": "C:\\Users\\alice\\AppData\\Local\\Docker\\wsl"}
+            ]
+        }"#;
+        let win_prop = validate_proposal_against_tree(
+            win_json,
+            Path::new(r"C:\Users\alice"),
+            Some(Path::new(r"C:\Users\alice")),
+            &win_root,
+            &DockerProbeStatus::NotInstalled,
+            TrashOs::Windows,
+            123,
+        )
+        .expect("win proposal");
+        assert_eq!(win_prop.items.len(), 1);
+        assert_eq!(win_prop.items[0].bytes, 8192);
+    }
+
+    #[test]
+    fn run_tree_analysis_for_config_analyzes_remote_snapshot_locally() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_cli = temp.path().join("fake-ai");
+        fs::write(&fake_cli, b"#!/bin/sh\n").unwrap();
+
+        let mut tree = make_tree_dir(
+            "deploy",
+            vec![make_tree_dir(
+                ".cache",
+                vec![Node::entry("blob.bin", NodeKind::File, 128 << 20)],
+            )],
+        );
+        crate::tree::aggregate(&mut tree, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut tree);
+
+        let runner = MockCommandRunner::with_output(CommandOutput {
+            status_code: 0,
+            stdout: r#"{"summary":"Remote cache + build cache","items":[{"path":"/home/deploy/.cache","mode":"permanent","reason":"pip cache"}],"docker_targets":[{"kind":"build_cache"}]}"#.to_owned(),
+            stderr: String::new(),
+        });
+        let cfg = AiConfig {
+            provider: AiCliProvider::Custom,
+            custom_command: fake_cli.to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        };
+        let docker =
+            DockerProbeStatus::Available(build_sample_docker_summary());
+
+        let prop = run_tree_analysis_for_config(
+            &cfg,
+            Path::new("/home/deploy"),
+            Some(Path::new("/home/deploy")),
+            &tree,
+            &docker,
+            TrashOs::Linux,
+            1_700_000_555,
+            &runner,
+        )
+        .expect("local tree analysis");
+
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.items[0].path, PathBuf::from("/home/deploy/.cache"));
+        assert_eq!(prop.items[0].bytes, 128 << 20);
+        assert_eq!(prop.docker_targets, vec![DockerCleanTarget::BuildCache]);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1[0].contains("/home/deploy/.cache"));
+        drop(calls);
     }
 }

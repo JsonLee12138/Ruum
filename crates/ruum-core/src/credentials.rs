@@ -12,10 +12,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -48,6 +50,9 @@ const MAGIC: &[u8; 4] = b"RMDC";
 const VERSION_EMPTY_AAD: u8 = 1;
 const VERSION_BOUND_AAD: u8 = 2;
 const KDF_INFO: &[u8] = b"ruum:device-credentials:v1";
+const HEADER_PREFIX_BYTES: usize = 4 + 1 + 12;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Operating system family for root secret storage and directory resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,9 +316,42 @@ struct StoredPayload {
     entries: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiskFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    header_prefix_len: usize,
+    header_prefix: [u8; HEADER_PREFIX_BYTES],
+}
+
+fn read_disk_fingerprint(file_path: &Path) -> Option<DiskFingerprint> {
+    let mut file = File::open(file_path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut header_prefix = [0_u8; HEADER_PREFIX_BYTES];
+    let mut filled = 0;
+    while filled < HEADER_PREFIX_BYTES {
+        match file.read(&mut header_prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(DiskFingerprint {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        header_prefix_len: filled,
+        header_prefix,
+    })
+}
+
 struct LoadedState {
     root_secret: Zeroizing<[u8; 32]>,
     entries: HashMap<String, String>,
+    fingerprint: Option<DiskFingerprint>,
 }
 
 struct LazyCredentialStoreInner {
@@ -459,12 +497,18 @@ fn save_encrypted_entries(
         }
     }
 
-    let tmp_path = file_path.with_extension("tmp");
-    {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let base_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CREDENTIALS_FILE_NAME);
+    let tmp_path =
+        file_path.with_file_name(format!("{base_name}.{pid}.{seq}.tmp"));
+    let write_res = (|| -> Result<(), String> {
         let mut file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .open(&tmp_path)
             .map_err(|e| format!("创建临时凭据文件失败: {e}"))?;
         #[cfg(unix)]
@@ -475,11 +519,14 @@ fn save_encrypted_entries(
         file.write_all(&file_bytes)
             .map_err(|e| format!("写入临时凭据文件失败: {e}"))?;
         file.flush().map_err(|e| format!("刷新凭据文件失败: {e}"))?;
+        drop(file);
+        fs::rename(&tmp_path, file_path)
+            .map_err(|e| format!("原子更新凭据文件失败: {e}"))
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-
-    fs::rename(&tmp_path, file_path)
-        .map_err(|e| format!("原子更新凭据文件失败: {e}"))?;
-    Ok(())
+    write_res
 }
 
 fn load_encrypted_entries(
@@ -547,37 +594,109 @@ fn load_encrypted_entries(
     })
 }
 
-impl LazyCredentialStoreInner {
-    fn ensure_loaded(&mut self) -> Result<&mut LoadedState, String> {
-        if let Some(reason) = &self.unavailable {
-            return Err(reason.clone());
+impl LazyCredentialStore {
+    fn sync_loaded_with_disk(
+        inner: &mut LazyCredentialStoreInner,
+    ) -> Result<(), String> {
+        let disk_fp = read_disk_fingerprint(&inner.file_path);
+        if inner
+            .loaded
+            .as_ref()
+            .is_some_and(|s| s.fingerprint.is_some())
+            && disk_fp.is_none()
+        {
+            inner.loaded = None;
+            return Ok(());
         }
-        if self.loaded.is_none() {
-            let root_store = self
-                .root_store
-                .as_ref()
-                .ok_or_else(|| "根钥匙串适配器未配置".to_owned())?;
-            let root_secret = root_store.get_or_create_root_secret()?;
-            let loaded = load_encrypted_entries(&self.file_path, &root_secret)?;
+        let file_path = inner.file_path.clone();
+        if let Some(state) = inner.loaded.as_mut()
+            && disk_fp != state.fingerprint
+        {
+            let loaded =
+                load_encrypted_entries(&file_path, &state.root_secret)?;
             if loaded.reseal {
                 save_encrypted_entries(
-                    &self.file_path,
-                    &root_secret,
+                    &file_path,
+                    &state.root_secret,
                     &loaded.entries,
                 )?;
             }
-            self.loaded = Some(LoadedState {
-                root_secret,
-                entries: loaded.entries,
-            });
+            state.entries = loaded.entries;
+            state.fingerprint = read_disk_fingerprint(&file_path);
         }
-        self.loaded
-            .as_mut()
-            .ok_or_else(|| "凭据状态初始化失败".to_owned())
+        Ok(())
     }
-}
 
-impl LazyCredentialStore {
+    fn load_into_inner(
+        inner: &mut LazyCredentialStoreInner,
+        root_secret: Zeroizing<[u8; 32]>,
+    ) -> Result<(), String> {
+        let loaded = load_encrypted_entries(&inner.file_path, &root_secret)?;
+        if loaded.reseal {
+            save_encrypted_entries(
+                &inner.file_path,
+                &root_secret,
+                &loaded.entries,
+            )?;
+        }
+        let fingerprint = read_disk_fingerprint(&inner.file_path);
+        inner.loaded = Some(LoadedState {
+            root_secret,
+            entries: loaded.entries,
+            fingerprint,
+        });
+        Ok(())
+    }
+
+    fn with_loaded_state<T>(
+        &self,
+        require_existing_file: bool,
+        op: impl FnOnce(&Path, &mut LoadedState) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let mut inner =
+            self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
+        if let Some(reason) = &inner.unavailable {
+            return Err(reason.clone());
+        }
+        Self::sync_loaded_with_disk(&mut inner)?;
+        if inner.loaded.is_none() {
+            if require_existing_file && !inner.file_path.is_file() {
+                return Ok(None);
+            }
+            let root_store = inner
+                .root_store
+                .clone()
+                .ok_or_else(|| "根钥匙串适配器未配置".to_owned())?;
+            drop(inner);
+
+            // Release the store mutex while calling the OS keychain so
+            // background preload never blocks UI interactions, and keep
+            // `unavailable` unset on transient errors or cancellations.
+            let root_secret = root_store.get_or_create_root_secret()?;
+
+            inner =
+                self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
+            if let Some(reason) = &inner.unavailable {
+                return Err(reason.clone());
+            }
+            Self::sync_loaded_with_disk(&mut inner)?;
+            if inner.loaded.is_none() {
+                if require_existing_file && !inner.file_path.is_file() {
+                    return Ok(None);
+                }
+                Self::load_into_inner(&mut inner, root_secret)?;
+            }
+        }
+        let file_path = inner.file_path.clone();
+        let state = inner
+            .loaded
+            .as_mut()
+            .ok_or_else(|| "凭据状态初始化失败".to_owned())?;
+        let outcome = op(&file_path, state);
+        drop(inner);
+        outcome.map(Some)
+    }
+
     /// Construct a lazy store using the host OS keychain adapter without
     /// touching the keychain during construction.
     #[must_use]
@@ -642,6 +761,76 @@ impl LazyCredentialStore {
             .unwrap_or_default()
     }
 
+    /// Return whether `device-credentials.enc` currently exists on disk without
+    /// touching the OS keychain.
+    #[must_use]
+    pub fn has_encrypted_file(&self) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        if inner.unavailable.is_some() {
+            return false;
+        }
+        let path = inner.file_path.clone();
+        drop(inner);
+        !path.as_os_str().is_empty() && path.is_file()
+    }
+
+    /// Return whether the root secret and encrypted entries are currently
+    /// cached in memory.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let file_exists = inner.file_path.is_file();
+        if inner
+            .loaded
+            .as_ref()
+            .is_some_and(|s| s.fingerprint.is_some() && !file_exists)
+        {
+            inner.loaded = None;
+        }
+        inner.loaded.is_some()
+    }
+
+    /// Pre-authorize and cache the root secret in memory when
+    /// `device-credentials.enc` exists and is not yet loaded.
+    ///
+    /// Returns `Ok(false)` with zero keychain calls when already loaded or when
+    /// no encrypted file exists on disk.
+    pub fn preload(&self) -> Result<bool, String> {
+        let mut inner =
+            self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
+        if let Some(reason) = &inner.unavailable {
+            return Err(reason.clone());
+        }
+        Self::sync_loaded_with_disk(&mut inner)?;
+        if inner.loaded.is_some() || !inner.file_path.is_file() {
+            return Ok(false);
+        }
+        let root_store = inner
+            .root_store
+            .clone()
+            .ok_or_else(|| "根钥匙串适配器未配置".to_owned())?;
+        drop(inner);
+
+        let root_secret = root_store.get_or_create_root_secret()?;
+
+        let mut inner =
+            self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
+        if let Some(reason) = &inner.unavailable {
+            return Err(reason.clone());
+        }
+        Self::sync_loaded_with_disk(&mut inner)?;
+        if inner.loaded.is_some() || !inner.file_path.is_file() {
+            return Ok(false);
+        }
+        Self::load_into_inner(&mut inner, root_secret)?;
+        drop(inner);
+        Ok(true)
+    }
+
     /// Read a secret by `(service, account)`.
     ///
     /// Short-circuits to `Ok(None)` with zero keychain calls when the store
@@ -652,21 +841,11 @@ impl LazyCredentialStore {
         account: &str,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
         let key = entry_key(service, account);
-        let encoded = {
-            let mut inner =
-                self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
-            let val = if let Some(reason) = &inner.unavailable {
-                Err(reason.clone())
-            } else if inner.loaded.is_none() && !inner.file_path.is_file() {
-                Ok(None)
-            } else {
-                inner
-                    .ensure_loaded()
-                    .map(|state| state.entries.get(&key).cloned())
-            };
-            drop(inner);
-            val?
-        };
+        let encoded = self
+            .with_loaded_state(true, |_, state| {
+                Ok(state.entries.get(&key).cloned())
+            })?
+            .flatten();
         let Some(encoded) = encoded else {
             return Ok(None);
         };
@@ -695,13 +874,19 @@ impl LazyCredentialStore {
     ) -> Result<(), String> {
         let key = entry_key(service, account);
         let encoded = STANDARD.encode(secret);
-        let mut inner =
-            self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
-        let file_path = inner.file_path.clone();
-        let state = inner.ensure_loaded()?;
-        state.entries.insert(key, encoded);
-        save_encrypted_entries(&file_path, &state.root_secret, &state.entries)?;
-        drop(inner);
+        self.with_loaded_state(false, |file_path, state| {
+            let mut next_entries = state.entries.clone();
+            next_entries.insert(key, encoded);
+            save_encrypted_entries(
+                file_path,
+                &state.root_secret,
+                &next_entries,
+            )?;
+            state.entries = next_entries;
+            state.fingerprint = read_disk_fingerprint(file_path);
+            Ok(())
+        })?
+        .ok_or_else(|| "凭据状态初始化失败".to_owned())?;
         Ok(())
     }
 
@@ -711,24 +896,20 @@ impl LazyCredentialStore {
     /// has not been loaded yet and `device-credentials.enc` does not exist.
     pub fn delete(&self, service: &str, account: &str) -> Result<(), String> {
         let key = entry_key(service, account);
-        let mut inner =
-            self.inner.lock().map_err(|_| "凭据互斥锁中毒".to_owned())?;
-        if let Some(reason) = &inner.unavailable {
-            return Err(reason.clone());
-        }
-        if inner.loaded.is_none() && !inner.file_path.is_file() {
-            return Ok(());
-        }
-        let file_path = inner.file_path.clone();
-        let state = inner.ensure_loaded()?;
-        if state.entries.remove(&key).is_some() {
-            save_encrypted_entries(
-                &file_path,
-                &state.root_secret,
-                &state.entries,
-            )?;
-        }
-        drop(inner);
+        let _ = self.with_loaded_state(true, |file_path, state| {
+            if state.entries.contains_key(&key) {
+                let mut next_entries = state.entries.clone();
+                next_entries.remove(&key);
+                save_encrypted_entries(
+                    file_path,
+                    &state.root_secret,
+                    &next_entries,
+                )?;
+                state.entries = next_entries;
+                state.fingerprint = read_disk_fingerprint(file_path);
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1210,5 +1391,206 @@ mod tests {
         );
         assert_eq!(fresh_root.call_count(), 0);
         assert!(db.get_ssh_profile_by_id(&profile2.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn preload_short_circuits_without_file_and_repeats_without_extra_calls() {
+        let (store, root_store, temp_dir) = temp_store();
+        let file_path = temp_dir.0.join(CREDENTIALS_FILE_NAME);
+
+        assert!(!store.has_encrypted_file());
+        assert!(!store.is_loaded());
+        assert_eq!(store.preload(), Ok(false));
+        assert_eq!(root_store.call_count(), 0);
+        assert!(!store.is_loaded());
+
+        // Write encrypted file from a separate store (simulating an earlier
+        // session or CLI process).
+        let writer = LazyCredentialStore::new(
+            file_path,
+            Arc::new(MemoryRootSecretStore::new([42_u8; 32])),
+        );
+        writer.set("ruum.ssh", "prof-1", b"hunter2").unwrap();
+
+        assert!(store.has_encrypted_file());
+        assert!(!store.is_loaded());
+        assert_eq!(store.preload(), Ok(true));
+        assert_eq!(root_store.call_count(), 1);
+        assert!(store.is_loaded());
+
+        // Subsequent preload and reads reuse the cached root secret (0 extra).
+        assert_eq!(store.preload(), Ok(false));
+        assert_eq!(
+            store.get("ruum.ssh", "prof-1").unwrap().unwrap().as_slice(),
+            b"hunter2"
+        );
+        assert_eq!(root_store.call_count(), 1);
+    }
+
+    #[test]
+    fn transient_keychain_error_allows_retry_without_locking_store() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct FlakyRootSecretStore {
+            fail_next: AtomicBool,
+            calls: AtomicUsize,
+            secret: [u8; 32],
+        }
+
+        impl RootSecretStore for FlakyRootSecretStore {
+            fn get_or_create_root_secret(
+                &self,
+            ) -> Result<Zeroizing<[u8; 32]>, String> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                if self.fail_next.swap(false, Ordering::AcqRel) {
+                    Err("User canceled the operation (-128)".to_owned())
+                } else {
+                    Ok(Zeroizing::new(self.secret))
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join(CREDENTIALS_FILE_NAME);
+        let seeder = LazyCredentialStore::new(
+            file_path.clone(),
+            Arc::new(MemoryRootSecretStore::new([77_u8; 32])),
+        );
+        seeder.set("ruum.ssh", "prof-cancel", b"pw-ok").unwrap();
+
+        let flaky = Arc::new(FlakyRootSecretStore {
+            fail_next: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+            secret: [77_u8; 32],
+        });
+        let store = LazyCredentialStore::new(file_path, flaky.clone());
+
+        assert!(store.preload().is_err());
+        assert_eq!(store.unavailable_reason(), None);
+        assert!(!store.is_loaded());
+        assert_eq!(flaky.calls.load(Ordering::Acquire), 1);
+
+        // Retry succeeds without rebuilding the store.
+        assert_eq!(store.preload(), Ok(true));
+        assert!(store.is_loaded());
+        assert_eq!(flaky.calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            store
+                .get("ruum.ssh", "prof-cancel")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"pw-ok"
+        );
+        assert_eq!(flaky.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn external_file_update_and_delete_refresh_cache_without_keychain() {
+        let (store, root_store, temp_dir) = temp_store();
+        let file_path = temp_dir.0.join(CREDENTIALS_FILE_NAME);
+
+        store.set("ruum.ssh", "prof-ext", b"secret-1").unwrap();
+        assert_eq!(root_store.call_count(), 1);
+        assert!(store.is_loaded());
+
+        // External process (same length within same timestamp quantum) updates
+        // the encrypted file with a fresh AES-GCM nonce.
+        let cli_store = LazyCredentialStore::new(
+            file_path.clone(),
+            Arc::new(MemoryRootSecretStore::new([42_u8; 32])),
+        );
+        cli_store.set("ruum.ssh", "prof-ext", b"secret-2").unwrap();
+
+        assert_eq!(
+            store
+                .get("ruum.ssh", "prof-ext")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"secret-2"
+        );
+        assert_eq!(root_store.call_count(), 1);
+
+        // External process deletes the encrypted file -> in-memory cache clears.
+        fs::remove_file(&file_path).unwrap();
+        assert_eq!(store.get("ruum.ssh", "prof-ext").unwrap(), None);
+        assert!(!store.is_loaded());
+        assert!(!store.has_encrypted_file());
+        assert_eq!(store.preload(), Ok(false));
+        assert_eq!(root_store.call_count(), 1);
+    }
+
+    #[test]
+    fn preload_releases_mutex_while_waiting_on_root_secret() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct BlockingRootSecretStore {
+            secret: [u8; 32],
+            entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+            release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+
+        impl RootSecretStore for BlockingRootSecretStore {
+            fn get_or_create_root_secret(
+                &self,
+            ) -> Result<Zeroizing<[u8; 32]>, String> {
+                let rx = self.release_rx.lock().unwrap().take();
+                if let Some(rx) = rx {
+                    let tx = self.entered_tx.lock().unwrap().take();
+                    if let Some(tx) = tx {
+                        let _ = tx.send(());
+                    }
+                    rx.recv_timeout(Duration::from_secs(5)).map_err(|err| {
+                        format!("timed out waiting for test release: {err}")
+                    })?;
+                }
+                Ok(Zeroizing::new(self.secret))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join(CREDENTIALS_FILE_NAME);
+        let seeder = LazyCredentialStore::new(
+            file_path.clone(),
+            Arc::new(MemoryRootSecretStore::new([55_u8; 32])),
+        );
+        seeder.set("ruum.ssh", "prof-a", b"alpha").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = Arc::new(BlockingRootSecretStore {
+            secret: [55_u8; 32],
+            entered_tx: Mutex::new(Some(entered_tx)),
+            release_rx: Mutex::new(Some(release_rx)),
+        });
+        let store = LazyCredentialStore::new(file_path, blocker);
+        let bg_store = store.clone();
+
+        let handle = std::thread::spawn(move || bg_store.preload());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("preload entered root_store");
+
+        // While Thread 1 is blocked inside OS keychain, main/UI thread MUST NOT
+        // block on `has_encrypted_file`, `is_loaded`, or `set`.
+        assert!(store.has_encrypted_file());
+        assert!(!store.is_loaded());
+        store.set("ruum.ssh", "prof-b", b"beta").unwrap();
+        assert!(store.is_loaded());
+
+        release_tx.send(()).expect("release preload");
+        assert_eq!(handle.join().unwrap(), Ok(false));
+
+        // Both pre-existing and concurrent entries remain intact.
+        assert_eq!(
+            store.get("ruum.ssh", "prof-a").unwrap().unwrap().as_slice(),
+            b"alpha"
+        );
+        assert_eq!(
+            store.get("ruum.ssh", "prof-b").unwrap().unwrap().as_slice(),
+            b"beta"
+        );
     }
 }

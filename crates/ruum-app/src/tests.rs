@@ -126,16 +126,17 @@ fn startup_chooser_never_scans_before_explicit_acceptance(
     cx.run_until_parked();
     draw(cx);
     assert!(cx.debug_bounds("choose-root-idle").is_some());
-    assert!(cx.debug_bounds("source-host").is_none());
-    assert!(cx.debug_bounds("source-path").is_some());
-    assert!(cx.debug_bounds("ssh-profiles-card").is_some());
+    assert!(cx.debug_bounds("volume-picker-modal").is_some());
+    assert!(cx.debug_bounds("modal-source-path").is_some());
+    assert!(cx.debug_bounds("source-path").is_none());
+    assert!(cx.debug_bounds("ssh-profiles-card").is_none());
     read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+        assert!(app.volumes_open);
         assert!(app.awaiting_root);
         assert_eq!(app.scan_epoch, 0);
         assert!(app.scan.is_none() && app.remote_scan.is_none());
     });
-    press(cx, "escape");
-    assert!(!read(&view, cx, |app| app.ssh_form_open));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
     press(cx, "r");
@@ -161,7 +162,7 @@ fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
         app.volumes_loading = false;
     });
     draw(cx);
-    let input = cx.debug_bounds("source-path").expect("path editor");
+    let input = cx.debug_bounds("modal-source-path").expect("path editor");
     cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
     cx.simulate_input(selected.path().to_str().unwrap());
     assert_eq!(
@@ -191,7 +192,10 @@ fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
     cx.run_until_parked();
-    update(&view, cx, Ruum::open_add_ssh_form);
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Remote, cx);
+        app.open_add_ssh_form(cx);
+    });
     draw(cx);
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
@@ -219,7 +223,9 @@ fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
     });
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.ssh_form_open));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Remote);
     press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
     assert!(!read(&view, cx, |app| app.volumes_open));
 }
 
@@ -264,8 +270,8 @@ fn chooser_fits_a_small_window_at_large_interface_zoom(
         cx.update(|window, _| window.set_rem_size(px(rem)));
         draw(cx);
         let bounds = cx
-            .debug_bounds("source-picker")
-            .expect("scrollable chooser");
+            .debug_bounds("volume-picker-modal")
+            .expect("unified volume picker modal");
         assert!(bounds.size.width > px(200.), "{bounds:?}");
         assert!(
             bounds.origin.x >= px(0.) && bounds.right() <= px(900.),
@@ -283,7 +289,7 @@ fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
-    update(&view, cx, Ruum::open_volumes);
+    update(&view, cx, |app, cx| app.navigate_rail(Screen::Remote, cx));
     cx.run_until_parked();
     update(&view, cx, Ruum::open_add_ssh_form);
     draw(cx);
@@ -300,6 +306,7 @@ fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
     assert!(!read(&view, cx, |app| app.ssh_form_open));
     draw(cx);
     press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
     assert!(!read(&view, cx, |app| app.volumes_open));
 }
 
@@ -324,7 +331,7 @@ fn a_directory_error_can_be_corrected_without_reconnecting(
 }
 
 #[gpui_kit::test]
-fn stale_local_discovery_cannot_overwrite_closed_sources_state(
+fn stale_local_discovery_cannot_overwrite_closed_picker_state(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_omarchy::init);
@@ -356,7 +363,6 @@ fn local_mounts_never_scan_nonexistent_remote_only_paths(
         });
         app.switch_host_tab(crate::state::HostTabKey::Ssh("srv-1".into()), cx);
         app.volumes_open = true;
-        app.screen = Screen::Sources;
         app.finish_volume_listing(
             Ok((
                 vec![Volume {
@@ -904,17 +910,17 @@ fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
 
-    // The picker lists volumes and draws them without panicking; Escape
-    // leaves the scan where it was.
+    // The picker lists volumes and draws them in a modal over Explore without
+    // jumping to Screen::Remote; Escape leaves the scan where it was.
     press(cx, "v");
     assert!(read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
     draw(cx);
+    assert!(cx.debug_bounds("volume-picker-modal").is_some());
     assert!(cx.debug_bounds("ruum-root").is_some());
     let before = read(&view, cx, |app| app.root_path.clone());
     press(cx, "down");
     press(cx, "up");
-    press(cx, "escape");
-    assert!(!read(&view, cx, |app| app.ssh_form_open));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
@@ -957,10 +963,8 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
-    // Fixed rows, so this checks the full-page layout and not which disks
-    // the machine running the test happens to have.
     update(&view, cx, |app, cx| {
-        app.navigate_rail(Screen::Sources, cx);
+        app.open_volumes(cx);
         app.volumes_loading = false;
         app.volumes = vec![
             Volume {
@@ -983,37 +987,229 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     draw(cx);
 
     let viewport = cx.update(|window, _| window.viewport_size());
+    let modal = cx
+        .debug_bounds("volume-picker-modal")
+        .expect("volume picker modal is drawn");
+    let rows = cx
+        .debug_bounds("modal-volume-rows")
+        .expect("the modal rows are drawn");
+    assert!(modal.size.width > px(200.), "{modal:?}");
+    assert!(rows.size.width > px(200.), "{rows:?}");
+    assert!(
+        cx.debug_bounds("modal-source-cancel").is_some(),
+        "modal picker has a Cancel button"
+    );
+    assert!(
+        modal.origin.x > px(0.) && modal.right() < viewport.width,
+        "modal picker is centred horizontally: {modal:?} in {viewport:?}"
+    );
+
+    // Clicking outside the modal card dismisses it and returns to Explore.
+    let outside = cx.debug_bounds("ruum-root").expect("ruum-root");
+    cx.simulate_click(
+        gpui_kit::point(outside.origin.x + px(8.), outside.origin.y + px(8.)),
+        gpui_kit::Modifiers::none(),
+    );
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    assert!(!read(&view, cx, |app| app.volumes_open));
+}
+
+#[gpui_kit::test]
+fn remote_page_renders_only_ssh_card_and_ignores_volume_keys(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let initial_root = read(&view, cx, |app| app.root_path.clone());
+    let initial_epoch = read(&view, cx, |app| app.scan_epoch);
+
+    // Opening Remote while volume modal is open closes the modal and never
+    // starts local volume discovery (`volumes_loading` stays false).
+    update(&view, cx, |app, cx| {
+        app.volumes_open = true;
+        app.volumes_loading = true;
+        app.volumes = vec![Volume {
+            point: temp.path().to_path_buf(),
+            device: Some("/dev/disk".into()),
+            space: None,
+        }];
+        app.volume_highlight = 0;
+        app.navigate_rail(Screen::Remote, cx);
+    });
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Remote);
+        assert!(!app.volumes_open);
+        assert!(!app.volumes_loading);
+    });
+
+    let viewport = cx.update(|window, _| window.viewport_size());
     let page = cx
-        .debug_bounds("sources-page")
-        .expect("sources full page is drawn");
-    let rows = cx.debug_bounds("volume-rows").expect("the rows are drawn");
+        .debug_bounds("remote-page")
+        .expect("remote full page is drawn");
     let rail = crate::ui::size::ICON_RAIL.to_pixels(px(16.));
     assert!(
         (page.origin.x - rail).abs() < px(2.),
-        "sources page starts next to icon rail: {page:?}"
+        "remote page starts next to icon rail: {page:?}"
     );
     assert!(
         (page.size.width - (viewport.width - rail)).abs() < px(2.),
-        "sources page fills remaining width: {page:?} in {viewport:?}"
+        "remote page fills remaining width: {page:?} in {viewport:?}"
     );
-    assert!(rows.size.width > px(200.), "{rows:?}");
-    assert!(
-        cx.debug_bounds("source-cancel").is_none(),
-        "full-page Sources view has no modal Cancel button"
-    );
+    assert!(cx.debug_bounds("remote-content").is_some());
+    assert!(cx.debug_bounds("ssh-profiles-card").is_some());
+    assert!(cx.debug_bounds("volume-rows").is_none());
+    assert!(cx.debug_bounds("source-path").is_none());
+    assert!(cx.debug_bounds("source-scan-path").is_none());
+    assert!(cx.debug_bounds("source-scan").is_none());
 
-    // Clicking empty space on the full-page Sources view does NOT dismiss it.
+    // Clicking empty space on Remote does NOT dismiss it.
     cx.simulate_click(
         gpui_kit::point(page.right() - px(8.), page.origin.y + px(8.)),
         gpui_kit::Modifiers::none(),
     );
     draw(cx);
-    assert_eq!(
-        read(&view, cx, |app| app.screen),
-        Screen::Sources,
-        "clicking empty space on full-page Sources must not dismiss it"
-    );
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Remote);
+
+    // Stale volume-list keys (`enter`, `up`, `down`, `j`, `k`) are ignored.
+    for key in ["down", "j", "up", "k", "enter"] {
+        press(cx, key);
+        read(&view, cx, |app| {
+            assert_eq!(app.screen, Screen::Remote);
+            assert_eq!(app.volume_highlight, 0);
+            assert_eq!(app.root_path, initial_root);
+            assert_eq!(app.scan_epoch, initial_epoch);
+        });
+    }
+
+    // Escape returns to Explore.
+    press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+}
+
+#[gpui_kit::test]
+fn breadcrumb_and_ssh_browse_open_unified_directory_modal(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::{AuthMode, SshProfile};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let other = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1200.), px(800.)));
+    draw(cx);
+
+    // 1. Clicking the scan-root breadcrumb opens the unified modal in-place on
+    //    Screen::Explore (never jumping to Screen::Remote).
+    let root_crumb =
+        cx.debug_bounds("crumb-scan-root").expect("crumb-scan-root");
+    cx.simulate_click(root_crumb.center(), Modifiers::none());
+    draw(cx);
     assert!(read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    assert!(cx.debug_bounds("volume-picker-modal").is_some());
+
+    // Clicking outside the modal card dismisses it.
+    let outside = cx.debug_bounds("ruum-root").expect("ruum-root");
+    cx.simulate_click(
+        gpui_kit::point(outside.origin.x + px(8.), outside.origin.y + px(8.)),
+        Modifiers::none(),
+    );
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.volumes_open));
+
+    // 2. Clicking the trail directory-switcher icon opens the modal too, and
+    //    submitting a local directory switches root_path in Explore.
+    let switch_btn = cx
+        .debug_bounds("trail-switch-root")
+        .expect("trail-switch-root");
+    cx.simulate_click(switch_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(read(&view, cx, |app| app.volumes_open));
+    update(&view, cx, |app, _| {
+        app.volumes_loading = false;
+        app.volumes_error = None;
+        app.volumes = vec![Volume {
+            point: other.path().to_path_buf(),
+            device: None,
+            space: None,
+        }];
+        app.volume_highlight = 0;
+    });
+    draw(cx);
+    let scan_btn = cx
+        .debug_bounds("modal-source-scan")
+        .expect("modal-source-scan");
+    cx.simulate_click(scan_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    assert_eq!(
+        read(&view, cx, |app| app.root_path.clone()),
+        dunce::canonicalize(other.path()).unwrap()
+    );
+    finish_scan(&view, cx);
+
+    // 3. Remote SSH modal mode validates remote paths (~ / absolute) without
+    //    touching local FS, and SSH cards expose `ssh-browse-0`.
+    let prof = SshProfile {
+        id: "srv-modal-1".into(),
+        alias: "edge-box".into(),
+        host: "10.9.9.9".into(),
+        port: 22,
+        username: "ops".into(),
+        auth_mode: AuthMode::PrivateKey,
+        default_path: None,
+        created_at_secs: 1,
+        updated_at_secs: 1,
+        last_total_bytes: None,
+        last_available_bytes: None,
+        last_scanned_secs: None,
+        pending_script_path: None,
+        pending_script_items: None,
+        pending_reclaim_bytes: None,
+        pending_created_secs: None,
+    };
+    update(&view, cx, |app, cx| {
+        app.ssh_profiles = vec![prof.clone()];
+        app.host_tabs.push(crate::state::ExploreHostTab {
+            key: crate::state::HostTabKey::Ssh(prof.id.clone()),
+            label: prof.alias.clone(),
+            session: None,
+        });
+        app.navigate_rail(Screen::Remote, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-browse-0").is_some());
+
+    // Simulate remote modal opened for the active SSH tab.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Explore, cx);
+        app.switch_host_tab(
+            crate::state::HostTabKey::Ssh("srv-modal-1".into()),
+            cx,
+        );
+        app.volumes_open = true;
+        app.volume_picker_remote_profile_id = Some("srv-modal-1".into());
+        app.volumes_loading = false;
+        app.volumes = vec![Volume {
+            point: PathBuf::from("/home/ops"),
+            device: Some("Home directory".into()),
+            space: None,
+        }];
+        app.choose_remote_root("srv-modal-1", Path::new("relative"), cx);
+        assert!(app.picker_error.is_some());
+        assert!(app.volumes_open);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("modal-picker-error").is_some());
+    assert!(cx.debug_bounds("volume-picker-modal").is_some());
 }
 
 #[gpui_kit::test]
@@ -2277,55 +2473,84 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
 
 #[gpui_kit::test]
 fn icon_rail_switches_pages_and_settings_shortcut(cx: &mut TestAppContext) {
+    use ruum_core::docker_adapter::{DockerProbeStatus, DockerUsageSummary};
+
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
 
-    // Initial page is Explore
+    // Initial page is Explore; `rail-docker` stays hidden while local Docker
+    // is not Available.
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
     assert!(cx.debug_bounds("icon-rail").is_some());
     assert!(cx.debug_bounds("rail-explore").is_some());
-    assert!(cx.debug_bounds("rail-sources").is_some());
+    assert!(cx.debug_bounds("rail-docker").is_none());
+    assert!(cx.debug_bounds("rail-remote").is_some());
     assert!(cx.debug_bounds("rail-watchdog").is_some());
     assert!(cx.debug_bounds("rail-settings").is_some());
 
-    // Explore -> Sources
-    let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
-    cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
+    // OpenDocker action is ignored when local Docker daemon is unavailable.
+    cx.dispatch_action(crate::app_menu::OpenDocker);
     draw(cx);
-    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
-    assert!(cx.debug_bounds("sources-page").is_some());
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
 
-    // Sources -> Watchdog
+    // Once local Docker daemon is Available, `rail-docker` appears and opens
+    // `Screen::Docker`.
+    update(&view, cx, |app, cx| {
+        app.apply_local_docker_status(DockerProbeStatus::Available(
+            DockerUsageSummary::default(),
+        ));
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("rail-docker").is_some());
+
+    // Explore -> Docker -> Escape returns to Explore
+    let docker_btn = cx.debug_bounds("rail-docker").expect("rail-docker");
+    cx.simulate_click(docker_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Docker);
+    assert!(cx.debug_bounds("docker-page").is_some());
+    press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+
+    // Explore -> Remote
+    let remote_btn = cx.debug_bounds("rail-remote").expect("rail-remote");
+    cx.simulate_click(remote_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Remote);
+    assert!(cx.debug_bounds("remote-page").is_some());
+
+    // Remote -> Watchdog
     let watchdog_btn = cx.debug_bounds("rail-watchdog").expect("rail-watchdog");
     cx.simulate_click(watchdog_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Watchdog);
     assert!(cx.debug_bounds("watchdog-page").is_some());
 
-    // Watchdog -> Sources (bidirectional click)
-    let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
-    cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
+    // Watchdog -> Remote (bidirectional click)
+    let remote_btn = cx.debug_bounds("rail-remote").expect("rail-remote");
+    cx.simulate_click(remote_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
-    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
-    assert!(cx.debug_bounds("sources-page").is_some());
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Remote);
+    assert!(cx.debug_bounds("remote-page").is_some());
 
-    // Sources -> Settings
+    // Remote -> Settings
     let settings_btn = cx.debug_bounds("rail-settings").expect("rail-settings");
     cx.simulate_click(settings_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Settings);
     assert!(cx.debug_bounds("settings-page").is_some());
 
-    // Settings -> Sources (bidirectional click)
-    let sources_btn = cx.debug_bounds("rail-sources").expect("rail-sources");
-    cx.simulate_click(sources_btn.center(), gpui_kit::Modifiers::none());
+    // Settings -> Remote (bidirectional click)
+    let remote_btn = cx.debug_bounds("rail-remote").expect("rail-remote");
+    cx.simulate_click(remote_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
-    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
-    assert!(cx.debug_bounds("sources-page").is_some());
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Remote);
+    assert!(cx.debug_bounds("remote-page").is_some());
 
-    // Sources -> Explore
+    // Remote -> Explore
     let explore_btn = cx.debug_bounds("rail-explore").expect("rail-explore");
     cx.simulate_click(explore_btn.center(), gpui_kit::Modifiers::none());
     draw(cx);
@@ -2340,13 +2565,27 @@ fn icon_rail_switches_pages_and_settings_shortcut(cx: &mut TestAppContext) {
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
 
     // Menu actions switch pages directly
+    cx.dispatch_action(crate::app_menu::OpenDocker);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Docker);
+
+    // Dropping local Docker daemon while on Screen::Docker falls back to
+    // Explore and hides `rail-docker`.
+    update(&view, cx, |app, cx| {
+        app.apply_local_docker_status(DockerProbeStatus::DaemonStopped);
+        cx.notify();
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    assert!(cx.debug_bounds("rail-docker").is_none());
+
     cx.dispatch_action(crate::app_menu::OpenWatchdog);
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Watchdog);
 
-    cx.dispatch_action(crate::app_menu::OpenSources);
+    cx.dispatch_action(crate::app_menu::OpenRemote);
     draw(cx);
-    assert_eq!(read(&view, cx, |app| app.screen), Screen::Sources);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Remote);
 
     cx.dispatch_action(crate::app_menu::OpenExplore);
     draw(cx);
@@ -2395,6 +2634,8 @@ fn cleanup_confirm_modal_selection_and_decision() {
                 git_warning: None,
             },
         ],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
 
     let (resp_tx, resp_rx) = channel();
@@ -2420,6 +2661,7 @@ fn cleanup_confirm_modal_selection_and_decision() {
         decision,
         CleanupConfirmDecision::Confirmed {
             selected_paths: vec![path_a, path_c],
+            selected_docker_targets: Vec::new(),
         }
     );
 
@@ -2448,6 +2690,8 @@ fn cleanup_confirm_modal_fail_closed_on_drop() {
             reason: None,
             git_warning: None,
         }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
 
     {
@@ -2615,6 +2859,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
                 Some("junk test file".into()),
                 None,
             )],
+            docker_targets: Vec::new(),
         });
         app.open_last_proposal(cx);
     });
@@ -2663,6 +2908,8 @@ fn confirm_only_standalone_mode(cx: &mut TestAppContext) {
             reason: None,
             git_warning: None,
         }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
 
     let (view, cx) = cx.add_window_view(|_, cx| {
@@ -2689,7 +2936,7 @@ fn confirm_only_standalone_mode(cx: &mut TestAppContext) {
     let decision: CleanupConfirmDecision =
         serde_json::from_str(&content).expect("parse");
     match decision {
-        CleanupConfirmDecision::Confirmed { selected_paths } => {
+        CleanupConfirmDecision::Confirmed { selected_paths, .. } => {
             assert_eq!(
                 selected_paths,
                 vec![PathBuf::from("/tmp/standalone.tmp")]
@@ -2734,6 +2981,8 @@ fn open_confirm_window_toggles_confirms_and_fails_closed_on_close(
                 git_warning: None,
             },
         ],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
 
     // 1. Toggle item checkbox and click Confirm -> returns checked paths only.
@@ -2763,6 +3012,7 @@ fn open_confirm_window_toggles_confirms_and_fails_closed_on_close(
         rx1.recv().expect("confirm decision"),
         CleanupConfirmDecision::Confirmed {
             selected_paths: vec![path_a],
+            selected_docker_targets: Vec::new(),
         }
     );
     assert_eq!(cx.windows().len(), 1);
@@ -3129,16 +3379,15 @@ fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
         draw(cx);
         assert!(cx.debug_bounds("ruum-root").is_some());
 
-        // Sources page (awaiting root -> localized window title).
+        // Explore (awaiting root -> localized window title + idle guide).
         update(&view, cx, |app, cx| {
             app.confirm_open = false;
             app.screen = Screen::Explore;
-            app.navigate_rail(Screen::Sources, cx);
+            app.navigate_rail(Screen::Explore, cx);
             app.awaiting_root = true;
             cx.notify();
         });
         draw(cx);
-        assert!(cx.debug_bounds("sources-page").is_some());
         assert!(cx.debug_bounds("choose-root-idle").is_some());
         let expected_choose_title =
             crate::i18n::messages::title_choose_source(locale);
@@ -3146,6 +3395,17 @@ fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
             read(&view, cx, |app| app.window_title().to_owned()),
             expected_choose_title
         );
+
+        // Remote page.
+        update(&view, cx, |app, cx| {
+            app.awaiting_root = false;
+            app.navigate_rail(Screen::Remote, cx);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("remote-page").is_some());
+        assert!(cx.debug_bounds("remote-content").is_some());
+        assert!(cx.debug_bounds("ssh-profiles-card").is_some());
 
         // Watchdog page.
         update(&view, cx, |app, cx| {
@@ -3180,6 +3440,8 @@ fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
             reason: Some("cache".into()),
             git_warning: Some("untracked files".into()),
         }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
     let (confirm_view, confirm_cx) = cx.add_window_view(|_, cx| {
         crate::CleanupConfirmWindow::new(req, None, None, false, cx)
@@ -3205,20 +3467,26 @@ fn initial_main_window_size_scales_and_clamps_to_minimum() {
 
     assert_eq!(
         crate::initial_main_window_size(Some(size(px(3840.), px(2160.)))),
-        size(px(2304.), px(1296.))
+        size(px(1440.), px(900.))
     );
     assert_eq!(
         crate::initial_main_window_size(Some(size(px(1920.), px(1080.)))),
-        size(px(1152.), px(648.))
+        size(px(1440.), px(900.))
     );
     assert_eq!(
         crate::initial_main_window_size(Some(size(px(1280.), px(720.)))),
-        size(px(800.), px(600.))
+        size(px(1280.), px(720.))
+    );
+    assert_eq!(
+        crate::initial_main_window_size(Some(size(px(800.), px(500.)))),
+        size(px(900.), px(600.))
     );
     assert_eq!(
         crate::initial_main_window_size(None),
-        size(px(864.), px(600.))
+        size(px(1440.), px(900.))
     );
+    assert_eq!(crate::DEFAULT_MAIN_WINDOW_SIZE, size(px(1440.), px(900.)));
+    assert_eq!(crate::MIN_MAIN_WINDOW_SIZE, size(px(900.), px(600.)));
 }
 
 #[gpui_kit::test]
@@ -4130,6 +4398,10 @@ fn default_explore_startup_does_not_touch_keychain_or_legacy_text_files(
             last_total_bytes: Some(1_000_000_000),
             last_available_bytes: Some(250_000_000),
             last_scanned_secs: Some(900),
+            pending_script_path: None,
+            pending_script_items: None,
+            pending_reclaim_bytes: None,
+            pending_created_secs: None,
         })
         .expect("seed ssh profile");
     }
@@ -4154,9 +4426,9 @@ fn default_explore_startup_does_not_touch_keychain_or_legacy_text_files(
     assert!(!cfg_dir.path().join("watchdog-state.json").exists());
     assert!(!cfg_dir.path().join("power-efficiency").exists());
 
-    // Rendering Sources SSH cards from SQLite also must not touch the keychain.
+    // Rendering Remote SSH cards from SQLite also must not touch the keychain.
     update(&view, cx, |app, cx| {
-        app.navigate_rail(Screen::Sources, cx);
+        app.navigate_rail(Screen::Remote, cx);
     });
     draw(cx);
     assert!(cx.debug_bounds("ssh-profiles-card").is_some());
@@ -4165,7 +4437,7 @@ fn default_explore_startup_does_not_touch_keychain_or_legacy_text_files(
 }
 
 #[gpui_kit::test]
-fn sources_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
+fn remote_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
     cx: &mut TestAppContext,
 ) {
     use gpui_kit::Modifiers;
@@ -4183,7 +4455,7 @@ fn sources_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
     update(&view, cx, |app, cx| {
         app.db_path = Some(db_path.clone());
         app.cred_store = Some(counter.store_for(&enc_path));
-        app.navigate_rail(Screen::Sources, cx);
+        app.navigate_rail(Screen::Remote, cx);
     });
     draw(cx);
     assert_eq!(counter.load_count(), 0);
@@ -4301,7 +4573,7 @@ fn sources_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
         app.db_path = Some(db_path.clone());
         app.cred_store = Some(counter2.store_for(&enc_path));
         app.reload_ssh_profiles();
-        app.navigate_rail(Screen::Sources, cx);
+        app.navigate_rail(Screen::Remote, cx);
     });
     draw(fresh_cx);
     assert_eq!(counter2.load_count(), 0);
@@ -4323,20 +4595,20 @@ fn sources_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
     });
     assert!(connected_or_errored);
 
-    // 4b. Re-opening Sources while an SSH card is active loads local mounts
-    //     only and performs 0 keychain reads (lazy keychain guarantee).
+    // 4b. Re-opening Remote while an SSH card is active performs 0 keychain
+    //     reads and never triggers local mount discovery.
     let counter_session = CountingRootSecret::new([0x2A; 32]);
     update(&fresh_view, fresh_cx, |app, cx| {
         app.cred_store = Some(counter_session.store_for(&enc_path));
         app.active_ssh_session = None;
         app.active_ssh_profile_id = Some(updated[0].id.clone());
         app.remote = Some(updated[0].alias.clone());
-        app.navigate_rail(Screen::Sources, cx);
+        app.navigate_rail(Screen::Remote, cx);
     });
     draw(fresh_cx);
     assert_eq!(counter_session.load_count(), 0);
     assert!(read(&fresh_view, fresh_cx, |app| {
-        app.active_ssh_session.is_none()
+        app.active_ssh_session.is_none() && !app.volumes_loading
     }));
 
     // 5. Delete SSH card deletes credential first, then SQLite row.
@@ -4378,6 +4650,10 @@ fn sources_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
             last_total_bytes: None,
             last_available_bytes: None,
             last_scanned_secs: None,
+            pending_script_path: None,
+            pending_script_items: None,
+            pending_reclaim_bytes: None,
+            pending_created_secs: None,
         })
         .expect("add profile");
     update(&fresh_view, fresh_cx, |app, cx| {
@@ -4843,7 +5119,7 @@ fn host_tabs_strip_preserves_sessions_and_local_tab_is_unclosable(
 }
 
 #[gpui_kit::test]
-fn sources_ssh_tilde_default_and_action_icon_buttons_and_spinners(
+fn remote_ssh_tilde_default_and_action_icon_buttons_and_spinners(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_omarchy::init);
@@ -4854,7 +5130,7 @@ fn sources_ssh_tilde_default_and_action_icon_buttons_and_spinners(
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
         app.db_path = Some(db_path.clone());
-        app.navigate_rail(Screen::Sources, cx);
+        app.navigate_rail(Screen::Remote, cx);
     });
     cx.run_until_parked();
     draw(cx);
@@ -4889,6 +5165,10 @@ fn sources_ssh_tilde_default_and_action_icon_buttons_and_spinners(
             last_total_bytes: None,
             last_available_bytes: None,
             last_scanned_secs: None,
+            pending_script_path: None,
+            pending_script_items: None,
+            pending_reclaim_bytes: None,
+            pending_created_secs: None,
         })
         .expect("add profile");
     }
@@ -4898,6 +5178,7 @@ fn sources_ssh_tilde_default_and_action_icon_buttons_and_spinners(
     });
     draw(cx);
     assert!(cx.debug_bounds("ssh-connect-0").is_some());
+    assert!(cx.debug_bounds("ssh-browse-0").is_some());
     assert!(cx.debug_bounds("ssh-check-0").is_some());
     assert!(cx.debug_bounds("ssh-ai-0").is_some());
     assert!(cx.debug_bounds("ssh-edit-0").is_some());
@@ -4951,6 +5232,7 @@ fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
                 None,
             ),
         ],
+        docker_targets: Vec::new(),
     };
     {
         let db = ruum_core::storage::StorageDb::open(&db_path).expect("db");
@@ -4979,7 +5261,12 @@ fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
     );
     let win = cx
         .update(|_, cx| {
-            crate::open_local_confirm_window(req, Some(db_path.clone()), cx)
+            crate::open_local_confirm_window(
+                req,
+                Some(db_path.clone()),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
         })
         .expect("confirm win");
     let mut confirm_cx = VisualTestContext::from_window(win.into(), &cx.cx);
@@ -5014,7 +5301,12 @@ fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
     );
     let win_b = cx
         .update(|_, cx| {
-            crate::open_local_confirm_window(req_b, Some(db_path), cx)
+            crate::open_local_confirm_window(
+                req_b,
+                Some(db_path),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
         })
         .expect("confirm win b");
     let mut confirm_cx_b = VisualTestContext::from_window(win_b.into(), &cx.cx);
@@ -5193,9 +5485,18 @@ fn local_confirm_cleanup_posts_started_then_done_notifications_and_toast(
             reason: Some("stale".into()),
             git_warning: None,
         }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
     let win = cx
-        .update(|cx| crate::open_local_confirm_window(req, Some(db_path), cx))
+        .update(|cx| {
+            crate::open_local_confirm_window(
+                req,
+                Some(db_path),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
+        })
         .expect("open local confirm window");
     win.update(cx, |confirm_win, _, _| {
         confirm_win.set_locale(crate::i18n::Locale::Zh);
@@ -5253,9 +5554,18 @@ fn local_confirm_cleanup_posts_started_then_done_notifications_and_toast(
             reason: None,
             git_warning: None,
         }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
     let win2 = cx
-        .update(|cx| crate::open_local_confirm_window(req2, None, cx))
+        .update(|cx| {
+            crate::open_local_confirm_window(
+                req2,
+                None,
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
+        })
         .expect("open second local confirm window");
     win2.update(cx, |confirm_win, window, cx| {
         confirm_win.set_locale(crate::i18n::Locale::En);
@@ -5311,6 +5621,8 @@ fn ipc_and_standalone_confirm_notify_only_on_nonempty_confirm(
             reason: None,
             git_warning: None,
         }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
     };
 
     // 1. Cancel does NOT emit any notification.
@@ -5368,7 +5680,7 @@ fn ipc_and_standalone_confirm_notify_only_on_nonempty_confirm(
     ipc_cx.simulate_click(confirm_ipc.center(), gpui_kit::Modifiers::none());
     assert!(matches!(
         ipc_rx.recv().expect("ipc decision"),
-        CleanupConfirmDecision::Confirmed { selected_paths }
+        CleanupConfirmDecision::Confirmed { selected_paths, .. }
             if selected_paths.len() == 1
     ));
     let shown = cx.shown_system_notifications();
@@ -5400,4 +5712,1813 @@ fn ipc_and_standalone_confirm_notify_only_on_nonempty_confirm(
     assert_eq!(shown.len(), 2);
     assert_eq!(shown[1].tag.as_ref(), NOTIF_TAG_CLEANUP_STARTED);
     let _ = standalone_win;
+}
+
+#[gpui_kit::test]
+fn docker_probe_status_persists_across_host_tabs_and_renders_page_states(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::{ExploreHostTab, ExploreSessionSnapshot, HostTabKey};
+    use ruum_core::docker_adapter::{
+        DockerImageEntry, DockerProbeStatus, DockerUsageSummary,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // 1. Explore never displays inline Docker banner; when local Docker is
+    //    NotInstalled/DaemonStopped/PermissionDenied, `rail-docker` stays
+    //    hidden, `navigate_rail(Screen::Docker)` is rejected, and
+    //    `remote-docker-btn` is hidden on the Local tab.
+    draw(cx);
+    assert!(cx.debug_bounds("docker-status-line").is_none());
+    assert!(cx.debug_bounds("rail-docker").is_none());
+    assert!(cx.debug_bounds("remote-docker-btn").is_none());
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Docker, cx);
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Explore);
+
+    update(&view, cx, |app, cx| {
+        app.apply_local_docker_status(DockerProbeStatus::PermissionDenied {
+            socket_hint: "/var/run/docker.sock".into(),
+        });
+        app.navigate_rail(Screen::Docker, cx);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("rail-docker").is_none());
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Explore);
+
+    // 2. Available on Local reveals `rail-docker` and renders local overview &
+    //    cards in `Screen::Docker`, while Explore stays decoupled.
+    let local_docker = DockerProbeStatus::Available(DockerUsageSummary {
+        build_cache_reclaimable_bytes: 1024 * 1024,
+        build_cache_shared_bytes: 512 * 1024,
+        removable_images: vec![DockerImageEntry {
+            id: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            repository: "<none>".into(),
+            tag: "<none>".into(),
+            created_since: "2d".into(),
+            size_bytes: 2 * 1024 * 1024,
+            unique_bytes: 2 * 1024 * 1024,
+            dangling: true,
+        }],
+        detailed: true,
+        ..DockerUsageSummary::default()
+    });
+    update(&view, cx, |app, cx| {
+        app.apply_local_docker_status(local_docker.clone());
+        app.navigate_rail(Screen::Docker, cx);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("rail-docker").is_some());
+    assert!(cx.debug_bounds("docker-overview").is_some());
+    assert!(cx.debug_bounds("docker-card-images").is_some());
+    assert!(cx.debug_bounds("docker-card-containers").is_some());
+    assert!(cx.debug_bounds("docker-card-build-cache").is_some());
+    assert!(cx.debug_bounds("docker-build-cache-shared").is_some());
+    assert!(cx.debug_bounds("docker-card-volumes").is_some());
+    assert!(cx.debug_bounds("docker-volumes-protected").is_some());
+
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Explore, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("docker-status-line").is_none());
+    assert!(cx.debug_bounds("remote-docker-btn").is_none());
+
+    // 3. Switching to a remote tab with PermissionDenied hides
+    //    `remote-docker-btn`, while `Screen::Docker` continues showing LOCAL
+    //    Docker cleanly (decoupled from active remote tab).
+    let mut denied_snap = ExploreSessionSnapshot::default();
+    denied_snap.root_path = PathBuf::from("/srv/app");
+    denied_snap.scan_root = PathBuf::from("/srv/app");
+    denied_snap.tree =
+        Some(std::sync::Arc::new(scan(temp.path(), options()).unwrap()));
+    denied_snap.remote = Some("prod-denied".into());
+    denied_snap.remote_platform = "linux".into();
+    denied_snap.docker = DockerProbeStatus::PermissionDenied {
+        socket_hint: "/var/run/docker.sock".into(),
+    };
+    update(&view, cx, |app, cx| {
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh("srv-denied".into()),
+            label: "prod-denied".into(),
+            session: Some(denied_snap),
+        });
+        app.switch_host_tab(HostTabKey::Ssh("srv-denied".into()), cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("remote-docker-btn").is_none());
+    assert!(cx.debug_bounds("rail-docker").is_some());
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Docker, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("docker-overview").is_some());
+    assert!(cx.debug_bounds("docker-permission-denied").is_none());
+
+    // 4. Switching to a remote tab with Available Docker renders
+    //    `remote-docker-btn` beside `trail-switch-root`, opens
+    //    `remote-docker-modal` on click, closes on Escape, and auto-closes on
+    //    host tab switch.
+    let mut avail_snap = ExploreSessionSnapshot::default();
+    avail_snap.root_path = PathBuf::from("/srv/docker");
+    avail_snap.scan_root = PathBuf::from("/srv/docker");
+    avail_snap.tree =
+        Some(std::sync::Arc::new(scan(temp.path(), options()).unwrap()));
+    avail_snap.remote = Some("prod-docker".into());
+    avail_snap.remote_platform = "linux".into();
+    avail_snap.docker = DockerProbeStatus::Available(DockerUsageSummary {
+        build_cache_reclaimable_bytes: 500_000_000,
+        detailed: true,
+        ..DockerUsageSummary::default()
+    });
+    update(&view, cx, |app, cx| {
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh("srv-docker".into()),
+            label: "prod-docker".into(),
+            session: Some(avail_snap),
+        });
+        app.switch_host_tab(HostTabKey::Ssh("srv-docker".into()), cx);
+    });
+    draw(cx);
+    let switch_root_bounds = cx
+        .debug_bounds("trail-switch-root")
+        .expect("trail-switch-root");
+    let remote_docker_btn = cx
+        .debug_bounds("remote-docker-btn")
+        .expect("remote-docker-btn");
+    assert!(remote_docker_btn.origin.x > switch_root_bounds.origin.x);
+
+    cx.simulate_click(remote_docker_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("remote-docker-modal").is_some());
+    assert!(cx.debug_bounds("docker-overview").is_some());
+    assert!(cx.debug_bounds("docker-build-cache").is_some());
+    assert!(cx.debug_bounds("docker-generate-script").is_some());
+
+    // Escape closes remote Docker modal without leaving Explore.
+    press(cx, "escape");
+    draw(cx);
+    assert!(cx.debug_bounds("remote-docker-modal").is_none());
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Explore);
+
+    // Re-open remote Docker modal then switch back to Local -> auto-closes.
+    cx.simulate_click(remote_docker_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |a| a.remote_docker_modal_open));
+    update(&view, cx, |app, cx| {
+        app.switch_host_tab(HostTabKey::Local, cx);
+    });
+    draw(cx);
+    assert!(!read(&view, cx, |a| a.remote_docker_modal_open));
+    assert!(cx.debug_bounds("remote-docker-btn").is_none());
+
+    // 5. Updating local docker to DaemonStopped while on Screen::Docker returns
+    //    to Explore and hides `rail-docker`.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Docker, cx);
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Docker);
+    update(&view, cx, |app, cx| {
+        app.apply_local_docker_status(DockerProbeStatus::DaemonStopped);
+        cx.notify();
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Explore);
+    assert!(cx.debug_bounds("rail-docker").is_none());
+}
+
+#[gpui_kit::test]
+fn slice3_remote_snapshot_ai_analysis_and_platform_script_selection(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::ai_cli::{CommandOutput, CommandRunner};
+    use ruum_core::docker_adapter::{
+        DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
+    };
+    use ruum_core::identity::HostIdentity;
+    use ruum_core::remote::{Header, Snapshot};
+    use ruum_core::storage::{AiConfig, AuthMode, SshProfile};
+    use ruum_core::tree::{Metric, Node, NodeKind, aggregate};
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    struct StubAiRunner(String);
+    impl CommandRunner for StubAiRunner {
+        fn run(
+            &self,
+            _program: &Path,
+            _args: &[&str],
+            _envs: &[(&str, &str)],
+        ) -> std::io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                status_code: 0,
+                stdout: self.0.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let fake_cli = temp.path().join("fake-ai");
+    std::fs::write(&fake_cli, b"stub\n").expect("write stub ai");
+
+    // 1. In-memory remote Linux snapshot analyzed locally via `analyze_remote_snapshot_with_runner`.
+    let mut cache_dir = Node::directory(".cache");
+    let mut pip_dir = Node::directory("pip");
+    pip_dir
+        .children
+        .push(Node::entry("wheel.whl", NodeKind::File, 99_000));
+    cache_dir.children.push(pip_dir);
+
+    let mut local_dir = Node::directory(".local");
+    let mut share_dir = Node::directory("share");
+    let mut docker_dir = Node::directory("docker");
+    docker_dir
+        .children
+        .push(Node::entry("layer.tar", NodeKind::File, 500_000));
+    share_dir.children.push(docker_dir);
+    local_dir.children.push(share_dir);
+
+    let mut tree = Node::directory("deploy");
+    tree.children.push(cache_dir);
+    tree.children.push(local_dir);
+    tree.children
+        .push(Node::entry("sym", NodeKind::Symlink, 10_000));
+    aggregate(&mut tree, Metric::Bytes);
+    ruum_core::classify::classify(&mut tree);
+
+    let mut header = Header::new(
+        PathBuf::from("/home/deploy"),
+        Some(PathBuf::from("/home/deploy")),
+        "linux",
+        Some(HostIdentity {
+            hostname: "prod-01".into(),
+            machine_id: Some("0123456789abcdef0123456789abcdef".into()),
+        }),
+    );
+    let docker_summary = DockerUsageSummary {
+        build_cache_reclaimable_bytes: 2_048_000,
+        detailed: true,
+        ..DockerUsageSummary::default()
+    };
+    header.docker = DockerProbeStatus::Available(docker_summary);
+
+    let snapshot = Snapshot {
+        docker: header.docker.clone(),
+        header,
+        tree,
+    };
+    let ai_cfg = AiConfig {
+        provider: AiCliProvider::Custom,
+        custom_command: fake_cli.to_string_lossy().into_owned(),
+        ..AiConfig::default()
+    };
+    let runner = StubAiRunner(
+        r#"{
+            "summary": "Safe remote cache + build cache",
+            "items": [
+                {"path": "/home/deploy/.cache/pip", "mode": "permanent", "reason": "pip"},
+                {"path": "/home/deploy/.local/share", "mode": "permanent", "reason": "docker ancestor"},
+                {"path": "/home/deploy/sym", "mode": "permanent", "reason": "symlink"}
+            ],
+            "docker_targets": [{"kind": "build_cache"}]
+        }"#
+        .to_owned(),
+    );
+
+    let proposal = crate::state::analyze_remote_snapshot_with_runner(
+        &ai_cfg,
+        &snapshot,
+        1_700_000_777,
+        &runner,
+    )
+    .expect("remote snapshot analyzed locally");
+    assert_eq!(proposal.items.len(), 1);
+    assert_eq!(
+        proposal.items[0].path,
+        PathBuf::from("/home/deploy/.cache/pip")
+    );
+    assert_eq!(proposal.items[0].bytes, 99_000);
+    assert_eq!(proposal.docker_targets, vec![DockerCleanTarget::BuildCache]);
+
+    let req = crate::state::remote_proposal_confirm_request(
+        snapshot.header.root,
+        "prod-01",
+        &proposal,
+        crate::i18n::Locale::En,
+    );
+    assert!(req.title.contains("prod-01"));
+    assert_eq!(req.items.len(), 1);
+
+    // 2. GPUI `analyze_ssh_profile` surfaces `ssh_ai_analyze_failed` when
+    //    credentials are missing without hanging or touching real SSH.
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x44; 32]);
+    let (view, cx) = view_over(temp.path(), cx);
+    let profile = SshProfile {
+        id: "srv-ai-err".into(),
+        alias: "broken-box".into(),
+        host: "127.0.0.1".into(),
+        port: 22,
+        username: "deploy".into(),
+        auth_mode: AuthMode::Password,
+        default_path: Some("~".into()),
+        created_at_secs: 1,
+        updated_at_secs: 1,
+        last_total_bytes: None,
+        last_available_bytes: None,
+        last_scanned_secs: None,
+        pending_script_path: None,
+        pending_script_items: None,
+        pending_reclaim_bytes: None,
+        pending_created_secs: None,
+    };
+    update(&view, cx, |app, cx| {
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.ssh_profiles = vec![profile];
+        app.analyze_ssh_profile("srv-ai-err", cx);
+    });
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert!(!app.ssh_analyzing_profiles.contains("srv-ai-err"));
+        let msg = app
+            .notice
+            .as_ref()
+            .map_or_else(String::new, |(text, _)| text.clone());
+        assert!(msg.contains("broken-box"), "unexpected notice: {msg}");
+    });
+}
+
+#[gpui_kit::test]
+fn cleanup_confirm_window_docker_multiselect_defaults_and_docker_only_confirm(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::CleanupConfirmDecision;
+    use ruum_core::docker_adapter::{
+        DockerCleanTarget, DockerContainerEntry, DockerImageEntry,
+        DockerProbeStatus, DockerUsageSummary,
+    };
+    use ruum_core::watchdog_config::CleanupProposal;
+    use std::sync::mpsc::channel;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_, cx) = view_over(temp.path(), cx);
+
+    let dangling_id = format!("sha256:{}", "1".repeat(64));
+    let tagged_id = format!("sha256:{}", "2".repeat(64));
+    let docker_summary = DockerUsageSummary {
+        build_cache_reclaimable_bytes: 200_000_000,
+        removable_images: vec![
+            DockerImageEntry {
+                id: dangling_id.clone(),
+                repository: "<none>".into(),
+                tag: "<none>".into(),
+                size_bytes: 500_000_000,
+                unique_bytes: 500_000_000,
+                created_since: "2 weeks ago".into(),
+                dangling: true,
+            },
+            DockerImageEntry {
+                id: tagged_id.clone(),
+                repository: "ghcr.io/demo/app".into(),
+                tag: "v1.0".into(),
+                size_bytes: 600_000_000,
+                unique_bytes: 300_000_000,
+                created_since: "5 days ago".into(),
+                dangling: false,
+            },
+        ],
+        stopped_containers: vec![DockerContainerEntry {
+            id: "deadbeef1234".into(),
+            name: "old-worker".into(),
+            image: "ubuntu:22.04".into(),
+            state: "exited".into(),
+            status: "Exited (0) 3 days ago".into(),
+            size_bytes: 100_000_000,
+        }],
+        detailed: true,
+        ..DockerUsageSummary::default()
+    };
+    let docker_status = DockerProbeStatus::Available(docker_summary);
+
+    // 0 file items, AI recommends the stopped container -> default checked:
+    // BuildCache + dangling image + AI-recommended stopped container.
+    let proposal = CleanupProposal {
+        timestamp_secs: 1_700_000_000,
+        summary: "Docker-only proposal".into(),
+        items: Vec::new(),
+        docker_targets: vec![DockerCleanTarget::Container {
+            id: "deadbeef1234".into(),
+            name: "old-worker".into(),
+        }],
+    };
+    let req = crate::state::proposal_confirm_request_with_docker(
+        temp.path().to_path_buf(),
+        &proposal,
+        &docker_status,
+        crate::i18n::Locale::En,
+    );
+    assert!(req.items.is_empty());
+    assert_eq!(req.docker_items.len(), 4);
+    assert!(req.docker_items[0].default_checked);
+    assert!(req.docker_items[1].default_checked);
+    assert!(!req.docker_items[2].default_checked);
+    assert_eq!(req.docker_items[2].reclaimable_bytes, 300_000_000);
+    assert!(req.docker_items[3].default_checked);
+    assert!(req.docker_items[3].reason.is_some());
+
+    let (tx, rx) = channel();
+    let handle = cx.update(|_, cx| {
+        crate::open_confirm_window(req, Some(tx), None, cx)
+            .expect("confirm window opened")
+    });
+    let mut confirm_cx = VisualTestContext::from_window(handle.into(), &cx.cx);
+    draw(&mut confirm_cx);
+
+    assert!(
+        confirm_cx
+            .debug_bounds("confirm-docker-group-cache")
+            .is_some()
+    );
+    assert!(
+        confirm_cx
+            .debug_bounds("confirm-docker-group-images")
+            .is_some()
+    );
+    assert!(
+        confirm_cx
+            .debug_bounds("confirm-docker-group-containers")
+            .is_some()
+    );
+
+    // Uncheck BuildCache (idx 0), check tagged image (idx 2).
+    let cache_cb = confirm_cx
+        .debug_bounds("confirm-docker-check-0")
+        .expect("build cache checkbox");
+    confirm_cx.simulate_click(cache_cb.center(), gpui_kit::Modifiers::none());
+    let tagged_cb = confirm_cx
+        .debug_bounds("confirm-docker-check-2")
+        .expect("tagged image checkbox");
+    confirm_cx.simulate_click(tagged_cb.center(), gpui_kit::Modifiers::none());
+    draw(&mut confirm_cx);
+
+    // Confirm with 0 files + 3 Docker targets.
+    let confirm_btn = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    confirm_cx
+        .simulate_click(confirm_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        rx.recv().expect("docker-only confirm decision"),
+        CleanupConfirmDecision::Confirmed {
+            selected_paths: Vec::new(),
+            selected_docker_targets: vec![
+                DockerCleanTarget::Image {
+                    id: dangling_id,
+                    reference: None,
+                    dangling: true,
+                },
+                DockerCleanTarget::Image {
+                    id: tagged_id,
+                    reference: Some("ghcr.io/demo/app:v1.0".into()),
+                    dangling: false,
+                },
+                DockerCleanTarget::Container {
+                    id: "deadbeef1234".into(),
+                    name: "old-worker".into(),
+                },
+            ],
+        }
+    );
+
+    // PermissionDenied renders read-only hint banner.
+    let denied_req = crate::state::proposal_confirm_request_with_docker(
+        temp.path().to_path_buf(),
+        &CleanupProposal::default(),
+        &DockerProbeStatus::PermissionDenied {
+            socket_hint: "/var/run/docker.sock".into(),
+        },
+        crate::i18n::Locale::En,
+    );
+    let denied_handle = cx.update(|_, cx| {
+        crate::open_confirm_window(denied_req, None, None, cx)
+            .expect("denied confirm window")
+    });
+    let mut denied_cx =
+        VisualTestContext::from_window(denied_handle.into(), &cx.cx);
+    draw(&mut denied_cx);
+    assert!(
+        denied_cx
+            .debug_bounds("confirm-docker-permission-denied")
+            .is_some()
+    );
+}
+
+#[gpui_kit::test]
+fn local_docker_workspace_batch_cleanup_and_done_routing(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::docker_adapter::{
+        DockerCleanTarget, DockerCommandOutput, DockerCommandRunner,
+        DockerContainerEntry, DockerImageEntry, DockerProbeStatus,
+        DockerUsageSummary,
+    };
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct MockDockerRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl DockerCommandRunner for MockDockerRunner {
+        fn run(
+            &self,
+            _program: &Path,
+            args: &[&str],
+            _timeout: Duration,
+        ) -> std::io::Result<DockerCommandOutput> {
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            if args.first().copied() == Some("system") {
+                return Ok(DockerCommandOutput {
+                    status_code: 0,
+                    stdout: r#"{"Images":[],"Containers":[],"Volumes":[],"BuildCache":[]}"#.into(),
+                    stderr: String::new(),
+                });
+            }
+            if args.starts_with(&["image", "rm", "--"]) {
+                if args.len() > 4 {
+                    return Ok(DockerCommandOutput {
+                        status_code: 1,
+                        stdout: String::new(),
+                        stderr: "batch image failure".into(),
+                    });
+                }
+                if args.get(3).copied() == Some("ghcr.io/demo/app:v1.0") {
+                    return Ok(DockerCommandOutput {
+                        status_code: 1,
+                        stdout: String::new(),
+                        stderr: "image is referenced by manifest".into(),
+                    });
+                }
+            }
+            Ok(DockerCommandOutput {
+                status_code: 0,
+                stdout: "Total reclaimed space: 100MB\n".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let runner = Arc::new(MockDockerRunner::default());
+
+    let dangling_id = format!("sha256:{}", "a".repeat(64));
+    let tagged_id = format!("sha256:{}", "b".repeat(64));
+    let untouched_id = format!("sha256:{}", "c".repeat(64));
+    let summary = DockerUsageSummary {
+        build_cache_reclaimable_bytes: 120_000_000,
+        build_cache_shared_bytes: 40_000_000,
+        removable_images: vec![
+            DockerImageEntry {
+                id: dangling_id.clone(),
+                repository: "<none>".into(),
+                tag: "<none>".into(),
+                size_bytes: 80_000_000,
+                unique_bytes: 80_000_000,
+                created_since: "3 days ago".into(),
+                dangling: true,
+            },
+            DockerImageEntry {
+                id: tagged_id,
+                repository: "ghcr.io/demo/app".into(),
+                tag: "v1.0".into(),
+                size_bytes: 10_000_000,
+                unique_bytes: 7_000_000,
+                created_since: "10 days ago".into(),
+                dangling: false,
+            },
+            DockerImageEntry {
+                id: untouched_id.clone(),
+                repository: "alpine".into(),
+                tag: "3.19".into(),
+                size_bytes: 5_000_000,
+                unique_bytes: 5_000_000,
+                created_since: "12 days ago".into(),
+                dangling: false,
+            },
+        ],
+        stopped_containers: vec![DockerContainerEntry {
+            id: "c123456789ab".into(),
+            name: "stopped-job".into(),
+            image: "ghcr.io/demo/app:v1.0".into(),
+            state: "exited".into(),
+            status: "Exited (1) 2 days ago".into(),
+            size_bytes: 5_000_000,
+        }],
+        detailed: true,
+        ..DockerUsageSummary::default()
+    };
+
+    update(&view, cx, |app, cx| {
+        let runner_concrete = Arc::clone(&runner);
+        let dyn_runner: Arc<dyn DockerCommandRunner> = runner_concrete;
+        app.docker_runner = Some(dyn_runner);
+        app.apply_local_docker_status(DockerProbeStatus::Available(summary));
+        cx.notify();
+    });
+    draw(cx);
+
+    // 1. With 0 file marks on Explore, Review stays hidden and `c` does not
+    //    leave Explore even though Docker has cleanable items.
+    assert!(cx.debug_bounds("review").is_none());
+    assert!(cx.debug_bounds("docker-status-line").is_none());
+    press(cx, "c");
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Explore);
+
+    // 2. Navigate to dedicated Docker page via rail icon.
+    let docker_rail = cx.debug_bounds("rail-docker").expect("rail-docker");
+    cx.simulate_click(docker_rail.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Docker);
+    assert!(cx.debug_bounds("docker-page").is_some());
+    assert!(cx.debug_bounds("docker-build-cache-shared").is_some());
+    assert!(cx.debug_bounds("docker-build-cache").is_some());
+    assert!(cx.debug_bounds("docker-image-0").is_some());
+    assert!(cx.debug_bounds("docker-image-1").is_some());
+    assert!(cx.debug_bounds("docker-image-2").is_some());
+    assert!(cx.debug_bounds("docker-container-0").is_some());
+
+    // Default checked: BuildCache + dangling image.
+    let expected_dangling = dangling_id;
+    read(&view, cx, |a| {
+        assert_eq!(
+            a.selected_local_docker_targets(),
+            vec![
+                DockerCleanTarget::Image {
+                    id: expected_dangling,
+                    reference: None,
+                    dangling: true,
+                },
+                DockerCleanTarget::BuildCache,
+            ]
+        );
+    });
+
+    // Check stopped container + slash-containing image `ghcr.io/demo/app:v1.0`.
+    let cont_cb = cx
+        .debug_bounds("docker-container-0")
+        .expect("stopped container checkbox");
+    cx.simulate_click(cont_cb.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    let img_cb = cx
+        .debug_bounds("docker-image-1")
+        .expect("tagged image checkbox");
+    cx.simulate_click(img_cb.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    let commit_btn = cx
+        .debug_bounds("docker-commit")
+        .expect("docker-commit button");
+    cx.simulate_click(commit_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+
+    // 3. Done shows outcomes without fake treemap rescan note, preserving full
+    //    Docker image path with slashes.
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Done);
+    assert!(cx.debug_bounds("done-rescan-note").is_none());
+    read(&view, cx, |a| {
+        assert_eq!(a.run_summary.removed, 3);
+        assert_eq!(a.run_summary.failed, 1);
+        assert!(
+            a.run_log.iter().any(|(path, res)| {
+                path == &PathBuf::from("docker: image ghcr.io/demo/app:v1.0")
+                    && res.is_err()
+            }),
+            "expected full docker image failure label in {:?}",
+            a.run_log
+        );
+        assert!(
+            a.run_log.iter().any(|(path, res)| {
+                path == &PathBuf::from("docker: build cache") && res.is_ok()
+            }),
+            "expected build cache log in {:?}",
+            a.run_log
+        );
+    });
+
+    let calls = runner.calls.lock().expect("lock calls").clone();
+    let c_idx = calls
+        .iter()
+        .position(|c| c == &["container", "rm", "--", "c123456789ab"])
+        .expect("container rm call");
+    let i_batch_idx = calls
+        .iter()
+        .position(|c| {
+            c.starts_with(&[
+                "image".to_owned(),
+                "rm".to_owned(),
+                "--".to_owned(),
+            ]) && c.len() == 5
+        })
+        .expect("batched image rm call");
+    let bc_idx = calls
+        .iter()
+        .position(|c| c == &["builder", "prune", "-f"])
+        .expect("builder prune call");
+    assert!(c_idx < i_batch_idx && i_batch_idx < bc_idx);
+    assert!(
+        !calls.iter().any(|c| c
+            .iter()
+            .any(|arg| arg == &untouched_id || arg == "alpine:3.19")),
+        "unchecked alpine:3.19 must not be removed: {calls:?}"
+    );
+
+    // 4. Enter on Done returns to Screen::Docker and resets return target.
+    press(cx, "enter");
+    draw(cx);
+    read(&view, cx, |a| {
+        assert_eq!(a.screen, Screen::Docker);
+        assert_eq!(a.done_return_screen, Screen::Explore);
+    });
+
+    // 5. Clicking Refresh on Screen::Docker triggers probe via mock runner.
+    let refresh_btn = cx
+        .debug_bounds("docker-refresh")
+        .expect("docker-refresh button");
+    cx.simulate_click(refresh_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    let calls_after = runner.calls.lock().expect("lock calls").clone();
+    assert!(
+        calls_after
+            .iter()
+            .filter(|c| c.first().map(String::as_str) == Some("system"))
+            .count()
+            >= 2
+    );
+}
+
+#[gpui_kit::test]
+fn remote_review_and_confirm_generate_script_dialog_and_pending_card_actions(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::credentials::SshCredentialSecret;
+    use ruum_core::docker_adapter::{
+        DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
+    };
+    use ruum_core::identity::HostIdentity;
+    use ruum_core::remote::Header;
+    use ruum_core::ssh_session::{SshAuthMaterial, SshEndpoint, SshSession};
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+    use ruum_core::terminal_launcher::{TerminalEnv, TerminalOs};
+    use ruum_core::watchdog_config::CleanupProposal;
+    use std::sync::Arc;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let db_dir = tempfile::tempdir().expect("db dir");
+    let db_path = db_dir.path().join("ruum.db");
+    let fake_kitty = db_dir.path().join("kitty");
+    let fake_ruum = db_dir.path().join("ruum");
+    std::fs::write(&fake_kitty, b"#!/bin/sh\n").expect("write fake kitty");
+    std::fs::write(&fake_ruum, b"#!/bin/sh\n").expect("write fake ruum");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for bin in [&fake_kitty, &fake_ruum] {
+            let mut perms = std::fs::metadata(bin).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(bin, perms).expect("chmod");
+        }
+    }
+
+    let profile = SshProfile {
+        id: "srv-remote-s4".into(),
+        alias: "prod-s4".into(),
+        host: "10.0.0.42".into(),
+        port: 2222,
+        username: "deploy".into(),
+        auth_mode: AuthMode::PrivateKey,
+        default_path: Some("/home/deploy".into()),
+        last_total_bytes: None,
+        last_available_bytes: None,
+        last_scanned_secs: None,
+        pending_script_path: None,
+        pending_script_items: None,
+        pending_reclaim_bytes: None,
+        pending_created_secs: None,
+        created_at_secs: 1,
+        updated_at_secs: 1,
+    };
+    let saved_profile = {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.add_ssh_profile(&profile).expect("save profile")
+    };
+    let profile_id = saved_profile.id.clone();
+
+    let (view, cx) = view_over(temp.path(), cx);
+    let mut header = Header::new(
+        PathBuf::from("/home/deploy"),
+        Some(PathBuf::from("/home/deploy")),
+        "linux",
+        Some(HostIdentity {
+            hostname: "prod-s4".into(),
+            machine_id: Some("00112233445566778899aabbccddeeff".into()),
+        }),
+    );
+    header.docker = DockerProbeStatus::Available(DockerUsageSummary {
+        build_cache_reclaimable_bytes: 400_000_000,
+        detailed: true,
+        ..DockerUsageSummary::default()
+    });
+
+    let terminal_env = TerminalEnv {
+        current_exe: db_dir.path().join("ruum-gui"),
+        path_var: Some(db_dir.path().as_os_str().to_os_string()),
+        terminal_var: None,
+        local_appdata: None,
+    };
+
+    let pid_for_setup = profile_id.clone();
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.reload_ssh_profiles();
+        app.root_path = header.root.clone();
+        app.home = header.home.clone();
+        app.remote = Some("prod-s4".into());
+        app.remote_identity = header.identity.clone();
+        app.remote_header = Some(header.clone());
+        app.active_ssh_profile_id = Some(pid_for_setup);
+        app.docker = header.docker.clone();
+        app.terminal_os_override = Some(TerminalOs::Linux);
+        app.terminal_env_override = Some(terminal_env);
+        app.marks.toggle(ruum_core::removal::Target {
+            path: PathBuf::from("/home/deploy/.cache/pip"),
+            bytes: 15_000_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.open_review();
+        cx.notify();
+    });
+    draw(cx);
+
+    assert!(cx.debug_bounds("generate-remote-script").is_some());
+    assert!(cx.debug_bounds("review-docker-panel").is_none());
+    assert!(cx.debug_bounds("review-docker-build-cache").is_none());
+
+    // 1. Remote Review primary button generates files-only `.sh`, saves DB
+    //    pending state, and displays the generated-script modal.
+    let gen_btn = cx
+        .debug_bounds("generate-remote-script")
+        .expect("generate remote script button");
+    cx.simulate_click(gen_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    assert!(cx.debug_bounds("script-generated-dialog").is_some());
+    let script_path = read(&view, cx, |a| {
+        a.generated_script_dialog
+            .as_ref()
+            .expect("dialog open")
+            .script_path
+            .clone()
+    });
+    assert!(script_path.exists());
+    let script_text =
+        std::fs::read_to_string(&script_path).expect("read generated script");
+    assert!(script_text.contains("remove '/home/deploy/.cache/pip'"));
+    assert!(!script_text.contains("docker 'builder' 'prune' '-f'"));
+
+    // Click "View Script File", then "Run in Terminal Now".
+    let reveal_btn = cx
+        .debug_bounds("script-dialog-reveal")
+        .expect("reveal script button");
+    cx.simulate_click(reveal_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    let run_btn = cx
+        .debug_bounds("script-dialog-run-terminal")
+        .expect("run in terminal button");
+    cx.simulate_click(run_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    let pid_for_assert = profile_id.clone();
+    read(&view, cx, |a| {
+        assert!(a.generated_script_dialog.is_none());
+        assert_eq!(a.terminal_launch_log.len(), 2);
+        assert_eq!(a.terminal_launch_log[0].0, "reveal");
+        assert_eq!(a.terminal_launch_log[1].0, "run-script");
+        assert_eq!(a.terminal_launch_log[1].1.program, fake_kitty);
+        assert!(
+            a.terminal_launch_log[1]
+                .1
+                .args
+                .iter()
+                .any(|arg| arg == pid_for_assert.as_str())
+        );
+    });
+
+    // 1b. Remote Docker modal in Explore generates Docker-only `.sh` script
+    //     and opens dialog while `rail-docker` remains hidden (local NotInstalled).
+    press(cx, "escape");
+    draw(cx);
+    assert_eq!(read(&view, cx, |a| a.screen), Screen::Explore);
+    assert!(cx.debug_bounds("rail-docker").is_none());
+    let remote_docker_btn = cx
+        .debug_bounds("remote-docker-btn")
+        .expect("remote-docker-btn in Explore toolbar");
+    cx.simulate_click(remote_docker_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("remote-docker-modal").is_some());
+    assert!(cx.debug_bounds("docker-build-cache").is_some());
+    let docker_gen_btn = cx
+        .debug_bounds("docker-generate-script")
+        .expect("docker generate script button");
+    cx.simulate_click(docker_gen_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("remote-docker-modal").is_none());
+    assert!(cx.debug_bounds("script-generated-dialog").is_some());
+    let docker_script_path = read(&view, cx, |a| {
+        a.generated_script_dialog
+            .as_ref()
+            .expect("docker script dialog open")
+            .script_path
+            .clone()
+    });
+    let docker_script_text = std::fs::read_to_string(&docker_script_path)
+        .expect("read docker remote script");
+    assert!(docker_script_text.contains("docker 'builder' 'prune' '-f'"));
+    assert!(!docker_script_text.contains("remove '/home/deploy/.cache/pip'"));
+    let close_dialog = cx.debug_bounds("script-dialog-later");
+    if let Some(close_btn) = close_dialog {
+        cx.simulate_click(close_btn.center(), gpui_kit::Modifiers::none());
+    } else {
+        update(&view, cx, |app, cx| {
+            app.generated_script_dialog = None;
+            cx.notify();
+        });
+    }
+    draw(cx);
+
+    // 2. Navigate to Remote -> SSH card renders pending banner with
+    //    Run / View / Discard buttons; Discard clears DB & hides banner.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Remote, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("ssh-pending-banner-0").is_some());
+    assert!(cx.debug_bounds("ssh-pending-run-0").is_some());
+    assert!(cx.debug_bounds("ssh-pending-view-0").is_some());
+    let discard_btn = cx
+        .debug_bounds("ssh-pending-discard-0")
+        .expect("discard pending script button");
+    cx.simulate_click(discard_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    assert!(cx.debug_bounds("ssh-pending-banner-0").is_none());
+    let db = StorageDb::open(&db_path).expect("reopen db");
+    let reloaded = db.list_ssh_profiles().expect("load profiles");
+    assert!(reloaded[0].pending_script_path.is_none());
+
+    // 3. Remote CleanupConfirmWindow confirmation generates script and pops
+    //    `script-generated-dialog` on the main window.
+    let endpoint = SshEndpoint::from_profile(&saved_profile).expect("endpoint");
+    let material = SshAuthMaterial::from_credential_secret(
+        &SshCredentialSecret::Password {
+            password: "dummy-password".into(),
+        },
+    );
+    let session = Arc::new(
+        SshSession::start(endpoint, material, 15).expect("start session"),
+    );
+    let remote_proposal = CleanupProposal {
+        timestamp_secs: 1_700_000_001,
+        summary: "Remote docker cache".into(),
+        items: Vec::new(),
+        docker_targets: vec![DockerCleanTarget::BuildCache],
+    };
+    let req = crate::state::remote_proposal_confirm_request_with_docker(
+        header.root.clone(),
+        "prod-s4",
+        &remote_proposal,
+        &header.docker,
+        crate::i18n::Locale::En,
+    );
+    let confirm_win = cx
+        .update(|_, cx| {
+            crate::open_remote_confirm_window(
+                req,
+                profile_id,
+                session,
+                header,
+                Some(db_path.clone()),
+                cx,
+            )
+        })
+        .expect("open remote confirm window");
+    let mut confirm_cx =
+        VisualTestContext::from_window(confirm_win.into(), &cx.cx);
+    draw(&mut confirm_cx);
+    let confirm_clean = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("remote confirm clean");
+    confirm_cx
+        .simulate_click(confirm_clean.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    draw(cx);
+
+    assert!(cx.debug_bounds("script-generated-dialog").is_some());
+    let db_after = StorageDb::open(&db_path).expect("db after confirm");
+    let profiles_after = db_after.list_ssh_profiles().expect("load after");
+    assert!(profiles_after[0].pending_script_path.is_some());
+}
+
+#[test]
+fn preload_credentials_if_needed_requires_profiles_and_encrypted_file() {
+    use ruum_core::credentials::CREDENTIALS_FILE_NAME;
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("ruum.db");
+    let enc_path = dir.path().join(CREDENTIALS_FILE_NAME);
+    let counter = CountingRootSecret::new([0x51; 32]);
+    let store = counter.store_for(&enc_path);
+
+    // 1. None or missing DB path -> Ok(false), 0 keychain calls, never creates DB.
+    assert_eq!(
+        crate::preload_credentials_if_needed(None, &store),
+        Ok(false)
+    );
+    assert_eq!(
+        crate::preload_credentials_if_needed(Some(&db_path), &store),
+        Ok(false)
+    );
+    assert!(!db_path.exists());
+    assert_eq!(counter.load_count(), 0);
+
+    // 2. Existing DB with 0 SSH profiles + existing encrypted file -> Ok(false),
+    //    0 keychain calls.
+    let writer = CountingRootSecret::new([0x51; 32]).store_for(&enc_path);
+    writer.set("ruum.ssh", "orphan", b"pw").expect("seed enc");
+    {
+        let _db = StorageDb::open(&db_path).expect("create db");
+    }
+    assert_eq!(
+        crate::preload_credentials_if_needed(Some(&db_path), &store),
+        Ok(false)
+    );
+    assert_eq!(counter.load_count(), 0);
+
+    // 3. Existing DB with SSH profile + missing encrypted file -> Ok(false),
+    //    0 keychain calls.
+    std::fs::remove_file(&enc_path).expect("remove enc");
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.add_ssh_profile(&SshProfile::new(
+            "prod",
+            "10.0.0.10",
+            22,
+            "ubuntu",
+            AuthMode::Password,
+        ))
+        .expect("add profile");
+    }
+    assert_eq!(
+        crate::preload_credentials_if_needed(Some(&db_path), &store),
+        Ok(false)
+    );
+    assert_eq!(counter.load_count(), 0);
+
+    // 4. Existing DB with SSH profile + existing encrypted file -> preloads
+    //    once, then repeats are no-ops.
+    writer
+        .set("ruum.ssh", "prod", b"secret")
+        .expect("re-seed enc");
+    assert_eq!(
+        crate::preload_credentials_if_needed(Some(&db_path), &store),
+        Ok(true)
+    );
+    assert!(store.is_loaded());
+    assert_eq!(counter.load_count(), 1);
+    assert_eq!(
+        crate::preload_credentials_if_needed(Some(&db_path), &store),
+        Ok(false)
+    );
+    assert_eq!(counter.load_count(), 1);
+}
+
+#[gpui_kit::test]
+fn ensure_cred_store_caches_and_reuses_shared_handle_across_reopens(
+    cx: &mut TestAppContext,
+) {
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("device-credentials.enc");
+    let counter = CountingRootSecret::new([0x66; 32]);
+    let shared_store = counter.store_for(&enc_path);
+    shared_store
+        .set("ruum.ssh", "prof-shared", b"shared-pw")
+        .expect("seed shared secret");
+    assert_eq!(counter.load_count(), 1);
+
+    // 1. Open main window #1 via AppRuntime + open_or_navigate_main_window:
+    //    `Ruum` inherits `AppRuntime.cred_store` automatically with 0 manual
+    //    field assignment and 0 extra keychain calls.
+    cx.update(|cx| {
+        gpui_omarchy::init(cx);
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+        crate::with_runtime_mut(cx, |rt| {
+            rt.cred_store = Some(shared_store.clone());
+        });
+        crate::open_or_navigate_main_window(None, cx);
+    });
+    cx.run_until_parked();
+
+    let win1 = cx
+        .read(|cx| cx.global::<crate::AppRuntime>().main_window)
+        .expect("win1 opened via AppRuntime");
+    let val1 = win1
+        .update(cx, |app, _, _| {
+            assert!(app.cred_store.is_some());
+            let store = app.ensure_cred_store().expect("win1 cred store");
+            store.get("ruum.ssh", "prof-shared").expect("get win1")
+        })
+        .expect("win1 update");
+    assert_eq!(val1.unwrap().as_slice(), b"shared-pw");
+    assert_eq!(counter.load_count(), 1);
+
+    // 2. Close main window #1 (tray-resident state) and reopen main window #2:
+    //    reopened window inherits the same `AppRuntime.cred_store` handle.
+    win1.update(cx, |_, window, cx| {
+        window.remove_window();
+        crate::with_runtime_mut(cx, |rt| rt.main_window = None);
+    })
+    .expect("close win1");
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        crate::open_or_navigate_main_window(None, cx);
+    });
+    cx.run_until_parked();
+
+    let win2 = cx
+        .read(|cx| cx.global::<crate::AppRuntime>().main_window)
+        .expect("win2 reopened via AppRuntime");
+    assert_ne!(win1, win2);
+    let val2 = win2
+        .update(cx, |app, _, _| {
+            assert!(app.cred_store.is_some());
+            let store = app.ensure_cred_store().expect("win2 cred store");
+            store.get("ruum.ssh", "prof-shared").expect("get win2")
+        })
+        .expect("win2 update");
+    assert_eq!(val2.unwrap().as_slice(), b"shared-pw");
+    assert_eq!(counter.load_count(), 1);
+
+    // 3. When `Ruum::cred_store` starts `None` with `db_path` set,
+    //    `ensure_cred_store` lazily constructs and caches it on `self`.
+    let fallback_win =
+        cx.add_window(|_, cx| Ruum::choose(options(), 3, None, cx));
+    fallback_win
+        .update(cx, |app, _, _| {
+            assert!(app.cred_store.is_none());
+            app.db_path = Some(db_path);
+            let created = app.ensure_cred_store().expect("create fallback");
+            assert!(app.cred_store.is_some());
+            assert_eq!(
+                created.file_path(),
+                app.cred_store.as_ref().unwrap().file_path()
+            );
+        })
+        .expect("fallback update");
+}
+
+#[gpui_kit::test]
+fn pending_open_docker_navigates_only_when_first_probe_is_available(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::docker_adapter::{DockerProbeStatus, DockerUsageSummary};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // 1. First probe arrives Available while `pending_open_docker` is armed ->
+    //    jumps to Screen::Docker and clears flag.
+    update(&view, cx, |app, cx| {
+        app.pending_open_docker = true;
+        app.apply_local_docker_status(DockerProbeStatus::Available(
+            DockerUsageSummary::default(),
+        ));
+        cx.notify();
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Docker);
+        assert!(!app.pending_open_docker);
+    });
+
+    // 2. First probe arrives DaemonStopped while `pending_open_docker` is
+    //    armed -> stays on Explore, clears flag so a later Available does not
+    //    hijack the active view.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Explore, cx);
+        app.pending_open_docker = true;
+        app.apply_local_docker_status(DockerProbeStatus::DaemonStopped);
+        cx.notify();
+    });
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+        assert!(!app.pending_open_docker);
+    });
+    update(&view, cx, |app, cx| {
+        app.apply_local_docker_status(DockerProbeStatus::Available(
+            DockerUsageSummary::default(),
+        ));
+        cx.notify();
+    });
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+    });
+}
+
+#[gpui_kit::test]
+fn ssd_mode_omits_csd_title_bar_and_f11_toggles_fullscreen(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.update(|_, cx| {
+        crate::app_menu::install_for(crate::i18n::Locale::En, cx);
+        crate::app_menu::set_tray_active(cx, true);
+    });
+    draw(cx);
+
+    // Default test window reports Decorations::Server -> no CSD chrome.
+    assert!(cx.debug_bounds("csd-title-bar").is_none());
+    assert!(cx.debug_bounds("csd-window-backdrop").is_none());
+    assert!(cx.debug_bounds("ruum-root").is_some());
+
+    // ToggleFullscreen action toggles fullscreen without panicking.
+    let initial_fs = cx.update(|window, _| window.is_fullscreen());
+    assert!(!initial_fs);
+    cx.dispatch_action(crate::app_menu::ToggleFullscreen);
+    draw(cx);
+    assert!(cx.update(|window, _| window.is_fullscreen()));
+    cx.dispatch_action(crate::app_menu::ToggleFullscreen);
+    draw(cx);
+    assert!(!cx.update(|window, _| window.is_fullscreen()));
+
+    // On non-macOS platforms, F11 is bound to ToggleFullscreen.
+    if !cfg!(target_os = "macos") {
+        let focus = read(&view, cx, |app| app.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        press(cx, "f11");
+        assert!(cx.update(|window, _| window.is_fullscreen()));
+        press(cx, "f11");
+        assert!(!cx.update(|window, _| window.is_fullscreen()));
+    }
+}
+
+#[gpui_kit::test]
+fn confirm_windows_close_window_action_cancels_and_denies_safely(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+        RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
+    };
+    use std::sync::mpsc::channel;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_, cx) = view_over(temp.path(), cx);
+    cx.update(|_, cx| {
+        crate::app_menu::install_for(crate::i18n::Locale::En, cx);
+    });
+
+    // 1. CleanupConfirmWindow: CloseWindow action invokes `cancel`.
+    let req = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: "Close Action Confirm".into(),
+        summary: Some("Cancel via CloseWindow".into()),
+        items: vec![CleanupConfirmItem {
+            path: temp.path().join("junk/blob.bin"),
+            bytes: 200_000,
+            mode: RemovalMode::Trash,
+            reason: None,
+            git_warning: None,
+        }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
+    };
+    let (tx_clean, rx_clean) = channel();
+    let clean_handle = cx.update(|_, cx| {
+        crate::open_confirm_window(req, Some(tx_clean), None, cx)
+            .expect("cleanup confirm window")
+    });
+    let mut clean_cx =
+        VisualTestContext::from_window(clean_handle.into(), &cx.cx);
+    draw(&mut clean_cx);
+    assert!(clean_cx.debug_bounds("csd-title-bar").is_none());
+    assert!(clean_cx.debug_bounds("confirm-cancel").is_some());
+    assert!(clean_cx.debug_bounds("confirm-clean").is_some());
+
+    clean_cx.dispatch_action(crate::app_menu::CloseWindow);
+    cx.run_until_parked();
+    assert_eq!(rx_clean.try_recv(), Ok(CleanupConfirmDecision::Cancelled));
+    assert_eq!(cx.windows().len(), 1);
+
+    // 2. RemoteConnectConfirmWindow: CloseWindow action invokes `deny`.
+    let remote_req = RemoteConnectConfirmRequest {
+        target_label: "prod".into(),
+        alias: Some("prod".into()),
+        host: "10.0.0.1".into(),
+        port: 22,
+        username: "deploy".into(),
+        auth_mode: "private_key".into(),
+        tool_name: "analyze_remote_disk".into(),
+    };
+    let (tx_remote, rx_remote) = channel();
+    let remote_handle = cx.update(|_, cx| {
+        crate::open_remote_connect_confirm_window_with_mode(
+            remote_req,
+            Some(tx_remote),
+            None,
+            false,
+            cx,
+        )
+        .expect("remote connect confirm window")
+    });
+    let mut remote_cx =
+        VisualTestContext::from_window(remote_handle.into(), &cx.cx);
+    draw(&mut remote_cx);
+    assert!(remote_cx.debug_bounds("csd-title-bar").is_none());
+    assert!(remote_cx.debug_bounds("remote-connect-deny").is_some());
+    assert!(remote_cx.debug_bounds("remote-connect-approve").is_some());
+
+    remote_cx.dispatch_action(crate::app_menu::CloseWindow);
+    cx.run_until_parked();
+    assert_eq!(
+        rx_remote.try_recv(),
+        Ok(RemoteConnectConfirmDecision::Denied)
+    );
+    assert_eq!(cx.windows().len(), 1);
+}
+
+#[gpui_kit::test]
+fn injected_csd_chrome_renders_controls_layout_drag_resize_and_tiling(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::{
+        Decorations, InteractiveElement as _, MAX_BUTTONS_PER_SIDE, Modifiers,
+        MouseButton, MouseDownEvent, MouseUpEvent, Render, ResizeEdge,
+        Styled as _, Tiling, WindowButton, WindowButtonLayout, WindowControls,
+        div, point, size,
+    };
+    use gpui_omarchy::IconName;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct ChromeCalls {
+        minimize: usize,
+        zoom: usize,
+        close: usize,
+        start_move: usize,
+        resizes: Vec<ResizeEdge>,
+        menus: Vec<Point<Pixels>>,
+    }
+
+    struct CsdTestHost {
+        state: crate::window_chrome::WindowChromeState,
+        calls: Rc<RefCell<ChromeCalls>>,
+    }
+
+    impl Render for CsdTestHost {
+        fn render(
+            &mut self,
+            window: &mut gpui_kit::Window,
+            _: &mut Context<'_, Self>,
+        ) -> impl gpui_kit::IntoElement {
+            let mut state = self.state;
+            state.window_size = window.bounds().size;
+            let c_min = Rc::clone(&self.calls);
+            let c_zoom = Rc::clone(&self.calls);
+            let c_close = Rc::clone(&self.calls);
+            let c_move = Rc::clone(&self.calls);
+            let c_resize = Rc::clone(&self.calls);
+            let c_menu = Rc::clone(&self.calls);
+            let actions = crate::window_chrome::WindowChromeActions {
+                start_resize: Rc::new(move |edge, _, _| {
+                    c_resize.borrow_mut().resizes.push(edge);
+                }),
+                start_move: Rc::new(move |_, _| {
+                    c_move.borrow_mut().start_move += 1;
+                }),
+                zoom: Rc::new(move |_, _| {
+                    c_zoom.borrow_mut().zoom += 1;
+                }),
+                minimize: Rc::new(move |_, _| {
+                    c_min.borrow_mut().minimize += 1;
+                }),
+                show_window_menu: Rc::new(move |pos, _, _| {
+                    c_menu.borrow_mut().menus.push(pos);
+                }),
+                close: Rc::new(move |_, _| {
+                    c_close.borrow_mut().close += 1;
+                }),
+            };
+            let body = div()
+                .id("csd-body-marker")
+                .debug_selector(|| "csd-body-marker".into())
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .size_full();
+            crate::window_chrome::wrap_window_chrome_with(
+                "ruum · ~/Projects",
+                body,
+                state,
+                actions,
+            )
+        }
+    }
+
+    cx.update(gpui_omarchy::init);
+    let calls = Rc::new(RefCell::new(ChromeCalls::default()));
+    let calls_ref = Rc::clone(&calls);
+    let initial_state = crate::window_chrome::WindowChromeState {
+        decorations: Decorations::Client {
+            tiling: Tiling::default(),
+        },
+        controls: WindowControls::default(),
+        button_layout: crate::window_chrome::default_linux_button_layout(),
+        is_maximized: false,
+        is_window_active: true,
+        window_size: size(px(800.0), px(600.0)),
+    };
+    let (view, cx) = cx.add_window_view(move |_, _| CsdTestHost {
+        state: initial_state,
+        calls: calls_ref,
+    });
+    cx.simulate_resize(size(px(800.0), px(600.0)));
+    draw(cx);
+
+    assert_eq!(
+        cx.update(|window, _| window.client_inset()),
+        Some(crate::window_chrome::CSD_SHADOW_SIZE)
+    );
+    let title_bar = cx.debug_bounds("csd-title-bar").expect("csd-title-bar");
+    let title_text = cx.debug_bounds("csd-title-text").expect("csd-title-text");
+    assert!(cx.debug_bounds("csd-controls-left").is_none());
+    assert!(cx.debug_bounds("csd-controls-right").is_some());
+    let btn_min = cx.debug_bounds("csd-btn-minimize").expect("min button");
+    let btn_max = cx.debug_bounds("csd-btn-maximize").expect("max button");
+    let btn_close = cx.debug_bounds("csd-btn-close").expect("close button");
+    assert!(btn_min.origin.x < btn_max.origin.x);
+    assert!(btn_max.origin.x < btn_close.origin.x);
+    assert!(title_text.right() <= btn_min.left());
+
+    // Clicking titlebar buttons fires each action without starting window drag.
+    cx.simulate_click(btn_min.center(), Modifiers::none());
+    cx.simulate_click(btn_max.center(), Modifiers::none());
+    cx.simulate_click(btn_close.center(), Modifiers::none());
+    {
+        let c = calls.borrow();
+        assert_eq!(c.minimize, 1);
+        assert_eq!(c.zoom, 1);
+        assert_eq!(c.close, 1);
+        assert_eq!(c.start_move, 0);
+    }
+
+    // Dragging empty title text starts window move.
+    let drag_start = title_text.center();
+    cx.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        point(drag_start.x + px(12.0), drag_start.y + px(2.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        point(drag_start.x + px(12.0), drag_start.y + px(2.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    assert_eq!(calls.borrow().start_move, 1);
+
+    // Double-clicking empty title text zooms without triggering move.
+    cx.simulate_event(MouseDownEvent {
+        position: drag_start,
+        modifiers: Modifiers::none(),
+        button: MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: drag_start,
+        modifiers: Modifiers::none(),
+        button: MouseButton::Left,
+        click_count: 2,
+    });
+    assert_eq!(calls.borrow().zoom, 2);
+    assert_eq!(calls.borrow().start_move, 1);
+
+    // Right-clicking title bar shows window menu only when controls allow it.
+    cx.simulate_mouse_down(drag_start, MouseButton::Right, Modifiers::none());
+    assert_eq!(calls.borrow().menus, vec![drag_start]);
+
+    // Left mouse down on top-left and right frame edges starts resize.
+    cx.simulate_mouse_down(
+        point(px(20.0), px(20.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_down(
+        point(px(780.0), px(300.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    assert_eq!(
+        calls.borrow().resizes,
+        vec![ResizeEdge::TopLeft, ResizeEdge::Right]
+    );
+
+    // Custom left-only button layout + filtered controls + maximized Restore icon.
+    view.update(cx, |host, cx| {
+        host.state.is_maximized = true;
+        host.state.controls = WindowControls {
+            fullscreen: false,
+            maximize: false,
+            minimize: false,
+            window_menu: false,
+        };
+        host.state.button_layout = WindowButtonLayout {
+            left: [
+                Some(WindowButton::Close),
+                Some(WindowButton::Minimize),
+                None,
+            ],
+            right: [Some(WindowButton::Maximize); MAX_BUTTONS_PER_SIDE],
+        };
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("csd-controls-left").is_some());
+    assert!(cx.debug_bounds("csd-controls-right").is_none());
+    assert!(cx.debug_bounds("csd-btn-close").is_some());
+    assert!(cx.debug_bounds("csd-btn-minimize").is_none());
+    assert!(cx.debug_bounds("csd-btn-maximize").is_none());
+    assert_eq!(
+        crate::window_chrome::window_button_icon(WindowButton::Maximize, true),
+        IconName::WindowRestore
+    );
+    cx.simulate_mouse_down(
+        title_bar.center(),
+        MouseButton::Right,
+        Modifiers::none(),
+    );
+    assert_eq!(calls.borrow().menus.len(), 1);
+
+    // Fully tiled mode hides visual outer shadow padding while keeping
+    // `client_inset` constant at `CSD_SHADOW_SIZE`.
+    view.update(cx, |host, cx| {
+        host.state.decorations = Decorations::Client {
+            tiling: Tiling::tiled(),
+        };
+        host.state.controls = WindowControls::default();
+        host.state.button_layout =
+            crate::window_chrome::default_linux_button_layout();
+        cx.notify();
+    });
+    draw(cx);
+    let tiled_bar = cx.debug_bounds("csd-title-bar").expect("tiled bar");
+    assert_eq!(tiled_bar.origin, point(px(0.0), px(0.0)));
+    assert_eq!(tiled_bar.size.width, px(800.0));
+    assert_eq!(
+        cx.update(|window, _| window.client_inset()),
+        Some(crate::window_chrome::CSD_SHADOW_SIZE)
+    );
+}
+
+#[gpui_kit::test]
+fn injected_csd_confirm_windows_preserve_buttons_and_safe_close(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::{
+        AppContext as _, Decorations, Modifiers, ParentElement as _, Render,
+        Styled as _, Tiling, WindowControls, div, size,
+    };
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
+        RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
+    };
+    use std::sync::mpsc::channel;
+
+    type CloseFn<V> =
+        dyn Fn(&Entity<V>, &mut gpui_kit::Window, &mut gpui_kit::App);
+
+    struct CsdConfirmHost<V: Render + 'static> {
+        inner: Entity<V>,
+        on_close: std::rc::Rc<CloseFn<V>>,
+    }
+
+    impl<V: Render + 'static> Render for CsdConfirmHost<V> {
+        fn render(
+            &mut self,
+            window: &mut gpui_kit::Window,
+            _: &mut Context<'_, Self>,
+        ) -> impl gpui_kit::IntoElement {
+            let state = crate::window_chrome::WindowChromeState {
+                decorations: Decorations::Client {
+                    tiling: Tiling::default(),
+                },
+                controls: WindowControls {
+                    fullscreen: false,
+                    maximize: false,
+                    minimize: true,
+                    window_menu: true,
+                },
+                button_layout:
+                    crate::window_chrome::default_linux_button_layout(),
+                is_maximized: false,
+                is_window_active: true,
+                window_size: window.bounds().size,
+            };
+            let entity = self.inner.clone();
+            let cb = std::rc::Rc::clone(&self.on_close);
+            let actions = crate::window_chrome::WindowChromeActions::new(
+                move |window, cx| cb(&entity, window, cx),
+            );
+            crate::window_chrome::wrap_window_chrome_with(
+                "CSD Confirm Test",
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .child(self.inner.clone()),
+                state,
+                actions,
+            )
+        }
+    }
+
+    cx.update(gpui_omarchy::init);
+    // Keep a background window alive so closing the confirm window doesn't quit.
+    let temp = fixture();
+    let (_, cx) = view_over(temp.path(), cx);
+
+    // 1. CleanupConfirmWindow inside CSD at 760x560 and minimum 560x380.
+    let req = CleanupConfirmRequest {
+        root: temp.path().to_path_buf(),
+        title: "CSD Cleanup".into(),
+        summary: Some("Verify buttons never clip under CSD".into()),
+        items: vec![CleanupConfirmItem {
+            path: temp.path().join("junk/blob.bin"),
+            bytes: 200_000,
+            mode: RemovalMode::Trash,
+            reason: Some("cache".into()),
+            git_warning: None,
+        }],
+        docker_items: Vec::new(),
+        docker_permission_hint: None,
+    };
+    let (tx_clean, rx_clean) = channel();
+    let (clean_host, clean_cx) = cx.add_window_view(move |_, cx| {
+        let inner = cx.new(|cx| {
+            crate::CleanupConfirmWindow::new(
+                req,
+                Some(tx_clean),
+                None,
+                false,
+                cx,
+            )
+        });
+        CsdConfirmHost {
+            inner,
+            on_close: std::rc::Rc::new(|entity, window, cx| {
+                crate::CleanupConfirmWindow::close_from_chrome(
+                    &entity.downgrade(),
+                    window,
+                    cx,
+                );
+            }),
+        }
+    });
+    clean_cx.simulate_resize(size(px(760.0), px(560.0)));
+    draw(clean_cx);
+    let cancel_b = clean_cx
+        .debug_bounds("confirm-cancel")
+        .expect("confirm-cancel visible");
+    let clean_b = clean_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm-clean visible");
+    let bar_b = clean_cx
+        .debug_bounds("csd-title-bar")
+        .expect("csd-title-bar");
+    assert!(cancel_b.top() >= bar_b.bottom());
+    assert!(cancel_b.bottom() <= px(560.0));
+    assert!(clean_b.bottom() <= px(560.0));
+
+    clean_cx.simulate_resize(size(px(560.0), px(380.0)));
+    draw(clean_cx);
+    let min_clean_b = clean_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm-clean at min size");
+    assert!(min_clean_b.bottom() <= px(380.0));
+
+    let close_btn = clean_cx
+        .debug_bounds("csd-btn-close")
+        .expect("csd close button");
+    clean_cx.simulate_click(close_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(rx_clean.try_recv(), Ok(CleanupConfirmDecision::Cancelled));
+    drop(clean_host);
+
+    // 2. RemoteConnectConfirmWindow inside CSD at 560x380 and minimum 460x320.
+    let remote_req = RemoteConnectConfirmRequest {
+        target_label: "staging".into(),
+        alias: Some("staging".into()),
+        host: "10.0.0.2".into(),
+        port: 22,
+        username: "ops".into(),
+        auth_mode: "password".into(),
+        tool_name: "scan_remote_disk".into(),
+    };
+    let (tx_remote, rx_remote) = channel();
+    let (remote_host, remote_cx) = cx.add_window_view(move |_, cx| {
+        let inner = cx.new(|cx| {
+            crate::RemoteConnectConfirmWindow::new(
+                remote_req,
+                Some(tx_remote),
+                None,
+                false,
+                cx,
+            )
+        });
+        CsdConfirmHost {
+            inner,
+            on_close: std::rc::Rc::new(|entity, window, cx| {
+                crate::RemoteConnectConfirmWindow::close_from_chrome(
+                    &entity.downgrade(),
+                    window,
+                    cx,
+                );
+            }),
+        }
+    });
+    remote_cx.simulate_resize(size(px(560.0), px(380.0)));
+    draw(remote_cx);
+    let deny_b = remote_cx
+        .debug_bounds("remote-connect-deny")
+        .expect("remote-connect-deny visible");
+    let approve_b = remote_cx
+        .debug_bounds("remote-connect-approve")
+        .expect("remote-connect-approve visible");
+    let r_bar_b = remote_cx
+        .debug_bounds("csd-title-bar")
+        .expect("csd-title-bar");
+    assert!(deny_b.top() >= r_bar_b.bottom());
+    assert!(deny_b.bottom() <= px(380.0));
+    assert!(approve_b.bottom() <= px(380.0));
+
+    remote_cx.simulate_resize(size(px(460.0), px(320.0)));
+    draw(remote_cx);
+    assert!(remote_cx.debug_bounds("remote-connect-deny").is_some());
+    assert!(remote_cx.debug_bounds("remote-connect-approve").is_some());
+
+    let r_close = remote_cx
+        .debug_bounds("csd-btn-close")
+        .expect("remote csd close");
+    remote_cx.simulate_click(r_close.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        rx_remote.try_recv(),
+        Ok(RemoteConnectConfirmDecision::Denied)
+    );
+    drop(remote_host);
 }

@@ -36,10 +36,11 @@ Source: "@GUI_EXE_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@README_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@LICENSE_PATH@"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@NOTICES_PATH@"; DestDir: "{app}"; Flags: ignoreversion
+@SCANNER_PACK_FILE_ENTRY@
 
 [Icons]
-Name: "{autoprograms}\ruum"; Filename: "{app}\ruum-gui.exe"
-Name: "{autodesktop}\ruum"; Filename: "{app}\ruum-gui.exe"; Tasks: desktopicon
+Name: "{autoprograms}\ruum"; Filename: "{app}\ruum-gui.exe"; AppUserModelID: "io.github.tobi.ruum"
+Name: "{autodesktop}\ruum"; Filename: "{app}\ruum-gui.exe"; Tasks: desktopicon; AppUserModelID: "io.github.tobi.ruum"
 
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))

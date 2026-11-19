@@ -171,11 +171,11 @@ mod tests {
 
     #[test]
     fn common_strings_differ_across_locales() {
-        assert_eq!(
-            common::tray_sources_and_drives(Locale::En),
-            "Sources && Drives\u{2026}"
-        );
+        assert_eq!(common::menu_remote(Locale::En), "Remote");
+        assert_eq!(common::tray_remote(Locale::En), "Remote");
         for locale in ALL_LOCALES {
+            assert!(!common::menu_remote(locale).is_empty());
+            assert!(!common::tray_remote(locale).is_empty());
             assert!(!common::menu_settings(locale).is_empty());
             assert!(!common::menu_quit_app(locale).is_empty());
             assert!(!common::tray_open_ruum(locale).is_empty());
@@ -185,18 +185,16 @@ mod tests {
             assert!(!common::age_bucket_label(0, locale).is_empty());
             assert!(!common::ago(1000, 900, locale).is_empty());
         }
-        assert_ne!(
-            common::tray_sources_and_drives(Locale::Zh),
-            common::tray_sources_and_drives(Locale::En)
-        );
-        assert_ne!(
-            common::tray_sources_and_drives(Locale::Ja),
-            common::tray_sources_and_drives(Locale::En)
-        );
-        assert_ne!(
-            common::tray_sources_and_drives(Locale::Ko),
-            common::tray_sources_and_drives(Locale::En)
-        );
+        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert_ne!(
+                common::menu_remote(locale),
+                common::menu_remote(Locale::En)
+            );
+            assert_ne!(
+                common::tray_remote(locale),
+                common::tray_remote(Locale::En)
+            );
+        }
     }
 
     #[test]
@@ -214,7 +212,9 @@ mod tests {
             assert!(
                 !review::blocked_reason(&blocked.reason, locale).is_empty()
             );
-            assert!(!pages::sources_title(locale).is_empty());
+            assert!(!pages::rail_remote(locale).is_empty());
+            assert!(!pages::remote_title(locale).is_empty());
+            assert!(!pages::remote_subtitle(locale).is_empty());
             assert!(!pages::watchdog_title(locale).is_empty());
             assert!(!pages::settings_title(locale).is_empty());
             assert!(!messages::title_choose_source(locale).is_empty());
@@ -297,8 +297,107 @@ mod tests {
             assert!(
                 !messages::invalid_webhook_config("bad", locale).is_empty()
             );
+            assert!(!explore::crumb_switch_root_tooltip(locale).is_empty());
+            assert!(!explore::switch_directory_tooltip(locale).is_empty());
+            assert!(!explore::remote_docker_tooltip(locale).is_empty());
+            assert!(!pages::docker_close_button(locale).is_empty());
+            assert!(!pages::ssh_browse_dirs_tooltip(locale).is_empty());
+            assert!(!pages::modal_mounts_local_title(locale).is_empty());
+            assert!(!pages::modal_mounts_local_desc(locale).is_empty());
+            assert!(
+                !pages::modal_mounts_remote_title("prod", locale).is_empty()
+            );
+            assert!(!pages::modal_mounts_remote_desc(locale).is_empty());
+            assert!(!pages::listing_remote_mounts(locale).is_empty());
+            assert!(!pages::no_remote_mounts_listed(locale).is_empty());
+            assert!(!messages::picker_remote_abs_path(locale).is_empty());
+            assert!(!messages::placeholder_path_or_tilde(locale).is_empty());
+            assert!(!review::docker_cleanup_section(locale).is_empty());
+            assert!(!review::docker_group_build_cache(locale).is_empty());
+            assert!(!review::docker_group_unused_images(locale).is_empty());
+            assert!(
+                !review::docker_group_stopped_containers(locale).is_empty()
+            );
+            assert!(!review::docker_build_cache_label(locale).is_empty());
+            assert!(!review::docker_ai_recommended(locale).is_empty());
+            assert!(
+                !review::docker_permission_denied_hint(
+                    "/var/run/docker.sock",
+                    locale,
+                )
+                .is_empty()
+            );
+            assert!(!review::docker_select_all(locale).is_empty());
+            assert!(!review::docker_select_none(locale).is_empty());
+            assert!(!review::row_docker_items(locale).is_empty());
+            assert!(
+                !review::generate_remote_script_button(3, locale).is_empty()
+            );
+            assert!(!pages::script_generated_title(locale).is_empty());
+            assert!(
+                !pages::script_generated_desc(
+                    "prod",
+                    2,
+                    "1.2 GB",
+                    "/tmp/s.sh",
+                    locale,
+                )
+                .is_empty()
+            );
+            assert!(!pages::script_run_in_terminal(locale).is_empty());
+            assert!(!pages::script_reveal_file(locale).is_empty());
+            assert!(!pages::script_run_later(locale).is_empty());
+            assert!(
+                !pages::ssh_pending_script_banner(3, "500 MB", locale)
+                    .is_empty()
+            );
+            assert!(!pages::ssh_pending_run(locale).is_empty());
+            assert!(!pages::ssh_pending_view(locale).is_empty());
+            assert!(!pages::ssh_pending_discard(locale).is_empty());
+            assert!(
+                !messages::script_generate_failed("err", locale).is_empty()
+            );
+            assert!(
+                !messages::script_launched_in_terminal("prod", locale)
+                    .is_empty()
+            );
+            assert!(!messages::script_launch_failed("err", locale).is_empty());
+            assert!(!messages::script_reveal_failed("err", locale).is_empty());
+            assert!(!messages::script_discarded("prod", locale).is_empty());
         }
         for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert_ne!(
+                pages::script_generated_title(locale),
+                pages::script_generated_title(Locale::En)
+            );
+            assert_ne!(
+                pages::script_run_in_terminal(locale),
+                pages::script_run_in_terminal(Locale::En)
+            );
+            assert_ne!(
+                pages::ssh_pending_run(locale),
+                pages::ssh_pending_run(Locale::En)
+            );
+            assert_ne!(
+                review::docker_cleanup_section(locale),
+                review::docker_cleanup_section(Locale::En)
+            );
+            assert_ne!(
+                review::generate_remote_script_button(2, locale),
+                review::generate_remote_script_button(2, Locale::En)
+            );
+            assert_ne!(
+                pages::modal_mounts_local_title(locale),
+                pages::modal_mounts_local_title(Locale::En)
+            );
+            assert_ne!(
+                pages::modal_mounts_remote_title("prod", locale),
+                pages::modal_mounts_remote_title("prod", Locale::En)
+            );
+            assert_ne!(
+                explore::crumb_switch_root_tooltip(locale),
+                explore::crumb_switch_root_tooltip(Locale::En)
+            );
             assert_ne!(
                 pages::ssh_servers_title(locale),
                 pages::ssh_servers_title(Locale::En)
@@ -344,8 +443,16 @@ mod tests {
                 review::blocked_reason(&blocked.reason, Locale::En)
             );
             assert_ne!(
-                pages::sources_title(locale),
-                pages::sources_title(Locale::En)
+                pages::rail_remote(locale),
+                pages::rail_remote(Locale::En)
+            );
+            assert_ne!(
+                pages::remote_title(locale),
+                pages::remote_title(Locale::En)
+            );
+            assert_ne!(
+                pages::remote_subtitle(locale),
+                pages::remote_subtitle(Locale::En)
             );
             assert_ne!(
                 messages::plus_more(3, locale),
@@ -359,6 +466,73 @@ mod tests {
                 messages::cleanup_started_notif_body(2, 1_500_000, locale),
                 messages::cleanup_started_notif_body(2, 1_500_000, Locale::En)
             );
+            assert_ne!(
+                pages::rail_docker(locale),
+                pages::rail_docker(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_refresh_button(locale),
+                pages::docker_refresh_button(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_close_button(locale),
+                pages::docker_close_button(Locale::En)
+            );
+            assert_ne!(
+                explore::remote_docker_tooltip(locale),
+                explore::remote_docker_tooltip(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_not_installed_title(locale),
+                pages::docker_not_installed_title(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_daemon_stopped_title(locale),
+                pages::docker_daemon_stopped_title(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_permission_denied_title(locale),
+                pages::docker_permission_denied_title(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_overview_title(locale),
+                pages::docker_overview_title(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_card_images(locale),
+                pages::docker_card_images(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_card_protected_badge(locale),
+                pages::docker_card_protected_badge(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_card_shared_note("2 GB", locale),
+                pages::docker_card_shared_note("2 GB", Locale::En)
+            );
+            assert_ne!(
+                pages::docker_build_cache_detail("1 GB", Some("2 GB"), locale),
+                pages::docker_build_cache_detail(
+                    "1 GB",
+                    Some("2 GB"),
+                    Locale::En
+                )
+            );
+            assert_ne!(
+                pages::docker_volumes_notice_title(locale),
+                pages::docker_volumes_notice_title(Locale::En)
+            );
+            assert_ne!(
+                pages::docker_commit_button(2, locale),
+                pages::docker_commit_button(2, Locale::En)
+            );
+            assert_ne!(
+                pages::docker_stage_images(locale),
+                pages::docker_stage_images(Locale::En)
+            );
+            assert!(!common::menu_docker(locale).is_empty());
+            assert!(!pages::docker_page_title(locale).is_empty());
+            assert!(!pages::docker_source_ssh("prod", locale).is_empty());
         }
         assert!(
             messages::cleanup_started_notif_body(2, 1_500_000, Locale::Zh)

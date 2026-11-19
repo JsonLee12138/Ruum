@@ -42,6 +42,8 @@
       <File Id="NoticesMd" Source="@NOTICES_PATH@" KeyPath="yes" />
     </Component>
 
+    @SCANNER_PACK_COMPONENT@
+
     <Component Id="StartMenuShortcutComponent" Directory="ApplicationProgramsFolder" Guid="7A9E3C21-5B4D-4F82-A1E6-9C3D8B2A5E02">
       <Shortcut
         Id="ApplicationStartMenuShortcut"
@@ -49,7 +51,11 @@
         Description="GPUI treemap explorer for disk usage"
         Target="[INSTALLFOLDER]ruum-gui.exe"
         WorkingDirectory="INSTALLFOLDER"
-        Icon="RuumIcon" />
+        Icon="RuumIcon">
+        <ShortcutProperty
+          Key="System.AppUserModel.ID"
+          Value="io.github.tobi.ruum" />
+      </Shortcut>
       <RemoveFolder Id="CleanUpShortcutFolder" On="uninstall" />
       <RegistryValue
         Root="HKMU"
@@ -84,6 +90,7 @@
       <ComponentRef Id="ReadmeFile" />
       <ComponentRef Id="LicenseFile" />
       <ComponentRef Id="NoticesFile" />
+      @SCANNER_PACK_COMPONENT_REF@
       <ComponentRef Id="StartMenuShortcutComponent" />
       <Feature Id="AddToPath" Title="Add ruum to system PATH" Level="1">
         <ComponentRef Id="PathEnvComponent" />

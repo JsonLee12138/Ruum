@@ -77,6 +77,36 @@ pub const fn crumb_widen_tooltip(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn crumb_switch_root_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Select scan directory or mount point \u{00b7} v",
+        "选择扫描目录或挂载点 \u{00b7} v",
+        "スキャンディレクトリまたはマウントポイントを選択 \u{00b7} v",
+        "스캔 디렉터리 또는 마운트 지점 선택 \u{00b7} v",
+    )
+}
+
+pub const fn switch_directory_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Switch scan directory or mount \u{00b7} v",
+        "切换扫描目录或挂载点 \u{00b7} v",
+        "スキャンディレクトリ / マウントを切り替え \u{00b7} v",
+        "스캔 디렉터리 / 마운트 전환 \u{00b7} v",
+    )
+}
+
+pub const fn remote_docker_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Inspect and clean remote Docker",
+        "查看并清理远程 Docker",
+        "リモート Docker の確認と整理",
+        "원격 Docker 확인 및 정리",
+    )
+}
+
 pub fn siblings_in(parent_name: &str, locale: Locale) -> String {
     match locale {
         Locale::En => format!("Siblings in {parent_name}"),

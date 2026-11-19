@@ -20,6 +20,7 @@ pub mod credentials;
 pub mod deployment;
 #[cfg(feature = "service")]
 pub mod desktop_launch;
+pub mod docker_adapter;
 pub mod export;
 pub mod filter;
 pub mod git;
@@ -37,7 +38,6 @@ pub mod notify;
 pub mod payload;
 pub mod remote;
 pub mod remote_progress;
-pub mod remote_trash;
 #[cfg(unix)]
 mod remote_walk;
 pub mod removal;
@@ -52,6 +52,8 @@ pub mod ssh_agent;
 pub mod ssh_session;
 #[cfg(feature = "service")]
 pub mod storage;
+#[cfg(feature = "service")]
+pub mod terminal_launcher;
 pub mod trash_adapter;
 pub mod tree;
 pub mod treemap;

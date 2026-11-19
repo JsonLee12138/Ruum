@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::confirm::removal_mode_serde;
+use crate::docker_adapter::DockerCleanTarget;
 use crate::i18n::Locale;
 use crate::removal::RemovalMode;
 
@@ -175,6 +176,8 @@ pub struct CleanupProposal {
     pub timestamp_secs: u64,
     pub summary: String,
     pub items: Vec<ProposalItem>,
+    #[serde(default)]
+    pub docker_targets: Vec<DockerCleanTarget>,
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -431,6 +434,7 @@ mod tests {
                 Some("cargo build cache".to_string()),
                 None,
             )],
+            docker_targets: Vec::new(),
         };
         let state = WatchdogState {
             last_checked_secs: Some(1_700_000_100),
@@ -553,6 +557,7 @@ mod tests {
                     None,
                 ),
             ],
+            docker_targets: Vec::new(),
         };
 
         // Sibling directory `/tmp/cache/a` must not prune `/tmp/cache2/keep`.
@@ -571,5 +576,41 @@ mod tests {
             1
         );
         assert!(proposal.items.is_empty());
+    }
+
+    #[test]
+    fn cleanup_proposal_docker_targets_legacy_json_compat() {
+        use crate::docker_adapter::DockerCleanTarget;
+
+        let legacy_json = r#"{
+            "timestamp_secs": 42,
+            "summary": "Legacy proposal",
+            "items": []
+        }"#;
+        let legacy: CleanupProposal =
+            serde_json::from_str(legacy_json).expect("legacy json");
+        assert!(legacy.docker_targets.is_empty());
+
+        let with_docker = CleanupProposal {
+            timestamp_secs: 42,
+            summary: "With docker".to_owned(),
+            items: Vec::new(),
+            docker_targets: vec![
+                DockerCleanTarget::Container {
+                    id: "abcdef123456".to_owned(),
+                    name: "old-app".to_owned(),
+                },
+                DockerCleanTarget::Image {
+                    id: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                    reference: Some("alpine:3.18".to_owned()),
+                    dangling: false,
+                },
+                DockerCleanTarget::BuildCache,
+            ],
+        };
+        let encoded = serde_json::to_string(&with_docker).expect("serialize");
+        let decoded: CleanupProposal =
+            serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, with_docker);
     }
 }

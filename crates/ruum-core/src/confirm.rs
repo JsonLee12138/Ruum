@@ -24,6 +24,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
+use crate::docker_adapter::DockerCleanTarget;
 use crate::removal::RemovalMode;
 use crate::watchdog_config::ipc_token_path;
 
@@ -79,6 +80,20 @@ pub struct CleanupConfirmItem {
     pub git_warning: Option<String>,
 }
 
+/// A single Docker cleanup item proposed for user confirmation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerConfirmItem {
+    pub target: DockerCleanTarget,
+    pub label: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub reclaimable_bytes: u64,
+    #[serde(default)]
+    pub default_checked: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// A request presented to the user for interactive confirmation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupConfirmRequest {
@@ -86,13 +101,21 @@ pub struct CleanupConfirmRequest {
     pub title: String,
     pub summary: Option<String>,
     pub items: Vec<CleanupConfirmItem>,
+    #[serde(default)]
+    pub docker_items: Vec<DockerConfirmItem>,
+    #[serde(default)]
+    pub docker_permission_hint: Option<String>,
 }
 
 /// The user's decision from a cleanup confirmation prompt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CleanupConfirmDecision {
-    Confirmed { selected_paths: Vec<PathBuf> },
+    Confirmed {
+        selected_paths: Vec<PathBuf>,
+        #[serde(default)]
+        selected_docker_targets: Vec<DockerCleanTarget>,
+    },
     Cancelled,
 }
 
@@ -1040,6 +1063,15 @@ mod tests {
                 reason: Some("old cache".to_string()),
                 git_warning: None,
             }],
+            docker_items: vec![DockerConfirmItem {
+                target: DockerCleanTarget::BuildCache,
+                label: "Docker Build Cache".to_owned(),
+                detail: Some("docker builder prune -f".to_owned()),
+                reclaimable_bytes: 2048,
+                default_checked: true,
+                reason: Some("AI recommended".to_owned()),
+            }],
+            docker_permission_hint: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -1049,12 +1081,51 @@ mod tests {
 
         let conf = CleanupConfirmDecision::Confirmed {
             selected_paths: vec![PathBuf::from("/Users/test/.cache")],
+            selected_docker_targets: vec![DockerCleanTarget::BuildCache],
         };
         let conf_json = serde_json::to_string(&conf).unwrap();
         assert!(conf_json.contains("\"status\":\"confirmed\""));
         let parsed_conf: CleanupConfirmDecision =
             serde_json::from_str(&conf_json).unwrap();
         assert_eq!(parsed_conf, conf);
+
+        // Legacy JSON without docker fields deserializes cleanly.
+        let legacy_req_json = r#"{
+            "root": "/Users/test",
+            "title": "Legacy",
+            "summary": null,
+            "items": []
+        }"#;
+        let legacy_req: CleanupConfirmRequest =
+            serde_json::from_str(legacy_req_json).unwrap();
+        assert!(legacy_req.docker_items.is_empty());
+        assert_eq!(legacy_req.docker_permission_hint, None);
+
+        let legacy_conf_json =
+            r#"{"status":"confirmed","selected_paths":["/Users/test/.cache"]}"#;
+        let legacy_conf: CleanupConfirmDecision =
+            serde_json::from_str(legacy_conf_json).unwrap();
+        assert_eq!(
+            legacy_conf,
+            CleanupConfirmDecision::Confirmed {
+                selected_paths: vec![PathBuf::from("/Users/test/.cache")],
+                selected_docker_targets: Vec::new(),
+            }
+        );
+
+        // Docker-only confirmation with 0 file paths round-trips cleanly.
+        let docker_only = CleanupConfirmDecision::Confirmed {
+            selected_paths: Vec::new(),
+            selected_docker_targets: vec![DockerCleanTarget::Image {
+                id: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                reference: None,
+                dangling: true,
+            }],
+        };
+        let docker_only_json = serde_json::to_string(&docker_only).unwrap();
+        let docker_only_parsed: CleanupConfirmDecision =
+            serde_json::from_str(&docker_only_json).unwrap();
+        assert_eq!(docker_only_parsed, docker_only);
 
         let canc = CleanupConfirmDecision::Cancelled;
         let canc_json = serde_json::to_string(&canc).unwrap();
@@ -1175,6 +1246,7 @@ mod tests {
                         Ok(IpcResponse::ConfirmDecision {
                             decision: CleanupConfirmDecision::Confirmed {
                                 selected_paths: selected,
+                                selected_docker_targets: Vec::new(),
                             },
                         })
                     }
@@ -1211,12 +1283,15 @@ mod tests {
                 reason: None,
                 git_warning: None,
             }],
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
         let decision = client.confirm(&req).unwrap();
         assert_eq!(
             decision,
             CleanupConfirmDecision::Confirmed {
                 selected_paths: vec![PathBuf::from("/test/file")],
+                selected_docker_targets: Vec::new(),
             }
         );
 
@@ -1249,6 +1324,8 @@ mod tests {
             title: "Fallback Test".to_string(),
             summary: None,
             items: vec![],
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
 
         // When display is reachable, spawner is called
@@ -1276,6 +1353,8 @@ mod tests {
             title: "Headless Test".to_string(),
             summary: None,
             items: vec![],
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
 
         // Force desktop_reachable to return false
@@ -1297,6 +1376,8 @@ mod tests {
                 title: "Confirm".to_string(),
                 summary: None,
                 items: Vec::new(),
+                docker_items: Vec::new(),
+                docker_permission_hint: None,
             },
         };
         let notify_req = IpcRequest::NotifyWatchdogUpdate {

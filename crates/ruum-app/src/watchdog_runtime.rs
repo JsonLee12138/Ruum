@@ -237,6 +237,8 @@ mod tests {
                 reason: Some("cache".to_string()),
                 git_warning: None,
             }],
+            docker_items: Vec::new(),
+            docker_permission_hint: None,
         };
 
         let req_frame = IpcRequest::ConfirmCleanup { token, request };
@@ -252,6 +254,7 @@ mod tests {
                 responder
                     .send(CleanupConfirmDecision::Confirmed {
                         selected_paths: vec![item_path],
+                        selected_docker_targets: Vec::new(),
                     })
                     .expect("send response");
             }

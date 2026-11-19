@@ -9,14 +9,21 @@
 //! never as a path to use.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::fs;
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 
+use crate::docker_adapter::{
+    DockerCleanTarget, DockerProbeStatus, command_args_for_target,
+    validate_targets_against_summary,
+};
 use crate::identity::HostIdentity;
-use crate::removal::{Target, normalize};
+use crate::remote::Header;
+use crate::removal::{Target, normalize, plan_remote_for_os, validate_header};
 use crate::size::human_bytes;
 use crate::space::SpaceInfo;
 use crate::trash_adapter::{
-    TrashAdapter, TrashAdapterFactory, TrashDisposition, TrashEnv,
+    TrashAdapter, TrashAdapterFactory, TrashDisposition, TrashEnv, TrashOs,
 };
 
 /// One path per line, outermost targets only, for `xargs -d '\n'`, a
@@ -178,6 +185,65 @@ pub fn delete_script(
     delete_script_for(targets, root, host, identity.as_ref())
 }
 
+/// Static delimiter marking the beginning of the remote execution payload
+/// inside a generated cleanup script.
+pub const REMOTE_PAYLOAD_BEGIN: &str = "# === RUUM_REMOTE_PAYLOAD_BEGIN ===";
+
+/// Static delimiter marking the end of the remote execution payload inside a
+/// generated cleanup script.
+pub const REMOTE_PAYLOAD_END: &str = "# === RUUM_REMOTE_PAYLOAD_END ===";
+
+/// Specification for generating a deterministic remote SSH cleanup `.sh`
+/// script with target-platform guards and whitelisted Docker clean commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteCleanupScriptSpec {
+    pub profile_alias: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub header: Header,
+    pub targets: Vec<Target>,
+    pub docker_targets: Vec<DockerCleanTarget>,
+}
+
+/// Extract the remote shell payload between [`REMOTE_PAYLOAD_BEGIN`] and
+/// [`REMOTE_PAYLOAD_END`] using pure Rust without invoking any shell binary.
+#[must_use]
+pub fn extract_remote_payload(script: &str) -> Option<String> {
+    let normalized = script.replace("\r\n", "\n");
+    let mut lines = normalized.lines();
+    let mut found_begin = false;
+    for line in &mut lines {
+        if line == REMOTE_PAYLOAD_BEGIN {
+            found_begin = true;
+            break;
+        }
+    }
+    if !found_begin {
+        return None;
+    }
+    let mut payload_lines = Vec::new();
+    for line in lines {
+        if line == REMOTE_PAYLOAD_END {
+            let mut out = payload_lines.join("\n");
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            return Some(out);
+        }
+        payload_lines.push(line);
+    }
+    None
+}
+
+const fn script_trash_os_for_platform(platform: &str) -> TrashOs {
+    if platform.eq_ignore_ascii_case("macos") {
+        TrashOs::MacOs
+    } else {
+        TrashOs::Linux
+    }
+}
+
 /// Use the identity captured by the scanner, not the UI machine or SSH alias.
 pub fn delete_script_for(
     targets: &[Target],
@@ -185,81 +251,36 @@ pub fn delete_script_for(
     host: Option<&str>,
     identity: Option<&HostIdentity>,
 ) -> String {
-    let mut body = String::from("set -eu\n");
-    body.push_str(&host_guard(identity));
-    body.push_str(
-        "command -v realpath >/dev/null\ncommand -v findmnt >/dev/null\n",
-    );
-    let _ = writeln!(body, "root={}", shell_quote(&root.to_string_lossy()));
-    let adapter = TrashAdapterFactory::create();
-    let env = TrashEnv::current();
-    let classified: Vec<(String, bool)> = targets
-        .iter()
-        .filter_map(|target| match line(&target.path) {
-            Line::Plain(path) => {
-                let container =
-                    is_trash_container(&target.path, adapter.as_ref(), &env);
-                Some((path, container))
-            }
-            Line::Escaped(_) => None,
-        })
-        .collect();
-    let has_containers = classified.iter().any(|(_, container)| *container);
+    delete_script_for_platform(targets, root, host, "linux", identity)
+}
 
-    body.push_str(r#"guard_target() {
-  p=$1
-  case "$root" in /) prefix=/;; *) prefix=$root/;; esac
-  case "$p" in "$prefix"*) ;; *) echo "Outside scan: $p" >&2; return 1;; esac
-  [ "$p" != "$root" ] || return 1
-  real=$(realpath -e -- "$p") || return 1
-  [ "$real" = "$p" ] || {
-    echo "Changed or linked path: $p" >&2; return 1;
-  }
-  case "$HOME/" in "$p/"*) echo "Contains home: $p" >&2; return 1;; esac
-  for system in /etc /usr /boot /bin /sbin /lib /lib64 /dev /proc /sys /run /var/lib /nix /gnu; do
-    case "$p/" in "$system/"*) echo "System path: $p" >&2; return 1;; esac
-    case "$system/" in "$p/"*) echo "Contains system: $p" >&2; return 1;; esac
-  done
-  mounts=$(findmnt -rn --raw -o TARGET) || return 1
-  printf '%s\n' "$mounts" | while IFS= read -r mount; do
-    mount=$(env printf '%b' "$mount") || exit 1
-    case "$mount/" in "$p/"*) echo "Contains mount: $p" >&2; exit 1;; esac
-  done
-}
-remove() {
-  guard_target "$1"
-  p=$1
-  rm -rf --one-file-system --preserve-root=all -- "$p"
-}
-"#);
-    if has_containers {
-        body.push_str(
-            r#"empty_container() {
-  guard_target "$1"
-  p=$1
-  [ -d "$p" ] || return 1
-  find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
-}
-"#,
-        );
-    }
-    for (path, container) in classified {
-        let cmd = if container {
-            "empty_container"
-        } else {
-            "remove"
-        };
-        let _ = writeln!(body, "{cmd} {}", shell_quote(&path));
-    }
+/// Same as [`delete_script_for`], choosing the trash adapter and shell guards
+/// for the scanned machine's `platform` (`"macos"` vs Linux).
+pub fn delete_script_for_platform(
+    targets: &[Target],
+    root: &Path,
+    host: Option<&str>,
+    platform: &str,
+    identity: Option<&HostIdentity>,
+) -> String {
+    let target_os = script_trash_os_for_platform(platform);
+    let body = build_payload_body(
+        targets,
+        root,
+        None,
+        identity,
+        target_os,
+        &[],
+        &DockerProbeStatus::NotInstalled,
+        false,
+    );
     let mut script = String::from(
-        r#"#!/bin/sh
-(
-# Generated by ruum; review every path before running.
-# GNU/Linux only. Races, shared blocks and changed sizes are possible.
-# This is NOT a substitute for checking git work and tool-owned data.
-set -eu
-if [ "${1-}" != --delete ]; then
-"#,
+        "#!/bin/sh\n(\n\
+         # Generated by ruum; review every path before running.\n\
+         # Races, shared blocks and changed sizes are possible.\n\
+         # This is NOT a substitute for checking git work and tool-owned data.\n\
+         set -eu\n\
+         if [ \"${1-}\" != --delete ]; then\n",
     );
     let preview = format!(
         "PREVIEW ONLY. Target: {}. Review this script, then pass --delete.\n{}",
@@ -284,6 +305,451 @@ if [ "${1-}" != --delete ]; then
     script.push_str("\n)\n");
     script
 }
+
+/// Deterministically generate an interactive remote cleanup `.sh` script.
+///
+/// Embeds a platform-specific remote payload bounded by static delimiters and
+/// invokes `ssh -T -p <port> -- <user>@<host> 'sh -s'` after confirmation
+/// (or `--yes`).
+pub fn build_remote_cleanup_script(
+    spec: &RemoteCleanupScriptSpec,
+) -> Result<String, String> {
+    let host = spec.host.trim();
+    if host.is_empty()
+        || host.starts_with('-')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("invalid SSH host for cleanup script".to_owned());
+    }
+    let username = spec.username.trim();
+    if username.is_empty()
+        || username
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("invalid SSH username for cleanup script".to_owned());
+    }
+    if spec.port == 0 {
+        return Err("invalid SSH port 0 for cleanup script".to_owned());
+    }
+
+    let identity =
+        validate_header(&spec.header).map_err(|err| err.to_string())?;
+    let target_os = script_trash_os_for_platform(&spec.header.platform);
+
+    let plan = plan_remote_for_os(&spec.targets, &spec.header, target_os);
+    if let Some(blocked) = plan.blocked.first() {
+        return Err(format!(
+            "blocked target {}: {}",
+            blocked.path.display(),
+            blocked.reason
+        ));
+    }
+    for target in &plan.targets {
+        if matches!(line(&target.path), Line::Escaped(_)) {
+            return Err(format!(
+                "unsafe characters in target path: {}",
+                target.path.display()
+            ));
+        }
+    }
+
+    let validated_docker = match &spec.header.docker {
+        DockerProbeStatus::Available(summary) => {
+            validate_targets_against_summary(&spec.docker_targets, summary)
+        }
+        DockerProbeStatus::NotInstalled
+        | DockerProbeStatus::DaemonStopped
+        | DockerProbeStatus::PermissionDenied { .. } => Vec::new(),
+    };
+
+    if plan.targets.is_empty() && validated_docker.is_empty() {
+        return Err("no validated file or Docker targets to clean".to_owned());
+    }
+
+    let payload = build_payload_body(
+        &plan.targets,
+        &spec.header.root,
+        spec.header.home.as_deref(),
+        Some(identity),
+        target_os,
+        &validated_docker,
+        &spec.header.docker,
+        true,
+    );
+
+    let display_alias = if spec.profile_alias.trim().is_empty() {
+        host.to_owned()
+    } else {
+        spec.profile_alias.trim().to_owned()
+    };
+    let reclaim_bytes = plan.bytes();
+    let total_items = plan.targets.len() + validated_docker.len();
+    let destination = format!("{username}@{host}");
+    let port_str = spec.port.to_string();
+
+    let mut docker_cmds = Vec::new();
+    for dt in &validated_docker {
+        if let Ok(args) = command_args_for_target(dt) {
+            let quoted: Vec<String> =
+                args.iter().map(|a| shell_quote(a)).collect();
+            docker_cmds.push(format!("docker {}", quoted.join(" ")));
+        }
+    }
+
+    let docker_notice = match &spec.header.docker {
+        DockerProbeStatus::PermissionDenied { socket_hint } => Some(format!(
+            "Docker cleanup skipped: permission denied on {} (read-only).",
+            socket_hint.replace(['\r', '\n'], " ")
+        )),
+        _ => None,
+    };
+
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    let _ = writeln!(script, "# Ruum deterministic remote cleanup script");
+    let _ = writeln!(
+        script,
+        "# Target: {} ({destination}:{port_str}, platform={})",
+        display_alias.replace(['\r', '\n'], " "),
+        match target_os {
+            TrashOs::MacOs => "macos",
+            TrashOs::Linux | TrashOs::Windows => "linux",
+        }
+    );
+    let _ = writeln!(
+        script,
+        "# Items: {total_items} (paths: {}, estimated reclaim: {}, docker: {})",
+        plan.targets.len(),
+        human_bytes(reclaim_bytes),
+        docker_cmds.len()
+    );
+    for cmd in &docker_cmds {
+        let _ = writeln!(script, "# Docker command: {cmd}");
+    }
+    if let Some(notice) = &docker_notice {
+        let _ = writeln!(script, "# {}", notice.replace(['\r', '\n'], " "));
+    }
+
+    script
+        .push_str("\nsend_payload() {\ncat <<'__RUUM_REMOTE_PAYLOAD_EOF__'\n");
+    script.push_str(REMOTE_PAYLOAD_BEGIN);
+    script.push('\n');
+    script.push_str(&payload);
+    if !payload.ends_with('\n') {
+        script.push('\n');
+    }
+    script.push_str(REMOTE_PAYLOAD_END);
+    script.push_str("\n__RUUM_REMOTE_PAYLOAD_EOF__\n}\n\n");
+
+    script.push_str(
+        "if [ \"${1-}\" = \"--payload-only\" ]; then\n\
+         \x20 send_payload\n\
+         \x20 exit 0\n\
+         fi\n\n",
+    );
+
+    let mut summary_lines = format!(
+        "Target host: {display_alias} ({destination}:{port_str})\n\
+         Paths to delete: {} (estimated {})\n",
+        plan.targets.len(),
+        human_bytes(reclaim_bytes)
+    );
+    for cmd in &docker_cmds {
+        let _ = writeln!(summary_lines, "Docker: {cmd}");
+    }
+    if let Some(notice) = &docker_notice {
+        let _ = writeln!(summary_lines, "{notice}");
+    }
+    let _ = writeln!(
+        script,
+        "printf '%s\\n' {}",
+        shell_quote(summary_lines.trim_end())
+    );
+    let _ = writeln!(
+        script,
+        "if [ \"${{1-}}\" != \"--yes\" ]; then\n\
+         \x20 printf 'Proceed with cleanup on %s? [y/N] ' {}\n\
+         \x20 IFS= read -r reply || exit 1\n\
+         \x20 case \"$reply\" in\n\
+         \x20   [Yy]|[Yy][Ee][Ss]) ;;\n\
+         \x20   *) echo 'Aborted.' >&2; exit 1;;\n\
+         \x20 esac\n\
+         fi\n\n\
+         send_payload | ssh -T -p {} -- {} 'sh -s'\n",
+        shell_quote(&display_alias),
+        shell_quote(&port_str),
+        shell_quote(&destination),
+    );
+    Ok(script)
+}
+
+fn sanitize_script_alias(alias: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in alias.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "remote".to_owned()
+    } else {
+        out
+    }
+}
+
+/// Atomically write a cleanup script to
+/// `<app_data_dir>/cleanup-scripts/<safe_alias>-<now_secs>.sh` with mode
+/// `0o700` on Unix.
+pub fn write_cleanup_script_atomic(
+    app_data_dir: &Path,
+    alias: &str,
+    now_secs: u64,
+    content: &str,
+) -> io::Result<PathBuf> {
+    let dir = app_data_dir.join("cleanup-scripts");
+    fs::create_dir_all(&dir)?;
+    let safe_alias = sanitize_script_alias(alias);
+    let target_path = dir.join(format!("{safe_alias}-{now_secs}.sh"));
+
+    let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+    temp.write_all(content.as_bytes())?;
+    temp.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    temp.persist(&target_path).map_err(|err| err.error)?;
+    Ok(target_path)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "payload builder needs target OS, optional home, docker targets, and df flag"
+)]
+fn build_payload_body(
+    targets: &[Target],
+    root: &Path,
+    home: Option<&Path>,
+    identity: Option<&HostIdentity>,
+    target_os: TrashOs,
+    docker_targets: &[DockerCleanTarget],
+    docker_status: &DockerProbeStatus,
+    include_df: bool,
+) -> String {
+    let mut body = String::from("set -eu\n");
+    body.push_str(&host_guard_for(identity, target_os));
+    let home_str =
+        home.map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+    let _ = writeln!(body, "root={}", shell_quote(&root.to_string_lossy()));
+    let _ = writeln!(body, "home_dir={}", shell_quote(&home_str));
+
+    let adapter = TrashAdapterFactory::create_for(target_os);
+    let env = TrashEnv {
+        home: home.map(Path::to_path_buf),
+        xdg_data_home: None,
+        uid: None,
+    };
+    let classified: Vec<(String, bool)> = targets
+        .iter()
+        .filter_map(|target| match line(&target.path) {
+            Line::Plain(path) => {
+                let container =
+                    is_trash_container(&target.path, adapter.as_ref(), &env);
+                Some((path, container))
+            }
+            Line::Escaped(_) => None,
+        })
+        .collect();
+    let has_containers = classified.iter().any(|(_, container)| *container);
+
+    match target_os {
+        TrashOs::MacOs => {
+            body.push_str(MACOS_GUARD_PREAMBLE);
+            if has_containers {
+                body.push_str(MACOS_EMPTY_CONTAINER_FN);
+            }
+        }
+        TrashOs::Linux | TrashOs::Windows => {
+            body.push_str(LINUX_GUARD_PREAMBLE);
+            if has_containers {
+                body.push_str(LINUX_EMPTY_CONTAINER_FN);
+            }
+        }
+    }
+
+    if include_df {
+        body.push_str(
+            "echo '=== Disk usage before cleanup ==='\n\
+             df -h \"$root\" || true\n",
+        );
+    }
+
+    for (path, container) in classified {
+        let cmd = if container {
+            "empty_container"
+        } else {
+            "remove"
+        };
+        let _ = writeln!(body, "{cmd} {}", shell_quote(&path));
+    }
+
+    for dt in docker_targets {
+        if let Ok(args) = command_args_for_target(dt) {
+            let quoted: Vec<String> =
+                args.iter().map(|a| shell_quote(a)).collect();
+            let _ = writeln!(body, "docker {}", quoted.join(" "));
+        }
+    }
+    if let DockerProbeStatus::PermissionDenied { socket_hint } = docker_status {
+        let msg = format!(
+            "Docker cleanup skipped (permission denied on {socket_hint}); \
+             read-only probe only."
+        );
+        let _ = writeln!(body, "printf '%s\\n' {}", shell_quote(&msg));
+    }
+
+    if include_df {
+        body.push_str(
+            "echo '=== Disk usage after cleanup ==='\n\
+             df -h \"$root\" || true\n",
+        );
+    }
+    body
+}
+
+const LINUX_GUARD_PREAMBLE: &str = r#"command -v realpath >/dev/null
+command -v findmnt >/dev/null
+guard_target() {
+  p=$1
+  case "$root" in /) prefix=/;; *) prefix=$root/;; esac
+  case "$p" in "$prefix"*) ;; *) echo "Outside scan: $p" >&2; return 1;; esac
+  [ "$p" != "$root" ] || return 1
+  real=$(realpath -e -- "$p") || return 1
+  [ "$real" = "$p" ] || {
+    echo "Changed or linked path: $p" >&2; return 1;
+  }
+  in_home=0
+  for h in "${HOME:-}" "$home_dir"; do
+    [ -n "$h" ] || continue
+    case "$h/" in "$p/"*) echo "Contains home: $p" >&2; return 1;; esac
+    case "$p/" in "$h/"*) in_home=1;; esac
+    for croot in "$h/.local/share/docker" "$h/.local/share/containers/storage"; do
+      case "$p/" in "$croot/"*) echo "Container storage: $p" >&2; return 1;; esac
+      case "$croot/" in "$p/"*) echo "Contains container storage: $p" >&2; return 1;; esac
+    done
+  done
+  for croot in /var/lib/docker /var/lib/containerd; do
+    case "$p/" in "$croot/"*) echo "Container storage: $p" >&2; return 1;; esac
+    case "$croot/" in "$p/"*) echo "Contains container storage: $p" >&2; return 1;; esac
+  done
+  for system in /etc /usr /boot /bin /sbin /lib /lib64 /dev /proc /sys /run /var/lib /nix /gnu; do
+    if [ "$in_home" -eq 0 ]; then
+      case "$p/" in "$system/"*) echo "System path: $p" >&2; return 1;; esac
+    fi
+    case "$system/" in "$p/"*) echo "Contains system: $p" >&2; return 1;; esac
+  done
+  mounts=$(findmnt -rn --raw -o TARGET) || return 1
+  printf '%s\n' "$mounts" | while IFS= read -r mount; do
+    mount=$(env printf '%b' "$mount") || exit 1
+    case "$mount/" in "$p/"*) echo "Contains mount: $p" >&2; exit 1;; esac
+  done
+}
+remove() {
+  guard_target "$1"
+  p=$1
+  rm -rf --one-file-system --preserve-root=all -- "$p"
+}
+"#;
+
+const LINUX_EMPTY_CONTAINER_FN: &str = r#"empty_container() {
+  guard_target "$1"
+  p=$1
+  [ -d "$p" ] || return 1
+  find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+}
+"#;
+
+const MACOS_GUARD_PREAMBLE: &str = r#"guard_target() {
+  p=$1
+  case "$root" in /) prefix=/;; *) prefix=$root/;; esac
+  case "$p" in "$prefix"*) ;; *) echo "Outside scan: $p" >&2; return 1;; esac
+  [ "$p" != "$root" ] || return 1
+  [ ! -L "$p" ] || { echo "Symlink path: $p" >&2; return 1; }
+  parent=$(dirname -- "$p")
+  base=$(basename -- "$p")
+  real_parent=$(cd -P -- "$parent" 2>/dev/null && pwd -P) || {
+    echo "Cannot resolve parent: $p" >&2; return 1;
+  }
+  case "$real_parent" in
+    /) real="$real_parent$base";;
+    *) real="$real_parent/$base";;
+  esac
+  [ "$real" = "$p" ] || {
+    echo "Changed or linked path: $p" >&2; return 1;
+  }
+  root_dev=$(stat -f '%d' -- "$root") || return 1
+  p_dev=$(stat -f '%d' -- "$p") || return 1
+  [ "$p_dev" = "$root_dev" ] || {
+    echo "Cross-device path: $p" >&2; return 1;
+  }
+  [ "$p" != "/Users" ] || { echo "Contains home: $p" >&2; return 1; }
+  p_lower=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+  in_home=0
+  for h in "${HOME:-}" "$home_dir"; do
+    [ -n "$h" ] || continue
+    case "$h/" in "$p/"*) echo "Contains home: $p" >&2; return 1;; esac
+    case "$p/" in "$h/"*) in_home=1;; esac
+    h_lower=$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')
+    for croot in \
+      "$h_lower/library/containers/com.docker.docker/data/vms" \
+      "$h_lower/orbstack" \
+      "$h_lower/.colima" \
+      "$h_lower/.lima"; do
+      case "$p_lower/" in "$croot/"*) echo "Container storage: $p" >&2; return 1;; esac
+      case "$croot/" in "$p_lower/"*) echo "Contains container storage: $p" >&2; return 1;; esac
+    done
+  done
+  for system in /System /Library /Applications /bin /sbin /usr /etc /var /private/etc /private/var /dev /Cores; do
+    if [ "$in_home" -eq 0 ]; then
+      case "$p/" in "$system/"*) echo "System path: $p" >&2; return 1;; esac
+    fi
+    case "$system/" in "$p/"*) echo "Contains system: $p" >&2; return 1;; esac
+  done
+  mount | while IFS= read -r line; do
+    rest=${line#* on }
+    mp=${rest%% (*}
+    [ -n "$mp" ] || continue
+    [ "$mp" = "/" ] && continue
+    case "$mp/" in "$p/"*) echo "Contains mount: $p" >&2; exit 1;; esac
+  done
+}
+remove() {
+  guard_target "$1"
+  p=$1
+  rm -rf -- "$p"
+}
+"#;
+
+const MACOS_EMPTY_CONTAINER_FN: &str = r#"empty_container() {
+  guard_target "$1"
+  p=$1
+  [ -d "$p" ] || return 1
+  find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+"#;
 
 fn is_trash_container(
     path: &Path,
@@ -338,16 +804,30 @@ fn has_trash_container_suffix(path: &Path) -> bool {
     false
 }
 
-fn host_guard(identity: Option<&HostIdentity>) -> String {
+fn host_guard_for(
+    identity: Option<&HostIdentity>,
+    target_os: TrashOs,
+) -> String {
     let Some(identity) = identity else {
         return "echo 'Refusing deletion: scan has no host identity.' >&2\n\
                 exit 1\n"
             .into();
     };
     let mut guard = String::from(
-        "# Refuse to operate on any machine other than the scanned host.\n\
-         IFS= read -r actual_host < /proc/sys/kernel/hostname || exit 1\n",
+        "# Refuse to operate on any machine other than the scanned host.\n",
     );
+    match target_os {
+        TrashOs::MacOs => {
+            guard.push_str(
+                "actual_host=$(hostname | tr -d '\\r\\n') || exit 1\n",
+            );
+        }
+        TrashOs::Linux | TrashOs::Windows => {
+            guard.push_str(
+                "IFS= read -r actual_host < /proc/sys/kernel/hostname || exit 1\n",
+            );
+        }
+    }
     let _ = writeln!(
         guard,
         "[ \"$actual_host\" = {} ] || {{ echo 'Wrong hostname; refusing deletion.' >&2; exit 1; }}",
@@ -708,5 +1188,498 @@ mod tests {
         assert!(xdg_trash.exists(), "Trash container directory must remain");
         assert!(!files.join("old.bin").exists());
         assert!(!info.join("old.bin.trashinfo").exists());
+    }
+
+    #[test]
+    fn delete_script_for_platform_selects_target_os_trash_and_guards() {
+        let identity = HostIdentity {
+            hostname: "mac-studio".into(),
+            machine_id: None,
+        };
+        let mac_targets = [
+            target("/Users/alice/.Trash", 4096, true),
+            target("/Users/alice/.cache/pip", 1024, true),
+        ];
+        let mac_script = delete_script_for_platform(
+            &mac_targets,
+            Path::new("/Users/alice"),
+            None,
+            "macos",
+            Some(&identity),
+        );
+        assert!(mac_script.contains("empty_container '/Users/alice/.Trash'"));
+        assert!(mac_script.contains("remove '/Users/alice/.cache/pip'"));
+        assert!(mac_script.contains("cd -P -- \"$parent\""));
+        assert!(!mac_script.contains("findmnt"));
+        assert!(!mac_script.contains("--one-file-system"));
+
+        let mac_remote = delete_script_for_platform(
+            &mac_targets,
+            Path::new("/Users/alice"),
+            Some("mac-studio"),
+            "macos",
+            Some(&identity),
+        );
+        assert!(mac_remote.contains("| ssh -T -- 'mac-studio'"));
+
+        let linux_identity = HostIdentity {
+            hostname: "prod-box".into(),
+            machine_id: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+        let linux_targets =
+            [target("/home/deploy/.local/share/Trash", 4096, true)];
+        let linux_script = delete_script_for_platform(
+            &linux_targets,
+            Path::new("/home/deploy"),
+            None,
+            "linux",
+            Some(&linux_identity),
+        );
+        assert!(
+            linux_script
+                .contains("empty_container '/home/deploy/.local/share/Trash'")
+        );
+        assert!(linux_script.contains("findmnt -rn"));
+        assert!(linux_script.contains("--one-file-system"));
+    }
+
+    #[test]
+    fn build_remote_cleanup_script_linux_payload_and_docker_order() {
+        use crate::docker_adapter::{
+            DockerContainerEntry, DockerImageEntry, DockerUsageSummary,
+        };
+
+        let summary = DockerUsageSummary {
+            build_cache_reclaimable_bytes: 1024 * 1024,
+            removable_images: vec![
+                DockerImageEntry {
+                    id: "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+                    repository: "my/app".to_owned(),
+                    tag: "v1".to_owned(),
+                    created_since: "1d".to_owned(),
+                    size_bytes: 500,
+                    unique_bytes: 500,
+                    dangling: false,
+                },
+            ],
+            stopped_containers: vec![DockerContainerEntry {
+                id: "abcdef012345".to_owned(),
+                name: "old-worker".to_owned(),
+                image: "my/app:v1".to_owned(),
+                state: "exited".to_owned(),
+                status: "Exited".to_owned(),
+                size_bytes: 100,
+            }],
+            detailed: true,
+            ..DockerUsageSummary::default()
+        };
+
+        let mut header = Header::new(
+            PathBuf::from("/home/deploy"),
+            Some(PathBuf::from("/home/deploy")),
+            "linux",
+            Some(HostIdentity {
+                hostname: "prod-01".to_owned(),
+                machine_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            }),
+        );
+        header.docker = DockerProbeStatus::Available(summary);
+
+        let spec = RemoteCleanupScriptSpec {
+            profile_alias: "prod'box".to_owned(),
+            host: "10.0.0.5".to_owned(),
+            port: 2222,
+            username: "deploy".to_owned(),
+            header,
+            targets: vec![target("/home/deploy/.cache/pip", 8192, true)],
+            docker_targets: vec![
+                DockerCleanTarget::BuildCache,
+                DockerCleanTarget::Image {
+                    id: "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+                    reference: Some("--tampered".to_owned()),
+                    dangling: false,
+                },
+                DockerCleanTarget::Container {
+                    id: "abcdef012345".to_owned(),
+                    name: "old-worker".to_owned(),
+                },
+                // Unknown container must be dropped by whitelist.
+                DockerCleanTarget::Container {
+                    id: "999999999999".to_owned(),
+                    name: "unknown".to_owned(),
+                },
+            ],
+        };
+
+        let script = build_remote_cleanup_script(&spec).expect("build script");
+        assert!(script.contains("--payload-only"));
+        assert!(script.contains("--yes"));
+        assert!(script.contains("Proceed with cleanup on"));
+        assert!(
+            script.contains("ssh -T -p '2222' -- 'deploy@10.0.0.5' 'sh -s'")
+        );
+
+        let payload = extract_remote_payload(&script).expect("extract payload");
+        assert!(payload.contains("/proc/sys/kernel/hostname"));
+        assert!(payload.contains("/etc/machine-id"));
+        assert!(payload.contains("realpath -e -- \"$p\""));
+        assert!(payload.contains("findmnt -rn --raw -o TARGET"));
+        assert!(payload.contains("/.local/share/docker"));
+        assert!(payload.contains("/.local/share/containers/storage"));
+        assert!(payload.contains("df -h \"$root\""));
+        assert!(payload.contains("remove '/home/deploy/.cache/pip'"));
+
+        // Verify exact execution order: Container -> Image -> BuildCache.
+        let c_pos = payload
+            .find("docker 'container' 'rm' '--' 'abcdef012345'")
+            .expect("container rm");
+        let i_pos = payload
+            .find("docker 'image' 'rm' '--' 'my/app:v1'")
+            .expect("image rm");
+        let b_pos = payload
+            .find("docker 'builder' 'prune' '-f'")
+            .expect("builder prune");
+        assert!(c_pos < i_pos && i_pos < b_pos);
+        assert!(!payload.contains("999999999999"));
+        assert!(!payload.contains("--tampered"));
+
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("remote.sh");
+            std::fs::write(&path, &script).unwrap();
+            assert!(
+                Command::new("sh")
+                    .arg("-n")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let out = Command::new("sh")
+                .arg(&path)
+                .arg("--payload-only")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                extract_remote_payload(&stdout).as_deref(),
+                Some(payload.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn build_remote_cleanup_script_macos_guards_and_permission_denied() {
+        let mut header = Header::new(
+            PathBuf::from("/Users/alice"),
+            Some(PathBuf::from("/Users/alice")),
+            "macos",
+            Some(HostIdentity {
+                hostname: "mac-mini".to_owned(),
+                machine_id: None,
+            }),
+        );
+        header.docker = DockerProbeStatus::PermissionDenied {
+            socket_hint: "/var/run/docker.sock".to_owned(),
+        };
+
+        // Container storage ancestor must fail closed.
+        let bad_spec = RemoteCleanupScriptSpec {
+            profile_alias: "mac".to_owned(),
+            host: "10.0.0.9".to_owned(),
+            port: 22,
+            username: "alice".to_owned(),
+            header: header.clone(),
+            targets: vec![target(
+                "/Users/alice/Library/Containers/com.docker.docker",
+                500,
+                true,
+            )],
+            docker_targets: Vec::new(),
+        };
+        assert!(build_remote_cleanup_script(&bad_spec).is_err());
+
+        let good_spec = RemoteCleanupScriptSpec {
+            profile_alias: "mac".to_owned(),
+            host: "10.0.0.9".to_owned(),
+            port: 22,
+            username: "alice".to_owned(),
+            header,
+            targets: vec![target(
+                "/Users/alice/Library/Caches/com.example",
+                500,
+                true,
+            )],
+            docker_targets: vec![DockerCleanTarget::BuildCache],
+        };
+        let script =
+            build_remote_cleanup_script(&good_spec).expect("mac script");
+        assert!(script.contains("permission denied on /var/run/docker.sock"));
+        let payload =
+            extract_remote_payload(&script).expect("extract mac payload");
+        assert!(payload.contains("hostname | tr -d"));
+        assert!(payload.contains("cd -P -- \"$parent\""));
+        assert!(payload.contains("pwd -P"));
+        assert!(payload.contains("stat -f '%d'"));
+        assert!(
+            payload.contains("library/containers/com.docker.docker/data/vms")
+        );
+        assert!(payload.contains("orbstack"));
+        assert!(payload.contains("df -h \"$root\""));
+        assert!(!payload.contains("docker 'builder' 'prune'"));
+        assert!(!payload.contains("findmnt"));
+    }
+
+    #[test]
+    fn extract_remote_payload_handles_crlf_and_missing_markers() {
+        assert_eq!(extract_remote_payload("no markers"), None);
+        assert_eq!(
+            extract_remote_payload(&format!(
+                "{REMOTE_PAYLOAD_BEGIN}\necho hi\n"
+            )),
+            None
+        );
+        let crlf = format!(
+            "before\r\n{REMOTE_PAYLOAD_BEGIN}\r\necho one\r\necho two\r\n{REMOTE_PAYLOAD_END}\r\nafter\r\n"
+        );
+        assert_eq!(
+            extract_remote_payload(&crlf).as_deref(),
+            Some("echo one\necho two\n")
+        );
+    }
+
+    #[test]
+    fn write_cleanup_script_atomic_creates_sanitized_script_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cleanup_script_atomic(
+            dir.path(),
+            "prod / box:01",
+            1_700_000_999,
+            "#!/bin/sh\necho ok\n",
+        )
+        .expect("write atomic script");
+        assert_eq!(
+            path,
+            dir.path().join("cleanup-scripts/prod-box-01-1700000999.sh")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/sh\necho ok\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode =
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_payload_executes_guards_and_refuses_symlink_ancestors() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let raw_dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(raw_dir.path()).unwrap();
+        let work_root = home.join("work");
+        let real_dir = work_root.join("real_cache");
+        let outside = work_root.join("outside");
+        let outside_keep = outside.join("keep.txt");
+        let docker_vms =
+            home.join("Library/Containers/com.docker.docker/Data/vms");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("stale.bin"), b"12345").unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_keep, b"keep").unwrap();
+        std::fs::create_dir_all(&docker_vms).unwrap();
+        symlink(&outside, work_root.join("sym_parent")).unwrap();
+
+        let identity = HostIdentity::current().unwrap();
+        let mut header = Header::new(
+            work_root.clone(),
+            Some(home.clone()),
+            "macos",
+            Some(identity),
+        );
+        header.docker = DockerProbeStatus::NotInstalled;
+
+        // 1. Real target succeeds and prints df -h before/after.
+        let ok_spec = RemoteCleanupScriptSpec {
+            profile_alias: "local-mac".to_owned(),
+            host: "localhost".to_owned(),
+            port: 22,
+            username: "tester".to_owned(),
+            header: header.clone(),
+            targets: vec![target(real_dir.to_str().unwrap(), 5, true)],
+            docker_targets: Vec::new(),
+        };
+        let ok_script = build_remote_cleanup_script(&ok_spec).unwrap();
+        let ok_script_path = work_root.join("ok.sh");
+        std::fs::write(&ok_script_path, &ok_script).unwrap();
+        assert!(
+            Command::new("sh")
+                .arg("-n")
+                .arg(&ok_script_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ok_payload = extract_remote_payload(&ok_script).unwrap();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&ok_payload)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("Disk usage before cleanup"));
+        assert!(stdout.contains("Disk usage after cleanup"));
+        assert!(!real_dir.exists());
+
+        // 2. Symlink ancestor is caught by `cd -P && pwd -P`.
+        let sym_target = work_root.join("sym_parent/keep.txt");
+        let sym_spec = RemoteCleanupScriptSpec {
+            profile_alias: "local-mac".to_owned(),
+            host: "localhost".to_owned(),
+            port: 22,
+            username: "tester".to_owned(),
+            header,
+            targets: vec![target(sym_target.to_str().unwrap(), 4, false)],
+            docker_targets: Vec::new(),
+        };
+        let sym_script = build_remote_cleanup_script(&sym_spec).unwrap();
+        let sym_payload = extract_remote_payload(&sym_script).unwrap();
+        let sym_out = Command::new("sh")
+            .arg("-c")
+            .arg(&sym_payload)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(!sym_out.status.success());
+        assert!(outside_keep.exists());
+
+        // 3. Real system path outside HOME (e.g. /private/etc) is refused by
+        //    the shell guard even when scanned under `/`.
+        let sys_check = format!(
+            "set -eu\nroot=/private\nhome_dir={}\n{}\nguard_target /private/etc\n",
+            shell_quote(&home.to_string_lossy()),
+            MACOS_GUARD_PREAMBLE
+        );
+        let sys_out = Command::new("sh")
+            .arg("-c")
+            .arg(&sys_check)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(!sys_out.status.success());
+        assert!(
+            String::from_utf8_lossy(&sys_out.stderr).contains("System path")
+        );
+    }
+
+    #[test]
+    fn build_remote_cleanup_script_supports_multi_tag_images_and_shared_cache_only()
+     {
+        use crate::docker_adapter::{
+            DockerCleanTarget, DockerImageEntry, DockerProbeStatus,
+            DockerUsageSummary,
+        };
+
+        let shared_id = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut header = Header::new(
+            PathBuf::from("/home/deploy"),
+            Some(PathBuf::from("/home/deploy")),
+            "linux",
+            Some(HostIdentity {
+                hostname: "prod-box".to_owned(),
+                machine_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            }),
+        );
+        header.docker = DockerProbeStatus::Available(DockerUsageSummary {
+            build_cache_reclaimable_bytes: 0,
+            build_cache_shared_bytes: 4096,
+            removable_images: vec![
+                DockerImageEntry {
+                    id: shared_id.to_owned(),
+                    repository: "ghcr.io/demo/app".to_owned(),
+                    tag: "v1".to_owned(),
+                    created_since: "2d".to_owned(),
+                    size_bytes: 100,
+                    unique_bytes: 100,
+                    dangling: false,
+                },
+                DockerImageEntry {
+                    id: shared_id.to_owned(),
+                    repository: "ghcr.io/demo/app".to_owned(),
+                    tag: "v2".to_owned(),
+                    created_since: "1d".to_owned(),
+                    size_bytes: 100,
+                    unique_bytes: 100,
+                    dangling: false,
+                },
+            ],
+            detailed: true,
+            ..DockerUsageSummary::default()
+        });
+
+        let spec = RemoteCleanupScriptSpec {
+            profile_alias: "prod".to_owned(),
+            host: "10.0.0.5".to_owned(),
+            port: 22,
+            username: "deploy".to_owned(),
+            header,
+            targets: Vec::new(),
+            docker_targets: vec![
+                DockerCleanTarget::BuildCache,
+                DockerCleanTarget::Image {
+                    id: shared_id.to_owned(),
+                    reference: Some("ghcr.io/demo/app:v2".to_owned()),
+                    dangling: false,
+                },
+                DockerCleanTarget::Image {
+                    id: shared_id.to_owned(),
+                    reference: Some("ghcr.io/demo/app:v1".to_owned()),
+                    dangling: false,
+                },
+            ],
+        };
+        let script = build_remote_cleanup_script(&spec).expect("build script");
+        let payload = extract_remote_payload(&script).expect("payload");
+        let i2 = payload
+            .find("docker 'image' 'rm' '--' 'ghcr.io/demo/app:v2'")
+            .expect("image v2");
+        let i1 = payload
+            .find("docker 'image' 'rm' '--' 'ghcr.io/demo/app:v1'")
+            .expect("image v1");
+        let bc = payload
+            .find("docker 'builder' 'prune' '-f'")
+            .expect("builder prune");
+        assert!(i2 < i1 && i1 < bc);
+
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("docker_only.sh");
+            std::fs::write(&path, &script).unwrap();
+            assert!(
+                Command::new("sh")
+                    .arg("-n")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
 }

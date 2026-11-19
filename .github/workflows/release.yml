@@ -277,7 +277,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
-          args=(--all)
+          args=(--all --require-scanner-pack)
           signed=false
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_SIGN_IDENTITY" ]; then
             args+=(--sign "$MACOS_SIGN_IDENTITY")
@@ -292,6 +292,9 @@ jobs:
               signed=true
             fi
           fi
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo xtask scanner-pack --strict --out target/scanner/ruum-scan-linux.pack
+          args+=(--scanner-pack target/scanner/ruum-scan-linux.pack)
           cargo xtask bundle "${args[@]}"
           rm -f "$RUNNER_TEMP/AuthKey.p8"
 
@@ -317,6 +320,8 @@ jobs:
             | grep -q "ruum.app/Contents/MacOS/ruum-gui"
           lsbom "$RUNNER_TEMP/pkg-expanded"/*/Bom \
             | grep -q "ruum.app/Contents/MacOS/ruum"
+          lsbom "$RUNNER_TEMP/pkg-expanded"/*/Bom \
+            | grep -q "ruum.app/Contents/Resources/ruum-scan-linux.pack"
           rm -rf "$RUNNER_TEMP/pkg-expanded"
 
           echo "signed=$signed" >> "$GITHUB_OUTPUT"
@@ -377,7 +382,10 @@ jobs:
         run: cargo xtask test
 
       - name: Build
-        run: cargo build --release --locked -p ruum-app -p ruum-core --bin ruum-gui --bin ruum
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo xtask scanner-pack --strict --out target/scanner/ruum-scan-linux.pack
+          cargo build --release --locked -p ruum-app -p ruum-core --bin ruum-gui --bin ruum
 
       - name: Install WiX and verify Inno Setup
         shell: pwsh
@@ -699,11 +707,13 @@ jobs:
 
           $exeAbs = (Resolve-Path "target\release\ruum.exe").Path
           $guiExeAbs = (Resolve-Path "target\release\ruum-gui.exe").Path
+          $scannerPackAbs = (Resolve-Path "target\scanner\ruum-scan-linux.pack").Path
           $stageOutput = cargo xtask package windows-stage `
             --arch $env:ARCH `
             --out $stageDir `
             --exe $exeAbs `
             --gui-exe $guiExeAbs `
+            --scanner-pack $scannerPackAbs `
             --version $env:VERSION
           if ($LASTEXITCODE -ne 0) { throw "cargo xtask package windows-stage failed" }
           $wixArchLine = $stageOutput | Where-Object { $_ -like "WIX_ARCH=*" } | Select-Object -First 1
@@ -712,7 +722,7 @@ jobs:
           $name = "ruum-$env:VERSION-$env:ARCH-windows"
           $zipStage = Join-Path $stageDir "zip\$name"
           New-Item -ItemType Directory -Force $zipStage | Out-Null
-          Copy-Item "target\release\ruum.exe", "target\release\ruum-gui.exe", README.md, LICENSE, THIRD_PARTY_NOTICES.md $zipStage
+          Copy-Item "target\release\ruum.exe", "target\release\ruum-gui.exe", $scannerPackAbs, README.md, LICENSE, THIRD_PARTY_NOTICES.md $zipStage
           Compress-Archive -Path $zipStage -DestinationPath "dist\$name.zip"
 
           & $env:WIX_PATH build (Join-Path $stageDir "ruum.wxs") -arch $wixArch -o "dist\$name.msi"

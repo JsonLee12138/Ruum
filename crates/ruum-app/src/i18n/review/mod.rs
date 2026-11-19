@@ -321,3 +321,129 @@ pub const fn section_kept_back(locale: Locale) -> &'static str {
         "\u{bcf4}\u{d638}\u{b41c} \u{d56d}\u{baa9}",
     )
 }
+
+pub const fn docker_cleanup_section(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Docker Cleanup",
+        "Docker \u{6e05}\u{7406}",
+        "Docker \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}",
+        "Docker \u{c815}\u{b9ac}",
+    )
+}
+
+pub const fn docker_group_build_cache(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Build Cache",
+        "\u{6784}\u{5efa}\u{7f13}\u{5b58} (Build Cache)",
+        "\u{30d3}\u{30eb}\u{30c9}\u{30ad}\u{30e3}\u{30c3}\u{30b7}\u{30e5}",
+        "\u{be4c}\u{b4dc} \u{ce90}\u{c2dc}",
+    )
+}
+
+pub const fn docker_group_unused_images(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Unused Images",
+        "\u{672a}\u{4f7f}\u{7528}\u{955c}\u{50cf} (Unused Images)",
+        "\u{672a}\u{4f7f}\u{7528}\u{30a4}\u{30e1}\u{30fc}\u{30b8}",
+        "\u{bbf8}\u{c0ac}\u{c6a9} \u{c774}\u{bbf8}\u{c9c0}",
+    )
+}
+
+pub const fn docker_group_stopped_containers(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Stopped Containers",
+        "\u{5df2}\u{505c}\u{6b62}\u{5bb9}\u{5668} (Stopped Containers)",
+        "\u{505c}\u{6b62}\u{6e08}\u{307f}\u{30b3}\u{30f3}\u{30c6}\u{30ca}",
+        "\u{c911}\u{c9c0}\u{b41c} \u{cee8}\u{d14c}\u{c774}\u{b108}",
+    )
+}
+
+pub const fn docker_build_cache_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Docker Build Cache",
+        "Docker \u{6784}\u{5efa}\u{7f13}\u{5b58}",
+        "Docker \u{30d3}\u{30eb}\u{30c9}\u{30ad}\u{30e3}\u{30c3}\u{30b7}\u{30e5}",
+        "Docker \u{be4c}\u{b4dc} \u{ce90}\u{c2dc}",
+    )
+}
+
+pub const fn docker_ai_recommended(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Recommended by AI",
+        "AI \u{63a8}\u{8350}\u{6e05}\u{7406}",
+        "AI \u{304a}\u{3059}\u{3059}\u{3081}",
+        "AI \u{cd94}\u{cc9c}",
+    )
+}
+
+pub fn docker_permission_denied_hint(socket: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!(
+            "Docker read-only: permission denied on {socket} (cleanup skipped)."
+        ),
+        Locale::Zh => format!(
+            "Docker \u{53ea}\u{8bfb}\u{63d0}\u{793a}\u{ff1a}\u{65e0}\u{6743}\u{8bbf}\u{95ee} {socket}\u{ff0c}\u{5df2}\u{8df3}\u{8fc7}\u{6e05}\u{7406}\u{3002}"
+        ),
+        Locale::Ja => format!(
+            "Docker \u{8aad}\u{307f}\u{53d6}\u{308a}\u{5c02}\u{7528}: {socket} \u{3078}\u{306e}\u{6a29}\u{9650}\u{304c}\u{306a}\u{3044}\u{305f}\u{3081}\u{30b9}\u{30ad}\u{30c3}\u{30d7}\u{3057}\u{307e}\u{3059}\u{3002}"
+        ),
+        Locale::Ko => format!(
+            "Docker \u{c77d}\u{ae30} \u{c804}\u{c6a9}: {socket} \u{ad8c}\u{d55c} \u{ac70}\u{bd80}\u{b85c} \u{c815}\u{b9ac}\u{b97c} \u{ac74}\u{b108}\u{b701}\u{b2c8}\u{b2e4}."
+        ),
+    }
+}
+
+pub const fn docker_select_all(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Select All",
+        "\u{5168}\u{9009}",
+        "\u{3059}\u{3079}\u{3066}\u{9078}\u{629e}",
+        "\u{baa8}\u{b450} \u{c120}\u{d0dd}",
+    )
+}
+
+pub const fn docker_select_none(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Select None",
+        "\u{5168}\u{4e0d}\u{9009}",
+        "\u{9078}\u{629e}\u{89e3}\u{9664}",
+        "\u{c120}\u{d0dd} \u{d574}\u{c81c}",
+    )
+}
+
+pub const fn row_docker_items(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Docker items",
+        "Docker \u{6e05}\u{7406}\u{9879}",
+        "Docker \u{9805}\u{76ee}",
+        "Docker \u{d56d}\u{baa9}",
+    )
+}
+
+pub fn generate_remote_script_button(count: usize, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Generate Cleanup Script ({count})"),
+        Locale::Zh => {
+            format!(
+                "\u{751f}\u{6210}\u{6e05}\u{7406}\u{811a}\u{672c} ({count})"
+            )
+        }
+        Locale::Ja => format!(
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{751f}\u{6210} ({count})"
+        ),
+        Locale::Ko => {
+            format!(
+                "\u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8} \u{c0dd}\u{c131} ({count})"
+            )
+        }
+    }
+}

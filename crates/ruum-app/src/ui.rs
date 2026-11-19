@@ -96,8 +96,12 @@ pub mod size {
     pub const SIZE_LANE: Rems = Rems(5.0);
     /// The cursor tooltip.
     pub const TOOLTIP: Rems = Rems(16.75);
-    /// Height of the volume and root picker list on the Sources page.
+    /// Height of the directory and mount list in the unified picker modal.
     pub const SOURCE_LIST_HEIGHT: Rems = Rems(18.0);
+    /// Width of the unified directory / mount picker modal.
+    pub const VOLUME_MODAL: Rems = Rems(34.0);
+    /// Width of the remote Docker inspection and cleanup modal.
+    pub const DOCKER_MODAL: Rems = Rems(48.0);
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
     /// The key column of the keyboard overlay.
@@ -110,6 +114,8 @@ pub mod size {
     pub const HOST_TABS_MAX: Rems = Rems(18.0);
     /// Left category sidebar width on the Zed-style Settings page.
     pub const SETTINGS_NAV: Rems = Rems(12.5);
+    /// Height (and square button width) of the Linux CSD titlebar.
+    pub const TITLE_BAR: Rems = Rems(2.125);
 }
 
 /// Interface zoom steps, as a factor of the 16 px default rem.

@@ -37,6 +37,8 @@ pub enum Category {
     Documents,
     /// Caches and other regenerable state.
     Cache,
+    /// Container/VM runtime backing storage (Docker, `OrbStack`, Colima, Lima).
+    Container,
     /// Nothing recognisable.
     #[default]
     Other,
@@ -44,7 +46,7 @@ pub enum Category {
 
 impl Category {
     /// The categories the legend lists, in its order.
-    pub const LEGEND: [Self; 8] = [
+    pub const LEGEND: [Self; 9] = [
         Self::Code,
         Self::AgentScratch,
         Self::Toolchain,
@@ -53,6 +55,7 @@ impl Category {
         Self::Media,
         Self::Documents,
         Self::Cache,
+        Self::Container,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -92,6 +95,10 @@ impl Category {
             (Self::Cache, Locale::Zh) => "缓存",
             (Self::Cache, Locale::Ja) => "キャッシュ",
             (Self::Cache, Locale::Ko) => "캐시",
+            (Self::Container, Locale::En) => "Containers",
+            (Self::Container, Locale::Zh) => "容器",
+            (Self::Container, Locale::Ja) => "コンテナ",
+            (Self::Container, Locale::Ko) => "컨테이너",
             (Self::Other, Locale::En) => "Other",
             (Self::Other, Locale::Zh) => "其他",
             (Self::Other, Locale::Ja) => "その他",
@@ -239,6 +246,8 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         // Windows: see `reclaim_of`.
         | "temp" | "$recycle.bin" | "npm-cache" | "v3-cache" | "inetcache"
         | "d3dscache" | "dxcache" | "glcache" | "crashdumps" => Category::Cache,
+        "com.docker.docker" | "orbstack" | ".orbstack" | ".colima"
+        | ".lima" => Category::Container,
         _ => return None,
     };
     Some(category)
@@ -251,6 +260,9 @@ pub fn reclaim_of(
     parent: Category,
     has_sibling: impl Fn(&str) -> bool,
 ) -> Option<Reclaim> {
+    if parent == Category::Container {
+        return None;
+    }
     let mut buffer = [0; LOWERED];
     let lower = lowered(name, &mut buffer);
     let reclaim = match &*lower {
@@ -301,11 +313,14 @@ pub fn classify(root: &mut Node) {
         // A top-level directory with an unknown name takes the kind of its
         // largest recognisable child: `~/world` is mostly `.git`.
         let category = category_of_name(&child.name)
+            .or_else(|| {
+                is_container_storage(child, Category::Other, Some(&root.name))
+                    .then_some(Category::Container)
+            })
             .or_else(|| is_git_store(child).then_some(Category::Git))
             .or_else(|| dominant_child_category(child))
             .unwrap_or(Category::Other);
-        let reclaim = child
-            .is_dir()
+        let reclaim = (category != Category::Container && child.is_dir())
             .then(|| reclaim_of(&child.name, Category::Other, has_sibling))
             .flatten();
         classify_below(&mut root.children[index], category, reclaim, 1);
@@ -334,7 +349,15 @@ fn classify_below(
     // decisions: there are half a million directories to get through.
     if depth < crate::tree::PARALLEL_LEVELS {
         let kinds: Vec<(Category, Option<Reclaim>)> = (0..node.children.len())
-            .map(|index| kind_of(&node.children, index, category, reclaim))
+            .map(|index| {
+                kind_of(
+                    &node.children,
+                    index,
+                    category,
+                    reclaim,
+                    Some(&node.name),
+                )
+            })
             .collect();
         node.children.par_iter_mut().zip(kinds).for_each(
             |(child, (category, reclaim))| {
@@ -343,8 +366,13 @@ fn classify_below(
         );
     } else {
         for index in 0..node.children.len() {
-            let (category, reclaim) =
-                kind_of(&node.children, index, category, reclaim);
+            let (category, reclaim) = kind_of(
+                &node.children,
+                index,
+                category,
+                reclaim,
+                Some(&node.name),
+            );
             classify_below(
                 &mut node.children[index],
                 category,
@@ -362,6 +390,7 @@ fn kind_of(
     index: usize,
     category: Category,
     reclaim: Option<Reclaim>,
+    parent_name: Option<&str>,
 ) -> (Category, Option<Reclaim>) {
     let child = &siblings[index];
     if !child.is_dir() {
@@ -370,11 +399,75 @@ fn kind_of(
     let has_sibling =
         |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
     let child_category = category_of_name(&child.name)
+        .or_else(|| {
+            is_container_storage(child, category, parent_name)
+                .then_some(Category::Container)
+        })
         .or_else(|| is_git_store(child).then_some(Category::Git))
         .unwrap_or(category);
-    let child_reclaim =
-        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling));
+    let child_reclaim = if child_category == Category::Container {
+        None
+    } else {
+        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling))
+    };
     (child_category, child_reclaim)
+}
+
+fn is_container_storage(
+    node: &Node,
+    parent: Category,
+    parent_name: Option<&str>,
+) -> bool {
+    if !node.is_dir() {
+        return false;
+    }
+    let has_child = |wanted: &str| {
+        node.children
+            .iter()
+            .any(|child| child.name.eq_ignore_ascii_case(wanted))
+    };
+    let mut buffer = [0; LOWERED];
+    let lower = lowered(&node.name, &mut buffer);
+    match &*lower {
+        "com.docker.docker" | "orbstack" | ".orbstack" | ".colima"
+        | ".lima" => true,
+        "docker" => {
+            parent == Category::Container
+                || parent_name.is_some_and(|p| {
+                    p.eq_ignore_ascii_case("local")
+                        || p.eq_ignore_ascii_case("share")
+                        || p.eq_ignore_ascii_case("lib")
+                })
+                || has_child("wsl")
+                || has_child("vms")
+                || has_child("overlay2")
+                || has_child("buildkit")
+                || has_child("containers")
+                || has_child("volumes")
+                || has_child("image")
+        }
+        "containerd" => {
+            parent == Category::Container
+                || parent_name.is_some_and(|p| p.eq_ignore_ascii_case("lib"))
+                || has_child("tmpmounts")
+                || node
+                    .children
+                    .iter()
+                    .any(|child| child.name.starts_with("io.containerd."))
+        }
+        "containers" => parent == Category::Container || has_child("storage"),
+        "wsl" | "vms" => {
+            parent == Category::Container
+                || parent_name.is_some_and(|p| {
+                    p.eq_ignore_ascii_case("docker")
+                        || p.eq_ignore_ascii_case("data")
+                })
+                || has_child("data")
+                || has_child("disk")
+                || has_child("Docker.raw")
+        }
+        _ => false,
+    }
 }
 
 /// The kind of an unknown directory, from what fills it: the first
@@ -669,6 +762,86 @@ mod tests {
         }
         assert_eq!(category_of_name(".nuget"), Some(Category::Toolchain));
         assert_eq!(category_of_name("OneDriveSetup"), None);
+    }
+
+    #[test]
+    fn container_storage_directories_are_classified_and_never_reclaimable() {
+        let mut root = dir(
+            "tobi",
+            vec![
+                dir(
+                    "Library",
+                    vec![dir(
+                        "Containers",
+                        vec![dir(
+                            "com.docker.docker",
+                            vec![dir(
+                                "Data",
+                                vec![
+                                    dir("vms", vec![file("Docker.raw", 1024)]),
+                                    dir("cache", vec![file("c.bin", 64)]),
+                                ],
+                            )],
+                        )],
+                    )],
+                ),
+                dir("OrbStack", vec![dir("tmp", vec![file("t.img", 512)])]),
+                dir(".colima", vec![dir("default", vec![file("disk", 256)])]),
+                dir(".lima", vec![dir("ubuntu", vec![file("diffdisk", 256)])]),
+                dir(
+                    "Docker",
+                    vec![dir(
+                        "wsl",
+                        vec![dir("data", vec![file("ext4.vhdx", 4096)])],
+                    )],
+                ),
+            ],
+        );
+        aggregate(&mut root, Metric::Bytes);
+        classify(&mut root);
+
+        let docker_desktop =
+            named(&root, &["Library", "Containers", "com.docker.docker"]);
+        assert_eq!(docker_desktop.category, Category::Container);
+        assert_eq!(docker_desktop.reclaim, None);
+        assert_eq!(
+            named(
+                &root,
+                &["Library", "Containers", "com.docker.docker", "Data", "vms"]
+            )
+            .category,
+            Category::Container
+        );
+        assert_eq!(
+            named(
+                &root,
+                &[
+                    "Library",
+                    "Containers",
+                    "com.docker.docker",
+                    "Data",
+                    "cache"
+                ]
+            )
+            .reclaim,
+            None,
+            "caches inside container storage must never be reclaimable"
+        );
+
+        for top in ["OrbStack", ".colima", ".lima", "Docker"] {
+            let node = named(&root, &[top]);
+            assert_eq!(node.category, Category::Container, "{top}");
+            assert_eq!(node.reclaim, None, "{top}");
+        }
+        assert_eq!(
+            named(&root, &["OrbStack", "tmp"]).reclaim,
+            None,
+            "tmp inside OrbStack must never be reclaimable"
+        );
+        assert_eq!(
+            named(&root, &["Docker", "wsl"]).category,
+            Category::Container
+        );
     }
 
     #[test]

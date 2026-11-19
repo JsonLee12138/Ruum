@@ -1,8 +1,9 @@
 //! Left Icon Rail and full-page navigation views.
 //!
 //! Provides the primary navigation rail and the full-page views:
-//! Sources, Watchdog, and Settings.
+//! Docker, Remote, Watchdog, and Settings.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::base::CheckboxState;
@@ -10,26 +11,30 @@ use gpui_kit::base::input::InputState;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, Context, Div, ElementId, Entity,
-    FocusHandle, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, Rems, SharedString, Stateful,
+    FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Svg, Transformation, Window, div,
-    radians, svg,
+    radians, relative, svg,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, IconName, button, checkbox, dialog_button,
     dialog_description, dialog_popup, dialog_title, with_tooltip,
 };
 use ruum_core::cli_install::CliInstallStatus;
+use ruum_core::docker_adapter::{
+    DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
+};
 use ruum_core::removal::RemovalMode;
 use ruum_core::size::human_bytes;
 use ruum_core::storage::AuthMode;
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::AiCliProvider;
 
+use crate::palette;
 use crate::power::PowerEfficiency;
 use crate::state::{
-    CleanupConfirmModal, RemoteConnectConfirmModal, Ruum, Screen,
-    SettingsCategory,
+    CleanupConfirmModal, DockerGroupKind, RemoteConnectConfirmModal, Ruum,
+    Screen, SettingsCategory,
 };
 use crate::ui::{icon, size, space, text};
 
@@ -228,8 +233,9 @@ fn rail_button(
 pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
     let theme = cx.omarchy().clone();
     let locale = app.locale;
-    let is_explore = app.screen == Screen::Explore && !app.volumes_open;
-    let is_sources = app.screen == Screen::Sources || app.volumes_open;
+    let is_explore = app.screen == Screen::Explore;
+    let is_docker = app.screen == Screen::Docker;
+    let is_remote = app.screen == Screen::Remote;
     let is_watchdog = app.screen == Screen::Watchdog;
     let is_settings = app.screen == Screen::Settings;
 
@@ -262,13 +268,25 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
                     },
                     cx,
                 ))
+                .when(app.has_local_docker_daemon(), |rail| {
+                    rail.child(rail_button(
+                        "rail-docker",
+                        IconName::Container,
+                        crate::i18n::pages::rail_docker(locale),
+                        is_docker,
+                        |this, _, cx| {
+                            this.navigate_rail(Screen::Docker, cx);
+                        },
+                        cx,
+                    ))
+                })
                 .child(rail_button(
-                    "rail-sources",
-                    IconName::HardDrive,
-                    crate::i18n::pages::rail_sources(locale),
-                    is_sources,
+                    "rail-remote",
+                    IconName::Network,
+                    crate::i18n::pages::rail_remote(locale),
+                    is_remote,
                     |this, _, cx| {
-                        this.navigate_rail(Screen::Sources, cx);
+                        this.navigate_rail(Screen::Remote, cx);
                     },
                     cx,
                 ))
@@ -313,20 +331,10 @@ fn ssh_profiles_card(
             .items_center()
             .justify_between()
             .gap(space::MD)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(space::XXS)
-                    .child(dialog_title(
-                        crate::i18n::pages::ssh_servers_title(locale),
-                        cx,
-                    ))
-                    .child(dialog_description(
-                        crate::i18n::pages::ssh_servers_desc(locale),
-                        cx,
-                    )),
-            )
+            .child(dialog_title(
+                crate::i18n::pages::ssh_servers_title(locale),
+                cx,
+            ))
             .child(
                 div().debug_selector(|| "ssh-add-btn".into()).child(
                     with_tooltip(
@@ -388,6 +396,7 @@ fn ssh_profiles_card(
             let is_checking = app.ssh_checking_profiles.contains(&profile.id);
             let is_analyzing = app.ssh_analyzing_profiles.contains(&profile.id);
             let id_connect = profile.id.clone();
+            let id_browse = profile.id.clone();
             let id_check = profile.id.clone();
             let id_ai = profile.id.clone();
             let id_edit = profile.id.clone();
@@ -431,6 +440,24 @@ fn ssh_profiles_card(
                         },
                     )),
                     crate::i18n::pages::connect_and_scan(locale),
+                ));
+
+            let browse_btn = div()
+                .debug_selector(move || format!("ssh-browse-{index}"))
+                .child(with_tooltip(
+                    gpui_omarchy::icon_button(
+                        ElementId::Name(format!("ssh-browse-{index}").into()),
+                        IconName::FolderOpen,
+                        crate::i18n::pages::ssh_browse_dirs_tooltip(locale),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.open_remote_volumes_modal(&id_browse, cx);
+                        },
+                    )),
+                    crate::i18n::pages::ssh_browse_dirs_tooltip(locale),
                 ));
 
             let check_btn = div()
@@ -555,6 +582,139 @@ fn ssh_profiles_card(
                     crate::i18n::pages::delete_ssh_server(locale),
                 ));
 
+            let pending_banner = profile.pending_script_path.as_ref().map(|p| {
+                let id_run = profile.id.clone();
+                let id_discard = profile.id.clone();
+                let script_run = PathBuf::from(p);
+                let script_view = PathBuf::from(p);
+                let banner_text = crate::i18n::pages::ssh_pending_script_banner(
+                    profile.pending_script_items.unwrap_or(0),
+                    &human_bytes(profile.pending_reclaim_bytes.unwrap_or(0)),
+                    locale,
+                );
+                div()
+                    .id(ElementId::Name(
+                        format!("ssh-pending-banner-{index}").into(),
+                    ))
+                    .debug_selector(move || {
+                        format!("ssh-pending-banner-{index}")
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::SM)
+                    .px(space::SM)
+                    .py(space::XS)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.35))
+                    .bg(theme.accent.opacity(0.08))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.bright)
+                            .child(banner_text),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::XS)
+                            .child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("ssh-pending-run-{index}")
+                                    })
+                                    .child(
+                                        button(
+                                            ElementId::Name(
+                                                format!(
+                                                    "ssh-pending-run-{index}"
+                                                )
+                                                .into(),
+                                            ),
+                                            crate::i18n::pages::ssh_pending_run(
+                                                locale,
+                                            ),
+                                            ButtonVariant::Primary,
+                                            cx,
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.execute_cleanup_script_in_terminal(
+                                                    &id_run,
+                                                    &script_run,
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("ssh-pending-view-{index}")
+                                    })
+                                    .child(
+                                        button(
+                                            ElementId::Name(
+                                                format!(
+                                                    "ssh-pending-view-{index}"
+                                                )
+                                                .into(),
+                                            ),
+                                            crate::i18n::pages::ssh_pending_view(
+                                                locale,
+                                            ),
+                                            ButtonVariant::Secondary,
+                                            cx,
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.reveal_cleanup_script(
+                                                    &script_view,
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("ssh-pending-discard-{index}")
+                                    })
+                                    .child(
+                                        button(
+                                            ElementId::Name(
+                                                format!(
+                                                    "ssh-pending-discard-{index}"
+                                                )
+                                                .into(),
+                                            ),
+                                            crate::i18n::pages::ssh_pending_discard(
+                                                locale,
+                                            ),
+                                            ButtonVariant::Secondary,
+                                            cx,
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.discard_ssh_pending_script(
+                                                    &id_discard,
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                    ),
+                            ),
+                    )
+            });
+
             list = list.child(
                 div()
                     .id(ElementId::Name(format!("ssh-card-{index}").into()))
@@ -604,6 +764,7 @@ fn ssh_profiles_card(
                                     .items_center()
                                     .gap(space::XS)
                                     .child(connect_btn)
+                                    .child(browse_btn)
                                     .child(check_btn)
                                     .child(ai_btn)
                                     .child(edit_btn)
@@ -625,7 +786,8 @@ fn ssh_profiles_card(
                                 )
                             }))
                             .child(space_line),
-                    ),
+                    )
+                    .children(pending_banner),
             );
         }
         card = card.child(list);
@@ -889,159 +1051,19 @@ fn ssh_profiles_card(
         .child(card)
 }
 
-/// Full-page Sources and Drives selection screen.
-pub fn sources_page(
+/// Full-page Remote SSH server configuration screen.
+pub fn remote_page(
     app: &Ruum,
     window: &Window,
     cx: &mut Context<'_, Ruum>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let locale = app.locale;
-
-    let mut rows = div()
-        .id("volume-rows")
-        .debug_selector(|| "volume-rows".into())
-        .flex()
-        .flex_col()
-        .gap(space::XS)
-        .max_h(size::SOURCE_LIST_HEIGHT)
-        .overflow_y_scroll();
-
-    if app.volumes_loading {
-        rows = rows.child(dialog_description(
-            crate::i18n::pages::listing_mounts(locale),
-            cx,
-        ));
-    } else if let Some(error) = &app.volumes_error {
-        rows = rows.child(div().text_color(theme.danger).child(error.clone()));
-    } else if app.volumes.is_empty() {
-        rows = rows.child(dialog_description(
-            crate::i18n::pages::no_mounts_listed(locale),
-            cx,
-        ));
-    }
-
-    for (index, volume) in app.volumes.iter().enumerate() {
-        let highlighted = index == app.volume_highlight;
-        let label = format!(
-            "{}  ·  {}",
-            volume.point.display(),
-            volume
-                .device
-                .as_deref()
-                .unwrap_or_else(|| crate::i18n::pages::mounted_volume(locale))
-        );
-        rows = rows.child(
-            div()
-                .id(ElementId::Name(format!("volume-{index}").into()))
-                .debug_selector(move || format!("volume-{index}"))
-                .px(space::MD)
-                .py(space::SM)
-                .rounded(space::XS)
-                .text_size(text::BODY)
-                .text_color(if highlighted {
-                    theme.bright
-                } else {
-                    theme.foreground
-                })
-                .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
-                .hover(|row| row.bg(theme.accent.opacity(0.1)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.volume_highlight = index;
-                    window.focus(&this.confirm_focus, cx);
-                    cx.notify();
-                })),
-        );
-    }
-
-    let path = app
-        .picker_path
-        .as_ref()
-        .expect("picker prepared before rendering");
-
-    let mounts_card =
-        dialog_popup(cx)
-            .w_full()
-            .child(dialog_title(
-                crate::i18n::pages::card_mounts_title(locale),
-                cx,
-            ))
-            .child(dialog_description(
-                crate::i18n::pages::card_mounts_desc(locale),
-                cx,
-            ))
-            .child(rows)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(space::SM)
-                    .child(
-                        gpui_omarchy::input("source-path", path, window, cx)
-                            .debug_selector(|| "source-path".into())
-                            .flex_1(),
-                    )
-                    .child(
-                        button(
-                            "source-scan-path",
-                            crate::i18n::pages::scan_directory(locale),
-                            ButtonVariant::Secondary,
-                            cx,
-                        )
-                        .disabled(
-                            app.volumes_loading || app.volumes_error.is_some(),
-                        )
-                        .on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.choose_picker_path(cx);
-                            },
-                        )),
-                    ),
-            )
-            .children(app.picker_error.as_ref().map(|error| {
-                div().text_color(theme.danger).child(error.clone())
-            }))
-            .child(
-                div().flex().flex_row().justify_end().gap(space::SM).child(
-                    dialog_button(
-                        "source-scan",
-                        crate::i18n::pages::scan_selected_root(locale),
-                        ButtonVariant::Primary,
-                        cx,
-                    )
-                    .disabled(
-                        app.volumes_loading
-                            || app.volumes_error.is_some()
-                            || app.volumes.is_empty(),
-                    )
-                    .on_click(cx.listener(
-                        |this, _, window, cx| {
-                            this.choose_volume(cx);
-                            this.apply_focus(window, cx);
-                        },
-                    )),
-                ),
-            );
-
     let ssh_card = ssh_profiles_card(app, window, cx);
 
-    let subtitle = if app.awaiting_root {
-        crate::i18n::pages::sources_subtitle_awaiting(locale)
-    } else {
-        crate::i18n::pages::sources_subtitle_ready(locale)
-    };
-
-    let mut subtitle_row = div().text_color(theme.secondary).child(subtitle);
-    if app.awaiting_root {
-        subtitle_row =
-            subtitle_row.debug_selector(|| "choose-root-idle".into());
-    }
-
     div()
-        .id("sources-page")
-        .debug_selector(|| "sources-page".into())
-        .track_focus(&app.confirm_focus)
+        .id("remote-page")
+        .debug_selector(|| "remote-page".into())
         .flex()
         .flex_col()
         .flex_1()
@@ -1052,13 +1074,17 @@ pub fn sources_page(
         .child(
             div()
                 .text_size(text::TITLE)
-                .child(crate::i18n::pages::sources_title(locale)),
+                .child(crate::i18n::pages::remote_title(locale)),
         )
-        .child(subtitle_row)
         .child(
             div()
-                .id("source-picker")
-                .debug_selector(|| "source-picker".into())
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::remote_subtitle(locale)),
+        )
+        .child(
+            div()
+                .id("remote-content")
+                .debug_selector(|| "remote-content".into())
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1066,8 +1092,7 @@ pub fn sources_page(
                 .w_full()
                 .gap(space::LG)
                 .overflow_y_scroll()
-                .child(ssh_card)
-                .child(mounts_card),
+                .child(ssh_card),
         )
 }
 
@@ -3014,7 +3039,10 @@ pub fn cleanup_confirm_view(
         .min_h_0()
         .overflow_y_scroll();
 
-    if modal.request.items.is_empty() {
+    if modal.request.items.is_empty()
+        && modal.request.docker_items.is_empty()
+        && modal.request.docker_permission_hint.is_none()
+    {
         rows = rows.child(dialog_description(
             crate::i18n::pages::no_candidate_items(locale),
             cx,
@@ -3142,9 +3170,237 @@ pub fn cleanup_confirm_view(
         rows = rows.child(row);
     }
 
+    if let Some(ref hint) = modal.request.docker_permission_hint {
+        rows = rows.child(
+            div()
+                .id("confirm-docker-permission-denied")
+                .debug_selector(|| "confirm-docker-permission-denied".into())
+                .flex()
+                .flex_col()
+                .gap(space::XXS)
+                .p(space::SM)
+                .rounded(space::XS)
+                .border_1()
+                .border_color(theme.warning.opacity(0.45))
+                .bg(theme.warning.opacity(0.08))
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.bright)
+                        .child(crate::i18n::review::docker_cleanup_section(
+                            locale,
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(
+                            crate::i18n::review::docker_permission_denied_hint(
+                                hint, locale,
+                            ),
+                        ),
+                ),
+        );
+    }
+
+    if !modal.request.docker_items.is_empty() {
+        rows = rows.child(
+            div()
+                .pt(space::SM)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::review::docker_cleanup_section(locale)),
+        );
+        for (group, group_key, group_label) in [
+            (
+                DockerGroupKind::BuildCache,
+                "cache",
+                crate::i18n::review::docker_group_build_cache(locale),
+            ),
+            (
+                DockerGroupKind::Images,
+                "images",
+                crate::i18n::review::docker_group_unused_images(locale),
+            ),
+            (
+                DockerGroupKind::Containers,
+                "containers",
+                crate::i18n::review::docker_group_stopped_containers(locale),
+            ),
+        ] {
+            let group_indices: Vec<usize> = modal
+                .request
+                .docker_items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let belongs = match group {
+                        DockerGroupKind::BuildCache => {
+                            matches!(item.target, DockerCleanTarget::BuildCache)
+                        }
+                        DockerGroupKind::Images => {
+                            matches!(
+                                item.target,
+                                DockerCleanTarget::Image { .. }
+                            )
+                        }
+                        DockerGroupKind::Containers => matches!(
+                            item.target,
+                            DockerCleanTarget::Container { .. }
+                        ),
+                    };
+                    belongs.then_some(idx)
+                })
+                .collect();
+            if group_indices.is_empty() {
+                continue;
+            }
+            let checked_in_group = group_indices
+                .iter()
+                .filter(|&&idx| {
+                    modal.is_docker_checked(
+                        &modal.request.docker_items[idx].target,
+                    )
+                })
+                .count();
+            let group_state = if checked_in_group == 0 {
+                CheckboxState::Unchecked
+            } else if checked_in_group == group_indices.len() {
+                CheckboxState::Checked
+            } else {
+                CheckboxState::Indeterminate
+            };
+            let entity_group = cx.entity().downgrade();
+            rows = rows.child(
+                div()
+                    .debug_selector(move || {
+                        format!("confirm-docker-group-{group_key}")
+                    })
+                    .pt(space::XS)
+                    .child(
+                        checkbox(
+                            ElementId::Name(
+                                format!("confirm-docker-group-{group_key}")
+                                    .into(),
+                            ),
+                            group_label,
+                            group_state,
+                            cx,
+                        )
+                        .tab_stop(false)
+                        .on_change(
+                            move |_, _, _, cx| {
+                                let _ = entity_group.update(cx, |this, cx| {
+                                    this.modal.toggle_docker_group(group);
+                                    cx.notify();
+                                });
+                            },
+                        ),
+                    ),
+            );
+            for idx in group_indices {
+                let item = &modal.request.docker_items[idx];
+                let is_checked = modal.is_docker_checked(&item.target);
+                let check_state = if is_checked {
+                    CheckboxState::Checked
+                } else {
+                    CheckboxState::Unchecked
+                };
+                let entity_docker = cx.entity().downgrade();
+                let target_clone = item.target.clone();
+                let mut row = div()
+                    .id(ElementId::Name(
+                        format!("confirm-docker-row-{idx}").into(),
+                    ))
+                    .debug_selector(move || format!("confirm-docker-row-{idx}"))
+                    .flex()
+                    .flex_col()
+                    .p(space::SM)
+                    .rounded(space::XS)
+                    .bg(if is_checked {
+                        theme.accent.opacity(0.06)
+                    } else {
+                        theme.accent.opacity(0.0)
+                    })
+                    .border_1()
+                    .border_color(if is_checked {
+                        theme.accent.opacity(0.2)
+                    } else {
+                        theme.divider()
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(space::SM)
+                            .child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("confirm-docker-check-{idx}")
+                                    })
+                                    .child(
+                                        checkbox(
+                                            ElementId::Name(
+                                                format!(
+                                                    "confirm-docker-check-{idx}"
+                                                )
+                                                .into(),
+                                            ),
+                                            item.label.clone(),
+                                            check_state,
+                                            cx,
+                                        )
+                                        .tab_stop(false)
+                                        .on_change(move |_, _, _, cx| {
+                                            let _ = entity_docker.update(
+                                                cx,
+                                                |this, cx| {
+                                                    this.modal
+                                                        .toggle_docker_target(
+                                                            &target_clone,
+                                                        );
+                                                    cx.notify();
+                                                },
+                                            );
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(text::BODY)
+                                    .text_color(theme.bright)
+                                    .child(human_bytes(item.reclaimable_bytes)),
+                            ),
+                    );
+                if let Some(ref detail) = item.detail {
+                    row = row.child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .pl(space::LG)
+                            .child(detail.clone()),
+                    );
+                }
+                if let Some(ref reason) = item.reason {
+                    row = row.child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.accent)
+                            .pl(space::LG)
+                            .child(reason.clone()),
+                    );
+                }
+                rows = rows.child(row);
+            }
+        }
+    }
+
     let summary_text = crate::i18n::pages::confirm_summary(
         modal.selected_count(),
-        modal.request.items.len(),
+        modal.total_count(),
         &human_bytes(modal.selected_bytes()),
         locale,
     );
@@ -3268,6 +3524,11 @@ pub fn cleanup_confirm_view(
         .debug_selector(|| "cleanup-confirm-window".into())
         .track_focus(focus)
         .key_context("CleanupConfirm")
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::CloseWindow, window, cx| {
+                this.cancel(window, cx);
+            },
+        ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             match event.keystroke.key.as_str() {
                 "escape" => this.cancel(window, cx),
@@ -3277,6 +3538,9 @@ pub fn cleanup_confirm_view(
         }))
         .flex()
         .flex_col()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
         .size_full()
         .p(space::XL)
         .bg(theme.background)
@@ -3427,6 +3691,11 @@ pub fn remote_connect_confirm_view(
         .debug_selector(|| "remote-connect-confirm-window".into())
         .track_focus(focus)
         .key_context("RemoteConnectConfirm")
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::CloseWindow, window, cx| {
+                this.deny(window, cx);
+            },
+        ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             match event.keystroke.key.as_str() {
                 "escape" => this.deny(window, cx),
@@ -3436,13 +3705,1157 @@ pub fn remote_connect_confirm_view(
         }))
         .flex()
         .flex_col()
-        .items_center()
-        .justify_center()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
         .size_full()
-        .p(space::XL)
         .bg(theme.background)
         .text_color(theme.foreground)
         .font_family(theme.font)
         .text_size(text::BODY)
-        .child(card)
+        .child(
+            div()
+                .id("remote-connect-confirm-scroll")
+                .flex()
+                .flex_col()
+                .items_center()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .overflow_y_scroll()
+                .p(space::LG)
+                .child(div().flex_1())
+                .child(card)
+                .child(div().flex_1()),
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockerScope {
+    Local,
+    Remote,
+}
+
+/// Dedicated local Docker workspace (`Screen::Docker`) for inspecting usage
+/// and cleaning build cache, unused images, and stopped containers.
+pub fn docker_page(
+    app: &Ruum,
+    _window: &Window,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let body = docker_status_body(
+        div()
+            .id("docker-page-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(space::XXL)
+            .py(space::LG)
+            .gap(space::LG),
+        app,
+        DockerScope::Local,
+        &app.local_docker,
+        &theme,
+        cx,
+    );
+
+    div()
+        .id("docker-page")
+        .debug_selector(|| "docker-page".into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .size_full()
+        .min_h_0()
+        .overflow_hidden()
+        .child(docker_header(app, &theme, cx))
+        .child(body)
+        .child(docker_footer(app, &theme, cx))
+}
+
+/// Centered modal overlay for inspecting remote SSH Docker usage and
+/// generating a deterministic cleanup script from `Screen::Explore`.
+pub fn remote_docker_modal(
+    app: &Ruum,
+    cx: &Context<'_, Ruum>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let source_text = remote_docker_source_label(app);
+    let refresh_label = if app.docker_probing {
+        crate::i18n::pages::docker_refreshing(locale)
+    } else {
+        crate::i18n::pages::docker_refresh_button(locale)
+    };
+    let selected_count = app.selected_review_docker_targets().len();
+    let can_generate = matches!(app.docker, DockerProbeStatus::Available(_))
+        && selected_count > 0;
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .gap(space::MD)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::MD)
+                .child(dialog_title(
+                    crate::i18n::pages::docker_page_title(locale),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .debug_selector(|| "docker-source-badge".into())
+                        .px(space::SM)
+                        .py(space::XXS)
+                        .border_1()
+                        .border_color(theme.divider())
+                        .bg(theme.surface)
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(source_text),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::XS)
+                .child(
+                    div().debug_selector(|| "docker-refresh".into()).child(
+                        action_button_with_spinner(
+                            "docker-refresh",
+                            "docker-refresh-spin",
+                            refresh_label,
+                            app.docker_probing,
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .disabled(app.docker_probing)
+                        .on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.refresh_remote_docker(cx);
+                                window.focus(&this.confirm_focus, cx);
+                            },
+                        )),
+                    ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "remote-docker-close".into())
+                        .child(
+                            gpui_omarchy::icon_button(
+                                "remote-docker-close",
+                                IconName::Close,
+                                crate::i18n::pages::docker_close_button(locale),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.close_remote_docker_modal(cx);
+                                    this.apply_focus(window, cx);
+                                },
+                            )),
+                        ),
+                ),
+        );
+
+    let body = docker_status_body(
+        div()
+            .id("remote-docker-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .gap(space::LG),
+        app,
+        DockerScope::Remote,
+        &app.docker,
+        &theme,
+        cx,
+    );
+
+    let footer = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .gap(space::LG)
+        .pt(space::MD)
+        .border_t_1()
+        .border_color(theme.divider())
+        .child(crate::widgets::hint(
+            "esc",
+            crate::i18n::pages::docker_close_button(locale),
+            cx,
+        ))
+        .child(
+            div()
+                .debug_selector(|| "docker-generate-script".into())
+                .child(
+                    button(
+                        "docker-generate-script",
+                        crate::i18n::review::generate_remote_script_button(
+                            selected_count,
+                            locale,
+                        ),
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .disabled(!can_generate)
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.generate_remote_docker_script(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+        );
+
+    let popup = dialog_popup(cx)
+        .w_full()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .overflow_hidden()
+        .child(header)
+        .child(body)
+        .child(footer);
+
+    let card = div()
+        .id("remote-docker-modal")
+        .debug_selector(|| "remote-docker-modal".into())
+        .track_focus(&app.confirm_focus)
+        .flex()
+        .flex_col()
+        .w(size::DOCKER_MODAL)
+        .max_w_full()
+        .max_h_full()
+        .child(popup);
+
+    let close = cx.entity().downgrade();
+    div()
+        .id("remote-docker-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(theme.background.opacity(0.68))
+        .child(crate::views::centred_popup(card, move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.close_remote_docker_modal(cx);
+                this.apply_focus(window, cx);
+            });
+        }))
+}
+
+fn docker_status_body(
+    mut body: Stateful<Div>,
+    app: &Ruum,
+    scope: DockerScope,
+    status: &DockerProbeStatus,
+    theme: &gpui_omarchy::Theme,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let locale = app.locale;
+    match status {
+        DockerProbeStatus::NotInstalled => {
+            body = body.child(docker_status_banner(
+                "docker-not-installed",
+                IconName::Info,
+                crate::i18n::pages::docker_not_installed_title(locale),
+                crate::i18n::pages::docker_not_installed_hint(locale),
+                theme.secondary,
+                theme,
+            ));
+        }
+        DockerProbeStatus::DaemonStopped => {
+            body = body.child(docker_status_banner(
+                "docker-daemon-stopped",
+                IconName::TriangleAlert,
+                crate::i18n::pages::docker_daemon_stopped_title(locale),
+                crate::i18n::pages::docker_daemon_stopped_hint(locale),
+                theme.warning,
+                theme,
+            ));
+        }
+        DockerProbeStatus::PermissionDenied { socket_hint } => {
+            let hint = crate::i18n::review::docker_permission_denied_hint(
+                socket_hint,
+                locale,
+            );
+            body = body.child(docker_status_banner(
+                "docker-permission-denied",
+                IconName::TriangleAlert,
+                crate::i18n::pages::docker_permission_denied_title(locale),
+                &hint,
+                theme.warning,
+                theme,
+            ));
+        }
+        DockerProbeStatus::Available(summary) => {
+            body = body
+                .child(docker_overview_panel(summary, locale, theme))
+                .child(docker_candidates_section(
+                    app, scope, summary, theme, cx,
+                ));
+        }
+    }
+    body
+}
+
+fn remote_docker_source_label(app: &Ruum) -> String {
+    let alias = app
+        .active_ssh_profile_id
+        .as_ref()
+        .and_then(|id| app.ssh_profiles.iter().find(|p| &p.id == id))
+        .map(|p| p.alias.as_str())
+        .or(app.remote.as_deref())
+        .unwrap_or("SSH");
+    crate::i18n::pages::docker_source_ssh(alias, app.locale)
+}
+
+fn docker_header(
+    app: &Ruum,
+    theme: &gpui_omarchy::Theme,
+    cx: &Context<'_, Ruum>,
+) -> Div {
+    let locale = app.locale;
+    let source_text = crate::i18n::pages::docker_source_local(locale);
+    let refresh_label = if app.local_docker_probing {
+        crate::i18n::pages::docker_refreshing(locale)
+    } else {
+        crate::i18n::pages::docker_refresh_button(locale)
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .gap(space::MD)
+        .px(space::XXL)
+        .py(space::LG)
+        .border_b_1()
+        .border_color(theme.divider())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::MD)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child(crate::i18n::pages::docker_page_title(locale)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "docker-source-badge".into())
+                        .px(space::SM)
+                        .py(space::XXS)
+                        .border_1()
+                        .border_color(theme.divider())
+                        .bg(theme.surface)
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(source_text),
+                ),
+        )
+        .child(
+            div().debug_selector(|| "docker-refresh".into()).child(
+                action_button_with_spinner(
+                    "docker-refresh",
+                    "docker-refresh-spin",
+                    refresh_label,
+                    app.local_docker_probing,
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .disabled(app.local_docker_probing)
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.refresh_local_docker_now(cx);
+                        window.focus(&this.focus, cx);
+                    },
+                )),
+            ),
+        )
+}
+
+fn docker_status_banner(
+    selector: &'static str,
+    icon_name: IconName,
+    title: &str,
+    hint: &str,
+    accent: Hsla,
+    theme: &gpui_omarchy::Theme,
+) -> Stateful<Div> {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.into())
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(space::MD)
+        .p(space::LG)
+        .border_1()
+        .border_color(accent.opacity(0.45))
+        .bg(accent.opacity(0.08))
+        .child(
+            div()
+                .pt(space::XXS)
+                .text_color(accent)
+                .child(gpui_omarchy::icon(icon_name)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XS)
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child(title.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.secondary)
+                        .child(hint.to_owned()),
+                ),
+        )
+}
+
+fn docker_overview_panel(
+    summary: &DockerUsageSummary,
+    locale: crate::i18n::Locale,
+    theme: &gpui_omarchy::Theme,
+) -> Stateful<Div> {
+    let highlight = palette::highlight(theme);
+    let reclaimable = summary.safe_reclaimable_bytes();
+    let total_bytes = summary
+        .images
+        .size_bytes
+        .saturating_add(summary.containers.size_bytes)
+        .saturating_add(summary.build_cache.size_bytes)
+        .saturating_add(summary.local_volumes.size_bytes);
+
+    let mut bar = div()
+        .flex()
+        .flex_row()
+        .w_full()
+        .h(space::SM)
+        .bg(theme.foreground.opacity(0.08))
+        .overflow_hidden();
+    if total_bytes > 0 {
+        let total_f = total_bytes as f32;
+        for (bytes, color) in [
+            (summary.images.size_bytes, theme.accent),
+            (summary.containers.size_bytes, theme.warning),
+            (summary.build_cache.size_bytes, highlight),
+            (summary.local_volumes.size_bytes, theme.secondary),
+        ] {
+            if bytes > 0 {
+                let ratio = (bytes as f32 / total_f).clamp(0.0, 1.0);
+                bar = bar.child(div().h_full().w(relative(ratio)).bg(color));
+            }
+        }
+    }
+
+    let bc_reclaim = summary
+        .build_cache_reclaimable_bytes
+        .max(summary.build_cache.reclaimable_bytes);
+    let shared_note = (summary.build_cache_shared_bytes > 0).then(|| {
+        crate::i18n::pages::docker_card_shared_note(
+            &human_bytes(summary.build_cache_shared_bytes),
+            locale,
+        )
+    });
+
+    div()
+        .id("docker-overview")
+        .debug_selector(|| "docker-overview".into())
+        .flex()
+        .flex_col()
+        .gap(space::MD)
+        .p(space::LG)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.surface)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child(crate::i18n::pages::docker_overview_title(
+                            locale,
+                        )),
+                )
+                .child(
+                    div().text_size(text::BODY).text_color(highlight).child(
+                        crate::i18n::pages::docker_overview_reclaimable(
+                            &human_bytes(reclaimable),
+                            locale,
+                        ),
+                    ),
+                ),
+        )
+        .child(bar)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(space::MD)
+                .child(docker_metric_card(
+                    "docker-card-images",
+                    crate::i18n::pages::docker_card_images(locale),
+                    &human_bytes(summary.images.size_bytes),
+                    &crate::i18n::pages::docker_card_meta(
+                        summary.images.total_count,
+                        summary.images.active_count,
+                        &human_bytes(summary.images.reclaimable_bytes),
+                        locale,
+                    ),
+                    theme.accent,
+                    None,
+                    None,
+                    theme,
+                ))
+                .child(docker_metric_card(
+                    "docker-card-containers",
+                    crate::i18n::pages::docker_card_containers(locale),
+                    &human_bytes(summary.containers.size_bytes),
+                    &crate::i18n::pages::docker_card_meta(
+                        summary.containers.total_count,
+                        summary.containers.active_count,
+                        &human_bytes(summary.containers.reclaimable_bytes),
+                        locale,
+                    ),
+                    theme.warning,
+                    None,
+                    None,
+                    theme,
+                ))
+                .child(docker_metric_card(
+                    "docker-card-build-cache",
+                    crate::i18n::pages::docker_card_build_cache(locale),
+                    &human_bytes(summary.build_cache.size_bytes),
+                    &crate::i18n::pages::docker_card_meta(
+                        summary.build_cache.total_count,
+                        summary.build_cache.active_count,
+                        &human_bytes(bc_reclaim),
+                        locale,
+                    ),
+                    highlight,
+                    None,
+                    shared_note.map(|text| ("docker-build-cache-shared", text)),
+                    theme,
+                ))
+                .child(docker_metric_card(
+                    "docker-card-volumes",
+                    crate::i18n::pages::docker_card_local_volumes(locale),
+                    &human_bytes(summary.local_volumes.size_bytes),
+                    &crate::i18n::pages::docker_card_meta(
+                        summary.local_volumes.total_count,
+                        summary.local_volumes.active_count,
+                        &human_bytes(summary.local_volumes.reclaimable_bytes),
+                        locale,
+                    ),
+                    theme.secondary,
+                    Some(crate::i18n::pages::docker_card_protected_badge(
+                        locale,
+                    )),
+                    None,
+                    theme,
+                )),
+        )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "metric card renders fixed four-slot summary fields"
+)]
+fn docker_metric_card(
+    selector: &'static str,
+    title: &str,
+    size_text: &str,
+    meta_text: &str,
+    accent: Hsla,
+    badge: Option<&str>,
+    note: Option<(&'static str, String)>,
+    theme: &gpui_omarchy::Theme,
+) -> Stateful<Div> {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w(Rems(12.0))
+        .gap(space::XS)
+        .p(space::MD)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.inset)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::XS)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::XS)
+                        .child(div().size(size::SWATCH).bg(accent))
+                        .child(
+                            div()
+                                .text_size(text::BODY)
+                                .text_color(theme.bright)
+                                .child(title.to_owned()),
+                        ),
+                )
+                .children(badge.map(|b| {
+                    div()
+                        .px(space::XS)
+                        .border_1()
+                        .border_color(theme.divider())
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(b.to_owned())
+                })),
+        )
+        .child(
+            div()
+                .text_size(text::HEADING)
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.bright)
+                .child(size_text.to_owned()),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(meta_text.to_owned()),
+        )
+        .children(note.map(|(note_sel, text)| {
+            div()
+                .debug_selector(move || note_sel.into())
+                .text_size(text::CAPTION)
+                .text_color(theme.warning)
+                .child(text)
+        }))
+}
+
+fn docker_candidates_section(
+    app: &Ruum,
+    scope: DockerScope,
+    summary: &DockerUsageSummary,
+    theme: &gpui_omarchy::Theme,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let locale = app.locale;
+    let (items, selected_count, selected_bytes) = match scope {
+        DockerScope::Local => (
+            app.local_docker_items().0,
+            app.selected_local_docker_targets().len(),
+            app.selected_local_docker_bytes(),
+        ),
+        DockerScope::Remote => (
+            app.review_docker_items().0,
+            app.selected_review_docker_targets().len(),
+            app.selected_review_docker_bytes(),
+        ),
+    };
+    let has_items = !items.is_empty();
+
+    let mut panel = div()
+        .id("docker-candidates")
+        .debug_selector(|| "docker-candidates".into())
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .p(space::LG)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.inset)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XXS)
+                        .child(
+                            div()
+                                .text_size(text::TITLE)
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.bright)
+                                .child(
+                                    crate::i18n::review::docker_cleanup_section(
+                                        locale,
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| {
+                                    "docker-selected-summary".into()
+                                })
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(format!(
+                                    "{} \u{00b7} {}",
+                                    crate::i18n::review::row_docker_items(
+                                        locale
+                                    ),
+                                    crate::i18n::pages::docker_selected_summary(
+                                        selected_count,
+                                        &human_bytes(selected_bytes),
+                                        locale,
+                                    )
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(space::XS)
+                        .child(
+                            div()
+                                .debug_selector(|| "docker-select-all".into())
+                                .child(
+                                    button(
+                                        "docker-select-all",
+                                        crate::i18n::review::docker_select_all(
+                                            locale,
+                                        ),
+                                        ButtonVariant::Secondary,
+                                        cx,
+                                    )
+                                    .disabled(!has_items)
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            match scope {
+                                                DockerScope::Local => this
+                                                    .select_all_local_docker(),
+                                                DockerScope::Remote => this
+                                                    .select_all_review_docker(),
+                                            }
+                                            this.apply_focus(window, cx);
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "docker-select-none".into())
+                                .child(
+                                    button(
+                                        "docker-select-none",
+                                        crate::i18n::review::docker_select_none(
+                                            locale,
+                                        ),
+                                        ButtonVariant::Secondary,
+                                        cx,
+                                    )
+                                    .disabled(!has_items)
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            match scope {
+                                                DockerScope::Local => this
+                                                    .select_none_local_docker(),
+                                                DockerScope::Remote => this
+                                                    .select_none_review_docker(
+                                                    ),
+                                            }
+                                            this.apply_focus(window, cx);
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        ),
+                ),
+        );
+
+    if items.is_empty() {
+        panel = panel.child(
+            div()
+                .p(space::MD)
+                .border_1()
+                .border_color(theme.divider())
+                .bg(theme.surface)
+                .text_size(text::BODY)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::docker_no_candidates_hint(
+                    summary.detailed,
+                    locale,
+                )),
+        );
+    } else {
+        for (group, group_key, group_label) in [
+            (
+                DockerGroupKind::BuildCache,
+                "cache",
+                crate::i18n::review::docker_group_build_cache(locale),
+            ),
+            (
+                DockerGroupKind::Images,
+                "images",
+                crate::i18n::review::docker_group_unused_images(locale),
+            ),
+            (
+                DockerGroupKind::Containers,
+                "containers",
+                crate::i18n::review::docker_group_stopped_containers(locale),
+            ),
+        ] {
+            panel = docker_append_group_rows(
+                panel,
+                app,
+                scope,
+                &items,
+                group,
+                group_key,
+                group_label,
+                theme,
+                cx,
+            );
+        }
+    }
+
+    panel.child(docker_volumes_notice_row(summary, locale, theme))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "group section helper shares parent styling and context"
+)]
+fn docker_append_group_rows(
+    mut panel: Stateful<Div>,
+    app: &Ruum,
+    scope: DockerScope,
+    items: &[ruum_core::confirm::DockerConfirmItem],
+    group: DockerGroupKind,
+    group_key: &'static str,
+    group_label: &str,
+    theme: &gpui_omarchy::Theme,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let group_items: Vec<_> = items
+        .iter()
+        .filter(|item| match group {
+            DockerGroupKind::BuildCache => {
+                matches!(item.target, DockerCleanTarget::BuildCache)
+            }
+            DockerGroupKind::Images => {
+                matches!(item.target, DockerCleanTarget::Image { .. })
+            }
+            DockerGroupKind::Containers => {
+                matches!(item.target, DockerCleanTarget::Container { .. })
+            }
+        })
+        .collect();
+    if group_items.is_empty() {
+        return panel;
+    }
+
+    let checked_set = match scope {
+        DockerScope::Local => &app.local_docker_checked,
+        DockerScope::Remote => &app.review_docker_checked,
+    };
+    let checked_count = group_items
+        .iter()
+        .filter(|item| checked_set.contains(&item.target))
+        .count();
+    let group_state = if checked_count == 0 {
+        CheckboxState::Unchecked
+    } else if checked_count == group_items.len() {
+        CheckboxState::Checked
+    } else {
+        CheckboxState::Indeterminate
+    };
+    let entity_group = cx.entity().downgrade();
+    panel = panel.child(
+        div()
+            .debug_selector(move || format!("docker-group-{group_key}"))
+            .pt(space::XS)
+            .child(
+                checkbox(
+                    ElementId::Name(format!("docker-group-{group_key}").into()),
+                    group_label.to_owned(),
+                    group_state,
+                    cx,
+                )
+                .tab_stop(false)
+                .on_change(move |_, _, _, cx| {
+                    let _ = entity_group.update(cx, |this, cx| {
+                        match scope {
+                            DockerScope::Local => {
+                                this.toggle_local_docker_group(group);
+                            }
+                            DockerScope::Remote => {
+                                this.toggle_review_docker_group(group);
+                            }
+                        }
+                        cx.notify();
+                    });
+                }),
+            ),
+    );
+
+    for (group_idx, item) in group_items.into_iter().enumerate() {
+        panel = panel.child(docker_candidate_item_row(
+            group_idx,
+            scope,
+            item,
+            checked_set.contains(&item.target),
+            theme,
+            cx,
+        ));
+    }
+    panel
+}
+
+fn docker_candidate_item_row(
+    group_idx: usize,
+    scope: DockerScope,
+    item: &ruum_core::confirm::DockerConfirmItem,
+    is_checked: bool,
+    theme: &gpui_omarchy::Theme,
+    cx: &Context<'_, Ruum>,
+) -> Div {
+    let selector = match &item.target {
+        DockerCleanTarget::BuildCache => "docker-build-cache".to_owned(),
+        DockerCleanTarget::Image { .. } => {
+            format!("docker-image-{group_idx}")
+        }
+        DockerCleanTarget::Container { .. } => {
+            format!("docker-container-{group_idx}")
+        }
+    };
+    let check_state = if is_checked {
+        CheckboxState::Checked
+    } else {
+        CheckboxState::Unchecked
+    };
+    let entity_item = cx.entity().downgrade();
+    let target_clone = item.target.clone();
+    let mut row = div()
+        .flex()
+        .flex_col()
+        .gap(space::XXS)
+        .px(space::SM)
+        .py(space::XS)
+        .border_1()
+        .border_color(if is_checked {
+            theme.accent.opacity(0.35)
+        } else {
+            theme.divider()
+        })
+        .bg(if is_checked {
+            theme.accent.opacity(0.08)
+        } else {
+            theme.surface
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .debug_selector({
+                            let selector = selector.clone();
+                            move || selector
+                        })
+                        .child(
+                            checkbox(
+                                ElementId::Name(selector.into()),
+                                item.label.clone(),
+                                check_state,
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(
+                                move |_, _, _, cx| {
+                                    let _ =
+                                        entity_item.update(cx, |this, cx| {
+                                            match scope {
+                                                DockerScope::Local => {
+                                                    this.toggle_local_docker_target(
+                                                        &target_clone,
+                                                    );
+                                                }
+                                                DockerScope::Remote => {
+                                                    this.toggle_review_docker_target(
+                                                        &target_clone,
+                                                    );
+                                                }
+                                            }
+                                            cx.notify();
+                                        });
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.bright)
+                        .child(human_bytes(item.reclaimable_bytes)),
+                ),
+        );
+    if let Some(ref detail) = item.detail {
+        row = row.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .pl(space::LG)
+                .child(detail.clone()),
+        );
+    }
+    row
+}
+
+fn docker_volumes_notice_row(
+    summary: &DockerUsageSummary,
+    locale: crate::i18n::Locale,
+    theme: &gpui_omarchy::Theme,
+) -> Stateful<Div> {
+    div()
+        .id("docker-volumes-protected")
+        .debug_selector(|| "docker-volumes-protected".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::SM)
+        .mt(space::XS)
+        .px(space::SM)
+        .py(space::XS)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.surface)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XXS)
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.foreground)
+                        .child(
+                            crate::i18n::pages::docker_volumes_notice_title(
+                                locale,
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(
+                            crate::i18n::pages::docker_volumes_notice_detail(
+                                summary.local_volumes.total_count,
+                                &human_bytes(summary.local_volumes.size_bytes),
+                                locale,
+                            ),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .px(space::XS)
+                .border_1()
+                .border_color(theme.divider())
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::docker_card_protected_badge(locale)),
+        )
+}
+
+fn docker_footer(
+    app: &Ruum,
+    theme: &gpui_omarchy::Theme,
+    cx: &Context<'_, Ruum>,
+) -> Div {
+    let locale = app.locale;
+    let selected_targets = app.selected_local_docker_targets();
+    let selected_count = selected_targets.len();
+    let can_execute =
+        matches!(app.local_docker, DockerProbeStatus::Available(_))
+            && selected_count > 0;
+
+    let action_slot = div().debug_selector(|| "docker-commit".into()).child(
+        button(
+            "docker-commit",
+            crate::i18n::pages::docker_commit_button(selected_count, locale),
+            ButtonVariant::Primary,
+            cx,
+        )
+        .disabled(!can_execute)
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.commit_docker_cleanup(cx);
+            this.apply_focus(window, cx);
+        })),
+    );
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .gap(space::LG)
+        .px(space::XXL)
+        .py(space::MD)
+        .border_t_1()
+        .border_color(theme.divider())
+        .child(crate::widgets::hint(
+            "esc",
+            crate::i18n::review::back(locale),
+            cx,
+        ))
+        .child(action_slot)
 }

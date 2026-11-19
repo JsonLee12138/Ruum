@@ -16,6 +16,11 @@ const FOOTER: u64 = 24;
 const MAX_MANIFEST: u64 = 64 << 10;
 const MAX_PAYLOAD: u64 = 64 << 20;
 
+/// Standalone cross-platform Linux static `ruum-scan` bundle filename.
+pub const PACK_FILE_NAME: &str = "ruum-scan-linux.pack";
+/// Environment variable overriding the `ruum-scan-linux.pack` path.
+pub const PACK_ENV_VAR: &str = "RUUM_SCANNER_PACK";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub arch: String,
@@ -49,6 +54,16 @@ impl Archive {
     pub fn open_with_sibling_fallback(
         current_exe: &Path,
     ) -> io::Result<Option<Self>> {
+        let env_pack = std::env::var_os(PACK_ENV_VAR)
+            .filter(|val| !val.is_empty())
+            .map(PathBuf::from);
+        Self::open_with_pack_lookup(current_exe, env_pack.as_deref())
+    }
+
+    pub(crate) fn open_with_pack_lookup(
+        current_exe: &Path,
+        env_pack: Option<&Path>,
+    ) -> io::Result<Option<Self>> {
         let canonical = dunce::canonicalize(current_exe)
             .unwrap_or_else(|_| current_exe.to_path_buf());
         if let Some(archive) = Self::open(&canonical)? {
@@ -57,8 +72,34 @@ impl Archive {
         let sibling_name = if cfg!(windows) { "ruum.exe" } else { "ruum" };
         if let Some(parent) = canonical.parent() {
             let sibling = parent.join(sibling_name);
-            if sibling != canonical && sibling.is_file() {
-                return Self::open(&sibling);
+            if sibling != canonical
+                && sibling.is_file()
+                && let Some(archive) = Self::open(&sibling)?
+            {
+                return Ok(Some(archive));
+            }
+        }
+        if let Some(pack_path) = env_pack
+            && pack_path.is_file()
+            && let Some(archive) = Self::open(pack_path)?
+        {
+            return Ok(Some(archive));
+        }
+        if let Some(parent) = canonical.parent() {
+            let sibling_pack = parent.join(PACK_FILE_NAME);
+            if sibling_pack.is_file()
+                && let Some(archive) = Self::open(&sibling_pack)?
+            {
+                return Ok(Some(archive));
+            }
+            if let Some(contents) = parent.parent() {
+                let resources_pack =
+                    contents.join("Resources").join(PACK_FILE_NAME);
+                if resources_pack.is_file()
+                    && let Some(archive) = Self::open(&resources_pack)?
+                {
+                    return Ok(Some(archive));
+                }
             }
         }
         Ok(None)
@@ -193,6 +234,76 @@ pub fn append(binary: &Path, helpers: &[(String, PathBuf)]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Write a standalone `ruum-scan-linux.pack` resource file (`base_length = 0`).
+pub fn write_pack(
+    out: &Path,
+    binaries: &[(String, PathBuf)],
+) -> io::Result<()> {
+    if binaries.is_empty() {
+        return Err(io::Error::other(
+            "scanner pack requires at least one binary",
+        ));
+    }
+    let mut entries = Vec::with_capacity(binaries.len());
+    let mut payloads = Vec::with_capacity(binaries.len());
+    let mut arches = std::collections::HashSet::new();
+    let mut offset = 0_u64;
+    for (arch, path) in binaries {
+        if !matches!(arch.as_str(), "x86_64" | "aarch64") {
+            return Err(io::Error::other(format!(
+                "unsupported scanner architecture `{arch}`"
+            )));
+        }
+        if !arches.insert(arch.as_str()) {
+            return Err(io::Error::other(format!(
+                "duplicate scanner architecture `{arch}`"
+            )));
+        }
+        let bytes = std::fs::read(path)?;
+        validate_static_elf(&bytes, arch)?;
+        entries.push(Entry {
+            arch: arch.clone(),
+            offset,
+            length: bytes.len() as u64,
+            sha256: digest(&bytes),
+        });
+        offset += bytes.len() as u64;
+        payloads.push(bytes);
+    }
+    let json = serde_json::to_vec(&Manifest {
+        version: 1,
+        base_length: 0,
+        entries,
+    })
+    .map_err(io::Error::other)?;
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(PACK_FILE_NAME);
+    let tmp =
+        out.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    let write_res = (|| {
+        let mut file = File::create(&tmp)?;
+        for bytes in payloads {
+            file.write_all(&bytes)?;
+        }
+        file.write_all(&json)?;
+        file.write_all(&(json.len() as u64).to_le_bytes())?;
+        file.write_all(MAGIC)?;
+        file.sync_all()
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    std::fs::rename(&tmp, out)
+}
+
 /// Our portability promise is static ELF64, not merely a musl filename.
 pub fn validate_static_elf(bytes: &[u8], arch: &str) -> io::Result<()> {
     let invalid = || io::Error::other("scanner must be static Linux ELF64");
@@ -231,9 +342,13 @@ mod tests {
     use super::*;
 
     fn elf() -> Vec<u8> {
+        elf_for_machine(62)
+    }
+
+    fn elf_for_machine(machine: u16) -> Vec<u8> {
         let mut bytes = vec![0; 120];
         bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
         bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
         bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
         bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
@@ -325,5 +440,69 @@ mod tests {
                 .unwrap();
             assert_eq!(from_link.load("x86_64").unwrap().1, elf());
         }
+    }
+
+    #[test]
+    fn write_pack_and_cross_platform_pack_fallback_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let x64_elf = elf_for_machine(62);
+        let arm_elf = elf_for_machine(183);
+        let x64_path = dir.path().join("ruum-scan-x64");
+        let arm_path = dir.path().join("ruum-scan-arm64");
+        std::fs::write(&x64_path, &x64_elf).unwrap();
+        std::fs::write(&arm_path, &arm_elf).unwrap();
+
+        assert!(write_pack(&dir.path().join("empty.pack"), &[]).is_err());
+
+        // 1. macOS bundle layout: Contents/MacOS/ruum-gui (+ sibling ruum with
+        //    no trailer) -> Contents/Resources/ruum-scan-linux.pack.
+        let contents = dir.path().join("ruum.app/Contents");
+        let macos = contents.join("MacOS");
+        let resources = contents.join("Resources");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        let cli_bin =
+            macos.join(if cfg!(windows) { "ruum.exe" } else { "ruum" });
+        let gui_bin = macos.join(if cfg!(windows) {
+            "ruum-gui.exe"
+        } else {
+            "ruum-gui"
+        });
+        std::fs::write(&cli_bin, b"cli-no-trailer").unwrap();
+        std::fs::write(&gui_bin, b"gui-no-trailer").unwrap();
+
+        let resources_pack = resources.join(PACK_FILE_NAME);
+        write_pack(
+            &resources_pack,
+            &[
+                ("x86_64".into(), x64_path.clone()),
+                ("aarch64".into(), arm_path.clone()),
+            ],
+        )
+        .unwrap();
+        let from_resources = Archive::open_with_pack_lookup(&gui_bin, None)
+            .unwrap()
+            .expect("must find ../Resources/ruum-scan-linux.pack");
+        assert_eq!(from_resources.load("x86_64").unwrap().1, x64_elf);
+        assert_eq!(from_resources.load("aarch64").unwrap().1, arm_elf);
+
+        // 2. Sibling pack takes precedence over ../Resources pack.
+        let sibling_pack = macos.join(PACK_FILE_NAME);
+        write_pack(&sibling_pack, &[("x86_64".into(), x64_path)]).unwrap();
+        let from_sibling = Archive::open_with_pack_lookup(&gui_bin, None)
+            .unwrap()
+            .expect("must find sibling ruum-scan-linux.pack");
+        assert!(from_sibling.load("x86_64").is_ok());
+        assert!(from_sibling.load("aarch64").is_err());
+
+        // 3. RUUM_SCANNER_PACK takes precedence over sibling/Resources packs.
+        let env_pack = dir.path().join("override.pack");
+        write_pack(&env_pack, &[("aarch64".into(), arm_path)]).unwrap();
+        let from_env =
+            Archive::open_with_pack_lookup(&gui_bin, Some(&env_pack))
+                .unwrap()
+                .expect("must find RUUM_SCANNER_PACK override");
+        assert!(from_env.load("aarch64").is_ok());
+        assert!(from_env.load("x86_64").is_err());
     }
 }

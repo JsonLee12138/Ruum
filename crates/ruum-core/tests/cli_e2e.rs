@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use ruum_core::confirm::{
-    CleanupConfirmDecision, IpcListenerGuard, IpcRequest, IpcResponse,
-    RemoteConnectConfirmDecision, load_or_create_ipc_token,
+    IpcListenerGuard, IpcRequest, IpcResponse, RemoteConnectConfirmDecision,
+    load_or_create_ipc_token,
 };
 use ruum_core::ssh_session::{
     ENV_ASKPASS_CMD, ENV_ASKPASS_ENDPOINT, ENV_ASKPASS_TOKEN, SshAuthMaterial,
@@ -1321,6 +1321,38 @@ fn cli_extract_scanner_validation_and_missing_trailer() {
 }
 
 #[test]
+fn cli_extract_scanner_reads_ruum_scanner_pack() {
+    let sb = Sandbox::new();
+    let mut elf = vec![0_u8; 120];
+    elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+
+    let helper_src = sb.tmp.join("ruum-scan-x64");
+    fs::write(&helper_src, &elf).unwrap();
+    let pack_path = sb.tmp.join(ruum_core::payload::PACK_FILE_NAME);
+    ruum_core::payload::write_pack(
+        &pack_path,
+        &[("x86_64".into(), helper_src)],
+    )
+    .unwrap();
+
+    let extracted = sb.tmp.join("extracted-scan");
+    let mut cmd = sb.cmd();
+    cmd.env(ruum_core::payload::PACK_ENV_VAR, &pack_path);
+    cmd.args([
+        "extract-scanner",
+        "x86_64",
+        extracted.to_str().expect("utf8"),
+    ]);
+    let out = cmd.output().expect("run extract-scanner");
+    assert!(out.status.success(), "{}", stderr_str(&out));
+    assert_eq!(fs::read(&extracted).unwrap(), elf);
+}
+
+#[test]
 fn cli_mcp_help_and_invalid_options() {
     let sb = Sandbox::new();
 
@@ -1730,9 +1762,9 @@ fn cli_mcp_remote_profiles_fail_closed_and_ipc_approved_flow() {
         let handled_srv = Arc::clone(&handled);
 
         let ipc_thread = thread::spawn(move || {
-            // Expect 1 remote connect confirmation + 1 cleanup confirmation.
+            // Expect 1 remote connect confirmation; remote trash_paths is disabled.
             while !stop_ipc_srv.load(Ordering::Acquire)
-                && handled_srv.load(Ordering::Acquire) < 2
+                && handled_srv.load(Ordering::Acquire) < 1
             {
                 let count_ref = &handled_srv;
                 let stop_ref = &stop_ipc_srv;
@@ -1752,19 +1784,6 @@ fn cli_mcp_remote_profiles_fail_closed_and_ipc_approved_flow() {
                                 Ok(IpcResponse::RemoteConnectDecision {
                                     decision:
                                         RemoteConnectConfirmDecision::Approved,
-                                })
-                            }
-                            IpcRequest::ConfirmCleanup { request, .. } => {
-                                let selected = request
-                                    .items
-                                    .into_iter()
-                                    .map(|i| i.path)
-                                    .collect();
-                                Ok(IpcResponse::ConfirmDecision {
-                                    decision:
-                                        CleanupConfirmDecision::Confirmed {
-                                            selected_paths: selected,
-                                        },
                                 })
                             }
                             other => {
@@ -1830,21 +1849,31 @@ fn cli_mcp_remote_profiles_fail_closed_and_ipc_approved_flow() {
         assert_eq!(scan_payload["totals"]["bytes"], 4096);
 
         let (trash_err, trash_payload) = parse_tool_result(&ok_resps[2]);
-        assert!(!trash_err, "approved remote trash failed: {trash_payload}");
-        assert_eq!(
-            handled.load(Ordering::Acquire),
-            2,
-            "expected ConfirmRemoteConnect + ConfirmCleanup IPC calls"
+        assert!(
+            trash_err,
+            "remote trash_paths must disable background SSH deletion: {trash_payload}"
         );
         assert!(
-            sb.root.path().join("ssh_trash.marker").exists(),
-            "remote trash command should execute via stub ssh"
+            trash_payload
+                .as_str()
+                .unwrap_or_default()
+                .contains("disabled"),
+            "unexpected trash_paths payload: {trash_payload}"
+        );
+        assert_eq!(
+            handled.load(Ordering::Acquire),
+            1,
+            "expected ConfirmRemoteConnect IPC call only"
+        );
+        assert!(
+            !sb.root.path().join("ssh_trash.marker").exists(),
+            "remote background trash must never execute via ssh"
         );
     }
 }
 
 #[test]
-fn cli_space_reports_json_and_permission_denied() {
+fn cli_space_reports_json_and_unreadable_directory_without_root_prompt() {
     let sb = Sandbox::new();
 
     let help = sb.run(&["space", "--help"]);
@@ -1883,7 +1912,8 @@ fn cli_space_reports_json_and_permission_denied() {
     let file_str = file_path.to_string_lossy().into_owned();
     assert!(!sb.run(&["space", &file_str]).status.success());
 
-    // Unreadable directory reports permission denied on Unix (non-root).
+    // Unreadable directory still returns space stats with readable=false
+    // and never tells the user root privileges are required.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1894,12 +1924,21 @@ fn cli_space_reports_json_and_permission_denied() {
             .unwrap();
         let locked_str = locked.to_string_lossy().into_owned();
         if fs::read_dir(&locked).is_err() {
-            let denied = sb.run(&["space", &locked_str, "--json"]);
-            assert!(!denied.status.success());
-            let err_msg = stderr_str(&denied).to_ascii_lowercase();
+            let space_locked = sb.run(&["space", &locked_str, "--json"]);
             assert!(
-                err_msg.contains("permission denied"),
-                "expected permission denied error: {err_msg}"
+                space_locked.status.success(),
+                "ruum space on unreadable dir must succeed: {}",
+                stderr_str(&space_locked)
+            );
+            let locked_json: Value =
+                serde_json::from_str(&stdout_str(&space_locked))
+                    .expect("locked space json");
+            assert_eq!(locked_json["readable"], false);
+            assert!(locked_json["total"].as_u64().unwrap_or(0) > 0);
+            assert!(
+                !stderr_str(&space_locked)
+                    .to_ascii_lowercase()
+                    .contains("root privileges")
             );
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))
@@ -2171,5 +2210,183 @@ fn cli_ssh_defaults_and_preserves_tilde_default_path() {
         )
         .expect("parse captured ssh req");
         assert_eq!(captured["root"], "~/workspace");
+    }
+}
+
+#[test]
+fn cli_run_script_bridges_ssh_session_pipes_payload_and_clears_pending() {
+    use ruum_core::export::{
+        RemoteCleanupScriptSpec, build_remote_cleanup_script,
+        write_cleanup_script_atomic,
+    };
+    use ruum_core::identity::HostIdentity;
+    use ruum_core::remote::Header;
+    use ruum_core::removal::Target;
+
+    let sb = Sandbox::new();
+    let added = sb.run_with_keychain(&[
+        "config",
+        "ssh",
+        "add",
+        "--alias",
+        "ops-box",
+        "--host",
+        "10.0.3.20",
+        "--username",
+        "deploy",
+        "--auth-mode",
+        "password",
+        "--password",
+        "super-secret-pw",
+        "--json",
+    ]);
+    assert!(added.status.success(), "{}", stderr_str(&added));
+    let profile: Value = serde_json::from_str(&stdout_str(&added)).unwrap();
+    let profile_id = profile["id"].as_str().unwrap().to_owned();
+
+    let header = Header::new(
+        PathBuf::from("/home/deploy"),
+        Some(PathBuf::from("/home/deploy")),
+        "linux",
+        Some(HostIdentity {
+            hostname: "ops-box".into(),
+            machine_id: Some("0123456789abcdef0123456789abcdef".into()),
+        }),
+    );
+    let script_text = build_remote_cleanup_script(&RemoteCleanupScriptSpec {
+        profile_alias: "ops-box".into(),
+        host: "10.0.3.20".into(),
+        port: 22,
+        username: "deploy".into(),
+        header,
+        targets: vec![Target {
+            path: PathBuf::from("/home/deploy/.cache/pip"),
+            bytes: 4096,
+            is_dir: true,
+            hidden: false,
+        }],
+        docker_targets: Vec::new(),
+    })
+    .expect("build remote cleanup script");
+    assert!(!script_text.contains("super-secret-pw"));
+
+    let script_path = write_cleanup_script_atomic(
+        &sb.config_dir(),
+        "ops-box",
+        1_700_000_123,
+        &script_text,
+    )
+    .expect("write cleanup script");
+
+    let db = StorageDb::open(sb.db_path()).expect("open db");
+    db.set_ssh_profile_pending_script(
+        &profile_id,
+        &script_path,
+        1,
+        4096,
+        1_700_000_123,
+    )
+    .expect("set pending script");
+
+    // 1. Declining [y/N] aborts without touching SSH and keeps pending script.
+    let mut abort_child = sb
+        .cmd_with_test_keychain()
+        .args([
+            "run-script",
+            script_path.to_str().unwrap(),
+            "--profile",
+            &profile_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn aborted run-script");
+    abort_child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let abort_out = abort_child.wait_with_output().unwrap();
+    assert!(!abort_out.status.success());
+    let still_pending = db.get_ssh_profile_by_id(&profile_id).unwrap().unwrap();
+    assert_eq!(
+        still_pending.pending_script_path.as_deref(),
+        Some(script_path.to_str().unwrap())
+    );
+
+    #[cfg(unix)]
+    {
+        // 2. Non-zero SSH exit fails and preserves pending script.
+        let fail_capture = sb.root.path().join("fail_ssh.txt");
+        let fail_ssh = format!(
+            "#!/bin/sh\ncat > \"{}\"\nexit 42\n",
+            fail_capture.display()
+        );
+        sb.write_unix_script("ssh", &fail_ssh);
+
+        let fail_out = sb
+            .cmd_with_sandbox_path()
+            .env("RUUM_TEST_ROOT_SECRET_HEX", VALID_TEST_ROOT_SECRET_HEX)
+            .args([
+                "run-script",
+                script_path.to_str().unwrap(),
+                "--profile",
+                "ops-box",
+                "--yes",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run-script fail");
+        assert!(!fail_out.status.success());
+        let after_fail =
+            db.get_ssh_profile_by_id(&profile_id).unwrap().unwrap();
+        assert!(after_fail.pending_script_path.is_some());
+
+        // 3. Confirming interactively with --pause pipes payload, streams
+        //    output, waits for Enter, and clears pending_script_* on exit 0.
+        let ok_capture = sb.root.path().join("ok_ssh_payload.sh");
+        let ok_ssh = format!(
+            "#!/bin/sh\n\
+             cat > \"{}\"\n\
+             printf 'REMOTE_CLEANUP_OK askpass=%s\\n' \"${{SSH_ASKPASS:-}}\"\n",
+            ok_capture.display()
+        );
+        sb.write_unix_script("ssh", &ok_ssh);
+
+        let mut ok_child = sb
+            .cmd_with_sandbox_path()
+            .env("RUUM_TEST_ROOT_SECRET_HEX", VALID_TEST_ROOT_SECRET_HEX)
+            .args([
+                "run-script",
+                script_path.to_str().unwrap(),
+                "--profile",
+                &profile_id,
+                "--pause",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ok run-script");
+        ok_child.stdin.take().unwrap().write_all(b"y\n\n").unwrap();
+        let ok_out = ok_child.wait_with_output().unwrap();
+        assert!(
+            ok_out.status.success(),
+            "run-script failed: {}",
+            stderr_str(&ok_out)
+        );
+        let stdout_text = stdout_str(&ok_out);
+        assert!(stdout_text.contains("Proceed with cleanup? [y/N]"));
+        assert!(stdout_text.contains("REMOTE_CLEANUP_OK askpass="));
+        assert!(stdout_text.contains("Press Enter to close..."));
+
+        let captured_payload =
+            fs::read_to_string(&ok_capture).expect("read piped payload");
+        assert!(captured_payload.contains("/home/deploy/.cache/pip"));
+        assert!(!captured_payload.contains("RUUM_REMOTE_PAYLOAD_BEGIN"));
+        assert!(!captured_payload.contains("super-secret-pw"));
+
+        let cleared = db.get_ssh_profile_by_id(&profile_id).unwrap().unwrap();
+        assert_eq!(cleared.pending_script_path, None);
+        assert_eq!(cleared.pending_script_items, None);
+        assert_eq!(cleared.pending_reclaim_bytes, None);
+        assert_eq!(cleared.pending_created_secs, None);
     }
 }

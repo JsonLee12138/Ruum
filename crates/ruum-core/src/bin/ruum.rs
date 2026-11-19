@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,6 +57,8 @@ usage: ruum                       launch ruum-gui if desktop is available, else 
        ruum watchdog [run | once | install | uninstall | status]
                                   run or manage the disk-space watchdog service
        ruum analyze [PATH]        run AI cleanup analysis using ai_config
+       ruum run-script <SCRIPT> [--profile ID_OR_ALIAS] [--yes] [--pause]
+                                  review and execute a generated cleanup script
        ruum mcp [--read-only]     run Model Context Protocol (MCP) server over stdio
        ruum extract-scanner ARCH OUTPUT
                                   extract embedded static Linux scanner (x86_64 | aarch64)
@@ -158,6 +160,17 @@ options:
       --json               emit JSON output
   -h, --help               show this help";
 
+const RUN_SCRIPT_HELP: &str = "\
+ruum run-script — review and execute a deterministic cleanup script
+
+usage: ruum run-script <SCRIPT_PATH> [--profile <ID_OR_ALIAS>] [--yes] [--pause]
+
+options:
+      --profile <ID_OR_ALIAS>  execute the embedded remote payload via saved SSH profile
+  -y, --yes                    skip interactive [y/N] confirmation prompt
+      --pause                  wait for Enter before exiting
+  -h, --help                   show this help";
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -201,6 +214,7 @@ fn run() -> Result<()> {
         "config" => cmd_config(&args[1..]),
         "watchdog" => cmd_watchdog(&args[1..]),
         "analyze" => cmd_analyze(&args[1..]),
+        "run-script" => cmd_run_script(&args[1..]),
         "mcp" => cmd_mcp(&args[1..]),
         "extract-scanner" => cmd_extract_scanner(&args[1..]),
         "ssh-askpass" => cmd_ssh_askpass(&args[1..]),
@@ -476,36 +490,11 @@ fn cmd_space(args: &[OsString]) -> Result<()> {
 
     let expanded = expand_local_tilde(path_arg.as_deref())?;
     let root = dunce::canonicalize(&expanded).unwrap_or(expanded);
-    let meta = match fs::metadata(&root) {
-        Ok(m) => m,
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            bail!(
-                "permission denied accessing {}: root privileges may be \
-                 required",
-                root.display()
-            );
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("cannot access {}", root.display()));
-        }
-    };
+    let meta = fs::metadata(&root)
+        .with_context(|| format!("cannot access {}", root.display()))?;
     anyhow::ensure!(meta.is_dir(), "{} is not a directory", root.display());
 
-    match fs::read_dir(&root) {
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            bail!(
-                "permission denied reading {}: root privileges may be required",
-                root.display()
-            );
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("cannot read {}", root.display()));
-        }
-    }
-
+    let readable = fs::read_dir(&root).is_ok();
     let info = space_info(&root).with_context(|| {
         format!("cannot inspect space for {}", root.display())
     })?;
@@ -517,7 +506,7 @@ fn cmd_space(args: &[OsString]) -> Result<()> {
                 "available": info.available,
                 "free": info.free,
                 "total": info.total,
-                "readable": true,
+                "readable": readable,
                 "platform": std::env::consts::OS,
             }))?
         );
@@ -1774,5 +1763,184 @@ fn cmd_ssh_askpass(args: &[OsString]) -> Result<()> {
     );
     let mut out = io::stdout().lock();
     run_askpass_cli_from_env(&mut out)?;
+    Ok(())
+}
+
+fn cmd_run_script(args: &[OsString]) -> Result<()> {
+    let mut script_path: Option<PathBuf> = None;
+    let mut profile_key: Option<String> = None;
+    let mut auto_yes = false;
+    let mut pause = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("-h" | "--help") => {
+                println!("{RUN_SCRIPT_HELP}");
+                return Ok(());
+            }
+            Some("--profile") => {
+                profile_key = Some(next_str(&mut iter, "--profile")?);
+            }
+            Some("-y" | "--yes") => auto_yes = true,
+            Some("--pause") => pause = true,
+            Some(other) if other.starts_with('-') => {
+                bail!("unknown option `{other}` for `ruum run-script`");
+            }
+            _ => {
+                anyhow::ensure!(
+                    script_path.is_none(),
+                    "ruum run-script accepts a single SCRIPT_PATH"
+                );
+                script_path = Some(PathBuf::from(arg));
+            }
+        }
+    }
+
+    let script_path = script_path.context(
+        "usage: ruum run-script <SCRIPT_PATH> [--profile <ID_OR_ALIAS>] [--yes] [--pause]",
+    )?;
+
+    let res =
+        execute_run_script(&script_path, profile_key.as_deref(), auto_yes);
+    if pause {
+        if let Err(ref err) = res {
+            eprintln!("ruum: {err:#}");
+        }
+        print!("\nPress Enter to close...");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+    }
+    res
+}
+
+fn execute_run_script(
+    script_path: &Path,
+    profile_key: Option<&str>,
+    auto_yes: bool,
+) -> Result<()> {
+    let script_content =
+        fs::read_to_string(script_path).with_context(|| {
+            format!("read cleanup script {}", script_path.display())
+        })?;
+
+    println!("Cleanup script: {}", script_path.display());
+    for line in script_content.lines().take(24) {
+        let trimmed = line.trim();
+        if trimmed == "#!/bin/sh" || trimmed == "set -eu" {
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            println!("  {}", comment.trim());
+        } else if !trimmed.is_empty() {
+            break;
+        }
+    }
+
+    if !auto_yes {
+        print!("Proceed with cleanup? [y/N] ");
+        io::stdout().flush()?;
+        let mut reply = String::new();
+        let read_bytes = io::stdin().read_line(&mut reply)?;
+        let normalized = reply.trim().to_ascii_lowercase();
+        if read_bytes == 0 || !matches!(normalized.as_str(), "y" | "yes") {
+            bail!("cleanup aborted by user");
+        }
+    }
+
+    if let Some(key) = profile_key {
+        let db = StorageDb::open_default()?;
+        let profile = db
+            .get_ssh_profile(key)?
+            .with_context(|| format!("SSH profile `{key}` not found"))?;
+        let duration = db
+            .load_app_settings()
+            .map_or(DEFAULT_SSH_SESSION_DURATION_MINUTES, |s| {
+                s.ssh_session_duration_minutes
+            });
+        let creds =
+            LazyCredentialStore::open_default().map_err(anyhow::Error::msg)?;
+        let endpoint =
+            SshEndpoint::from_profile(&profile).map_err(anyhow::Error::msg)?;
+        let material =
+            SshAuthMaterial::from_profile_and_store(&profile, &creds)
+                .map_err(anyhow::Error::msg)?;
+        let mut session = SshSession::start(endpoint, material, duration)
+            .map_err(anyhow::Error::msg)?;
+
+        let payload = ruum_core::export::extract_remote_payload(
+            &script_content,
+        )
+        .context(
+            "cleanup script does not contain a valid RUUM_REMOTE_PAYLOAD \
+                 block",
+        )?;
+
+        let mut cmd = session
+            .build_ssh_command(&[], "sh -s")
+            .context("build ssh command for remote cleanup script")?;
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let mut child = cmd
+            .spawn()
+            .context("spawn ssh process for remote cleanup script")?;
+
+        let write_res = if let Some(mut child_stdin) = child.stdin.take() {
+            let res = child_stdin
+                .write_all(payload.as_bytes())
+                .and_then(|()| child_stdin.flush());
+            drop(child_stdin);
+            res
+        } else {
+            Ok(())
+        };
+
+        let status = child
+            .wait()
+            .context("wait for remote ssh cleanup execution")?;
+        session.close();
+        write_res.context("write cleanup payload to remote ssh stdin")?;
+
+        if !status.success() {
+            bail!(
+                "remote cleanup script exited with status {}",
+                status.code().unwrap_or(1)
+            );
+        }
+        let _ = db.clear_ssh_profile_pending_script(&profile.id);
+        println!("Remote cleanup finished; cleared pending script status.");
+        return Ok(());
+    }
+
+    let flag = if script_content.contains("--delete")
+        && !script_content.contains("--yes")
+    {
+        "--delete"
+    } else {
+        "--yes"
+    };
+    let mut cmd = Command::new("sh");
+    cmd.arg(script_path)
+        .arg(flag)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let status = cmd
+        .status()
+        .context("execute local cleanup script via sh")?;
+    if !status.success() {
+        bail!(
+            "cleanup script exited with status {}",
+            status.code().unwrap_or(1)
+        );
+    }
     Ok(())
 }

@@ -42,12 +42,11 @@ pub fn root(
     app: &mut Ruum,
     window: &mut Window,
     cx: &mut Context<'_, Ruum>,
-) -> Stateful<Div> {
-    if app.volumes_open && app.screen == Screen::Explore {
-        app.screen = Screen::Sources;
-    }
-    if app.screen == Screen::Sources {
+) -> impl IntoElement {
+    if app.volumes_open {
         app.prepare_picker_inputs(window, cx);
+    }
+    if app.screen == Screen::Remote {
         app.ensure_ssh_form_inputs(window, cx);
     }
     if app.screen == Screen::Settings {
@@ -61,12 +60,21 @@ pub fn root(
             app.sync_webhook_form_inputs(window, cx);
         }
     }
+    if app.screen == Screen::Docker {
+        app.ensure_local_docker_initialized();
+    }
+    if app.remote_docker_modal_open {
+        app.ensure_review_docker_initialized();
+    }
     app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
     let body = match app.screen {
         Screen::Explore => explore(app, window, cx).into_any_element(),
-        Screen::Sources => {
-            crate::rail_pages::sources_page(app, window, cx).into_any_element()
+        Screen::Docker => {
+            crate::rail_pages::docker_page(app, window, cx).into_any_element()
+        }
+        Screen::Remote => {
+            crate::rail_pages::remote_page(app, window, cx).into_any_element()
         }
         Screen::Watchdog => {
             crate::rail_pages::watchdog_page(app, window, cx).into_any_element()
@@ -103,8 +111,11 @@ pub fn root(
         .on_action(cx.listener(|this, _: &crate::app_menu::OpenExplore, _, cx| {
             this.navigate_rail(Screen::Explore, cx);
         }))
-        .on_action(cx.listener(|this, _: &crate::app_menu::OpenSources, _, cx| {
-            this.navigate_rail(Screen::Sources, cx);
+        .on_action(cx.listener(|this, _: &crate::app_menu::OpenDocker, _, cx| {
+            this.navigate_rail(Screen::Docker, cx);
+        }))
+        .on_action(cx.listener(|this, _: &crate::app_menu::OpenRemote, _, cx| {
+            this.navigate_rail(Screen::Remote, cx);
         }))
         .on_action(cx.listener(
             |this, _: &crate::app_menu::OpenWatchdog, _, cx| {
@@ -154,6 +165,11 @@ pub fn root(
                 }
             },
         ))
+        .on_action(cx.listener(
+            |_, _: &crate::app_menu::ToggleFullscreen, window, _| {
+                window.toggle_fullscreen();
+            },
+        ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if this.zoom_interface(event, window) {
                 cx.notify();
@@ -180,16 +196,29 @@ pub fn root(
     if app.show_help {
         root = root.child(help_overlay(app, cx));
     }
+    if app.volumes_open {
+        root = root.child(volume_picker_modal(app, window, cx));
+    }
+    if app.remote_docker_modal_open && app.screen == Screen::Explore {
+        root = root.child(crate::rail_pages::remote_docker_modal(app, cx));
+    }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
     }
     if let Some(dialog) = remote_connect_dialog(app, cx) {
         root = root.child(dialog);
     }
+    if let Some(dialog) = script_generated_dialog(app, cx) {
+        root = root.child(dialog);
+    }
     if let Some(toast) = toast_overlay(app, cx) {
         root = root.child(toast);
     }
-    root
+    crate::window_chrome::wrap_window_chrome(
+        app.window_title().to_owned(),
+        root,
+        |window, _| window.remove_window(),
+    )
 }
 
 /// Put a dialog's popup in the middle of the window, and close it when a
@@ -201,7 +230,7 @@ pub fn root(
 /// the click that dismisses a dialog, so the click is taken here instead. The
 /// card stops a mouse-down from reaching this wrapper, so a click on the
 /// dialog itself stays the dialog's own.
-fn centred_popup(
+pub fn centred_popup(
     card: impl IntoElement,
     on_outside: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
@@ -221,6 +250,10 @@ fn centred_popup(
         .child(
             div()
                 .id("dialog-card")
+                .flex()
+                .flex_col()
+                .max_w_full()
+                .max_h_full()
                 .on_any_mouse_down(
                     |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
@@ -236,17 +269,18 @@ fn centred_popup(
 fn delete_dialog(app: &Ruum, cx: &mut Context<'_, Ruum>) -> impl IntoElement {
     let locale = app.locale;
     let plan = app.plan();
-    let title = match plan.targets.as_slice() {
-        [only] => crate::i18n::review::delete_title_single(
-            &short_name(&only.path),
+    let total_count = plan.targets.len();
+    let total_bytes = plan.bytes();
+    let title = if total_count == 1 {
+        crate::i18n::review::delete_title_single(
+            &short_name(&plan.targets[0].path),
             locale,
-        ),
-        targets => {
-            crate::i18n::review::delete_title_many(targets.len(), locale)
-        }
+        )
+    } else {
+        crate::i18n::review::delete_title_many(total_count, locale)
     };
     let body =
-        crate::i18n::review::delete_body(&human_bytes(plan.bytes()), locale);
+        crate::i18n::review::delete_body(&human_bytes(total_bytes), locale);
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
     let actions = div()
@@ -354,6 +388,120 @@ fn remote_connect_dialog(
             .on_cancel(move |_, window, cx| {
                 let _ = deny.update(cx, |this, cx| {
                     this.deny_remote_connect(cx);
+                    this.apply_focus(window, cx);
+                });
+                false
+            })
+            .popup(centred),
+    )
+}
+
+fn script_generated_dialog(
+    app: &Ruum,
+    cx: &mut Context<'_, Ruum>,
+) -> Option<impl IntoElement> {
+    let dialog = app.generated_script_dialog.as_ref()?;
+    let locale = app.locale;
+    let title = crate::i18n::pages::script_generated_title(locale);
+    let desc = crate::i18n::pages::script_generated_desc(
+        &dialog.alias,
+        dialog.item_count,
+        &human_bytes(dialog.reclaim_bytes),
+        &dialog.script_path.display().to_string(),
+        locale,
+    );
+    let profile_id_run = dialog.profile_id.clone();
+    let script_path_run = dialog.script_path.clone();
+    let script_path_reveal = dialog.script_path.clone();
+    let actions = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .justify_end()
+        .gap(space::SM)
+        .child(
+            div().debug_selector(|| "script-dialog-later".into()).child(
+                dialog_button(
+                    "script-dialog-later",
+                    crate::i18n::pages::script_run_later(locale),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.close_generated_script_dialog(cx);
+                        this.apply_focus(window, cx);
+                    },
+                )),
+            ),
+        )
+        .child(
+            div()
+                .debug_selector(|| "script-dialog-reveal".into())
+                .child(
+                    dialog_button(
+                        "script-dialog-reveal",
+                        crate::i18n::pages::script_reveal_file(locale),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.reveal_cleanup_script(&script_path_reveal, cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+        )
+        .child(
+            div()
+                .debug_selector(|| "script-dialog-run-terminal".into())
+                .child(
+                    dialog_button(
+                        "script-dialog-run-terminal",
+                        crate::i18n::pages::script_run_in_terminal(locale),
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.execute_cleanup_script_in_terminal(
+                                &profile_id_run,
+                                &script_path_run,
+                                cx,
+                            );
+                            this.close_generated_script_dialog(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+        );
+
+    let popup = div()
+        .id("script-generated-dialog")
+        .debug_selector(|| "script-generated-dialog".into())
+        .child(
+            dialog_popup(cx)
+                .child(dialog_title(title, cx))
+                .child(dialog_description(desc, cx))
+                .child(actions),
+        );
+    let close = cx.entity().downgrade();
+    let centred = centred_popup(popup, {
+        let close = close.clone();
+        move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.close_generated_script_dialog(cx);
+                this.apply_focus(window, cx);
+            });
+        }
+    });
+    Some(
+        alert_dialog(&app.confirm_focus, cx)
+            .open(true)
+            .on_cancel(move |_, window, cx| {
+                let _ = close.update(cx, |this, cx| {
+                    this.close_generated_script_dialog(cx);
                     this.apply_focus(window, cx);
                 });
                 false
@@ -535,6 +683,15 @@ fn top_bar(
         .child(host_tabs_strip(app, theme, cx))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
+        .child(switch_root_button(app, cx))
+        .when(
+            app.remote.is_some()
+                && matches!(
+                    app.docker,
+                    ruum_core::docker_adapter::DockerProbeStatus::Available(_)
+                ),
+            |bar| bar.child(remote_docker_button(app, cx)),
+        )
         .child(div().flex_1())
         .child(view_settings(app, window, cx))
 }
@@ -741,12 +898,27 @@ fn tree_crumb(
     cx: &Context<'_, Ruum>,
 ) -> gpui_kit::AnyElement {
     let Some((&index, parent)) = path.split_last() else {
-        // The scanned root: no siblings in the tree to offer.
-        return widgets::crumb(id, label, current, cx)
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.go_to(Vec::new(), cx)),
+        // The scanned root: clicking while at root opens the unified directory
+        // / mount picker modal; from a deeper directory it ascends to root.
+        let chip = widgets::crumb(id, label, current, cx)
+            .debug_selector(|| "crumb-scan-root".into())
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if current {
+                    this.open_volumes(cx);
+                } else {
+                    this.go_to(Vec::new(), cx);
+                }
+            }));
+        return if current {
+            with_tooltip(
+                chip,
+                crate::i18n::explore::crumb_switch_root_tooltip(app.locale),
             )
-            .into_any_element();
+            .into_any_element()
+        } else {
+            chip.into_any_element()
+        };
     };
     let parent = parent.to_vec();
     let open = app
@@ -2123,7 +2295,7 @@ fn toast_overlay(app: &Ruum, cx: &Context<'_, Ruum>) -> Option<Stateful<Div>> {
             .debug_selector(|| "toast-notification".into())
             .occlude()
             .absolute()
-            .bottom(space::MD)
+            .bottom(Rems(3.5))
             .right(space::MD)
             .max_w(size::TOAST)
             .flex()
@@ -2325,20 +2497,27 @@ fn disk_section(app: &Ruum, theme: &Theme, cx: &Context<'_, Ruum>) -> Div {
             })),
         );
     let mut section = div().flex().flex_col().gap(space::SM).child(header);
-    let Some(space_info) = app.space else {
-        return section.child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(crate::i18n::explore::panel::free_space_unavailable(
-                    locale,
-                )),
-        );
-    };
     let plan = app.plan();
+    let reclaiming = plan.reclaim();
+    let Some(space_info) = app.space else {
+        return section
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(
+                        crate::i18n::explore::panel::free_space_unavailable(
+                            locale,
+                        ),
+                    ),
+            )
+            .children(
+                (!app.marks.is_empty())
+                    .then(|| review_button(app, reclaiming, theme, cx)),
+            );
+    };
     // The meter measures this volume, so it projects only the marks whose
     // bytes come back to it; the rest is said, never added.
-    let reclaiming = plan.reclaim();
     let after = space_info.after_removing(reclaiming);
     let highlight = palette::highlight(theme);
     let (number, unit) =
@@ -2477,6 +2656,7 @@ fn review_button(
     let count = app.marks.len();
     div()
         .id("review")
+        .debug_selector(|| "review".into())
         .flex()
         .flex_row()
         .items_center()
@@ -2904,6 +3084,7 @@ fn review(app: &Ruum, window: &mut Window, cx: &mut Context<'_, Ruum>) -> Div {
         .flex_col()
         .flex_1()
         .min_w_0()
+        .min_h_0()
         .overflow_y_scroll()
         .border_1()
         .border_color(theme.border)
@@ -3258,7 +3439,7 @@ fn review_summary(
     panel
         .child(div().flex_1())
         .child(export_controls(plan, locale, cx))
-        .children(app.remote.is_none().then(|| commit_controls(app, plan, cx)))
+        .child(commit_controls(app, plan, cx))
 }
 
 /// The list handed on instead of acted on: saved as paths, or copied as a
@@ -3333,19 +3514,41 @@ fn commit_controls(
 ) -> Div {
     let locale = app.locale;
     let count = plan.targets.len();
-    let (label, variant) = match app.removal_mode {
-        RemovalMode::Trash => (
-            crate::i18n::review::move_to_trash_button(count, locale),
+    let (label, variant) = if app.remote.is_some() {
+        (
+            crate::i18n::review::generate_remote_script_button(count, locale),
             ButtonVariant::Primary,
-        ),
-        RemovalMode::Permanent => (
-            crate::i18n::review::delete_button(count, locale),
-            ButtonVariant::Danger,
-        ),
+        )
+    } else {
+        match app.removal_mode {
+            RemovalMode::Trash => (
+                crate::i18n::review::move_to_trash_button(count, locale),
+                ButtonVariant::Primary,
+            ),
+            RemovalMode::Permanent => (
+                crate::i18n::review::delete_button(count, locale),
+                ButtonVariant::Danger,
+            ),
+        }
     };
-    let unavailable = plan.is_empty()
-        || (app.removal_mode == RemovalMode::Trash
+    let unavailable = count == 0
+        || (app.remote.is_none()
+            && app.removal_mode == RemovalMode::Trash
             && !app.trash_backend.is_available());
+
+    let commit_btn = button("commit", label, variant, cx)
+        .disabled(unavailable)
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.commit(cx);
+            this.apply_focus(window, cx);
+        }));
+    let commit_slot = if app.remote.is_some() {
+        div()
+            .debug_selector(|| "generate-remote-script".into())
+            .child(commit_btn)
+    } else {
+        div().debug_selector(|| "commit".into()).child(commit_btn)
+    };
 
     div()
         .flex()
@@ -3365,14 +3568,7 @@ fn commit_controls(
                 window.focus(&this.focus, cx);
             })),
         )
-        .child(
-            button("commit", label, variant, cx)
-                .disabled(unavailable)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.commit(cx);
-                    this.apply_focus(window, cx);
-                })),
-        )
+        .child(commit_slot)
 }
 
 fn review_footer(app: &Ruum, theme: &Theme, cx: &App) -> Div {
@@ -3500,7 +3696,7 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                         } else {
                             theme.danger
                         })
-                        .child(short_name(path)),
+                        .child(run_log_display_name(path)),
                 )
                 .children(outcome.as_ref().err().map(|error| {
                     div()
@@ -3512,6 +3708,13 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
     }
 
     let locale = app.locale;
+    let progress_subtitle =
+        crate::i18n::review::removing_subtitle(done, summary.total, locale);
+    let subtitle = if let Some(stage) = &app.run_stage {
+        format!("{stage} \u{00b7} {progress_subtitle}")
+    } else {
+        progress_subtitle
+    };
     div()
         .flex()
         .flex_col()
@@ -3519,11 +3722,7 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
         .min_h_0()
         .child(screen_header(
             crate::i18n::review::removing_title(locale),
-            &crate::i18n::review::removing_subtitle(
-                done,
-                summary.total,
-                locale,
-            ),
+            &subtitle,
             &theme,
             cx,
         ))
@@ -3567,12 +3766,23 @@ fn running(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 .py(space::SM)
                 .border_t_1()
                 .border_color(theme.divider())
-                .child(widgets::hint(
-                    "esc",
-                    crate::i18n::review::stop_hint(locale),
-                    cx,
-                )),
+                .children(app.run.is_some().then(|| {
+                    widgets::hint(
+                        "esc",
+                        crate::i18n::review::stop_hint(locale),
+                        cx,
+                    )
+                })),
         )
+}
+
+fn run_log_display_name(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    if text.starts_with("docker: ") {
+        text.into_owned()
+    } else {
+        short_name(path)
+    }
 }
 
 // ── done ────────────────────────────────────────────────────────────────
@@ -3604,7 +3814,11 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                 .flex_row()
                 .gap(space::SM)
                 .text_size(text::CAPTION)
-                .child(div().text_color(theme.danger).child(short_name(path)))
+                .child(
+                    div()
+                        .text_color(theme.danger)
+                        .child(run_log_display_name(path)),
+                )
                 .child(div().text_color(theme.secondary).child(
                     outcome.as_ref().err().cloned().unwrap_or_default(),
                 )),
@@ -3663,25 +3877,30 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                         cx,
                     )
                 })),
-        )
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(crate::i18n::review::done_rescan_note(locale)),
         );
 
     if let Some(space) = app.space {
         body = body.child(widgets::space_meter_in(space, 0, locale, cx));
     }
     if app.scan.is_some() {
-        body = body.child(widgets::meter_row(
-            crate::i18n::review::rescanning_label(locale),
-            crate::i18n::review::rescanning_files(app.progress.files, locale),
-            progress_estimate(app.progress.files),
-            theme.accent,
-            cx,
-        ));
+        body = body
+            .child(
+                div()
+                    .debug_selector(|| "done-rescan-note".into())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(crate::i18n::review::done_rescan_note(locale)),
+            )
+            .child(widgets::meter_row(
+                crate::i18n::review::rescanning_label(locale),
+                crate::i18n::review::rescanning_files(
+                    app.progress.files,
+                    locale,
+                ),
+                progress_estimate(app.progress.files),
+                theme.accent,
+                cx,
+            ));
     }
     if summary.failed > 0 {
         body = body
@@ -3725,8 +3944,7 @@ fn done(app: &Ruum, cx: &gpui_kit::Context<'_, Ruum>) -> Div {
                     )
                     .on_click(cx.listener(
                         |this, _, window, cx| {
-                            this.screen = Screen::Explore;
-                            cx.notify();
+                            this.finish_done_screen(cx);
                             window.focus(&this.focus, cx);
                         },
                     )),
@@ -3796,16 +4014,22 @@ pub fn cursor_tooltip(
     let content = hover_tooltip(app, cx)?;
     let origin = app.treemap_origin.get();
     let window_size = window.bounds().size;
+    let (chrome_left, chrome_top, chrome_right, chrome_bottom) =
+        crate::window_chrome::window_content_margins(window);
+    let content_w =
+        (window_size.width.as_f32() - chrome_left - chrome_right).max(0.0);
+    let content_h =
+        (window_size.height.as_f32() - chrome_top - chrome_bottom).max(0.0);
 
     // Flip to the other side of the pointer rather than overflow the window.
-    let anchor_x = origin.x.as_f32() + pointer.x.as_f32();
-    let anchor_y = origin.y.as_f32() + pointer.y.as_f32();
-    let x = if anchor_x + gap + width > window_size.width.as_f32() {
+    let anchor_x = origin.x.as_f32() + pointer.x.as_f32() - chrome_left;
+    let anchor_y = origin.y.as_f32() + pointer.y.as_f32() - chrome_top;
+    let x = if anchor_x + gap + width > content_w {
         (anchor_x - gap - width).max(edge)
     } else {
         anchor_x + gap
     };
-    let y = if anchor_y + gap + height > window_size.height.as_f32() {
+    let y = if anchor_y + gap + height > content_h {
         (anchor_y - gap - height).max(edge)
     } else {
         anchor_y + gap
@@ -4089,4 +4313,261 @@ fn help_overlay(app: &Ruum, cx: &gpui_kit::App) -> Div {
                         )),
                 ),
         )
+}
+
+fn switch_root_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
+    div()
+        .debug_selector(|| "trail-switch-root".into())
+        .child(with_tooltip(
+            gpui_omarchy::icon_button(
+                "trail-switch-root",
+                IconName::FolderOpen,
+                crate::i18n::explore::switch_directory_tooltip(app.locale),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_volumes(cx);
+                this.apply_focus(window, cx);
+            })),
+            crate::i18n::explore::switch_directory_tooltip(app.locale),
+        ))
+}
+
+fn remote_docker_button(
+    app: &Ruum,
+    cx: &Context<'_, Ruum>,
+) -> impl IntoElement {
+    let tooltip = crate::i18n::explore::remote_docker_tooltip(app.locale);
+    div()
+        .debug_selector(|| "remote-docker-btn".into())
+        .child(with_tooltip(
+            gpui_omarchy::icon_button(
+                "remote-docker-btn",
+                IconName::Container,
+                tooltip,
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_remote_docker_modal(cx);
+                this.apply_focus(window, cx);
+            })),
+            tooltip,
+        ))
+}
+
+fn volume_picker_modal(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let remote_alias =
+        app.volume_picker_remote_profile_id.as_deref().map(|id| {
+            app.ssh_profiles
+                .iter()
+                .find(|p| p.id == id)
+                .map_or_else(|| id.to_owned(), |p| p.alias.clone())
+        });
+    let is_remote = remote_alias.is_some();
+
+    let title = match remote_alias.as_deref() {
+        Some(alias) => {
+            crate::i18n::pages::modal_mounts_remote_title(alias, locale)
+        }
+        None => crate::i18n::pages::modal_mounts_local_title(locale).to_owned(),
+    };
+    let description = if is_remote {
+        crate::i18n::pages::modal_mounts_remote_desc(locale)
+    } else {
+        crate::i18n::pages::modal_mounts_local_desc(locale)
+    };
+
+    let mut rows = div()
+        .id("modal-volume-rows")
+        .debug_selector(|| "modal-volume-rows".into())
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .max_h(size::SOURCE_LIST_HEIGHT)
+        .overflow_y_scroll();
+
+    if app.volumes_loading {
+        rows = rows.child(dialog_description(
+            if is_remote {
+                crate::i18n::pages::listing_remote_mounts(locale)
+            } else {
+                crate::i18n::pages::listing_mounts(locale)
+            },
+            cx,
+        ));
+    } else if let Some(error) = &app.volumes_error {
+        rows = rows.child(
+            div()
+                .debug_selector(|| "modal-volumes-error".into())
+                .text_color(theme.danger)
+                .child(error.clone()),
+        );
+    } else if app.volumes.is_empty() {
+        rows = rows.child(dialog_description(
+            if is_remote {
+                crate::i18n::pages::no_remote_mounts_listed(locale)
+            } else {
+                crate::i18n::pages::no_mounts_listed(locale)
+            },
+            cx,
+        ));
+    }
+
+    for (index, volume) in app.volumes.iter().enumerate() {
+        let highlighted = index == app.volume_highlight;
+        let label = format!(
+            "{}  ·  {}",
+            volume.point.display(),
+            volume
+                .device
+                .as_deref()
+                .unwrap_or_else(|| crate::i18n::pages::mounted_volume(locale))
+        );
+        rows = rows.child(
+            div()
+                .id(ElementId::Name(format!("modal-volume-{index}").into()))
+                .debug_selector(move || format!("modal-volume-{index}"))
+                .px(space::MD)
+                .py(space::SM)
+                .rounded(space::XS)
+                .text_size(text::BODY)
+                .text_color(if highlighted {
+                    theme.bright
+                } else {
+                    theme.foreground
+                })
+                .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
+                .hover(|row| row.bg(theme.accent.opacity(0.1)))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.volume_highlight = index;
+                    window.focus(&this.confirm_focus, cx);
+                    cx.notify();
+                })),
+        );
+    }
+
+    let path = app
+        .picker_path
+        .as_ref()
+        .expect("picker prepared before rendering");
+    let path_submit_disabled =
+        app.volumes_loading || (!is_remote && app.volumes_error.is_some());
+    let list_submit_disabled = app.volumes_loading
+        || app.volumes_error.is_some()
+        || app.volumes.is_empty();
+
+    let popup = dialog_popup(cx)
+        .w_full()
+        .child(dialog_title(title, cx))
+        .child(dialog_description(description, cx))
+        .child(rows)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(space::SM)
+                .child(
+                    gpui_omarchy::input("modal-source-path", path, window, cx)
+                        .debug_selector(|| "modal-source-path".into())
+                        .flex_1(),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "modal-source-scan-path".into())
+                        .child(
+                            button(
+                                "modal-source-scan-path",
+                                crate::i18n::pages::scan_directory(locale),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .disabled(path_submit_disabled)
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.choose_picker_path(cx);
+                                },
+                            )),
+                        ),
+                ),
+        )
+        .children(app.picker_error.as_ref().map(|error| {
+            div()
+                .debug_selector(|| "modal-picker-error".into())
+                .text_color(theme.danger)
+                .child(error.clone())
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .debug_selector(|| "modal-source-cancel".into())
+                        .child(
+                            dialog_button(
+                                "modal-source-cancel",
+                                crate::i18n::review::cancel(locale),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.close_volumes(cx);
+                                    this.apply_focus(window, cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div().debug_selector(|| "modal-source-scan".into()).child(
+                        dialog_button(
+                            "modal-source-scan",
+                            crate::i18n::pages::scan_selected_root(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .disabled(list_submit_disabled)
+                        .on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.choose_volume(cx);
+                                this.apply_focus(window, cx);
+                            },
+                        )),
+                    ),
+                ),
+        );
+
+    let card = div()
+        .id("volume-picker-modal")
+        .debug_selector(|| "volume-picker-modal".into())
+        .track_focus(&app.confirm_focus)
+        .w(size::VOLUME_MODAL)
+        .max_w_full()
+        .max_h_full()
+        .overflow_y_scroll()
+        .child(popup);
+
+    let close = cx.entity().downgrade();
+    div()
+        .id("volume-picker-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(theme.background.opacity(0.68))
+        .child(centred_popup(card, move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.close_volumes(cx);
+                this.apply_focus(window, cx);
+            });
+        }))
 }

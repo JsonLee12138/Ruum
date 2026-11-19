@@ -814,21 +814,6 @@ pub fn ssh_ai_analyze_failed(alias: &str, err: &str, locale: Locale) -> String {
     }
 }
 
-pub fn ssh_remote_cleanup_failed(err: &str, locale: Locale) -> String {
-    match locale {
-        Locale::En => format!("Remote cleanup failed: {err}"),
-        Locale::Zh => format!(
-            "\u{8fdc}\u{7a0b}\u{6e05}\u{7406}\u{5931}\u{8d25}\u{ff1a}{err}"
-        ),
-        Locale::Ja => format!(
-            "\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{5931}\u{6557}: {err}"
-        ),
-        Locale::Ko => {
-            format!("\u{c6d0}\u{aca9} \u{c815}\u{b9ac} \u{c2e4}\u{d328}: {err}")
-        }
-    }
-}
-
 pub fn webhook_saved(name: &str, locale: Locale) -> String {
     match locale {
         Locale::En => format!("Saved webhook `{name}`"),
@@ -897,5 +882,88 @@ pub fn webhook_save_failed(err: &str, locale: Locale) -> String {
         Locale::Ko => {
             format!("Webhook \u{c800}\u{c7a5} \u{c2e4}\u{d328}: {err}")
         }
+    }
+}
+
+pub fn script_generate_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to generate cleanup script: {err}"),
+        Locale::Zh => {
+            format!(
+                "\u{751f}\u{6210}\u{6e05}\u{7406}\u{811a}\u{672c}\u{5931}\u{8d25}\u{ff1a}{err}"
+            )
+        }
+        Locale::Ja => format!(
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{306e}\u{751f}\u{6210}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "\u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8} \u{c0dd}\u{c131} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn script_launched_in_terminal(alias: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => {
+            format!("Opened terminal to run cleanup script for `{alias}`")
+        }
+        Locale::Zh => format!(
+            "\u{5df2}\u{5728}\u{7ec8}\u{7aef}\u{4e2d}\u{6253}\u{5f00}\u{300c}{alias}\u{300d}\u{7684}\u{6e05}\u{7406}\u{811a}\u{672c}"
+        ),
+        Locale::Ja => format!(
+            "`{alias}` \u{306e}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{7aef}\u{672b}\u{3067}\u{958b}\u{304d}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!(
+            "`{alias}` \u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8}\u{b97c} \u{d130}\u{bbf8}\u{b110}\u{c5d0}\u{c11c} \u{c5f4}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}"
+        ),
+    }
+}
+
+pub fn script_launch_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to open terminal for script: {err}"),
+        Locale::Zh => {
+            format!(
+                "\u{6253}\u{5f00}\u{7ec8}\u{7aef}\u{6267}\u{884c}\u{811a}\u{672c}\u{5931}\u{8d25}\u{ff1a}{err}"
+            )
+        }
+        Locale::Ja => format!(
+            "\u{7aef}\u{672b}\u{3067}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{958b}\u{3051}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "\u{d130}\u{bbf8}\u{b110}\u{c5d0}\u{c11c} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8} \u{c2e4}\u{d589} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn script_reveal_failed(err: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Failed to reveal script file: {err}"),
+        Locale::Zh => {
+            format!(
+                "\u{6253}\u{5f00}\u{811a}\u{672c}\u{6240}\u{5728}\u{76ee}\u{5f55}\u{5931}\u{8d25}\u{ff1a}{err}"
+            )
+        }
+        Locale::Ja => format!(
+            "\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{3092}\u{8868}\u{793a}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}: {err}"
+        ),
+        Locale::Ko => format!(
+            "\u{c2a4}\u{d06c}\u{b9bd}\u{d2b8} \u{d30c}\u{c77c} \u{c5f4}\u{ae30} \u{c2e4}\u{d328}: {err}"
+        ),
+    }
+}
+
+pub fn script_discarded(alias: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Discarded pending cleanup script for `{alias}`"),
+        Locale::Zh => format!(
+            "\u{5df2}\u{4f5c}\u{5e9f}\u{300c}{alias}\u{300d}\u{7684}\u{5f85}\u{6267}\u{884c}\u{6e05}\u{7406}\u{811a}\u{672c}"
+        ),
+        Locale::Ja => format!(
+            "`{alias}` \u{306e}\u{672a}\u{5b9f}\u{884c}\u{30b9}\u{30af}\u{30ea}\u{30d7}\u{30c8}\u{3092}\u{7834}\u{68c4}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!(
+            "`{alias}`\u{c758} \u{b300}\u{ae30} \u{c815}\u{b9ac} \u{c2a4}\u{d06c}\u{b9bd}\u{d2b8}\u{b97c} \u{d3d0}\u{ae30}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}"
+        ),
     }
 }

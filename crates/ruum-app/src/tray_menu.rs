@@ -20,7 +20,7 @@ const ICON_SIZE_PX: u32 = 32;
 
 const ID_STATUS: &str = "ruum.tray.status";
 const ID_OPEN_RUUM: &str = "ruum.tray.open_ruum";
-const ID_OPEN_SOURCES: &str = "ruum.tray.open_sources";
+const ID_OPEN_REMOTE: &str = "ruum.tray.open_remote";
 const ID_OPEN_WATCHDOG: &str = "ruum.tray.open_watchdog";
 const ID_OPEN_SETTINGS: &str = "ruum.tray.open_settings";
 const ID_CHECK_DISK: &str = "ruum.tray.check_disk";
@@ -47,8 +47,8 @@ struct TrayEventSink {
 pub enum TrayAction {
     /// Open or focus the main `Ruum` window.
     OpenRuum,
-    /// Open the `Sources & Drives` page in the main window.
-    OpenSources,
+    /// Open the `Remote` SSH servers page in the main window.
+    OpenRemote,
     /// Open the `Watchdog` page in the main window.
     OpenWatchdog,
     /// Open the `Settings` page in the main window.
@@ -105,11 +105,9 @@ impl TrayMenu {
             true,
             None,
         );
-        // `muda` interprets a single `&` as a mnemonic marker on Windows/GTK
-        // and strips it on macOS; `&&` renders a literal `&` everywhere.
-        let sources_item = MenuItem::with_id(
-            ID_OPEN_SOURCES,
-            common::tray_sources_and_drives(locale),
+        let remote_item = MenuItem::with_id(
+            ID_OPEN_REMOTE,
+            common::tray_remote(locale),
             true,
             None,
         );
@@ -158,7 +156,7 @@ impl TrayMenu {
             &status_item,
             &sep1,
             &open_item,
-            &sources_item,
+            &remote_item,
             &watchdog_item,
             &settings_item,
             &sep2,
@@ -289,7 +287,7 @@ fn ensure_global_handlers_registered() {
 pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     match id {
         ID_OPEN_RUUM => Some(TrayAction::OpenRuum),
-        ID_OPEN_SOURCES => Some(TrayAction::OpenSources),
+        ID_OPEN_REMOTE => Some(TrayAction::OpenRemote),
         ID_OPEN_WATCHDOG => Some(TrayAction::OpenWatchdog),
         ID_OPEN_SETTINGS => Some(TrayAction::OpenSettings),
         ID_CHECK_DISK => Some(TrayAction::CheckDiskSpaceNow),
@@ -660,8 +658,8 @@ mod tests {
             Some(TrayAction::OpenRuum)
         );
         assert_eq!(
-            action_for_menu_id(ID_OPEN_SOURCES),
-            Some(TrayAction::OpenSources)
+            action_for_menu_id(ID_OPEN_REMOTE),
+            Some(TrayAction::OpenRemote)
         );
         assert_eq!(
             action_for_menu_id(ID_OPEN_WATCHDOG),

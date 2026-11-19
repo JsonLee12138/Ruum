@@ -30,6 +30,7 @@ const fn hue(category: Category) -> (f32, f32) {
         Category::Git => (0.955, 1.0),
         Category::Media => (0.745, 1.0),
         Category::Cache => (0.125, 0.95),
+        Category::Container => (0.305, 1.0),
         Category::Documents => (0.6, 0.18),
         Category::Other => (0.6, 0.08),
     }

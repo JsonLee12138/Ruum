@@ -51,6 +51,8 @@ struct Options {
     identity: Option<String>,
     /// An optional `Developer ID Installer: …` identity for `.pkg`.
     installer_identity: Option<String>,
+    scanner_pack: Option<PathBuf>,
+    require_scanner_pack: bool,
     notarize: bool,
     zip: bool,
     dmg: bool,
@@ -84,6 +86,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     options.installer_identity = Some(identity.clone());
                 }
             }
+            "--scanner-pack" => {
+                let path = args
+                    .next()
+                    .filter(|p| !p.trim().is_empty())
+                    .ok_or("--scanner-pack needs a file path")?;
+                options.scanner_pack = Some(PathBuf::from(path));
+            }
+            "--require-scanner-pack" => options.require_scanner_pack = true,
             "--notarize" => options.notarize = true,
             "--zip" => {
                 options.zip = true;
@@ -191,6 +201,29 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
         &out,
         &resources.join("AppIcon.icns"),
     )?;
+
+    if let Some(pack_src) = options.scanner_pack.as_deref() {
+        if !pack_src.is_file() {
+            return Err(format!(
+                "scanner pack not found at {}",
+                pack_src.display()
+            ));
+        }
+        copy(
+            pack_src,
+            &resources.join(ruum_core::payload::PACK_FILE_NAME),
+        )?;
+    } else if let Some(pack_src) = crate::scanner_pack::ensure_pack(
+        &root,
+        &target,
+        None,
+        options.require_scanner_pack,
+    )? {
+        copy(
+            &pack_src,
+            &resources.join(ruum_core::payload::PACK_FILE_NAME),
+        )?;
+    }
 
     sign(&app, options.identity.as_deref())?;
 
@@ -698,6 +731,19 @@ mod tests {
         assert!(should_notarize_pkg(&signed_pkg));
 
         assert!(parse(&args(&["--installer-sign"])).is_err());
+        assert!(parse(&args(&["--scanner-pack"])).is_err());
+
+        let with_pack = parse(&args(&[
+            "--scanner-pack",
+            "target/scanner/ruum-scan-linux.pack",
+            "--require-scanner-pack",
+        ]))
+        .expect("scanner pack flags");
+        assert_eq!(
+            with_pack.scanner_pack.as_deref(),
+            Some(Path::new("target/scanner/ruum-scan-linux.pack"))
+        );
+        assert!(with_pack.require_scanner_pack);
     }
 
     #[test]

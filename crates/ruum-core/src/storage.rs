@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS ssh_profiles (
     last_total_bytes INTEGER,
     last_available_bytes INTEGER,
     last_scanned_secs INTEGER,
+    pending_script_path TEXT,
+    pending_script_items INTEGER,
+    pending_reclaim_bytes INTEGER,
+    pending_created_secs INTEGER,
     created_at_secs INTEGER NOT NULL,
     updated_at_secs INTEGER NOT NULL
 );
@@ -221,6 +225,14 @@ pub struct SshProfile {
     pub last_total_bytes: Option<u64>,
     pub last_available_bytes: Option<u64>,
     pub last_scanned_secs: Option<u64>,
+    #[serde(default)]
+    pub pending_script_path: Option<String>,
+    #[serde(default)]
+    pub pending_script_items: Option<u64>,
+    #[serde(default)]
+    pub pending_reclaim_bytes: Option<u64>,
+    #[serde(default)]
+    pub pending_created_secs: Option<u64>,
     pub created_at_secs: u64,
     pub updated_at_secs: u64,
 }
@@ -246,6 +258,10 @@ impl SshProfile {
             last_total_bytes: None,
             last_available_bytes: None,
             last_scanned_secs: None,
+            pending_script_path: None,
+            pending_script_items: None,
+            pending_reclaim_bytes: None,
+            pending_created_secs: None,
             created_at_secs: 0,
             updated_at_secs: 0,
         }
@@ -729,8 +745,12 @@ fn row_to_ssh_profile(row: &Row<'_>) -> rusqlite::Result<SshProfile> {
     let last_total: Option<i64> = row.get(7)?;
     let last_avail: Option<i64> = row.get(8)?;
     let last_scanned: Option<i64> = row.get(9)?;
-    let created_at: i64 = row.get(10)?;
-    let updated_at: i64 = row.get(11)?;
+    let pending_script_path: Option<String> = row.get(10)?;
+    let pending_script_items: Option<i64> = row.get(11)?;
+    let pending_reclaim_bytes: Option<i64> = row.get(12)?;
+    let pending_created_secs: Option<i64> = row.get(13)?;
+    let created_at: i64 = row.get(14)?;
+    let updated_at: i64 = row.get(15)?;
 
     let port = u16::try_from(port_raw).unwrap_or(DEFAULT_SSH_PORT);
     let auth_mode = AuthMode::parse(&auth_mode_raw).map_err(|e| {
@@ -752,6 +772,13 @@ fn row_to_ssh_profile(row: &Row<'_>) -> rusqlite::Result<SshProfile> {
         last_total_bytes: last_total.and_then(|v| u64::try_from(v).ok()),
         last_available_bytes: last_avail.and_then(|v| u64::try_from(v).ok()),
         last_scanned_secs: last_scanned.and_then(|v| u64::try_from(v).ok()),
+        pending_script_path,
+        pending_script_items: pending_script_items
+            .and_then(|v| u64::try_from(v).ok()),
+        pending_reclaim_bytes: pending_reclaim_bytes
+            .and_then(|v| u64::try_from(v).ok()),
+        pending_created_secs: pending_created_secs
+            .and_then(|v| u64::try_from(v).ok()),
         created_at_secs: sqlite_i64_to_u64(created_at),
         updated_at_secs: sqlite_i64_to_u64(updated_at),
     })
@@ -760,7 +787,8 @@ fn row_to_ssh_profile(row: &Row<'_>) -> rusqlite::Result<SshProfile> {
 const SSH_PROFILE_SELECT: &str = "\
 SELECT id, alias, host, port, username, auth_mode, default_path, \
        last_total_bytes, last_available_bytes, last_scanned_secs, \
-       created_at_secs, updated_at_secs \
+       pending_script_path, pending_script_items, pending_reclaim_bytes, \
+       pending_created_secs, created_at_secs, updated_at_secs \
 FROM ssh_profiles";
 
 const WEBHOOK_ENDPOINT_SELECT: &str = "\
@@ -788,6 +816,36 @@ fn row_to_webhook_endpoint(row: &Row<'_>) -> rusqlite::Result<WebhookEndpoint> {
         created_at_secs: sqlite_i64_to_u64(created_at_secs),
         updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
     })
+}
+
+fn migrate_ssh_profiles_pending_columns(
+    conn: &Connection,
+) -> rusqlite::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(ssh_profiles)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            existing.insert(name);
+        }
+    }
+    for (col_name, col_type) in [
+        ("pending_script_path", "TEXT"),
+        ("pending_script_items", "INTEGER"),
+        ("pending_reclaim_bytes", "INTEGER"),
+        ("pending_created_secs", "INTEGER"),
+    ] {
+        if !existing.contains(col_name) {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE ssh_profiles ADD COLUMN {col_name} {col_type}"
+                ),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn migrate_legacy_webhook_config(conn: &Connection) -> rusqlite::Result<()> {
@@ -861,6 +919,7 @@ impl StorageDb {
                 "PRAGMA busy_timeout = 5000;\nPRAGMA journal_mode = WAL;",
             )?;
             conn.execute_batch(SCHEMA_SQL)?;
+            migrate_ssh_profiles_pending_columns(&conn)?;
             migrate_legacy_webhook_config(&conn)
         })?;
         Ok(Self {
@@ -1017,6 +1076,10 @@ impl StorageDb {
             last_total_bytes: profile.last_total_bytes,
             last_available_bytes: profile.last_available_bytes,
             last_scanned_secs: profile.last_scanned_secs,
+            pending_script_path: profile.pending_script_path.clone(),
+            pending_script_items: profile.pending_script_items,
+            pending_reclaim_bytes: profile.pending_reclaim_bytes,
+            pending_created_secs: profile.pending_created_secs,
             created_at_secs: created_at,
             updated_at_secs: updated_at,
         };
@@ -1026,8 +1089,13 @@ impl StorageDb {
             "INSERT INTO ssh_profiles (
                 id, alias, host, port, username, auth_mode, default_path,
                 last_total_bytes, last_available_bytes, last_scanned_secs,
+                pending_script_path, pending_script_items,
+                pending_reclaim_bytes, pending_created_secs,
                 created_at_secs, updated_at_secs
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16
+             )",
             params![
                 inserted.id,
                 inserted.alias,
@@ -1039,6 +1107,10 @@ impl StorageDb {
                 inserted.last_total_bytes.map(u64_to_sqlite_i64),
                 inserted.last_available_bytes.map(u64_to_sqlite_i64),
                 inserted.last_scanned_secs.map(u64_to_sqlite_i64),
+                inserted.pending_script_path,
+                inserted.pending_script_items.map(u64_to_sqlite_i64),
+                inserted.pending_reclaim_bytes.map(u64_to_sqlite_i64),
+                inserted.pending_created_secs.map(u64_to_sqlite_i64),
                 u64_to_sqlite_i64(inserted.created_at_secs),
                 u64_to_sqlite_i64(inserted.updated_at_secs),
             ],
@@ -1211,6 +1283,85 @@ impl StorageDb {
                     u64_to_sqlite_i64(scanned_secs),
                     u64_to_sqlite_i64(scanned_secs),
                 ],
+            )
+            .map_err(|e| sqlite_err(&e))?
+        };
+        if changed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("ssh profile `{id}` not found"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persist a pending cleanup script attachment for an SSH profile.
+    pub fn set_ssh_profile_pending_script(
+        &self,
+        id: &str,
+        script_path: impl AsRef<Path>,
+        items: u64,
+        reclaim_bytes: u64,
+        created_secs: u64,
+    ) -> io::Result<()> {
+        let id = id.trim();
+        let path_str = script_path.as_ref().to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pending script path must be valid UTF-8",
+            )
+        })?;
+        if path_str.is_empty() || path_str.chars().any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pending script path must not be empty or contain control chars",
+            ));
+        }
+        let changed = {
+            let conn = self.lock_conn()?;
+            conn.execute(
+                "UPDATE ssh_profiles SET
+                    pending_script_path = ?2,
+                    pending_script_items = ?3,
+                    pending_reclaim_bytes = ?4,
+                    pending_created_secs = ?5,
+                    updated_at_secs = ?6
+                 WHERE id = ?1",
+                params![
+                    id,
+                    path_str,
+                    u64_to_sqlite_i64(items),
+                    u64_to_sqlite_i64(reclaim_bytes),
+                    u64_to_sqlite_i64(created_secs),
+                    u64_to_sqlite_i64(created_secs),
+                ],
+            )
+            .map_err(|e| sqlite_err(&e))?
+        };
+        if changed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("ssh profile `{id}` not found"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Clear any pending cleanup script attachment from an SSH profile.
+    pub fn clear_ssh_profile_pending_script(&self, id: &str) -> io::Result<()> {
+        let id = id.trim();
+        let updated_at = now_unix_secs();
+        let changed = {
+            let conn = self.lock_conn()?;
+            conn.execute(
+                "UPDATE ssh_profiles SET
+                    pending_script_path = NULL,
+                    pending_script_items = NULL,
+                    pending_reclaim_bytes = NULL,
+                    pending_created_secs = NULL,
+                    updated_at_secs = ?2
+                 WHERE id = ?1",
+                params![id, u64_to_sqlite_i64(updated_at)],
             )
             .map_err(|e| sqlite_err(&e))?
         };
@@ -2132,6 +2283,7 @@ mod tests {
                 Some("build cache".to_owned()),
                 None,
             )],
+            docker_targets: Vec::new(),
         };
         let state = AiState::from_proposal(&proposal, 1_700_000_401).unwrap();
         db.save_ai_state(&state).unwrap();
@@ -2448,6 +2600,7 @@ mod tests {
                     None,
                 ),
             ],
+            docker_targets: Vec::new(),
         };
         let state = AiState::from_proposal(&proposal, 1_700_000_000).unwrap();
         db.save_ai_state(&state).unwrap();
@@ -2469,5 +2622,99 @@ mod tests {
         let cleared = db.load_ai_state().unwrap();
         assert_eq!(cleared.last_proposal_json, None);
         assert_eq!(cleared.updated_at_secs, 1_700_000_200);
+    }
+
+    #[test]
+    fn ssh_profiles_migrates_legacy_table_and_roundtrips_pending_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("legacy.db");
+
+        // Seed a legacy 12-column ssh_profiles table without pending_* columns.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ssh_profiles (
+                    id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL UNIQUE,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 22,
+                    username TEXT NOT NULL,
+                    auth_mode TEXT NOT NULL,
+                    default_path TEXT,
+                    last_total_bytes INTEGER,
+                    last_available_bytes INTEGER,
+                    last_scanned_secs INTEGER,
+                    created_at_secs INTEGER NOT NULL,
+                    updated_at_secs INTEGER NOT NULL
+                );
+                INSERT INTO ssh_profiles (
+                    id, alias, host, port, username, auth_mode, default_path,
+                    last_total_bytes, last_available_bytes, last_scanned_secs,
+                    created_at_secs, updated_at_secs
+                ) VALUES (
+                    'legacy-1', 'prod', '10.0.0.10', 22, 'deploy',
+                    'private_key', '~', 1000, 200, 50, 10, 20
+                );",
+            )
+            .unwrap();
+        }
+
+        // Opening twice must be idempotent and preserve existing rows.
+        let db = StorageDb::open(&db_path).unwrap();
+        drop(db);
+        let db = StorageDb::open(&db_path).unwrap();
+
+        let loaded = db.get_ssh_profile_by_id("legacy-1").unwrap().unwrap();
+        assert_eq!(loaded.alias, "prod");
+        assert_eq!(loaded.pending_script_path, None);
+        assert_eq!(loaded.pending_script_items, None);
+        assert_eq!(loaded.pending_reclaim_bytes, None);
+        assert_eq!(loaded.pending_created_secs, None);
+
+        let script = temp.path().join("cleanup-scripts/prod-123.sh");
+        db.set_ssh_profile_pending_script(
+            "legacy-1",
+            &script,
+            4,
+            2_048_000,
+            1_700_000_123,
+        )
+        .unwrap();
+
+        let with_pending =
+            db.get_ssh_profile_by_id("legacy-1").unwrap().unwrap();
+        assert_eq!(
+            with_pending.pending_script_path.as_deref(),
+            Some(script.to_string_lossy().as_ref())
+        );
+        assert_eq!(with_pending.pending_script_items, Some(4));
+        assert_eq!(with_pending.pending_reclaim_bytes, Some(2_048_000));
+        assert_eq!(with_pending.pending_created_secs, Some(1_700_000_123));
+
+        // Updating profile metadata preserves pending script fields.
+        let mut edited = with_pending;
+        edited.host = "10.0.0.11".to_owned();
+        let after_edit = db.update_ssh_profile(&edited).unwrap();
+        assert_eq!(
+            after_edit.pending_script_path.as_deref(),
+            Some(script.to_string_lossy().as_ref())
+        );
+        assert_eq!(after_edit.pending_script_items, Some(4));
+
+        // Clearing resets all four fields to None.
+        db.clear_ssh_profile_pending_script("legacy-1").unwrap();
+        let cleared = db.get_ssh_profile("prod").unwrap().unwrap();
+        assert_eq!(cleared.pending_script_path, None);
+        assert_eq!(cleared.pending_script_items, None);
+        assert_eq!(cleared.pending_reclaim_bytes, None);
+        assert_eq!(cleared.pending_created_secs, None);
+
+        // Missing profile returns NotFound.
+        let err = db
+            .set_ssh_profile_pending_script("missing", &script, 1, 10, 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let err2 = db.clear_ssh_profile_pending_script("missing").unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::NotFound);
     }
 }

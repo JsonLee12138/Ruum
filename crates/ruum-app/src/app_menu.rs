@@ -42,8 +42,10 @@ mod menu_actions {
             GoForward,
             /// Switch to the Explore view.
             OpenExplore,
-            /// Switch to the Sources & Drives view.
-            OpenSources,
+            /// Switch to the Docker view.
+            OpenDocker,
+            /// Switch to the Remote SSH servers view.
+            OpenRemote,
             /// Switch to the Watchdog view.
             OpenWatchdog,
             /// Open the Settings page.
@@ -52,6 +54,8 @@ mod menu_actions {
             InstallCliCommand,
             /// Show or focus the main window.
             ShowMainWindow,
+            /// Toggle fullscreen mode for the active main window.
+            ToggleFullscreen,
         ]
     );
 }
@@ -134,7 +138,22 @@ pub fn install_for(locale: Locale, cx: &mut App) {
     cx.on_action(|_: &Quit, cx| request_quit(cx));
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_, window, _| window.remove_window());
+            if let Some(confirm) =
+                window.downcast::<crate::CleanupConfirmWindow>()
+            {
+                let _ = confirm.update(cx, |this, window, cx| {
+                    this.cancel(window, cx);
+                });
+            } else if let Some(remote) =
+                window.downcast::<crate::RemoteConnectConfirmWindow>()
+            {
+                let _ = remote.update(cx, |this, window, cx| {
+                    this.deny(window, cx);
+                });
+            } else {
+                let _ =
+                    window.update(cx, |_, window, _| window.remove_window());
+            }
         }
     });
     // `Rescan`, `OpenFolder`, `ShowInFinder` and the history are handled by
@@ -146,6 +165,7 @@ pub fn install_for(locale: Locale, cx: &mut App) {
             KeyBinding::new("ctrl-o", OpenFolder, None),
             KeyBinding::new("ctrl-r", Rescan, None),
             KeyBinding::new("f5", Rescan, None),
+            KeyBinding::new("f11", ToggleFullscreen, None),
             KeyBinding::new("ctrl-shift-r", ShowInFinder, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
         ]);
@@ -202,10 +222,8 @@ fn build_menus(locale: Locale) -> [Menu; 4] {
         ]),
         Menu::new(common::menu_view(locale)).items([
             MenuItem::action(common::menu_explore(locale), OpenExplore),
-            MenuItem::action(
-                common::menu_sources_and_drives(locale),
-                OpenSources,
-            ),
+            MenuItem::action(common::menu_docker(locale), OpenDocker),
+            MenuItem::action(common::menu_remote(locale), OpenRemote),
             MenuItem::action(common::menu_watchdog(locale), OpenWatchdog),
             MenuItem::action(common::menu_settings(locale), OpenSettings),
             MenuItem::separator(),

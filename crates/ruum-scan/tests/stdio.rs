@@ -295,3 +295,110 @@ fn executable_discovers_roots_without_scanning_a_path() {
     assert!(helper.0.wait().unwrap().success());
     drop(input);
 }
+
+#[cfg(unix)]
+#[test]
+fn docker_probe_degrades_gracefully_and_streams_available_usage_through_stdio()
+{
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use ruum_core::docker_adapter::DockerProbeStatus;
+
+    let scan_dir = tempfile::tempdir().unwrap();
+    std::fs::write(scan_dir.path().join("file.txt"), b"abc").unwrap();
+
+    // 1. Simulated Go runtime OOM failure (as can happen under Linux 1 GiB
+    //    RLIMIT_AS): helper must degrade gracefully and finish the scan.
+    let oom_bin_dir = tempfile::tempdir().unwrap();
+    let oom_docker = oom_bin_dir.path().join("docker");
+    std::fs::write(
+        &oom_docker,
+        "#!/bin/sh\necho 'fatal error: out of memory' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &oom_docker,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let prepend_path = |dir: &std::path::Path| {
+        let mut entries = vec![dir.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            entries.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(entries).unwrap()
+    };
+
+    let mut oom_child = Command::new(env!("CARGO_BIN_EXE_ruum-scan"))
+        .arg("--stdio-v1")
+        .env("PATH", prepend_path(oom_bin_dir.path()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let req = Request {
+        root: Some(scan_dir.path().to_path_buf()),
+        disk: false,
+        options: ScanOptions {
+            apparent_size: true,
+            ..ScanOptions::default()
+        },
+    };
+    let mut stdin = oom_child.stdin.take().unwrap();
+    serde_json::to_writer(&mut stdin, &req).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    drop(stdin);
+    let oom_snap =
+        read_snapshot(&mut BufReader::new(oom_child.stdout.take().unwrap()))
+            .unwrap();
+    assert!(oom_child.wait().unwrap().success());
+    assert_eq!(oom_snap.tree.files, 1);
+    assert_eq!(oom_snap.docker, DockerProbeStatus::DaemonStopped);
+    assert_eq!(oom_snap.header.docker, DockerProbeStatus::DaemonStopped);
+
+    // 2. Healthy docker CLI returning `-v` JSON populates `snapshot.docker`
+    //    and `snapshot.header.docker` identically.
+    let ok_bin_dir = tempfile::tempdir().unwrap();
+    let ok_docker = ok_bin_dir.path().join("docker");
+    std::fs::write(
+        &ok_docker,
+        r#"#!/bin/sh
+cat <<'EOF'
+{"Images":[{"Repository":"<none>","Tag":"<none>","ID":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","CreatedSince":"2d","Size":"50MB","UniqueSize":"50MB","Containers":"0"}],"Containers":[{"ID":"111122223333","Names":"stopped-job","Image":"alpine:latest","State":"exited","Status":"Exited (0)","Size":"10MB"}],"Volumes":[],"BuildCache":[{"ID":"bc1","InUse":"false","Size":"20MB"}]}
+EOF
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &ok_docker,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let mut ok_child = Command::new(env!("CARGO_BIN_EXE_ruum-scan"))
+        .arg("--stdio-v1")
+        .env("PATH", prepend_path(ok_bin_dir.path()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ok_stdin = ok_child.stdin.take().unwrap();
+    serde_json::to_writer(&mut ok_stdin, &req).unwrap();
+    ok_stdin.write_all(b"\n").unwrap();
+    drop(ok_stdin);
+    let ok_snap =
+        read_snapshot(&mut BufReader::new(ok_child.stdout.take().unwrap()))
+            .unwrap();
+    assert!(ok_child.wait().unwrap().success());
+    assert_eq!(ok_snap.docker, ok_snap.header.docker);
+    let DockerProbeStatus::Available(summary) = ok_snap.docker else {
+        panic!(
+            "expected Available docker summary, got {:?}",
+            ok_snap.docker
+        );
+    };
+    assert_eq!(summary.removable_images.len(), 1);
+    assert_eq!(summary.stopped_containers.len(), 1);
+    assert_eq!(summary.build_cache_reclaimable_bytes, 20_000_000);
+}

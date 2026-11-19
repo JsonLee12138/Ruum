@@ -106,7 +106,7 @@ pub fn plus_more(count: usize, locale: Locale) -> String {
     }
 }
 
-/// Label for the synthetic home-directory volume row in Sources & Drives.
+/// Label for the synthetic home-directory row in the directory & mount picker.
 #[must_use]
 pub const fn home_directory(locale: Locale) -> &'static str {
     pick(
@@ -115,18 +115,6 @@ pub const fn home_directory(locale: Locale) -> &'static str {
         "\u{4e3b}\u{76ee}\u{5f55}",
         "\u{30db}\u{30fc}\u{30e0}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}",
         "\u{d648} \u{b514}\u{b809}\u{d130}\u{b9ac}",
-    )
-}
-
-/// Placeholder for the directory path input in Sources & Drives.
-#[must_use]
-pub const fn placeholder_abs_path(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "/absolute/path",
-        "/\u{7edd}\u{5bf9}/\u{8def}\u{5f84}",
-        "/\u{7d76}\u{5bfe}/\u{30d1}\u{30b9}",
-        "/\u{c808}\u{b300}/\u{acbd}\u{b85c}",
     )
 }
 
@@ -175,6 +163,30 @@ pub const fn picker_abs_path(locale: Locale) -> &'static str {
         "\u{8bf7}\u{8f93}\u{5165}\u{7edd}\u{5bf9}\u{76ee}\u{5f55}\u{8def}\u{5f84}\u{3002}",
         "\u{7d76}\u{5bfe}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}\u{30d1}\u{30b9}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
         "\u{c808}\u{b300} \u{b514}\u{b809}\u{d130}\u{b9ac} \u{acbd}\u{b85c}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+/// Picker error shown when a relative remote path is submitted.
+#[must_use]
+pub const fn picker_remote_abs_path(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Enter ~ or an absolute remote directory path.",
+        "\u{8bf7}\u{8f93}\u{5165} ~ \u{6216}\u{8fdc}\u{7a0b}\u{7edd}\u{5bf9}\u{76ee}\u{5f55}\u{8def}\u{5f84}\u{3002}",
+        "~ \u{307e}\u{305f}\u{306f}\u{30ea}\u{30e2}\u{30fc}\u{30c8}\u{306e}\u{7d76}\u{5bfe}\u{30d1}\u{30b9}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "~ \u{b610}\u{b294} \u{c6d0}\u{aca9} \u{c808}\u{b300} \u{b514}\u{b809}\u{d130}\u{b9ac} \u{acbd}\u{b85c}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+/// Placeholder for directory path inputs supporting `~` or absolute paths.
+#[must_use]
+pub const fn placeholder_path_or_tilde(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "~ or /absolute/path",
+        "~ \u{6216} /\u{7edd}\u{5bf9}/\u{8def}\u{5f84}",
+        "~ \u{307e}\u{305f}\u{306f} /\u{7d76}\u{5bfe}/\u{30d1}\u{30b9}",
+        "~ \u{b610}\u{b294} /\u{c808}\u{b300}/\u{acbd}\u{b85c}",
     )
 }
 

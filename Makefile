@@ -18,6 +18,7 @@ ICONDIR ?= $(PREFIX)/share/icons/hicolor/scalable/apps
 
 APPS ?= $(HOME)/Applications
 BUNDLE = target/bundle/ruum.app
+LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 UNAME := $(shell uname -s)
 
 MANIFEST = Cargo.toml
@@ -109,9 +110,14 @@ ifeq ($(UNAME),Darwin)
 # bundle breaks its signature.
 install:
 	$(CARGO) xtask bundle
+	-$(LSREGISTER) -u "$(BUNDLE)" 2>/dev/null || true
 	install -d "$(APPS)" "$(BINDIR)"
 	rm -rf "$(APPS)/ruum.app"
 	ditto "$(BUNDLE)" "$(APPS)/ruum.app"
+	touch "$(APPS)/ruum.app" "$(APPS)/ruum.app/Contents/Info.plist"
+	$(LSREGISTER) -f "$(APPS)/ruum.app" 2>/dev/null || true
+	killall NotificationCenter usernoted 2>/dev/null || true
+	if [ -f "$$HOME/Library/LaunchAgents/com.ruum.watchdog.plist" ]; then launchctl kickstart -k "gui/$$(id -u)/com.ruum.watchdog" 2>/dev/null || true; fi
 	ln -sf "$(APPS)/ruum.app/Contents/MacOS/ruum" "$(BINDIR)/ruum"
 	@echo
 	@echo "installed:"
@@ -129,6 +135,9 @@ install: build
 	install -m755 $(TARGET) $(BINDIR)/ruum
 	install -m755 $(GUI_TARGET) $(BINDIR)/ruum-gui
 	install -m644 $(ICON) $(ICONDIR)/ruum.svg
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+	    gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null || true; \
+	fi
 	VERSION=$$(sed -n 's/^version = "\(.*\)"/\1/p' $(MANIFEST) | head -1) && \
 	sed -e 's|@BINDIR@|$(BINDIR)|' -e "s|@VERSION@|$$VERSION|" \
 	    $(DESKTOP) > $(APPDIR)/ruum.desktop && \
@@ -149,6 +158,9 @@ install: build
 
 uninstall:
 	rm -f $(BINDIR)/ruum $(BINDIR)/ruum-gui $(APPDIR)/ruum.desktop $(ICONDIR)/ruum.svg
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+	    gtk-update-icon-cache -f -t "$(PREFIX)/share/icons/hicolor" 2>/dev/null || true; \
+	fi
 	@if command -v update-desktop-database >/dev/null 2>&1; then \
 	    update-desktop-database $(APPDIR) 2>/dev/null || true; \
 	fi

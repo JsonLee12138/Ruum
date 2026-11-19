@@ -9,6 +9,7 @@
 mod bundle;
 mod package;
 mod portable;
+mod scanner_pack;
 
 use std::process::{Command, ExitCode, Stdio};
 
@@ -23,7 +24,11 @@ tasks:
   test      cargo test --workspace
   ci        lint, then test
   portable  Linux: desktop executable with static x86_64/ARM64 scanners
+  scanner-pack [--out <path>] [--strict]
+            cross-compile static Linux scanners into ruum-scan-linux.pack
   bundle    macOS: target/bundle/ruum.app and its zip
+              --scanner-pack <path>      embed prebuilt ruum-scan-linux.pack
+              --require-scanner-pack     fail if Linux musl targets are missing
               --sign IDENTITY            sign app with Developer ID (default: ad hoc)
               --installer-sign IDENTITY  sign .pkg with Developer ID Installer
               --dmg                      build .dmg disk image
@@ -52,6 +57,7 @@ fn main() -> ExitCode {
         "bundle" => bundle::bundle(&args[1..]),
         "package" => package::package(&args[1..]),
         "portable" => portable::build(),
+        "scanner-pack" => scanner_pack::run(&args[1..]),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

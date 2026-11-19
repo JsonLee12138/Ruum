@@ -21,7 +21,7 @@ usage: cargo xtask package <subcommand> [options]
 
 subcommands:
   linux-stage    --arch <x86_64|aarch64> --out <dir> [--binary <path>] [--gui-binary <path>] [--version <V>]
-  windows-stage  --arch <x86_64|aarch64> --out <dir> [--exe <path>] [--gui-exe <path>] [--version <V>]
+  windows-stage  --arch <x86_64|aarch64> --out <dir> [--exe <path>] [--gui-exe <path>] [--scanner-pack <path>] [--version <V>]
   homebrew-cask  --version <V> --arm64-sha256 <H1> --x64-sha256 <H2> --repo <owner/repo> --out <path> [--signed]
   checksums      --dir <dist_dir>
 ";
@@ -88,6 +88,7 @@ pub struct WindowsStageOptions {
     pub out: PathBuf,
     pub exe: Option<PathBuf>,
     pub gui_exe: Option<PathBuf>,
+    pub scanner_pack: Option<PathBuf>,
     pub version: String,
 }
 
@@ -216,6 +217,7 @@ fn parse_windows_stage(args: &[String]) -> Result<WindowsStageOptions, String> {
     let mut out = None;
     let mut exe = None;
     let mut gui_exe = None;
+    let mut scanner_pack = None;
     let mut version = env!("CARGO_PKG_VERSION").to_string();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -228,6 +230,10 @@ fn parse_windows_stage(args: &[String]) -> Result<WindowsStageOptions, String> {
             "--gui-exe" => {
                 gui_exe =
                     Some(PathBuf::from(next_arg(&mut iter, "--gui-exe")?));
+            }
+            "--scanner-pack" => {
+                scanner_pack =
+                    Some(PathBuf::from(next_arg(&mut iter, "--scanner-pack")?));
             }
             "--version" => {
                 version = next_arg(&mut iter, "--version")?.to_string();
@@ -242,6 +248,7 @@ fn parse_windows_stage(args: &[String]) -> Result<WindowsStageOptions, String> {
         out: out.ok_or("--out is required")?,
         exe,
         gui_exe,
+        scanner_pack,
         version,
     })
 }
@@ -449,6 +456,41 @@ pub fn stage_windows(opts: &WindowsStageOptions) -> Result<(), String> {
     let readme_path = root.join("README.md");
     let license_path = root.join("LICENSE");
     let notices_path = root.join("THIRD_PARTY_NOTICES.md");
+    let resolved_pack = if let Some(explicit) = &opts.scanner_pack {
+        if !explicit.is_file() {
+            return Err(format!(
+                "scanner pack not found at {}",
+                explicit.display()
+            ));
+        }
+        Some(explicit.clone())
+    } else {
+        let default_pack = crate::scanner_pack::default_pack_path(
+            &crate::scanner_pack::target_dir_for(&root),
+        );
+        default_pack.is_file().then_some(default_pack)
+    };
+    let (wxs_pack_component, wxs_pack_ref, iss_pack_entry) = if let Some(
+        pack_path,
+    ) =
+        &resolved_pack
+    {
+        let escaped = xml_escape(&native_path(pack_path));
+        let comp = format!(
+            "<Component Id=\"ScannerPackFile\" Directory=\"INSTALLFOLDER\" \
+                 Guid=\"B7F4E102-1C94-4A6D-9B28-3D71E5A4C006\">\n      \
+                 <File Id=\"ScannerPack\" Source=\"{escaped}\" KeyPath=\"yes\" />\n    \
+                 </Component>"
+        );
+        let comp_ref = "<ComponentRef Id=\"ScannerPackFile\" />".to_owned();
+        let iss_entry = format!(
+            "Source: \"{}\"; DestDir: \"{{app}}\"; Flags: ignoreversion",
+            native_path(pack_path)
+        );
+        (comp, comp_ref, iss_entry)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
 
     let wxs = WXS_TEMPLATE
         .replace("@MSI_VERSION@", &xml_escape(&msi_version))
@@ -457,7 +499,9 @@ pub fn stage_windows(opts: &WindowsStageOptions) -> Result<(), String> {
         .replace("@ICON_PATH@", &xml_escape(&native_path(&icon_path)))
         .replace("@README_PATH@", &xml_escape(&native_path(&readme_path)))
         .replace("@LICENSE_PATH@", &xml_escape(&native_path(&license_path)))
-        .replace("@NOTICES_PATH@", &xml_escape(&native_path(&notices_path)));
+        .replace("@NOTICES_PATH@", &xml_escape(&native_path(&notices_path)))
+        .replace("@SCANNER_PACK_COMPONENT@", &wxs_pack_component)
+        .replace("@SCANNER_PACK_COMPONENT_REF@", &wxs_pack_ref);
     let wxs_path = opts.out.join("ruum.wxs");
     write_file(&wxs_path, &wxs)?;
 
@@ -472,7 +516,8 @@ pub fn stage_windows(opts: &WindowsStageOptions) -> Result<(), String> {
         .replace("@ICON_PATH@", &native_path(&icon_path))
         .replace("@README_PATH@", &native_path(&readme_path))
         .replace("@LICENSE_PATH@", &native_path(&license_path))
-        .replace("@NOTICES_PATH@", &native_path(&notices_path));
+        .replace("@NOTICES_PATH@", &native_path(&notices_path))
+        .replace("@SCANNER_PACK_FILE_ENTRY@", &iss_pack_entry);
     let iss_path = opts.out.join("ruum.iss");
     write_file(&iss_path, &iss)?;
 
@@ -758,15 +803,19 @@ mod tests {
 
         let desktop = fs::read_to_string(out.join("ruum.desktop")).unwrap();
         assert!(desktop.contains("Exec=/usr/bin/ruum-gui %f"));
+        assert!(desktop.contains("Actions=remote;"));
+        assert!(desktop.contains("[Desktop Action remote]"));
         assert!(
-            desktop.contains("Exec=/usr/bin/ruum-gui --open-screen sources")
+            desktop.contains("Exec=/usr/bin/ruum-gui --open-screen remote")
         );
         assert!(desktop.contains("X-AppVersion=0.1.1"));
 
         let appdir_desktop =
             fs::read_to_string(out.join("AppDir/ruum.desktop")).unwrap();
         assert!(appdir_desktop.contains("Exec=ruum-gui %f"));
-        assert!(appdir_desktop.contains("Exec=ruum-gui --open-screen sources"));
+        assert!(appdir_desktop.contains("Actions=remote;"));
+        assert!(appdir_desktop.contains("[Desktop Action remote]"));
+        assert!(appdir_desktop.contains("Exec=ruum-gui --open-screen remote"));
         assert!(!appdir_desktop.contains("@BINDIR@"));
 
         let nfpm = fs::read_to_string(out.join("nfpm.yaml")).unwrap();
@@ -812,6 +861,7 @@ mod tests {
             out: out_x64.clone(),
             exe: Some(tmp.path().join("ruum.exe")),
             gui_exe: None,
+            scanner_pack: None,
             version: "0.1.1-beta.1".into(),
         })
         .unwrap();
@@ -819,6 +869,9 @@ mod tests {
         assert!(wxs_x64.contains("Version=\"0.1.1\""));
         assert!(wxs_x64.contains("Scope=\"perMachine\""));
         assert!(wxs_x64.contains("ruum-gui.exe"));
+        assert!(wxs_x64.contains("Key=\"System.AppUserModel.ID\""));
+        assert!(wxs_x64.contains("Value=\"io.github.tobi.ruum\""));
+        assert!(!wxs_x64.contains("ScannerPackFile"));
         assert!(!wxs_x64.contains('@'));
         let iss_x64 = fs::read_to_string(out_x64.join("ruum.iss")).unwrap();
         assert!(
@@ -830,20 +883,31 @@ mod tests {
             "OutputBaseFilename=ruum-0.1.1-beta.1-x86_64-windows-setup"
         ));
         assert!(iss_x64.contains("ruum-gui.exe"));
+        assert!(iss_x64.contains("AppUserModelID: \"io.github.tobi.ruum\""));
+        assert!(!iss_x64.contains("ruum-scan-linux.pack"));
         assert!(!iss_x64.contains('@'));
 
+        let pack_file = tmp.path().join("ruum-scan-linux.pack");
+        fs::write(&pack_file, b"pack-bytes").unwrap();
         let out_arm = tmp.path().join("arm64");
         stage_windows(&WindowsStageOptions {
             arch: Arch::Aarch64,
             out: out_arm.clone(),
             exe: None,
             gui_exe: None,
+            scanner_pack: Some(pack_file),
             version: "0.1.1".into(),
         })
         .unwrap();
+        let wxs_arm = fs::read_to_string(out_arm.join("ruum.wxs")).unwrap();
+        assert!(wxs_arm.contains("ScannerPackFile"));
+        assert!(wxs_arm.contains("ruum-scan-linux.pack"));
+        assert!(!wxs_arm.contains('@'));
         let iss_arm = fs::read_to_string(out_arm.join("ruum.iss")).unwrap();
         assert!(iss_arm.contains("ArchitecturesAllowed=arm64"));
         assert!(iss_arm.contains("ArchitecturesInstallIn64BitMode=arm64"));
+        assert!(iss_arm.contains("ruum-scan-linux.pack"));
+        assert!(!iss_arm.contains('@'));
     }
 
     #[test]
@@ -954,6 +1018,7 @@ mod tests {
             out: tricky.clone(),
             exe: Some(tricky.join("ruum.exe")),
             gui_exe: None,
+            scanner_pack: None,
             version: "0.1.1".into(),
         })
         .unwrap();
@@ -973,5 +1038,7 @@ mod tests {
         assert!(workflow.contains("WIX_PATH="));
         assert!(workflow.contains("& $env:WIX_PATH build"));
         assert!(!workflow.contains("dotnet tool install --global wix"));
+        assert!(workflow.contains("cargo xtask scanner-pack --strict"));
+        assert!(workflow.contains("ruum-scan-linux.pack"));
     }
 }

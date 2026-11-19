@@ -1347,6 +1347,15 @@ fn elapsed_nanos_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn format_timeout(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs == 0 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn spawn_activity_reader(
     pipe: Option<impl io::Read + Send + 'static>,
     start: Instant,
@@ -1364,7 +1373,7 @@ fn spawn_activity_reader(
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     last_activity_ns
-                        .store(elapsed_nanos_u64(start), Ordering::Release);
+                        .fetch_max(elapsed_nanos_u64(start), Ordering::AcqRel);
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -1428,13 +1437,13 @@ fn run_docker_command(
             drop((stdout_handle, stderr_handle));
             let msg = if total_elapsed >= max_runtime {
                 format!(
-                    "docker command exceeded max runtime {}s",
-                    max_runtime.as_secs()
+                    "docker command exceeded max runtime {}",
+                    format_timeout(max_runtime)
                 )
             } else {
                 format!(
-                    "docker command idle timed out after {}s",
-                    timeout.as_secs()
+                    "docker command idle timed out after {}",
+                    format_timeout(timeout)
                 )
             };
             return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
@@ -2348,7 +2357,7 @@ mod tests {
         let script = dir.path().join("streaming-docker");
         std::fs::write(
             &script,
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 5 ]; do\n  echo \"tick $i\"\n  i=$((i + 1))\n  sleep 0.045\ndone\n",
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 4 ]; do\n  echo \"tick $i\"\n  i=$((i + 1))\n  sleep 0.25\ndone\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -2360,10 +2369,37 @@ mod tests {
         let out = run_docker_command(
             &script,
             &["builder", "prune", "-f"],
-            Duration::from_millis(140),
+            Duration::from_millis(600),
         )
         .expect("streaming output should extend idle timeout");
         assert_eq!(out.status_code, 0);
-        assert!(out.stdout.contains("tick 4"));
+        assert!(out.stdout.contains("tick 3"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_timeout_kills_silent_command_with_ms_message() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("silent-docker");
+        std::fs::write(&script, "#!/bin/sh\nsleep 0.4\n").unwrap();
+        std::fs::set_permissions(
+            &script,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let err = run_docker_command(
+            &script,
+            &["system", "df"],
+            Duration::from_millis(80),
+        )
+        .expect_err("silent command should hit idle timeout");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("80ms"),
+            "expected 80ms in error message, got: {err}"
+        );
     }
 }

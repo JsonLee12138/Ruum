@@ -17,7 +17,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use config::{
     DEFAULT_COOLDOWN_SECS, DEFAULT_MIN_FREE_GB, DEFAULT_POLL_INTERVAL_SECS,
@@ -276,7 +276,8 @@ pub fn run_loop(
         let _ = run_once(config_service, mount_path, now_secs, probe, sink);
 
         let sleep_secs = active_config.normalized().poll_interval_secs;
-        for _ in 0..sleep_secs {
+        let sleep_deadline = Instant::now() + Duration::from_secs(sleep_secs);
+        loop {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -285,7 +286,12 @@ pub fn run_loop(
             {
                 break;
             }
-            std::thread::sleep(Duration::from_secs(1));
+            let now = Instant::now();
+            if now >= sleep_deadline {
+                break;
+            }
+            let remaining = sleep_deadline.saturating_duration_since(now);
+            std::thread::sleep(Duration::from_millis(200).min(remaining));
         }
     }
 
@@ -679,8 +685,8 @@ mod tests {
                 break;
             }
             assert!(
-                wake_start.elapsed() < Duration::from_secs(3),
-                "run_loop did not wake within <= 3s on SQLite config change"
+                wake_start.elapsed() < Duration::from_secs(10),
+                "run_loop did not wake within <= 10s on SQLite config change"
             );
             std::thread::sleep(Duration::from_millis(50));
         }

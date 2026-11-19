@@ -282,9 +282,49 @@ pub fn ipc_token_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("ipc.token"))
 }
 
+const SHARING_RETRY_BACKOFFS_MS: [u64; 5] = [10, 20, 40, 80, 160];
+
+fn is_transient_sharing_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+        || err.raw_os_error() == Some(32)
+}
+
+fn persist_with_retry(
+    mut temp: tempfile::NamedTempFile,
+    path: &Path,
+) -> io::Result<()> {
+    for delay_ms in SHARING_RETRY_BACKOFFS_MS {
+        match temp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(persist_err) => {
+                if !is_transient_sharing_error(&persist_err.error) {
+                    return Err(persist_err.error);
+                }
+                temp = persist_err.file;
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        }
+    }
+    temp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn read_to_string_with_retry(path: &Path) -> io::Result<String> {
+    for delay_ms in SHARING_RETRY_BACKOFFS_MS {
+        match fs::read_to_string(path) {
+            Ok(content) => return Ok(content),
+            Err(err) if is_transient_sharing_error(&err) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    fs::read_to_string(path)
+}
+
 /// Atomically load watchdog configuration, falling back to defaults if absent.
 pub fn load_config(path: &Path) -> io::Result<WatchdogConfig> {
-    match fs::read_to_string(path) {
+    match read_to_string_with_retry(path) {
         Ok(content) => {
             let cfg: WatchdogConfig = serde_json::from_str(&content)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -306,13 +346,12 @@ pub fn save_config(path: &Path, config: &WatchdogConfig) -> io::Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temp, config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    persist_with_retry(temp, path)
 }
 
 /// Atomically load watchdog state, falling back to empty state if absent.
 pub fn load_state(path: &Path) -> io::Result<WatchdogState> {
-    match fs::read_to_string(path) {
+    match read_to_string_with_retry(path) {
         Ok(content) => {
             let state: WatchdogState = serde_json::from_str(&content)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -334,8 +373,7 @@ pub fn save_state(path: &Path, state: &WatchdogState) -> io::Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temp, state)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    persist_with_retry(temp, path)
 }
 
 #[cfg(test)]
@@ -612,5 +650,52 @@ mod tests {
         let decoded: CleanupProposal =
             serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, with_docker);
+    }
+
+    #[test]
+    fn transient_sharing_error_classification() {
+        let perm = io::Error::new(io::ErrorKind::PermissionDenied, "locked");
+        assert!(is_transient_sharing_error(&perm));
+
+        let sharing = io::Error::from_raw_os_error(32);
+        assert!(is_transient_sharing_error(&sharing));
+
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "missing");
+        assert!(!is_transient_sharing_error(&not_found));
+
+        let invalid = io::Error::new(io::ErrorKind::InvalidInput, "bad path");
+        assert!(!is_transient_sharing_error(&invalid));
+    }
+
+    #[test]
+    fn persist_and_read_with_retry_roundtrip_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("watchdog-state.json");
+
+        // Absent file falls back to default state without error.
+        let initial = load_state(&state_path).unwrap();
+        assert_eq!(initial, WatchdogState::default());
+
+        let state1 = WatchdogState {
+            last_checked_secs: Some(1_700_000_010),
+            last_triggered_secs: Some(1_700_000_000),
+            last_triggered_threshold_gb: Some(25),
+            last_proposal: None,
+        };
+        save_state(&state_path, &state1).unwrap();
+        assert_eq!(load_state(&state_path).unwrap(), state1);
+
+        // Overwrite existing target via persist_with_retry.
+        let mut temp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let state2 = WatchdogState {
+            last_checked_secs: Some(1_700_000_099),
+            ..state1
+        };
+        serde_json::to_writer_pretty(&mut temp, &state2).unwrap();
+        persist_with_retry(temp, &state_path).unwrap();
+
+        let raw = read_to_string_with_retry(&state_path).unwrap();
+        assert!(raw.contains("1700000099"));
+        assert_eq!(load_state(&state_path).unwrap(), state2);
     }
 }

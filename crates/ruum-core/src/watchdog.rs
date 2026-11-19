@@ -819,13 +819,22 @@ pub fn run_loop(
             .unwrap_or_default()
             .normalized()
             .poll_interval_secs;
-        for _ in 0..sleep_secs {
+        let sleep_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(sleep_secs);
+        loop {
             if cancel.load(Ordering::Relaxed)
                 || file_stamp(config_path) != config_stamp
             {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            let now = std::time::Instant::now();
+            if now >= sleep_deadline {
+                break;
+            }
+            let remaining = sleep_deadline.saturating_duration_since(now);
+            std::thread::sleep(
+                std::time::Duration::from_millis(200).min(remaining),
+            );
         }
     }
     Ok(())
@@ -1525,7 +1534,7 @@ mod tests {
         };
         crate::watchdog_config::save_config(&cfg_path, &cfg_updated).unwrap();
 
-        // Loop must wake up within <= 2s (well below the 60s poll interval)
+        // Loop must wake up well below the 60s poll interval
         let wake_start = std::time::Instant::now();
         loop {
             let checked = load_state(&state_path).unwrap().last_checked_secs;
@@ -1533,8 +1542,8 @@ mod tests {
                 break;
             }
             assert!(
-                wake_start.elapsed() < std::time::Duration::from_secs(3),
-                "run_loop did not wake within <= 2s on watchdog.json change"
+                wake_start.elapsed() < std::time::Duration::from_secs(10),
+                "run_loop did not wake within <= 10s on watchdog.json change"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

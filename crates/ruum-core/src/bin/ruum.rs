@@ -1878,7 +1878,7 @@ fn execute_run_script(
         )?;
 
         let mut cmd = session
-            .build_ssh_command(&[], "sh -s")
+            .build_ssh_command(&[], "/bin/sh -s")
             .context("build ssh command for remote cleanup script")?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::inherit())
@@ -1921,7 +1921,7 @@ fn execute_run_script(
     } else {
         "--yes"
     };
-    let mut cmd = Command::new("sh");
+    let mut cmd = Command::new(if cfg!(unix) { "/bin/sh" } else { "sh" });
     cmd.arg(script_path)
         .arg(flag)
         .stdin(Stdio::null())

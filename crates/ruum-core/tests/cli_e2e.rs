@@ -1648,7 +1648,7 @@ fn cli_mcp_remote_profiles_fail_closed_and_ipc_approved_flow() {
              printf 'invoked\\n' > \"{}\"\n\
              last=\"\"\n\
              for a in \"$@\"; do last=\"$a\"; done\n\
-             if [ \"$last\" = \"sh -s\" ]; then\n\
+             if [ \"$last\" = \"/bin/sh -s\" ]; then\n\
                cat >/dev/null\n\
                printf 'trashed\\n' > \"{}\"\n\
                exit 0\n\
@@ -2339,13 +2339,23 @@ fn cli_run_script_bridges_ssh_session_pipes_payload_and_clears_pending() {
             db.get_ssh_profile_by_id(&profile_id).unwrap().unwrap();
         assert!(after_fail.pending_script_path.is_some());
 
-        // 3. Confirming interactively with --pause pipes payload, streams
-        //    output, waits for Enter, and clears pending_script_* on exit 0.
+        // 3. Confirming interactively with --pause pipes payload, passes
+        //    "/bin/sh -s", streams output, waits for Enter, and clears
+        //    pending_script_* on exit 0.
         let ok_capture = sb.root.path().join("ok_ssh_payload.sh");
+        let ok_cmd_capture = sb.root.path().join("ok_ssh_cmd.txt");
         let ok_ssh = format!(
             "#!/bin/sh\n\
+             last=\"\"\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             printf '%s' \"$last\" > \"{}\"\n\
+             if [ \"$last\" != \"/bin/sh -s\" ]; then\n\
+               echo \"unexpected remote shell cmd: $last\" >&2\n\
+               exit 19\n\
+             fi\n\
              cat > \"{}\"\n\
              printf 'REMOTE_CLEANUP_OK askpass=%s\\n' \"${{SSH_ASKPASS:-}}\"\n",
+            ok_cmd_capture.display(),
             ok_capture.display()
         );
         sb.write_unix_script("ssh", &ok_ssh);
@@ -2372,6 +2382,10 @@ fn cli_run_script_bridges_ssh_session_pipes_payload_and_clears_pending() {
             "run-script failed: {}",
             stderr_str(&ok_out)
         );
+        assert_eq!(
+            fs::read_to_string(&ok_cmd_capture).expect("read captured ssh cmd"),
+            "/bin/sh -s"
+        );
         let stdout_text = stdout_str(&ok_out);
         assert!(stdout_text.contains("Proceed with cleanup? [y/N]"));
         assert!(stdout_text.contains("REMOTE_CLEANUP_OK askpass="));
@@ -2388,5 +2402,31 @@ fn cli_run_script_bridges_ssh_session_pipes_payload_and_clears_pending() {
         assert_eq!(cleared.pending_script_items, None);
         assert_eq!(cleared.pending_reclaim_bytes, None);
         assert_eq!(cleared.pending_created_secs, None);
+
+        // 4. Local run-script (without --profile) uses /bin/sh on Unix and
+        //    ignores a shadowed `sh` in PATH.
+        sb.write_unix_script("sh", "#!/bin/sh\nexit 99\n");
+        let local_marker = sb.root.path().join("local_run_script.marker");
+        let local_script = sb.root.path().join("local_cleanup.sh");
+        fs::write(
+            &local_script,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s' \"${{1-}}\" > \"{}\"\n",
+                local_marker.display()
+            ),
+        )
+        .unwrap();
+        let local_out = sb
+            .cmd_with_sandbox_path()
+            .args(["run-script", local_script.to_str().unwrap(), "--yes"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run local run-script");
+        assert!(
+            local_out.status.success(),
+            "local run-script failed: {}",
+            stderr_str(&local_out)
+        );
+        assert_eq!(fs::read_to_string(&local_marker).unwrap(), "--yes");
     }
 }

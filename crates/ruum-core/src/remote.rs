@@ -25,15 +25,22 @@ const MAX_DIAGNOSTICS: usize = 16 << 10;
 
 // Non-interactive shells often omit ~/.local/bin. Do not require users to
 // edit the server's startup files after the documented user-local install.
-const REMOTE_COMMAND: &str = r#"if command -v ruum-scan >/dev/null 2>&1; then
-exec ruum-scan --stdio-v1
-elif [ -x "$HOME/.local/bin/ruum-scan" ]; then
-exec "$HOME/.local/bin/ruum-scan" --stdio-v1
-else
-echo 'ruum-scan is not installed on this server.' >&2
-echo 'On the server, run make install-scan from the ruum checkout.' >&2
-exit 127
-fi"#;
+// Wrapped in a single-line `/bin/sh -c '...'` with zero inner `'`, `\`, `!`,
+// or newlines so any remote login shell delegates cleanly without touching
+// `stdin`.
+const REMOTE_COMMAND: &str = concat!(
+    "/bin/sh -c '",
+    "if command -v ruum-scan >/dev/null 2>&1; then ",
+    "exec ruum-scan --stdio-v1; ",
+    r#"elif [ -x "$HOME/.local/bin/ruum-scan" ]; then "#,
+    r#"exec "$HOME/.local/bin/ruum-scan" --stdio-v1; "#,
+    "else ",
+    r#"echo "ruum-scan is not installed on this server." >&2; "#,
+    r#"echo "On the server, run make install-scan "#,
+    r#"from the ruum checkout." >&2; "#,
+    "exit 127; ",
+    "fi'",
+);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -674,11 +681,22 @@ fn read_diagnostics(mut input: impl io::Read) -> String {
 }
 
 fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
+    let fallback_msg = fallback.to_string();
     let reason = if details.is_empty() {
-        fallback.to_string()
+        fallback_msg.clone()
     } else {
         details.to_owned()
     };
+    let lower_reason = reason.to_ascii_lowercase();
+    let missing_bin_sh = reason.contains("/bin/sh")
+        && (lower_reason.contains("not found")
+            || lower_reason.contains("no such file")
+            || lower_reason.contains("not recognized"));
+    let handshake_err = reason.contains("unexpected SSH deployment handshake")
+        || reason.contains("incomplete SSH deployment handshake")
+        || (!reason.contains("not installed")
+            && !reason.contains("not found")
+            && fallback_msg.contains("unexpected SSH deployment handshake"));
     let hint = if reason.contains("Permission denied")
         || reason.contains("Authentication failed")
     {
@@ -689,6 +707,17 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
         )
     } else if reason.contains("Host key verification failed") {
         format!("Run ssh {host} in a terminal and verify its host key first.")
+    } else if missing_bin_sh {
+        format!(
+            "Remote scan on {host} requires Unix POSIX /bin/sh, which was \
+             not found on the target host."
+        )
+    } else if handshake_err {
+        format!(
+            "Check remote startup files on {host} (such as \
+             ~/.config/fish/config.fish, ~/.bashrc, or ~/.zshenv) for \
+             non-interactive SSH stdout output."
+        )
     } else if reason.contains("not installed") || reason.contains("not found") {
         format!(
             "Install ruum-scan ON {host}, not on this computer. \
@@ -1103,12 +1132,20 @@ impl RemoteSpace {
 
 fn is_unsupported_space_error(err: &io::Error) -> bool {
     let lower = err.to_string().to_ascii_lowercase();
+    let missing_bin_sh = lower.contains("/bin/sh")
+        && (lower.contains("not found")
+            || lower.contains("no such file")
+            || lower.contains("not recognized"));
     let transport_or_auth = lower.contains("permission denied")
         || lower.contains("authentication failed")
         || lower.contains("host key verification failed")
         || lower.contains("remote host identification has changed")
         || lower.contains("not installed")
         || lower.contains("command not found")
+        || lower.contains("unexpected ssh deployment handshake")
+        || lower.contains("incomplete ssh deployment handshake")
+        || lower.contains("requires unix posix /bin/sh")
+        || missing_bin_sh
         || lower.contains("connection refused")
         || lower.contains("connection timed out")
         || lower.contains("operation timed out")
@@ -2020,6 +2057,7 @@ mod tests {
             "Host key verification failed.",
             "ssh: connect to host 10.0.0.1 port 22: Connection refused",
             "ruum-scan: command not found",
+            "/bin/sh: not found",
         ] {
             let err = RemoteSpace::check_with_jobs(
                 || {
@@ -2129,5 +2167,323 @@ mod tests {
         assert_eq!(lines[lines.len() - 1], "\"done\"");
         let snapshot = read_snapshot(&mut out.as_slice()).unwrap();
         assert_eq!(snapshot.header.docker, snapshot.docker);
+    }
+
+    #[test]
+    fn remote_command_is_single_line_bin_sh_c_without_outer_shell_hazards() {
+        assert!(
+            REMOTE_COMMAND.starts_with("/bin/sh -c '"),
+            "REMOTE_COMMAND must start with /bin/sh -c ': {REMOTE_COMMAND}"
+        );
+        assert!(
+            REMOTE_COMMAND.ends_with('\''),
+            "REMOTE_COMMAND must end with single quote: {REMOTE_COMMAND}"
+        );
+        assert!(
+            !REMOTE_COMMAND.contains(['\n', '\r', '\0']),
+            "REMOTE_COMMAND must be single-line without NUL"
+        );
+        let inner = REMOTE_COMMAND
+            .strip_prefix("/bin/sh -c '")
+            .and_then(|s| s.strip_suffix('\''))
+            .expect("wrapped in /bin/sh -c '...'");
+        assert!(!inner.is_empty());
+        for forbidden in ['\'', '\\', '!', '\n', '\r', '\0'] {
+            assert!(
+                !inner.contains(forbidden),
+                "forbidden char {forbidden:?} in REMOTE_COMMAND inner script"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn find_shell_in_path(name: &str) -> Option<PathBuf> {
+        let mut dirs = std::env::var_os("PATH")
+            .map(|val| std::env::split_paths(&val).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let p = PathBuf::from(extra);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+        dirs.into_iter()
+            .map(|dir| dir.join(name))
+            .find(|cand| cand.is_file())
+    }
+
+    #[cfg(unix)]
+    fn available_unix_shells() -> Vec<String> {
+        let candidates = [
+            "/bin/sh",
+            "/bin/dash",
+            "bash",
+            "zsh",
+            "/bin/csh",
+            "/bin/tcsh",
+            "fish",
+            "nu",
+        ];
+        let mut shells = Vec::new();
+        for cand in candidates {
+            let resolved = if cand.starts_with('/') {
+                Path::new(cand).is_file().then(|| cand.to_owned())
+            } else {
+                find_shell_in_path(cand)
+                    .map(|p| p.to_string_lossy().into_owned())
+            };
+            let Some(shell) = resolved else {
+                continue;
+            };
+            if shells.contains(&shell) {
+                continue;
+            }
+            let ok = Command::new(&shell)
+                .args(["-c", "echo ok"])
+                .output()
+                .is_ok_and(|out| {
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout).trim() == "ok"
+                });
+            if ok {
+                shells.push(shell);
+            }
+        }
+        assert!(
+            shells.iter().any(|s| s == "/bin/sh"),
+            "expected /bin/sh in {shells:?}"
+        );
+        shells
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_executes_across_available_shells() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let empty_home = dir.path().join("empty_home");
+        let local_home = dir.path().join("local_home");
+        let local_bin = local_home.join(".local/bin");
+        let path_bin = dir.path().join("path_bin");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::create_dir_all(&path_bin).unwrap();
+
+        let local_helper = local_bin.join("ruum-scan");
+        std::fs::write(
+            &local_helper,
+            "#!/bin/sh\nIFS= read -r req\nprintf 'LOCAL|%s|%s\\n' \"${1-}\" \"$req\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &local_helper,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let path_helper = path_bin.join("ruum-scan");
+        std::fs::write(
+            &path_helper,
+            "#!/bin/sh\nIFS= read -r req\nprintf 'PATH|%s|%s\\n' \"${1-}\" \"$req\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &path_helper,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut path_dirs = vec![path_bin];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path_dirs.extend(std::env::split_paths(&existing));
+        }
+        let path_with_helper = std::env::join_paths(path_dirs).unwrap();
+
+        for shell in available_unix_shells() {
+            // 1. Missing helper returns 127 and documented stderr hint.
+            let missing = Command::new(&shell)
+                .args(["-c", REMOTE_COMMAND])
+                .env("HOME", &empty_home)
+                .env("PATH", "/nonexistent")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(
+                missing.status.code(),
+                Some(127),
+                "shell={shell} stderr={}",
+                String::from_utf8_lossy(&missing.stderr)
+            );
+            let missing_err = String::from_utf8_lossy(&missing.stderr);
+            assert!(
+                missing_err
+                    .contains("ruum-scan is not installed on this server."),
+                "shell={shell} stderr={missing_err}"
+            );
+            assert!(missing.stdout.is_empty(), "shell={shell}");
+
+            // 2. Fallback to $HOME/.local/bin/ruum-scan with stdin passthrough.
+            let mut local_child = Command::new(&shell)
+                .args(["-c", REMOTE_COMMAND])
+                .env("HOME", &local_home)
+                .env("PATH", "/nonexistent")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = local_child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"discover_version\":1}\n");
+            let local_out = local_child.wait_with_output().unwrap();
+            assert!(
+                local_out.status.success(),
+                "shell={shell} stderr={}",
+                String::from_utf8_lossy(&local_out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&local_out.stdout),
+                "LOCAL|--stdio-v1|{\"discover_version\":1}\n",
+                "shell={shell}"
+            );
+
+            // 3. PATH helper takes priority over $HOME/.local/bin/ruum-scan.
+            let mut path_child = Command::new(&shell)
+                .args(["-c", REMOTE_COMMAND])
+                .env("HOME", &local_home)
+                .env("PATH", &path_with_helper)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = path_child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"ok\":true}\n");
+            let path_out = path_child.wait_with_output().unwrap();
+            assert!(
+                path_out.status.success(),
+                "shell={shell} stderr={}",
+                String::from_utf8_lossy(&path_out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&path_out.stdout),
+                "PATH|--stdio-v1|{\"ok\":true}\n",
+                "shell={shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_error_classifies_handshake_pollution_and_missing_bin_sh() {
+        for msg in [
+            "unexpected SSH deployment handshake",
+            "incomplete SSH deployment handshake",
+        ] {
+            let err = ssh_error("dev", "", &io::Error::other(msg)).to_string();
+            assert!(err.contains("config.fish"), "{err}");
+            assert!(err.contains(".bashrc"), "{err}");
+            assert!(err.contains(".zshenv"), "{err}");
+            assert!(err.contains("stdout"), "{err}");
+            assert!(!err.contains("Install ruum-scan"), "{err}");
+        }
+
+        let noisy_warn = ssh_error(
+            "dev",
+            "Warning: Permanently added 'dev' to known hosts.",
+            &io::Error::other("unexpected SSH deployment handshake"),
+        )
+        .to_string();
+        assert!(noisy_warn.contains("config.fish"), "{noisy_warn}");
+        assert!(noisy_warn.contains("stdout"), "{noisy_warn}");
+
+        for stderr in [
+            "/bin/sh: not found",
+            "zsh: no such file or directory: /bin/sh",
+            "'/bin/sh' is not recognized as an internal or external command",
+        ] {
+            let err = ssh_error(
+                "dev",
+                stderr,
+                &io::Error::other("incomplete SSH deployment handshake"),
+            )
+            .to_string();
+            assert!(err.contains("/bin/sh"), "{err}");
+            assert!(err.contains("Unix POSIX /bin/sh"), "{err}");
+            assert!(!err.contains("Install ruum-scan"), "{err}");
+        }
+
+        let missing_scan = ssh_error(
+            "dev",
+            "ruum-scan: command not found",
+            &io::Error::other("SSH exited with 127"),
+        )
+        .to_string();
+        assert!(
+            missing_scan.contains("Install ruum-scan ON dev"),
+            "{missing_scan}"
+        );
+
+        let auth = ssh_error(
+            "dev",
+            "Permission denied (publickey).",
+            &io::Error::other("incomplete SSH deployment handshake"),
+        )
+        .to_string();
+        assert!(auth.contains("verify your credentials"), "{auth}");
+        assert!(!auth.contains("config.fish"), "{auth}");
+    }
+
+    #[test]
+    fn is_unsupported_space_error_rejects_handshake_and_missing_bin_sh() {
+        let non_fallback_errors = [
+            ssh_error(
+                "dev",
+                "",
+                &io::Error::other("unexpected SSH deployment handshake"),
+            ),
+            ssh_error(
+                "dev",
+                "",
+                &io::Error::other("incomplete SSH deployment handshake"),
+            ),
+            ssh_error(
+                "dev",
+                "/bin/sh: not found",
+                &io::Error::other("incomplete SSH deployment handshake"),
+            ),
+            ssh_error(
+                "dev",
+                "No such file or directory: /bin/sh",
+                &io::Error::other("SSH exited with 127"),
+            ),
+            ssh_error(
+                "dev",
+                "'/bin/sh' is not recognized",
+                &io::Error::other("SSH exited with 1"),
+            ),
+            io::Error::other(
+                "unexpected SSH deployment handshake (missing field)",
+            ),
+            io::Error::other("/bin/sh: not found (missing field)"),
+        ];
+        for err in &non_fallback_errors {
+            assert!(
+                !is_unsupported_space_error(err),
+                "must not fall back for: {err}"
+            );
+        }
+
+        assert!(is_unsupported_space_error(&io::Error::other(
+            "data did not match any variant of untagged enum Operation"
+        )));
+        assert!(is_unsupported_space_error(&io::Error::other(
+            "unsupported space check version"
+        )));
     }
 }

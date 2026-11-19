@@ -295,7 +295,7 @@ pub fn delete_script_for_platform(
     if let Some(host) = host {
         let _ = writeln!(
             script,
-            "printf '%s' {} | ssh -T -- {} 'sh -s'",
+            "printf '%s' {} | ssh -T -- {} '/bin/sh -s'",
             shell_quote(&body),
             shell_quote(host)
         );
@@ -309,7 +309,7 @@ pub fn delete_script_for_platform(
 /// Deterministically generate an interactive remote cleanup `.sh` script.
 ///
 /// Embeds a platform-specific remote payload bounded by static delimiters and
-/// invokes `ssh -T -p <port> -- <user>@<host> 'sh -s'` after confirmation
+/// invokes `ssh -T -p <port> -- <user>@<host> '/bin/sh -s'` after confirmation
 /// (or `--yes`).
 pub fn build_remote_cleanup_script(
     spec: &RemoteCleanupScriptSpec,
@@ -475,7 +475,7 @@ pub fn build_remote_cleanup_script(
          \x20   *) echo 'Aborted.' >&2; exit 1;;\n\
          \x20 esac\n\
          fi\n\n\
-         send_payload | ssh -T -p {} -- {} 'sh -s'\n",
+         send_payload | ssh -T -p {} -- {} '/bin/sh -s'\n",
         shell_quote(&display_alias),
         shell_quote(&port_str),
         shell_quote(&destination),
@@ -1220,7 +1220,8 @@ mod tests {
             "macos",
             Some(&identity),
         );
-        assert!(mac_remote.contains("| ssh -T -- 'mac-studio'"));
+        assert!(mac_remote.contains("| ssh -T -- 'mac-studio' '/bin/sh -s'"));
+        assert!(!mac_remote.contains("'sh -s'"));
 
         let linux_identity = HostIdentity {
             hostname: "prod-box".into(),
@@ -1316,7 +1317,8 @@ mod tests {
         assert!(script.contains("--yes"));
         assert!(script.contains("Proceed with cleanup on"));
         assert!(
-            script.contains("ssh -T -p '2222' -- 'deploy@10.0.0.5' 'sh -s'")
+            script
+                .contains("ssh -T -p '2222' -- 'deploy@10.0.0.5' '/bin/sh -s'")
         );
 
         let payload = extract_remote_payload(&script).expect("extract payload");
@@ -1680,6 +1682,194 @@ mod tests {
                     .unwrap()
                     .success()
             );
+        }
+    }
+
+    #[cfg(unix)]
+    fn find_export_shell(name: &str) -> Option<PathBuf> {
+        let mut dirs = std::env::var_os("PATH")
+            .map(|val| std::env::split_paths(&val).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let p = PathBuf::from(extra);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+        dirs.into_iter()
+            .map(|dir| dir.join(name))
+            .find(|cand| cand.is_file())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_cleanup_invocation_runs_bin_sh_s_across_available_shells() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let cmd_capture = dir.path().join("ssh_remote_cmd.txt");
+        let stdin_capture = dir.path().join("ssh_stdin.txt");
+        let fake_ssh = format!(
+            "#!/bin/sh\n\
+             last=\"\"\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             printf '%s' \"$last\" > {}\n\
+             cat > {}\n",
+            shell_quote(cmd_capture.to_str().unwrap()),
+            shell_quote(stdin_capture.to_str().unwrap()),
+        );
+        let ssh_path = bin_dir.join("ssh");
+        std::fs::write(&ssh_path, fake_ssh).unwrap();
+        std::fs::set_permissions(
+            &ssh_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut path_dirs = vec![bin_dir];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path_dirs.extend(std::env::split_paths(&existing));
+        }
+        let path_env = std::env::join_paths(path_dirs).unwrap();
+
+        let identity = HostIdentity {
+            hostname: "prod-01".to_owned(),
+            machine_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        };
+        let targets = [target("/home/deploy/.cache/pip", 4096, true)];
+        let delete_remote = delete_script_for_platform(
+            &targets,
+            Path::new("/home/deploy"),
+            Some("prod-01"),
+            "linux",
+            Some(&identity),
+        );
+        assert!(delete_remote.contains("'/bin/sh -s'"));
+        assert!(!delete_remote.contains("'sh -s'"));
+
+        let delete_path = dir.path().join("delete_remote.sh");
+        std::fs::write(&delete_path, &delete_remote).unwrap();
+        let del_out = Command::new("/bin/sh")
+            .arg(&delete_path)
+            .arg("--delete")
+            .env("PATH", &path_env)
+            .output()
+            .unwrap();
+        assert!(
+            del_out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&del_out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cmd_capture).unwrap(),
+            "/bin/sh -s"
+        );
+        assert!(
+            std::fs::read_to_string(&stdin_capture)
+                .unwrap()
+                .contains("/home/deploy/.cache/pip")
+        );
+
+        let header = Header::new(
+            PathBuf::from("/home/deploy"),
+            Some(PathBuf::from("/home/deploy")),
+            "linux",
+            Some(identity),
+        );
+        let cleanup = build_remote_cleanup_script(&RemoteCleanupScriptSpec {
+            profile_alias: "prod".to_owned(),
+            host: "10.0.0.5".to_owned(),
+            port: 22,
+            username: "deploy".to_owned(),
+            header,
+            targets: targets.to_vec(),
+            docker_targets: Vec::new(),
+        })
+        .unwrap();
+        assert!(cleanup.contains("'/bin/sh -s'"));
+        assert!(!cleanup.contains("'sh -s'"));
+
+        let cleanup_path = dir.path().join("cleanup_remote.sh");
+        std::fs::write(&cleanup_path, &cleanup).unwrap();
+        let cleanup_out = Command::new("/bin/sh")
+            .arg(&cleanup_path)
+            .arg("--yes")
+            .env("PATH", &path_env)
+            .output()
+            .unwrap();
+        assert!(
+            cleanup_out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&cleanup_out.stderr)
+        );
+        let captured_cmd = std::fs::read_to_string(&cmd_capture).unwrap();
+        assert_eq!(captured_cmd, "/bin/sh -s");
+
+        let candidates = [
+            "/bin/sh",
+            "/bin/dash",
+            "bash",
+            "zsh",
+            "/bin/csh",
+            "/bin/tcsh",
+            "fish",
+            "nu",
+        ];
+        let mut shells = Vec::new();
+        for cand in candidates {
+            let resolved = if cand.starts_with('/') {
+                Path::new(cand).is_file().then(|| cand.to_owned())
+            } else {
+                find_export_shell(cand)
+                    .map(|p| p.to_string_lossy().into_owned())
+            };
+            if let Some(shell) = resolved
+                && !shells.contains(&shell)
+            {
+                let ok = Command::new(&shell)
+                    .args(["-c", "echo ok"])
+                    .output()
+                    .is_ok_and(|o| {
+                        o.status.success()
+                            && String::from_utf8_lossy(&o.stdout).trim() == "ok"
+                    });
+                if ok {
+                    shells.push(shell);
+                }
+            }
+        }
+        assert!(shells.iter().any(|s| s == "/bin/sh"));
+
+        for (idx, shell) in shells.into_iter().enumerate() {
+            let marker = dir.path().join(format!("marker_{idx}.txt"));
+            let stdin_script = format!(
+                "set -eu\nprintf '%s\\n' ok > {}\n",
+                shell_quote(marker.to_str().unwrap())
+            );
+            let mut child = Command::new(&shell)
+                .args(["-c", &captured_cmd])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin_script.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "shell={shell} stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ok\n");
         }
     }
 }

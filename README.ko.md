@@ -64,7 +64,7 @@ brew tap JsonLee12138/tap && brew install --cask ruum
   ```
 - **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage:** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
+- **AppImage:** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
 - **포터블 압축 파일(`.tar.gz`):** `ruum-*-x86_64-linux.tar.gz`를 풀고 `./install.sh`를 실행하거나 `ruum`을 `PATH` 경로에 복사합니다.
 
 **Hyprland 플로팅 창 규칙:** Hyprland는 기본적으로 새 창을 타일링하므로 `ruum`(창 클래스 `ruum`)에 넉넉한 플로팅 창 규칙을 지정하는 것을 권장합니다:

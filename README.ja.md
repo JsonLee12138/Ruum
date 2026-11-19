@@ -64,7 +64,7 @@ brew tap JsonLee12138/tap && brew install --cask ruum
   ```
 - **Debian / Ubuntu（`.deb`）：** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL（`.rpm`）：** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage：** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
+- **AppImage：** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
 - **ポータブルアーカイブ（`.tar.gz`）：** `ruum-*-x86_64-linux.tar.gz` を展開し、`./install.sh` を実行します（または `ruum` を `PATH` の通ったディレクトリへコピーします）。
 
 **Hyprland のフローティングウィンドウ設定：** Hyprland は新規ウィンドウを既定でタイリングするため、`ruum`（ウィンドウクラス `ruum`）には十分なサイズのフローティング設定を推奨します：

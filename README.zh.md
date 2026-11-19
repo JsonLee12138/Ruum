@@ -64,7 +64,7 @@ brew tap JsonLee12138/tap && brew install --cask ruum
   ```
 - **Debian / Ubuntu（`.deb`）：** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL（`.rpm`）：** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage：** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
+- **AppImage：** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
 - **便携压缩包（`.tar.gz`）：** 解压 `ruum-*-x86_64-linux.tar.gz` 后运行 `./install.sh`（或直接将 `ruum` 放到 `PATH` 中）。
 
 **Hyprland 浮动窗口规则：** Hyprland 默认平铺新窗口，建议为 `ruum`（窗口类名为 `ruum`）配置宽松的浮动规则：

@@ -2349,52 +2349,64 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
     let path = config.path().join("ruum.db");
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
-    update(&view, cx, |app, _| {
-        app.db_path = Some(path.clone());
-        // Enough CPUs that every preset is offered, whatever runs the test.
-        app.cpu_threads = 18;
-    });
-    let epoch = read(&view, cx, |app| app.scan_epoch);
-    for preset in Power::ALL {
-        draw(cx);
-        let button = cx.debug_bounds("power-efficiency").expect("control");
-        cx.simulate_click(button.center(), Modifiers::none());
-        draw(cx);
-        let choice = cx.debug_bounds(preset.key()).expect("preset");
-        cx.simulate_click(choice.center(), Modifiers::none());
-        draw(cx);
-        let saved = StorageDb::open(&path)
-            .expect("open db")
-            .load_app_settings()
-            .expect("saved");
-        assert_eq!(saved.power_preset, preset.key());
-        read(&view, cx, |app| {
-            assert_eq!(app.power_choice, Some(preset));
-            assert_eq!(
-                app.options.threads.max_threads,
-                preset.threads(app.cpu_threads)
-            );
-            assert!(!app.options.threads.adaptive);
-            assert!(app.power_menu.is_none());
-            assert_eq!(app.scan_epoch, epoch);
-            assert!(app.tree.is_some());
-        });
+    let mut locales = vec![read(&view, cx, |app| app.locale)];
+    if !locales.contains(&crate::i18n::Locale::En) {
+        locales.push(crate::i18n::Locale::En);
     }
-    // Persistence failure must not masquerade as a saved preference.
-    update(&view, cx, |app, cx| {
-        app.db_path = Some(config.path().to_owned());
-        app.set_power_efficiency(Power::Miser, cx);
-    });
-    assert!(read(&view, cx, |app| {
-        let label = Power::Miser.label_in(app.cpu_threads, app.locale);
-        let prefix =
-            crate::i18n::messages::power_save_failed(&label, "", app.locale);
-        // Compare without the OS-specific trailing error text.
-        let head = prefix.trim_end();
-        app.notice
-            .as_ref()
-            .is_some_and(|(message, _)| message.starts_with(head))
-    }));
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    for locale in locales {
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            app.db_path = Some(path.clone());
+            // Enough CPUs that every preset is offered, whatever runs the test.
+            app.cpu_threads = 18;
+            app.power_menu = None;
+            app.power_hover = false;
+            app.notice = None;
+            cx.notify();
+        });
+        for preset in Power::ALL {
+            draw(cx);
+            let button = cx.debug_bounds("power-efficiency").expect("control");
+            cx.simulate_click(button.center(), Modifiers::none());
+            draw(cx);
+            let choice = cx.debug_bounds(preset.key()).expect("preset");
+            cx.simulate_click(choice.center(), Modifiers::none());
+            draw(cx);
+            let saved = StorageDb::open(&path)
+                .expect("open db")
+                .load_app_settings()
+                .expect("saved");
+            assert_eq!(saved.power_preset, preset.key());
+            read(&view, cx, |app| {
+                assert_eq!(app.power_choice, Some(preset));
+                assert_eq!(
+                    app.options.threads.max_threads,
+                    preset.threads(app.cpu_threads)
+                );
+                assert!(!app.options.threads.adaptive);
+                assert!(app.power_menu.is_none());
+                assert_eq!(app.scan_epoch, epoch);
+                assert!(app.tree.is_some());
+            });
+        }
+        // Persistence failure must not masquerade as a saved preference.
+        update(&view, cx, |app, cx| {
+            app.db_path = Some(config.path().to_owned());
+            app.set_power_efficiency(Power::Miser, cx);
+        });
+        assert!(read(&view, cx, |app| {
+            let label = Power::Miser.label_in(app.cpu_threads, app.locale);
+            let prefix = crate::i18n::messages::power_save_failed(
+                &label, "", app.locale,
+            );
+            // Compare without the OS-specific trailing error text.
+            let head = prefix.trim_end();
+            app.notice
+                .as_ref()
+                .is_some_and(|(message, _)| message.starts_with(head))
+        }));
+    }
     update(&view, cx, Ruum::start_scan);
     assert_eq!(read(&view, cx, |app| app.scan_epoch), epoch + 1);
 }
@@ -2411,64 +2423,185 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     let config = tempfile::tempdir().expect("config");
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
-    update(&view, cx, |app, _| {
-        app.db_path = Some(config.path().join("ruum.db"));
-        // Aggressive and Drain My Battery would both run four workers.
-        app.cpu_threads = 4;
-        app.power_choice = Some(Power::Balanced);
+    let mut locales = vec![read(&view, cx, |app| app.locale)];
+    if !locales.contains(&crate::i18n::Locale::En) {
+        locales.push(crate::i18n::Locale::En);
+    }
+    for locale in locales {
+        cx.simulate_mouse_move(
+            gpui_kit::point(px(0.), px(0.)),
+            None,
+            Modifiers::none(),
+        );
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            app.db_path = Some(config.path().join("ruum.db"));
+            // Aggressive and Drain My Battery would both run four workers.
+            app.cpu_threads = 4;
+            app.power_choice = Some(Power::Balanced);
+            app.power_menu = None;
+            app.power_hover = false;
+            app.notice = None;
+            cx.notify();
+        });
+        draw(cx);
+        let toggle = cx.debug_bounds("power-efficiency").expect("control");
+        cx.simulate_mouse_move(toggle.center(), None, Modifiers::none());
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        draw(cx);
+        assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
+
+        // The pointer takes the highlight, and the check stays on what is
+        // saved.
+        let miser = cx.debug_bounds(Power::Miser.key()).expect("row");
+        cx.simulate_mouse_move(miser.center(), None, Modifiers::none());
+        draw(cx);
+        assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
+        let balanced = cx.debug_bounds(Power::Balanced.key()).expect("row");
+        let check = cx.debug_bounds("power-check").expect("check");
+        assert!(balanced.contains(&check.center()), "check on {check:?}");
+
+        // A disabled row ignores the click and leaves the menu to be dismissed.
+        let drain = cx.debug_bounds(Power::DrainMyBattery.key()).expect("row");
+        cx.simulate_click(drain.center(), Modifiers::none());
+        draw(cx);
+        read(&view, cx, |app| {
+            assert_eq!(app.power_choice, Some(Power::Balanced));
+            assert!(app.notice.is_none());
+        });
+
+        // The arrows step over what is not offered, and Enter chooses.
+        update(&view, cx, |app, cx| {
+            app.power_menu = None;
+            app.toggle_power_menu(cx);
+        });
+        press(cx, "down");
+        assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
+        press(cx, "up");
+        assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
+        press(cx, "enter");
+        read(&view, cx, |app| {
+            assert_eq!(app.power_choice, Some(Power::Miser));
+            assert_eq!(app.options.threads.max_threads, 2);
+            assert!(app.power_menu.is_none());
+        });
+
+        // The button closes what it opened, rather than the press outside the
+        // menu closing it only for the click to open it again.
+        draw(cx);
+        let toggle = cx.debug_bounds("power-efficiency").expect("control");
+        cx.simulate_mouse_move(toggle.center(), None, Modifiers::none());
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        draw(cx);
+        assert!(read(&view, cx, |app| app.power_menu.is_some()));
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        draw(cx);
+        assert!(read(&view, cx, |app| app.power_menu.is_none()));
+    }
+}
+
+#[gpui_kit::test]
+fn top_bar_wraps_cleanly_at_min_width_across_all_locales(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::{ExploreHostTab, ExploreSessionSnapshot, HostTabKey};
+    use gpui_kit::Modifiers;
+    use ruum_core::docker_adapter::{DockerProbeStatus, DockerUsageSummary};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    let mut avail_snap = ExploreSessionSnapshot::default();
+    avail_snap.root_path = PathBuf::from("/srv/docker");
+    avail_snap.scan_root = PathBuf::from("/srv/docker");
+    avail_snap.tree =
+        Some(std::sync::Arc::new(scan(temp.path(), options()).unwrap()));
+    avail_snap.remote = Some("prod-docker".into());
+    avail_snap.remote_platform = "linux".into();
+    avail_snap.docker = DockerProbeStatus::Available(DockerUsageSummary {
+        build_cache_reclaimable_bytes: 500_000_000,
+        detailed: true,
+        ..DockerUsageSummary::default()
     });
-    draw(cx);
-    let toggle = cx.debug_bounds("power-efficiency").expect("control");
-    cx.simulate_mouse_move(toggle.center(), None, Modifiers::none());
-    cx.simulate_click(toggle.center(), Modifiers::none());
-    draw(cx);
-    assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
-
-    // The pointer takes the highlight, and the check stays on what is saved.
-    let miser = cx.debug_bounds(Power::Miser.key()).expect("row");
-    cx.simulate_mouse_move(miser.center(), None, Modifiers::none());
-    draw(cx);
-    assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
-    let balanced = cx.debug_bounds(Power::Balanced.key()).expect("row");
-    let check = cx.debug_bounds("power-check").expect("check");
-    assert!(balanced.contains(&check.center()), "check on {check:?}");
-
-    // A disabled row ignores the click and leaves the menu to be dismissed.
-    let drain = cx.debug_bounds(Power::DrainMyBattery.key()).expect("row");
-    cx.simulate_click(drain.center(), Modifiers::none());
-    draw(cx);
-    read(&view, cx, |app| {
-        assert_eq!(app.power_choice, Some(Power::Balanced));
-        assert!(app.notice.is_none());
-    });
-
-    // The arrows step over what is not offered, and Enter chooses.
     update(&view, cx, |app, cx| {
-        app.power_menu = None;
-        app.toggle_power_menu(cx);
-    });
-    press(cx, "down");
-    assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
-    press(cx, "up");
-    assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
-    press(cx, "enter");
-    read(&view, cx, |app| {
-        assert_eq!(app.power_choice, Some(Power::Miser));
-        assert_eq!(app.options.threads.max_threads, 2);
-        assert!(app.power_menu.is_none());
+        app.cpu_threads = 18;
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh("srv-docker".into()),
+            label: "prod-docker".into(),
+            session: Some(avail_snap),
+        });
+        app.switch_host_tab(HostTabKey::Ssh("srv-docker".into()), cx);
     });
 
-    // The button closes what it opened, rather than the press outside the
-    // menu closing it only for the click to open it again.
+    let assert_inside =
+        |name: &str, bounds: Bounds<Pixels>, width: f32, height: f32| {
+            assert!(
+                bounds.origin.x >= px(0.)
+                    && bounds.right() <= px(width)
+                    && bounds.origin.y >= px(0.)
+                    && bounds.bottom() <= px(height),
+                "{name} out of {width}x{height} bounds: {bounds:?}"
+            );
+        };
+
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    for locale in crate::i18n::ALL_LOCALES {
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            app.power_menu = None;
+            cx.notify();
+        });
+        draw(cx);
+        let switch_bounds = cx
+            .debug_bounds("trail-switch-root")
+            .expect("trail-switch-root");
+        let docker_bounds = cx
+            .debug_bounds("remote-docker-btn")
+            .expect("remote-docker-btn");
+        let power_bounds = cx
+            .debug_bounds("power-efficiency")
+            .expect("power-efficiency");
+        assert_inside("trail-switch-root", switch_bounds, 900., 600.);
+        assert_inside("remote-docker-btn", docker_bounds, 900., 600.);
+        assert_inside("power-efficiency", power_bounds, 900., 600.);
+
+        cx.simulate_mouse_move(power_bounds.center(), None, Modifiers::none());
+        cx.simulate_click(power_bounds.center(), Modifiers::none());
+        draw(cx);
+        assert!(
+            read(&view, cx, |app| app.power_menu.is_some()),
+            "power-menu failed to open in {locale:?}"
+        );
+        let menu_bounds = cx.debug_bounds("power-menu").expect("power-menu");
+        assert_inside("power-menu", menu_bounds, 900., 600.);
+    }
+
+    // At the default 1440x900 width, the top bar stays on a single row.
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    update(&view, cx, |app, cx| {
+        app.set_locale(crate::i18n::Locale::En);
+        app.power_menu = None;
+        cx.notify();
+    });
     draw(cx);
-    let toggle = cx.debug_bounds("power-efficiency").expect("control");
-    cx.simulate_mouse_move(toggle.center(), None, Modifiers::none());
-    cx.simulate_click(toggle.center(), Modifiers::none());
-    draw(cx);
-    assert!(read(&view, cx, |app| app.power_menu.is_some()));
-    cx.simulate_click(toggle.center(), Modifiers::none());
-    draw(cx);
-    assert!(read(&view, cx, |app| app.power_menu.is_none()));
+    let switch_bounds = cx
+        .debug_bounds("trail-switch-root")
+        .expect("trail-switch-root");
+    let docker_bounds = cx
+        .debug_bounds("remote-docker-btn")
+        .expect("remote-docker-btn");
+    let power_bounds = cx
+        .debug_bounds("power-efficiency")
+        .expect("power-efficiency");
+    assert_inside("trail-switch-root", switch_bounds, 1440., 900.);
+    assert_inside("remote-docker-btn", docker_bounds, 1440., 900.);
+    assert_inside("power-efficiency", power_bounds, 1440., 900.);
+    assert!(
+        (switch_bounds.center().y - power_bounds.center().y).abs() < px(10.),
+        "top bar wrapped at 1440x900: switch={switch_bounds:?}, \
+         power={power_bounds:?}"
+    );
 }
 
 #[gpui_kit::test]

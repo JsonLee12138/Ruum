@@ -663,23 +663,25 @@ fn top_bar(
     window: &mut Window,
     cx: &mut Context<'_, Ruum>,
 ) -> Div {
-    div()
+    let nav = div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(space::LG)
-        .px(space::LG)
-        .py(space::MD)
-        .border_b_1()
-        .border_color(theme.divider())
-        .child(with_tooltip(
-            logo(theme).id("choose-source").cursor_pointer()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_volumes(cx);
-                    this.apply_focus(window, cx);
-                })),
-            crate::i18n::explore::logo_tooltip(app.locale),
-        ))
+        .gap(space::SM)
+        .flex_1()
+        .min_w(size::TOP_BAR_NAV_MIN)
+        .overflow_hidden()
+        .child(
+            div().flex_shrink_0().child(with_tooltip(
+                logo(theme).id("choose-source").cursor_pointer().on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.open_volumes(cx);
+                        this.apply_focus(window, cx);
+                    }),
+                ),
+                crate::i18n::explore::logo_tooltip(app.locale),
+            )),
+        )
         .child(host_tabs_strip(app, theme, cx))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
@@ -691,8 +693,21 @@ fn top_bar(
                     ruum_core::docker_adapter::DockerProbeStatus::Available(_)
                 ),
             |bar| bar.child(remote_docker_button(app, cx)),
-        )
-        .child(div().flex_1())
+        );
+
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap_x(space::MD)
+        .gap_y(space::XS)
+        .px(space::LG)
+        .py(space::MD)
+        .border_b_1()
+        .border_color(theme.divider())
+        .child(nav)
         .child(view_settings(app, window, cx))
 }
 
@@ -706,6 +721,7 @@ fn host_tabs_strip(
     let mut strip = div()
         .id("host-tabs")
         .debug_selector(|| "host-tabs".into())
+        .min_w_0()
         .max_w(size::HOST_TABS_MAX)
         .overflow_x_scroll()
         .flex()
@@ -4317,6 +4333,7 @@ fn help_overlay(app: &Ruum, cx: &gpui_kit::App) -> Div {
 
 fn switch_root_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
     div()
+        .flex_shrink_0()
         .debug_selector(|| "trail-switch-root".into())
         .child(with_tooltip(
             gpui_omarchy::icon_button(
@@ -4340,6 +4357,7 @@ fn remote_docker_button(
 ) -> impl IntoElement {
     let tooltip = crate::i18n::explore::remote_docker_tooltip(app.locale);
     div()
+        .flex_shrink_0()
         .debug_selector(|| "remote-docker-btn".into())
         .child(with_tooltip(
             gpui_omarchy::icon_button(

@@ -112,6 +112,9 @@ pub mod size {
     pub const TOAST: Rems = Rems(26.0);
     /// Bounded width of the horizontally scrollable host tag strip in top bar.
     pub const HOST_TABS_MAX: Rems = Rems(18.0);
+    /// Minimum width reserved for the Explore top bar's navigation group
+    /// before the right-hand view controls wrap onto a second row.
+    pub const TOP_BAR_NAV_MIN: Rems = Rems(18.0);
     /// Left category sidebar width on the Zed-style Settings page.
     pub const SETTINGS_NAV: Rems = Rems(12.5);
     /// Height (and square button width) of the Linux CSD titlebar.

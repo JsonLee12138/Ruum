@@ -75,7 +75,8 @@ jobs:
             pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev \
-            desktop-file-utils rpm cpio
+            desktop-file-utils rpm cpio patchelf appstream xvfb \
+            mesa-vulkan-drivers
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -123,6 +124,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           name="ruum-$VERSION-$ARCH-linux"
+          appimage_name="ruum-$VERSION-$ARCH"
           tar_stage="$RUNNER_TEMP/tar-stage/$name"
           pkg_stage="$RUNNER_TEMP/pkg-stage"
           verify_dir="$RUNNER_TEMP/verify"
@@ -146,16 +148,35 @@ jobs:
 
           desktop-file-validate "$pkg_stage/ruum.desktop"
           desktop-file-validate "$pkg_stage/AppDir/ruum.desktop"
+          desktop-file-validate "$pkg_stage/AppDir/usr/share/applications/ruum.desktop"
 
           nfpm package --config "$pkg_stage/nfpm.yaml" \
             --packager deb --target "dist/$name.deb"
           nfpm package --config "$pkg_stage/nfpm.yaml" \
             --packager rpm --target "dist/$name.rpm"
 
+          bash packaging/linux/bundle-appdir-libs.sh \
+            "$pkg_stage/AppDir" \
+            packaging/linux/appimage-excludelist
+
+          file -b "$pkg_stage/AppDir/.DirIcon" | grep -q '^PNG image data'
+          test -f "$pkg_stage/AppDir/usr/lib/libxkbcommon-x11.so.0"
+          while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+            entry=${raw_line%%#*}
+            entry=${entry//[[:space:]]/}
+            [ -z "$entry" ] && continue
+            if [ -e "$pkg_stage/AppDir/usr/lib/$entry" ]; then
+              echo "excluded library $entry leaked into AppDir/usr/lib" >&2
+              exit 1
+            fi
+          done < packaging/linux/appimage-excludelist
+
+          appstreamcli validate-tree "$pkg_stage/AppDir"
+
           ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
             "$RUNNER_TEMP/appimage/appimagetool-${ARCH}.AppImage" \
-            "$pkg_stage/AppDir" "dist/$name.AppImage"
-          chmod +x "dist/$name.AppImage"
+            "$pkg_stage/AppDir" "dist/$appimage_name.AppImage"
+          chmod +x "dist/$appimage_name.AppImage"
 
           # Verify the embedded ruum-scan trailer survived all package formats.
           deb_member=$(dpkg-deb --fsys-tarfile "dist/$name.deb" | tar -tf - \
@@ -175,12 +196,24 @@ jobs:
           "$verify_dir/ruum-rpm" extract-scanner "$ARCH" "$verify_dir/scan-rpm"
 
           (cd "$verify_dir" && APPIMAGE_EXTRACT_AND_RUN=1 \
-            "$GITHUB_WORKSPACE/dist/$name.AppImage" \
+            "$GITHUB_WORKSPACE/dist/$appimage_name.AppImage" \
             --appimage-extract usr/bin/ruum >/dev/null)
           cmp -s target/portable/ruum \
             "$verify_dir/squashfs-root/usr/bin/ruum"
           "$verify_dir/squashfs-root/usr/bin/ruum" \
             extract-scanner "$ARCH" "$verify_dir/scan-appimage"
+
+          # Smoke-check AppImage startup under headless Xvfb (must stay alive
+          # rather than aborting immediately on missing shared libraries).
+          set +e
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a -s "-screen 0 1280x800x24" \
+            timeout -k 2s 4s "./dist/$appimage_name.AppImage"
+          smoke_rc=$?
+          set -e
+          if [ "$smoke_rc" -ne 124 ]; then
+            echo "AppImage smoke launch exited prematurely (code $smoke_rc)" >&2
+            exit 1
+          fi
 
           rm -rf "$verify_dir" "$tar_stage" "$pkg_stage"
 
@@ -191,7 +224,7 @@ jobs:
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.tar.gz
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.deb
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.rpm
-            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.AppImage
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}.AppImage
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

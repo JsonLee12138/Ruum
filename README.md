@@ -64,7 +64,7 @@ Download a package from the [latest release](https://github.com/JsonLee12138/Ruu
   ```
 - **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage:** `chmod +x ruum-*-x86_64-linux.AppImage && ./ruum-*-x86_64-linux.AppImage`
+- **AppImage:** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
 - **Portable tarball:** unpack `ruum-*-x86_64-linux.tar.gz` and run `./install.sh` (or copy `ruum` onto your `PATH`).
 
 **Hyprland floating window rule:** Hyprland tiles new windows by default; ruum works best in a roomy floating window (`class` is `ruum`):

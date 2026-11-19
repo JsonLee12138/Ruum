@@ -3,6 +3,7 @@ set -eu
 
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 APPDIR=${APPDIR:-"$HERE"}
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [ "${RUUM_ASKPASS_CMD-}" = "ssh-askpass" ]; then
     exec "$APPDIR/usr/bin/ruum" "$@"

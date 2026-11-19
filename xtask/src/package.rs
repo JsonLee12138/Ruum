@@ -11,6 +11,8 @@ use sha2::{Digest as _, Sha256};
 const DESKTOP_TEMPLATE: &str = include_str!("../../packaging/ruum.desktop.in");
 const NFPM_TEMPLATE: &str = include_str!("../../packaging/linux/nfpm.yaml.in");
 const APPRUN_SCRIPT: &str = include_str!("../../packaging/linux/AppRun");
+const APPDATA_XML: &str =
+    include_str!("../../packaging/linux/io.github.tobi.ruum.appdata.xml");
 const WXS_TEMPLATE: &str = include_str!("../../packaging/windows/ruum.wxs");
 const ISS_TEMPLATE: &str = include_str!("../../packaging/windows/ruum.iss");
 const HOMEBREW_TEMPLATE: &str =
@@ -410,11 +412,32 @@ pub fn stage_linux(opts: &LinuxStageOptions) -> Result<(), String> {
         .replace("@BINDIR@", "")
         .replace("@VERSION@", &opts.version);
     write_file(&appdir.join("ruum.desktop"), &desktop_appdir)?;
+    let share_apps = appdir.join("usr/share/applications");
+    create_dir_all(&share_apps)?;
+    write_file(&share_apps.join("ruum.desktop"), &desktop_appdir)?;
 
+    let png_src = root.join("assets/ruum.png");
     let svg_src = root.join("assets/ruum.svg");
     let staged_icon = appdir.join("ruum.svg");
     copy_file(&svg_src, &staged_icon)?;
-    copy_file(&svg_src, &appdir.join(".DirIcon"))?;
+    copy_file(&png_src, &appdir.join("ruum.png"))?;
+    copy_file(&png_src, &appdir.join(".DirIcon"))?;
+
+    let icon_256_dir = appdir.join("usr/share/icons/hicolor/256x256/apps");
+    create_dir_all(&icon_256_dir)?;
+    copy_file(&png_src, &icon_256_dir.join("ruum.png"))?;
+
+    let icon_scalable_dir =
+        appdir.join("usr/share/icons/hicolor/scalable/apps");
+    create_dir_all(&icon_scalable_dir)?;
+    copy_file(&svg_src, &icon_scalable_dir.join("ruum.svg"))?;
+
+    let metainfo_dir = appdir.join("usr/share/metainfo");
+    create_dir_all(&metainfo_dir)?;
+    write_file(
+        &metainfo_dir.join("io.github.tobi.ruum.appdata.xml"),
+        APPDATA_XML,
+    )?;
 
     let apprun_path = appdir.join("AppRun");
     write_file(&apprun_path, APPRUN_SCRIPT)?;
@@ -670,6 +693,11 @@ fn workspace_root() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+fn create_dir_all(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|err| format!("cannot create {}: {err}", path.display()))
+}
+
 fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
     fs::copy(from, to).map(drop).map_err(|err| {
         format!("cannot copy {} to {}: {err}", from.display(), to.display())
@@ -827,8 +855,58 @@ mod tests {
         assert!(out.join("AppDir/usr/bin/ruum").is_file());
         assert!(out.join("AppDir/usr/bin/ruum-gui").is_file());
         assert!(out.join("AppDir/ruum.svg").is_file());
+        assert!(out.join("AppDir/ruum.png").is_file());
         assert!(out.join("AppDir/.DirIcon").is_file());
+        assert!(
+            out.join("AppDir/usr/share/icons/hicolor/256x256/apps/ruum.png")
+                .is_file()
+        );
+        assert!(
+            out.join("AppDir/usr/share/icons/hicolor/scalable/apps/ruum.svg")
+                .is_file()
+        );
         assert!(out.join("AppDir/AppRun").is_file());
+
+        let png_magic = b"\x89PNG\r\n\x1a\n";
+        for icon_rel in [
+            "AppDir/.DirIcon",
+            "AppDir/ruum.png",
+            "AppDir/usr/share/icons/hicolor/256x256/apps/ruum.png",
+        ] {
+            let bytes = fs::read(out.join(icon_rel)).unwrap();
+            assert!(
+                bytes.starts_with(png_magic),
+                "{icon_rel} must be a valid PNG"
+            );
+        }
+
+        let share_desktop = fs::read_to_string(
+            out.join("AppDir/usr/share/applications/ruum.desktop"),
+        )
+        .unwrap();
+        assert_eq!(share_desktop, appdir_desktop);
+
+        let metainfo =
+            fs::read_to_string(out.join(
+                "AppDir/usr/share/metainfo/io.github.tobi.ruum.appdata.xml",
+            ))
+            .unwrap();
+        assert!(metainfo.contains("<id>io.github.tobi.ruum</id>"));
+        assert!(
+            metainfo
+                .contains("<project_license>GPL-3.0-only</project_license>")
+        );
+        assert!(metainfo.contains(
+            "<launchable type=\"desktop-id\">ruum.desktop</launchable>"
+        ));
+        assert!(metainfo.contains("<binary>ruum-gui</binary>"));
+        assert!(metainfo.contains("<binary>ruum</binary>"));
+        assert!(!metainfo.contains('@'));
+
+        let apprun = fs::read_to_string(out.join("AppDir/AppRun")).unwrap();
+        assert!(apprun.contains(
+            "export LD_LIBRARY_PATH=\"$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\""
+        ));
 
         #[cfg(unix)]
         {
@@ -1040,5 +1118,122 @@ mod tests {
         assert!(!workflow.contains("dotnet tool install --global wix"));
         assert!(workflow.contains("cargo xtask scanner-pack --strict"));
         assert!(workflow.contains("ruum-scan-linux.pack"));
+    }
+
+    #[test]
+    fn linux_release_workflow_and_readme_use_compliant_appimage_contract() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        assert!(workflow.contains("bundle-appdir-libs.sh"));
+        assert!(workflow.contains("appstreamcli validate-tree"));
+        assert!(workflow.contains("xvfb-run"));
+        assert!(workflow.contains(
+            "dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}.AppImage"
+        ));
+        assert!(!workflow.contains("-linux.AppImage"));
+
+        let readme = include_str!("../../README.md");
+        assert!(readme.contains("ruum-*-x86_64.AppImage"));
+        assert!(!readme.contains("-linux.AppImage"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_appdir_libs_filters_excludelist_and_preserves_ruum_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let root = workspace_root();
+        let appdir = tmp.path().join("AppDir");
+        let bin_dir = appdir.join("usr/bin");
+        let fake_sys_lib = tmp.path().join("syslib");
+        let mock_tools = tmp.path().join("tools");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&fake_sys_lib).unwrap();
+        fs::create_dir_all(&mock_tools).unwrap();
+
+        let ruum_bytes = b"RUUM_ELF_HEADER_PLUS_RUUM_SCAN_TRAILER_12345";
+        fs::write(bin_dir.join("ruum"), ruum_bytes).unwrap();
+        fs::write(bin_dir.join("ruum-gui"), b"RUUM_GUI_ELF").unwrap();
+
+        for lib in [
+            "libxkbcommon-x11.so.0",
+            "libxkbcommon.so.0",
+            "libxcb-shape.so.0",
+            "libc.so.6",
+            "libGL.so.1",
+            "libwayland-client.so.0",
+            "libfontconfig.so.1",
+        ] {
+            fs::write(fake_sys_lib.join(lib), format!("SO:{lib}")).unwrap();
+        }
+
+        let patchelf_log = tmp.path().join("patchelf.log");
+        let ldd_script = format!(
+            "#!/bin/sh\n\
+             printf '\\tlinux-vdso.so.1 (0x00007fff)\\n'\n\
+             printf '\\tlibxkbcommon-x11.so.0 => {sys}/libxkbcommon-x11.so.0 (0x1)\\n'\n\
+             printf '\\tlibxkbcommon.so.0 => {sys}/libxkbcommon.so.0 (0x2)\\n'\n\
+             printf '\\tlibxcb-shape.so.0 => {sys}/libxcb-shape.so.0 (0x3)\\n'\n\
+             printf '\\tlibGL.so.1 => {sys}/libGL.so.1 (0x4)\\n'\n\
+             printf '\\tlibwayland-client.so.0 => {sys}/libwayland-client.so.0 (0x5)\\n'\n\
+             printf '\\tlibfontconfig.so.1 => {sys}/libfontconfig.so.1 (0x6)\\n'\n\
+             printf '\\tlibc.so.6 => {sys}/libc.so.6 (0x7)\\n'\n",
+            sys = fake_sys_lib.display()
+        );
+        let ldd_path = mock_tools.join("ldd");
+        fs::write(&ldd_path, ldd_script).unwrap();
+        fs::set_permissions(&ldd_path, fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let patchelf_script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {log}\n",
+            log = patchelf_log.display()
+        );
+        let patchelf_path = mock_tools.join("patchelf");
+        fs::write(&patchelf_path, patchelf_script).unwrap();
+        fs::set_permissions(&patchelf_path, fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let combined_path = format!(
+            "{}:{}",
+            mock_tools.display(),
+            existing_path.to_string_lossy()
+        );
+        let output = Command::new("bash")
+            .arg(root.join("packaging/linux/bundle-appdir-libs.sh"))
+            .arg(&appdir)
+            .arg(root.join("packaging/linux/appimage-excludelist"))
+            .env("PATH", combined_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bundle-appdir-libs.sh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(appdir.join("usr/lib/libxkbcommon-x11.so.0").is_file());
+        assert!(appdir.join("usr/lib/libxkbcommon.so.0").is_file());
+        assert!(appdir.join("usr/lib/libxcb-shape.so.0").is_file());
+        assert!(!appdir.join("usr/lib/libc.so.6").exists());
+        assert!(!appdir.join("usr/lib/libGL.so.1").exists());
+        assert!(!appdir.join("usr/lib/libwayland-client.so.0").exists());
+        assert!(!appdir.join("usr/lib/libfontconfig.so.1").exists());
+
+        assert_eq!(fs::read(bin_dir.join("ruum")).unwrap(), ruum_bytes);
+
+        let log_contents = fs::read_to_string(&patchelf_log).unwrap();
+        assert!(log_contents.contains("--set-rpath $ORIGIN/../lib"));
+        assert!(log_contents.contains("usr/bin/ruum-gui"));
+        assert!(log_contents.contains("--set-rpath $ORIGIN "));
+        assert!(
+            !log_contents
+                .lines()
+                .any(|line| line.ends_with("usr/bin/ruum")),
+            "patchelf must never touch usr/bin/ruum: {log_contents}"
+        );
     }
 }

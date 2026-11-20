@@ -2638,6 +2638,14 @@ fn locate_tarball_root(stage_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::missing_const_for_fn,
+        clippy::unnecessary_wraps,
+        reason = "Unix-only chmod; non-Unix keeps uniform Result signature"
+    )
+)]
 fn set_executable_mode(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

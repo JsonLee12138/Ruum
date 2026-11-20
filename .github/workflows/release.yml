@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,6 +25,7 @@ jobs:
   validate:
     name: Validate tag and version
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -63,6 +68,7 @@ jobs:
           - { runner: ubuntu-22.04, arch: x86_64 }
           - { runner: ubuntu-22.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
@@ -254,6 +260,7 @@ jobs:
           - { runner: macos-15, arch: aarch64 }
           - { runner: macos-15-intel, arch: x86_64 }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
     env:
       # Signing and notarizing happen only when the repository has these
       # secrets; without them the app is signed ad hoc, and a downloaded
@@ -393,6 +400,7 @@ jobs:
           - { runner: windows-2025, arch: x86_64 }
           - { runner: windows-11-arm, arch: aarch64 }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     env:
       # The C runtime linked in, so ruum.exe also runs where the Visual
       # C++ runtime was never installed. For the tests too, so both steps
@@ -807,6 +815,7 @@ jobs:
     name: Publish
     needs: [validate, linux, macos, windows]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:

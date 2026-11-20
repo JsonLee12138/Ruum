@@ -1888,4 +1888,146 @@ mod tests {
         assert!(workflow.contains("--remote"));
         assert!(workflow.contains("channels/$CHANNEL/manifest.json"));
     }
+
+    fn workflow_job_section<'a>(
+        workflow: &'a str,
+        job_id: &str,
+        next_job_id: Option<&str>,
+    ) -> &'a str {
+        let marker = format!("\n  {job_id}:\n");
+        let (_, from_job) = workflow
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("missing job `{job_id}`"));
+        match next_job_id {
+            Some(next) => {
+                let next_marker = format!("\n  {next}:\n");
+                from_job
+                    .split_once(&next_marker)
+                    .map_or(from_job, |(section, _)| section)
+            }
+            None => from_job,
+        }
+    }
+
+    #[test]
+    fn ci_and_release_workflows_enforce_concurrency_timeouts_and_change_gating()
+    {
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        assert!(ci.contains(concat!(
+            "paths-ignore: ",
+            "[\"**.md\", \"docs/**\", \"cliff.toml\", \"LICENSE\"]"
+        )));
+        assert!(ci.contains("workflow_dispatch:"));
+        assert!(ci.contains("include_macos_intel:"));
+        assert!(ci.contains(
+            "group: ci-${{ github.event.pull_request.number || github.ref }}"
+        ));
+        assert!(ci.contains(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}"
+        ));
+
+        let changes = workflow_job_section(ci, "changes", Some("tooling-test"));
+        assert!(changes.contains("fetch-depth: 0"));
+        assert!(changes.contains("node scripts/ci-classify-changes.mjs"));
+        assert!(changes.contains("timeout-minutes: 5"));
+        for out in [
+            "run_rust",
+            "run_macos_bundle",
+            "run_worker",
+            "run_ci_scripts",
+            "run_macos_intel",
+        ] {
+            assert!(
+                changes.contains(&format!(
+                    "{out}: ${{{{ steps.classify.outputs.{out} }}}}"
+                )),
+                "changes job missing output `{out}`"
+            );
+        }
+
+        let tooling = workflow_job_section(ci, "tooling-test", Some("check"));
+        assert!(tooling.contains("needs: changes"));
+        assert!(tooling.contains(concat!(
+            "needs.changes.outputs.run_worker == 'true' || ",
+            "needs.changes.outputs.run_ci_scripts == 'true'"
+        )));
+        assert!(tooling.contains("timeout-minutes: 5"));
+        assert!(
+            tooling
+                .contains("node --test scripts/ci-classify-changes.test.mjs")
+        );
+        assert!(
+            tooling.contains(
+                "node --test infra/update-worker/tests/worker.test.mjs"
+            )
+        );
+
+        let check = workflow_job_section(ci, "check", Some("check-macos"));
+        assert!(check.contains("needs: changes"));
+        assert!(check.contains("if: needs.changes.outputs.run_rust == 'true'"));
+        assert!(check.contains("timeout-minutes: 35"));
+
+        let macos = workflow_job_section(ci, "check-macos", Some("windows"));
+        assert!(macos.contains("needs: changes"));
+        assert!(macos.contains("if: needs.changes.outputs.run_rust == 'true'"));
+        assert!(macos.contains("timeout-minutes: 45"));
+        assert!(
+            macos.contains(
+                "if: needs.changes.outputs.run_macos_bundle == 'true'"
+            )
+        );
+        assert!(macos.contains("cargo xtask bundle --all"));
+
+        let windows =
+            workflow_job_section(ci, "windows", Some("other-architectures"));
+        assert!(windows.contains("needs: changes"));
+        assert!(
+            windows.contains("if: needs.changes.outputs.run_rust == 'true'")
+        );
+        assert!(windows.contains("timeout-minutes: 45"));
+
+        let other = workflow_job_section(
+            ci,
+            "other-architectures",
+            Some("test-macos-intel"),
+        );
+        assert!(other.contains("needs: changes"));
+        assert!(other.contains("if: needs.changes.outputs.run_rust == 'true'"));
+        assert!(other.contains("timeout-minutes: 45"));
+        assert!(other.contains("ubuntu-24.04-arm"));
+        assert!(other.contains("windows-11-arm"));
+        assert!(!other.contains("macos-15-intel"));
+
+        let intel = workflow_job_section(ci, "test-macos-intel", None);
+        assert!(intel.contains("needs: changes"));
+        assert!(intel.contains(concat!(
+            "if: needs.changes.outputs.run_rust == 'true' && ",
+            "needs.changes.outputs.run_macos_intel == 'true'"
+        )));
+        assert!(intel.contains("runs-on: macos-15-intel"));
+        assert!(intel.contains("timeout-minutes: 60"));
+        assert!(intel.contains("cargo xtask test"));
+
+        let release = include_str!("../../.github/workflows/release.yml");
+        assert!(
+            release.contains(
+                "group: release-${{ inputs.tag || github.ref_name }}"
+            )
+        );
+        assert!(release.contains("cancel-in-progress: true"));
+
+        for (job, next, timeout) in [
+            ("validate", Some("linux"), "timeout-minutes: 10"),
+            ("linux", Some("macos"), "timeout-minutes: 45"),
+            ("macos", Some("windows"), "timeout-minutes: 75"),
+            ("windows", Some("publish"), "timeout-minutes: 60"),
+            ("publish", None, "timeout-minutes: 20"),
+        ] {
+            let section = workflow_job_section(release, job, next);
+            assert!(
+                section.contains(timeout),
+                "release job `{job}` missing `{timeout}`"
+            );
+        }
+    }
 }

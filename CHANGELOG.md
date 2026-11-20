@@ -2,6 +2,14 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.3-beta.1] - 2026-11-20
+
+### Features
+
+- **app:** Add non-intrusive three-tier update UX (left icon-rail update entry, once-per-version floating toast, structured Changelog modal with on-demand download & background hide, system tray / macOS menu integration, and **Settings › Updates** with `Stable` / `Beta` channels across `en`/`zh`/`ja`/`ko`).
+- **core,cli:** Add Ed25519 + SHA256 verified update engine with tri-platform desktop installers (`macOS` `.app`, `Windows` Inno/MSI, `Linux` AppImage/tarball), GitHub Releases fallback, SQLite `update_settings`, and `ruum update [check]` / `ruum config update`.
+- **release,infra:** Add Cloudflare Worker + private R2 edge distribution (`https://ruum-updates.jsonlee12138.com`) with one-line `install.sh [--cli-only]` / `install.ps1` installers and signed `manifest.json` generation in `release.yml`.
+
 ## [0.2.2] - 2026-11-20
 
 ### Fixes

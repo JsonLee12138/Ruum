@@ -9,6 +9,7 @@
 mod bundle;
 mod package;
 mod portable;
+mod release;
 mod scanner_pack;
 
 use std::process::{Command, ExitCode, Stdio};
@@ -41,6 +42,9 @@ tasks:
               windows-stage --arch <x86_64|aarch64> --out <dir>
               homebrew-cask --version <V> --arm64-sha256 <H1> --x64-sha256 <H2> --repo <owner/repo> --out <path> [--signed]
               checksums --dir <dist_dir>
+              manifest --version <V> --tag <T> --channel <stable|beta> --repo <owner/repo> --dir <dist> --notes-file <path> --out <path> [--sign-key-env <ENV>] [--published-at <iso8601>]
+  release-notes --version <V> [--changelog CHANGELOG.md] [--out <path>]
+  release-prep  <version> [--changelog CHANGELOG.md] [--dry-run]
 ";
 
 fn main() -> ExitCode {
@@ -57,6 +61,8 @@ fn main() -> ExitCode {
         "bundle" => bundle::bundle(&args[1..]),
         "package" => package::package(&args[1..]),
         "portable" => portable::build(),
+        "release-notes" => release::release_notes(&args[1..]),
+        "release-prep" => release::release_prep(&args[1..]),
         "scanner-pack" => scanner_pack::run(&args[1..]),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");

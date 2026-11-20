@@ -22,6 +22,9 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ChangesEnvironment=yes
+CloseApplications=yes
+CloseApplicationsFilter=ruum.exe,ruum-gui.exe
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

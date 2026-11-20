@@ -29,6 +29,21 @@
 
 ## 설치 및 초기 설정
 
+### 원라인 빠른 설치
+
+- **macOS & Linux**(데스크톱 앱과 `ruum` CLI를 SHA-256 검증과 함께 설치):
+  ```sh
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh
+  # 헤드리스 / 서버용 CLI만 설치:
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh -s -- --cli-only
+  ```
+- **Windows(PowerShell)**:
+  ```powershell
+  irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
+  ```
+
+> **앱 내 자동 업데이트 및 CLI 확인:** 데스크톱 앱은 백그라운드에서 서명된 릴리스를 조용히 확인합니다(**설정 › 업데이트**에서 Stable / Beta 채널 전환 및 자동 확인 설정 가능, **다운로드 및 업데이트**를 누르기 전에는 패키지를 미리 내려받지 않습니다). 헤드리스 서버에서는 `ruum update check`로 서명 검증 및 정확한 업그레이드 명령을 확인할 수 있습니다.
+
 ### macOS
 
 Homebrew로 설치할 수 있습니다(macOS 11 이상, Apple Silicon `aarch64-macos` 및 Intel `x86_64-macos` 지원):
@@ -314,6 +329,9 @@ ruum [옵션] [PATH]                     # PATH 스캔(생략 시 ~ 기본값)
 ruum ssh HOST [옵션] [PATH]            # SSH로 원격 호스트 분석(읽기 전용)
 ruum mcp [--read-only]                 # stdio MCP 서버 실행
 ruum watchdog [--once]                 # 디스크 워치독 데몬(또는 1회 점검) 실행
+ruum update [check] [--channel stable|beta] [--json]
+                                       # 서명된 릴리스 확인 및 업그레이드 명령 출력
+ruum config update get|set [...]       # 업데이트 설정 조회 및 변경
 ruum extract-scanner ARCH OUTPUT       # 내장 Linux 정적 스캐너 추출(x86_64 | aarch64)
 ```
 

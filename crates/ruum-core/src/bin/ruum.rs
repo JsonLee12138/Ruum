@@ -34,9 +34,14 @@ use ruum_core::ssh_session::{
 };
 use ruum_core::storage::{
     AiState, AuthMode, DEFAULT_SSH_PORT, DEFAULT_SSH_SESSION_DURATION_MINUTES,
-    SshProfile, StorageDb, WebhookEndpoint,
+    SshProfile, StorageDb, UpdateChannel, WebhookEndpoint,
 };
 use ruum_core::tree::{Metric, Node};
+use ruum_core::updater::{
+    DEFAULT_GITHUB_REPO, UpdateArch, UpdateCheckRequest, UpdateEnv,
+    UpdateFactory, check_for_updates, resolve_effective_public_key_for_url,
+    resolve_update_base_url,
+};
 use ruum_core::watchdog::{
     ServiceStatus, install_service, run_default_loop_with_db,
     run_default_once_with_db, service_status, uninstall_service,
@@ -60,6 +65,8 @@ usage: ruum                       launch ruum-gui if desktop is available, else 
        ruum run-script <SCRIPT> [--profile ID_OR_ALIAS] [--yes] [--pause]
                                   review and execute a generated cleanup script
        ruum mcp [--read-only]     run Model Context Protocol (MCP) server over stdio
+       ruum update [check] [--channel stable|beta] [--json]
+                                  check for updates and show upgrade instructions
        ruum extract-scanner ARCH OUTPUT
                                   extract embedded static Linux scanner (x86_64 | aarch64)
 
@@ -134,7 +141,20 @@ usage:
   ruum config ai get [--json]
   ruum config ai set [--auto-analyze BOOL] [--provider agy|pi|codex|custom]
                      [--custom-command CMD] [--extra-args ARGS]
-                     [--model M | --clear-model] [--json]";
+                     [--model M | --clear-model] [--json]
+  ruum config update get [--json]
+  ruum config update set [--auto-check BOOL] [--channel stable|beta]
+                         [--send-client-id BOOL] [--clear-skipped] [--json]";
+
+const UPDATE_HELP: &str = "\
+ruum update — check for ruum updates and print upgrade instructions
+
+usage: ruum update [check] [OPTIONS]
+
+options:
+      --channel stable|beta  override configured release channel
+      --json                 emit JSON output
+  -h, --help                 show this help";
 
 const WATCHDOG_HELP: &str = "\
 ruum watchdog — disk space watchdog service and single-tick runner
@@ -216,6 +236,7 @@ fn run() -> Result<()> {
         "analyze" => cmd_analyze(&args[1..]),
         "run-script" => cmd_run_script(&args[1..]),
         "mcp" => cmd_mcp(&args[1..]),
+        "update" => cmd_update(&args[1..]),
         "extract-scanner" => cmd_extract_scanner(&args[1..]),
         "ssh-askpass" => cmd_ssh_askpass(&args[1..]),
         other if other.starts_with('-') => {
@@ -690,6 +711,7 @@ fn cmd_config(args: &[OsString]) -> Result<()> {
         "watchdog" => cmd_config_watchdog(&args[1..]),
         "webhook" => cmd_config_webhook(&args[1..]),
         "ai" => cmd_config_ai(&args[1..]),
+        "update" => cmd_config_update(&args[1..]),
         other => {
             bail!("unknown config section `{other}`; try `ruum config --help`")
         }
@@ -1568,6 +1590,193 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
         }
         other => bail!("unknown `config ai` action `{other}`"),
     }
+}
+
+fn cmd_config_update(args: &[OsString]) -> Result<()> {
+    let Some(action) = args.first().map(|a| a.to_string_lossy()) else {
+        bail!("usage: ruum config update <get|set>");
+    };
+    if matches!(action.as_ref(), "-h" | "--help" | "help") {
+        println!("{CONFIG_HELP}");
+        return Ok(());
+    }
+    let rest = &args[1..];
+    let db = StorageDb::open_default()?;
+    match action.as_ref() {
+        "get" => {
+            let json_out = check_json_only(rest, "ruum config update get")?;
+            let cfg = db.load_update_settings()?;
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&cfg)?);
+            } else {
+                println!("auto_check = {}", cfg.auto_check);
+                println!("channel = {}", cfg.channel);
+                println!("send_client_id = {}", cfg.send_client_id);
+                println!(
+                    "skipped_version = {}",
+                    cfg.skipped_version.as_deref().unwrap_or("")
+                );
+                println!("last_checked_at_secs = {}", cfg.last_checked_at_secs);
+            }
+            Ok(())
+        }
+        "set" => {
+            let mut cfg = db.load_update_settings()?;
+            let mut json_out = false;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.to_str() {
+                    Some("--auto-check") => {
+                        let raw = next_str(&mut iter, "--auto-check")?;
+                        cfg.auto_check = parse_bool(&raw, "--auto-check")?;
+                    }
+                    Some("--channel") => {
+                        let raw = next_str(&mut iter, "--channel")?;
+                        cfg.channel = raw.parse::<UpdateChannel>()?;
+                    }
+                    Some("--send-client-id") => {
+                        let raw = next_str(&mut iter, "--send-client-id")?;
+                        cfg.send_client_id =
+                            parse_bool(&raw, "--send-client-id")?;
+                    }
+                    Some("--clear-skipped") => cfg.skipped_version = None,
+                    Some("--json") => json_out = true,
+                    Some(other) => {
+                        bail!(
+                            "unknown option `{other}` for `config update set`"
+                        )
+                    }
+                    None => {
+                        bail!("invalid UTF-8 option for `config update set`")
+                    }
+                }
+            }
+            cfg.updated_at_secs = now_unix_secs();
+            db.save_update_settings(&cfg)?;
+            let saved = db.load_update_settings()?;
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&saved)?);
+            } else {
+                println!("update_settings updated");
+            }
+            Ok(())
+        }
+        other => bail!("unknown `config update` action `{other}`"),
+    }
+}
+
+fn normalized_cli_lang() -> String {
+    let raw = sys_locale::get_locale().unwrap_or_else(|| "en".to_owned());
+    let head = raw.split(['-', '_', '.']).next().unwrap_or("en").trim();
+    if head.is_empty() {
+        "en".to_owned()
+    } else {
+        head.to_ascii_lowercase()
+    }
+}
+
+fn cmd_update(args: &[OsString]) -> Result<()> {
+    let rest = match args.first().and_then(|a| a.to_str()) {
+        Some("check") => &args[1..],
+        Some("-h" | "--help" | "help") => {
+            println!("{UPDATE_HELP}");
+            return Ok(());
+        }
+        _ => args,
+    };
+
+    let mut channel_override: Option<UpdateChannel> = None;
+    let mut json_out = false;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("-h" | "--help") => {
+                println!("{UPDATE_HELP}");
+                return Ok(());
+            }
+            Some("--channel") => {
+                let raw = next_str(&mut iter, "--channel")?;
+                channel_override = Some(raw.parse::<UpdateChannel>()?);
+            }
+            Some("--json") => json_out = true,
+            Some(other) => {
+                bail!(
+                    "unknown option `{other}` for `ruum update`; try \
+                     `ruum update --help`"
+                );
+            }
+            None => bail!("invalid UTF-8 option for `ruum update`"),
+        }
+    }
+
+    let db = StorageDb::open_default()?;
+    let mut settings = db.load_update_settings()?;
+    let channel = channel_override.unwrap_or(settings.channel);
+    let client_id = if settings.send_client_id {
+        Some(db.ensure_update_client_id()?)
+    } else {
+        None
+    };
+
+    let base_url = resolve_update_base_url();
+    let pubkey_b64 = resolve_effective_public_key_for_url(&base_url);
+    let env = UpdateEnv::current();
+    let os = env.os.unwrap_or_else(UpdateFactory::current_os);
+    let arch = env.arch.unwrap_or_else(UpdateArch::current);
+    let install_kind = UpdateFactory::create_for(os).detect_install_kind(&env);
+    let lang = normalized_cli_lang();
+
+    let result = check_for_updates(&UpdateCheckRequest {
+        channel,
+        current_version: env!("CARGO_PKG_VERSION"),
+        os,
+        arch,
+        install_kind,
+        lang: &lang,
+        entry: "cli",
+        client_id: client_id.as_deref(),
+        base_url: &base_url,
+        public_key_b64: &pubkey_b64,
+        github_repo: DEFAULT_GITHUB_REPO,
+        github_fallback_base: None,
+    })?;
+
+    let now = now_unix_secs();
+    settings = db.load_update_settings()?;
+    settings.last_checked_at_secs = now;
+    settings.updated_at_secs = now;
+    db.save_update_settings(&settings)?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    if result.update_available {
+        println!(
+            "Update available: v{} -> v{} ({})",
+            result.current_version, result.latest_version, result.channel
+        );
+        println!("Published: {}", result.manifest.published_at);
+        if let Some(asset) = &result.selected_asset {
+            println!(
+                "Package: {} ({})",
+                asset.filename,
+                human_bytes(asset.size)
+            );
+        }
+        if !result.manifest.notes.trim().is_empty() {
+            println!("\n{}", result.manifest.notes.trim());
+        }
+        println!("\nUpgrade command:\n  {}", result.upgrade_command);
+        println!("Release page: {}", result.manifest.release_url);
+    } else {
+        println!(
+            "ruum v{} is up to date ({}, latest v{})",
+            result.current_version, result.channel, result.latest_version
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

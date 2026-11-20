@@ -1,0 +1,12 @@
+{
+  "name": "ruum-update-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker edge proxy and installer entrypoint for Ruum releases",
+  "scripts": {
+    "test": "node --test tests/worker.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}

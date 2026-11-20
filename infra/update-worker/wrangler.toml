@@ -1,0 +1,17 @@
+name = "ruum-updates"
+main = "src/index.mjs"
+compatibility_date = "2025-03-01"
+
+[[r2_buckets]]
+binding = "RELEASES_BUCKET"
+bucket_name = "ruum-releases"
+
+[observability]
+enabled = true
+
+[observability.logs]
+invocation_logs = true
+head_sampling_rate = 1
+
+[vars]
+GITHUB_REPO = "JsonLee12138/Ruum"

@@ -573,6 +573,476 @@ pub const fn settings_tab_cli(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn settings_tab_updates(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Updates",
+        "\u{66f4}\u{65b0}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8}",
+    )
+}
+
+// ── software updates settings & modal ───────────────────────────────────
+
+pub const fn updates_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Software Updates",
+        "\u{8f6f}\u{4ef6}\u{66f4}\u{65b0}",
+        "\u{30bd}\u{30d5}\u{30c8}\u{30a6}\u{30a7}\u{30a2}\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}",
+        "\u{c18c}\u{d504}\u{d2b8}\u{c6e8}\u{c5b4} \u{c5c5}\u{b370}\u{c774}\u{d2b8}",
+    )
+}
+
+pub const fn updates_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Check for signed releases, switch channels, and manage update \
+         preferences.",
+        "\u{68c0}\u{67e5}\u{7b7e}\u{540d}\u{53d1}\u{5e03}\u{7248}\u{672c}\u{3001}\u{5207}\u{6362}\u{66f4}\u{65b0}\u{901a}\u{9053}\u{5e76}\u{7ba1}\u{7406}\u{66f4}\u{65b0}\u{504f}\u{597d}\u{8bbe}\u{7f6e}\u{3002}",
+        "\u{7f72}\u{540d}\u{6e08}\u{307f}\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{306e}\u{78ba}\u{8a8d}\u{3001}\u{30c1}\u{30e3}\u{30f3}\u{30cd}\u{30eb}\u{5207}\u{308a}\u{66ff}\u{3048}\u{3001}\u{66f4}\u{65b0}\u{8a2d}\u{5b9a}\u{3092}\u{7ba1}\u{7406}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{c11c}\u{ba85}\u{b41c} \u{b9b4}\u{b9ac}\u{c2a4} \u{d655}\u{c778}, \u{cc44}\u{b110} \u{c804}\u{d658} \u{bc0f} \u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{ae30}\u{bcf8} \u{c124}\u{c815}\u{c744} \u{ad00}\u{b9ac}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn updates_current_version_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Current Version:",
+        "\u{5f53}\u{524d}\u{7248}\u{672c}\u{ff1a}",
+        "\u{73fe}\u{5728}\u{306e}\u{30d0}\u{30fc}\u{30b8}\u{30e7}\u{30f3}:",
+        "\u{d604}\u{c7ac} \u{bc84}\u{c804}:",
+    )
+}
+
+pub const fn updates_install_kind_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Install Form:",
+        "\u{5b89}\u{88c5}\u{5f62}\u{6001}\u{ff1a}",
+        "\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}\u{5f62}\u{614b}:",
+        "\u{c124}\u{ce58} \u{d615}\u{d0dc}:",
+    )
+}
+
+pub const fn updates_last_checked_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Last Checked:",
+        "\u{4e0a}\u{6b21}\u{68c0}\u{67e5}\u{ff1a}",
+        "\u{6700}\u{7d42}\u{78ba}\u{8a8d}:",
+        "\u{b9c8}\u{c9c0}\u{b9c9} \u{d655}\u{c778}:",
+    )
+}
+
+pub const fn updates_last_checked_never(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Never",
+        "\u{4ece}\u{672a}\u{68c0}\u{67e5}",
+        "\u{672a}\u{78ba}\u{8a8d}",
+        "\u{d655}\u{c778} \u{ae30}\u{b85d} \u{c5c6}\u{c74c}",
+    )
+}
+
+pub const fn install_kind_label(
+    kind: ruum_core::updater::InstallKind,
+    locale: Locale,
+) -> &'static str {
+    use ruum_core::updater::InstallKind;
+
+    match kind {
+        InstallKind::MacAppBundle => pick(
+            locale,
+            "macOS App Bundle (.app)",
+            "macOS \u{5e94}\u{7528}\u{5305} (.app)",
+            "macOS \u{30a2}\u{30d7}\u{30ea}\u{30d0}\u{30f3}\u{30c9}\u{30eb} (.app)",
+            "macOS \u{c571} \u{bc88}\u{b4e4} (.app)",
+        ),
+        InstallKind::WindowsInno => pick(
+            locale,
+            "Windows Installer (Inno)",
+            "Windows \u{5b89}\u{88c5}\u{7a0b}\u{5e8f} (Inno)",
+            "Windows \u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30e9} (Inno)",
+            "Windows \u{c124}\u{ce58} \u{d504}\u{b85c}\u{adf8}\u{b7a8} (Inno)",
+        ),
+        InstallKind::WindowsMsi => pick(
+            locale,
+            "Windows MSI Package",
+            "Windows MSI \u{5b89}\u{88c5}\u{5305}",
+            "Windows MSI \u{30d1}\u{30c3}\u{30b1}\u{30fc}\u{30b8}",
+            "Windows MSI \u{d328}\u{d0a4}\u{c9c0}",
+        ),
+        InstallKind::WindowsPortable => pick(
+            locale,
+            "Windows Portable (.zip)",
+            "Windows \u{4fbf}\u{643a}\u{7248} (.zip)",
+            "Windows \u{30dd}\u{30fc}\u{30bf}\u{30d6}\u{30eb} (.zip)",
+            "Windows \u{d3ec}\u{d130}\u{be14} (.zip)",
+        ),
+        InstallKind::LinuxAppImage => pick(
+            locale,
+            "Linux AppImage",
+            "Linux AppImage",
+            "Linux AppImage",
+            "Linux AppImage",
+        ),
+        InstallKind::LinuxTarball => pick(
+            locale,
+            "Linux Portable Tarball",
+            "Linux \u{4fbf}\u{643a}\u{538b}\u{7f29}\u{5305}",
+            "Linux \u{30dd}\u{30fc}\u{30bf}\u{30d6}\u{30eb} Tarball",
+            "Linux \u{d3ec}\u{d130}\u{be14} Tarball",
+        ),
+        InstallKind::LinuxSystemPackage => pick(
+            locale,
+            "Linux System Package",
+            "Linux \u{7cfb}\u{7edf}\u{8f6f}\u{4ef6}\u{5305}",
+            "Linux \u{30b7}\u{30b9}\u{30c6}\u{30e0}\u{30d1}\u{30c3}\u{30b1}\u{30fc}\u{30b8}",
+            "Linux \u{c2dc}\u{c2a4}\u{d15c} \u{d328}\u{d0a4}\u{c9c0}",
+        ),
+        InstallKind::CliStandalone => pick(
+            locale,
+            "Standalone CLI",
+            "\u{72ec}\u{7acb} CLI",
+            "\u{30b9}\u{30bf}\u{30f3}\u{30c9}\u{30a2}\u{30ed}\u{30f3} CLI",
+            "\u{b3c5}\u{b9bd}\u{d615} CLI",
+        ),
+        InstallKind::Development => pick(
+            locale,
+            "Development Build",
+            "\u{5f00}\u{53d1}\u{6784}\u{5efa}",
+            "\u{958b}\u{767a}\u{30d3}\u{30eb}\u{30c9}",
+            "\u{ac1c}\u{bc1c} \u{be4c}\u{b4dc}",
+        ),
+    }
+}
+
+pub const fn updates_check_now(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Check Now",
+        "\u{7acb}\u{5373}\u{68c0}\u{67e5}",
+        "\u{4eca}\u{3059}\u{3050}\u{78ba}\u{8a8d}",
+        "\u{c9c0}\u{ae08} \u{d655}\u{c778}",
+    )
+}
+
+pub const fn updates_checking(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Checking for updates\u{2026}",
+        "\u{6b63}\u{5728}\u{68c0}\u{67e5}\u{66f4}\u{65b0}\u{2026}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{3092}\u{78ba}\u{8a8d}\u{4e2d}\u{2026}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{d655}\u{c778} \u{c911}\u{2026}",
+    )
+}
+
+pub const fn updates_up_to_date(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "You are on the latest version.",
+        "\u{5f53}\u{524d}\u{5df2}\u{662f}\u{6700}\u{65b0}\u{7248}\u{672c}\u{3002}",
+        "\u{6700}\u{65b0}\u{30d0}\u{30fc}\u{30b8}\u{30e7}\u{30f3}\u{3092}\u{304a}\u{4f7f}\u{3044}\u{3067}\u{3059}\u{3002}",
+        "\u{cd5c}\u{c2e0} \u{bc84}\u{c804}\u{c744} \u{c0ac}\u{c6a9} \u{c911}\u{c785}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn updates_auto_check(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Automatically check for updates",
+        "\u{81ea}\u{52a8}\u{68c0}\u{67e5}\u{66f4}\u{65b0}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{3092}\u{81ea}\u{52d5}\u{78ba}\u{8a8d}",
+        "\u{c790}\u{b3d9}\u{c73c}\u{b85c} \u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{d655}\u{c778}",
+    )
+}
+
+pub const fn updates_channel_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Update Channel:",
+        "\u{66f4}\u{65b0}\u{901a}\u{9053}\u{ff1a}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{30c1}\u{30e3}\u{30f3}\u{30cd}\u{30eb}:",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{cc44}\u{b110}:",
+    )
+}
+
+pub const fn updates_channel_stable(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Stable",
+        "\u{7a33}\u{5b9a}\u{7248}",
+        "\u{5b89}\u{5b9a}\u{7248}",
+        "\u{c548}\u{c815} \u{bc84}\u{c804}",
+    )
+}
+
+pub const fn updates_channel_beta(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Beta",
+        "\u{6d4b}\u{8bd5}\u{7248}",
+        "\u{30d9}\u{30fc}\u{30bf}\u{7248}",
+        "\u{bca0}\u{d0c0}",
+    )
+}
+
+pub const fn updates_send_client_id(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Include anonymous install ID",
+        "\u{5305}\u{542b}\u{533f}\u{540d}\u{5b89}\u{88c5} ID",
+        "\u{533f}\u{540d}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb} ID \u{3092}\u{542b}\u{3081}\u{308b}",
+        "\u{c775}\u{ba85} \u{c124}\u{ce58} ID \u{d3ec}\u{d568}",
+    )
+}
+
+pub const fn updates_privacy_note(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Sends only channel, OS, arch, package form, version, language, and \
+         an optional random UUIDv4. No IP addresses, user paths, or file data \
+         are logged.",
+        "\u{4ec5}\u{53d1}\u{9001}\u{901a}\u{9053}\u{3001}\u{64cd}\u{4f5c}\u{7cfb}\u{7edf}\u{3001}\u{67b6}\u{6784}\u{3001}\u{5b89}\u{88c5}\u{5305}\u{5f62}\u{6001}\u{3001}\u{7248}\u{672c}\u{53f7}\u{3001}\u{8bed}\u{8a00}\u{4e0e}\u{53ef}\u{5173}\u{95ed}\u{7684}\u{968f}\u{673a} UUIDv4\u{ff0c}\u{7edd}\u{4e0d}\u{8bb0}\u{5f55} IP \u{5730}\u{5740}\u{3001}\u{7528}\u{6237}\u{8def}\u{5f84}\u{6216}\u{6587}\u{4ef6}\u{6570}\u{636e}\u{3002}",
+        "\u{30c1}\u{30e3}\u{30f3}\u{30cd}\u{30eb}\u{30fb}OS\u{30fb}\u{30a2}\u{30fc}\u{30ad}\u{30c6}\u{30af}\u{30c1}\u{30e3}\u{30fb}\u{30d1}\u{30c3}\u{30b1}\u{30fc}\u{30b8}\u{5f62}\u{614b}\u{30fb}\u{30d0}\u{30fc}\u{30b8}\u{30e7}\u{30f3}\u{30fb}\u{8a00}\u{8a9e}\u{3068}\u{4efb}\u{610f}\u{306e}\u{30e9}\u{30f3}\u{30c0}\u{30e0} UUIDv4 \u{306e}\u{307f}\u{3092}\u{9001}\u{4fe1}\u{3057}\u{307e}\u{3059}\u{3002}IP \u{30a2}\u{30c9}\u{30ec}\u{30b9}\u{3001}\u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{30d1}\u{30b9}\u{3001}\u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{60c5}\u{5831}\u{306f}\u{8a18}\u{9332}\u{3055}\u{308c}\u{307e}\u{305b}\u{3093}\u{3002}",
+        "\u{cc44}\u{b110}, OS, \u{c544}\u{d0a4}\u{d14d}\u{cc98}, \u{d328}\u{d0a4}\u{c9c0} \u{d615}\u{d0dc}, \u{bc84}\u{c804}, \u{c5b8}\u{c5b4} \u{bc0f} \u{c120}\u{d0dd}\u{c801} \u{bb34}\u{c791}\u{c704} UUIDv4\u{b9cc} \u{c804}\u{c1a1}\u{d569}\u{b2c8}\u{b2e4}. IP \u{c8fc}\u{c18c}, \u{c0ac}\u{c6a9}\u{c790} \u{acbd}\u{b85c}, \u{d30c}\u{c77c} \u{b370}\u{c774}\u{d130}\u{b294} \u{ae30}\u{b85d}\u{d558}\u{c9c0} \u{c54a}\u{c2b5}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub fn update_banner_available(version: &str, locale: Locale) -> String {
+    let ver = version.trim().trim_start_matches('v');
+    match locale {
+        Locale::En => format!("v{ver} available"),
+        Locale::Zh => {
+            format!("\u{53d1}\u{73b0}\u{65b0}\u{7248}\u{672c} v{ver}")
+        }
+        Locale::Ja => {
+            format!(
+                "v{ver} \u{304c}\u{5229}\u{7528}\u{53ef}\u{80fd}\u{3067}\u{3059}"
+            )
+        }
+        Locale::Ko => {
+            format!("v{ver} \u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{ac00}\u{b2a5}")
+        }
+    }
+}
+
+pub fn update_banner_ready(version: &str, locale: Locale) -> String {
+    let ver = version.trim().trim_start_matches('v');
+    match locale {
+        Locale::En => format!("v{ver} ready to install"),
+        Locale::Zh => {
+            format!("v{ver} \u{5df2}\u{5c31}\u{7eea}\u{53ef}\u{5b89}\u{88c5}")
+        }
+        Locale::Ja => format!(
+            "v{ver} \u{306e}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}\u{6e96}\u{5099}\u{5b8c}\u{4e86}"
+        ),
+        Locale::Ko => {
+            format!("v{ver} \u{c124}\u{ce58} \u{c900}\u{be44} \u{c644}\u{b8cc}")
+        }
+    }
+}
+
+pub const fn update_banner_view(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "View",
+        "\u{67e5}\u{770b}",
+        "\u{8868}\u{793a}",
+        "\u{bcf4}\u{ae30}",
+    )
+}
+
+pub const fn update_modal_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Software Update",
+        "\u{8f6f}\u{4ef6}\u{66f4}\u{65b0}",
+        "\u{30bd}\u{30d5}\u{30c8}\u{30a6}\u{30a7}\u{30a2}\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}",
+        "\u{c18c}\u{d504}\u{d2b8}\u{c6e8}\u{c5b4} \u{c5c5}\u{b370}\u{c774}\u{d2b8}",
+    )
+}
+
+pub fn update_published_at(date: &str, locale: Locale) -> String {
+    let short = date.split('T').next().unwrap_or(date);
+    match locale {
+        Locale::En => format!("Published {short}"),
+        Locale::Zh => format!("\u{53d1}\u{5e03}\u{4e8e} {short}"),
+        Locale::Ja => format!("\u{516c}\u{958b}\u{65e5}: {short}"),
+        Locale::Ko => format!("\u{bc30}\u{d3ec}\u{c77c}: {short}"),
+    }
+}
+
+pub const fn update_changelog_empty(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "No release notes provided.",
+        "\u{6682}\u{65e0}\u{66f4}\u{65b0}\u{8bf4}\u{660e}\u{3002}",
+        "\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{30ce}\u{30fc}\u{30c8}\u{306f}\u{3042}\u{308a}\u{307e}\u{305b}\u{3093}\u{3002}",
+        "\u{b9b4}\u{b9ac}\u{c2a4} \u{b178}\u{d2b8}\u{ac00} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn update_download_and_update(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Download & Update",
+        "\u{4e0b}\u{8f7d}\u{5e76}\u{66f4}\u{65b0}",
+        "\u{30c0}\u{30a6}\u{30f3}\u{30ed}\u{30fc}\u{30c9}\u{3057}\u{3066}\u{66f4}\u{65b0}",
+        "\u{b2e4}\u{c6b4}\u{b85c}\u{b4dc} \u{bc0f} \u{c5c5}\u{b370}\u{c774}\u{d2b8}",
+    )
+}
+
+pub const fn update_later(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Later",
+        "\u{7a0d}\u{540e}\u{63d0}\u{9192}",
+        "\u{5f8c}\u{3067}",
+        "\u{b098}\u{c911}\u{c5d0}",
+    )
+}
+
+pub fn update_skip_version(version: &str, locale: Locale) -> String {
+    let ver = version.trim().trim_start_matches('v');
+    match locale {
+        Locale::En => format!("Skip v{ver}"),
+        Locale::Zh => format!("\u{8df3}\u{8fc7} v{ver}"),
+        Locale::Ja => {
+            format!("v{ver} \u{3092}\u{30b9}\u{30ad}\u{30c3}\u{30d7}")
+        }
+        Locale::Ko => format!("v{ver} \u{ac74}\u{b108}\u{b6f0}\u{ae30}"),
+    }
+}
+
+pub const fn update_copy_command(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Copy Command",
+        "\u{590d}\u{5236}\u{5347}\u{7ea7}\u{547d}\u{4ee4}",
+        "\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{30b3}\u{30d4}\u{30fc}",
+        "\u{ba85}\u{b839} \u{bcf5}\u{c0ac}",
+    )
+}
+
+pub const fn update_open_release(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Open Release",
+        "\u{6253}\u{5f00}\u{53d1}\u{5e03}\u{9875}",
+        "\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{30da}\u{30fc}\u{30b8}\u{3092}\u{958b}\u{304f}",
+        "\u{b9b4}\u{b9ac}\u{c2a4} \u{c5f4}\u{ae30}",
+    )
+}
+
+pub const fn update_open_github_release(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Open GitHub Release",
+        "\u{6253}\u{5f00} GitHub Release",
+        "GitHub Release \u{3092}\u{958b}\u{304f}",
+        "GitHub Release \u{c5f4}\u{ae30}",
+    )
+}
+
+pub const fn update_hide(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Hide",
+        "\u{6536}\u{8d77}",
+        "\u{96a0}\u{3059}",
+        "\u{c228}\u{ae30}\u{ae30}",
+    )
+}
+
+pub const fn update_cancel(locale: Locale) -> &'static str {
+    cancel(locale)
+}
+
+pub const fn update_restart_and_install(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Restart & Install",
+        "\u{91cd}\u{542f}\u{5e76}\u{5b89}\u{88c5}",
+        "\u{518d}\u{8d77}\u{52d5}\u{3057}\u{3066}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}",
+        "\u{c7ac}\u{c2dc}\u{c791} \u{bc0f} \u{c124}\u{ce58}",
+    )
+}
+
+pub const fn update_retry(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Retry",
+        "\u{91cd}\u{8bd5}",
+        "\u{518d}\u{8a66}\u{884c}",
+        "\u{c7ac}\u{c2dc}\u{b3c4}",
+    )
+}
+
+pub const fn update_installing_status(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Installing update and preparing restart\u{2026}",
+        "\u{6b63}\u{5728}\u{5b89}\u{88c5}\u{66f4}\u{65b0}\u{5e76}\u{51c6}\u{5907}\u{91cd}\u{542f}\u{2026}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{3092}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}\u{3057}\u{3066}\u{3044}\u{307e}\u{3059}\u{2026}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8}\u{b97c} \u{c124}\u{ce58}\u{d558}\u{ace0} \u{c7ac}\u{c2dc}\u{c791}\u{c744} \u{c900}\u{be44}\u{d558}\u{b294} \u{c911}\u{2026}",
+    )
+}
+
+pub const fn update_verified_badge(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Ed25519 signature & SHA-256 checksum verified. Ready to install.",
+        "Ed25519 \u{7b7e}\u{540d}\u{4e0e} SHA-256 \u{6821}\u{9a8c}\u{5df2}\u{901a}\u{8fc7}\u{ff0c}\u{53ef}\u{91cd}\u{542f}\u{5b89}\u{88c5}\u{3002}",
+        "Ed25519 \u{7f72}\u{540d}\u{3068} SHA-256 \u{30c1}\u{30a7}\u{30c3}\u{30af}\u{30b5}\u{30e0}\u{3092}\u{691c}\u{8a3c}\u{6e08}\u{307f}\u{3067}\u{3059}\u{3002}",
+        "Ed25519 \u{c11c}\u{ba85} \u{bc0f} SHA-256 \u{ccb4}\u{d06c}\u{c12c} \u{ac80}\u{c99d} \u{c644}\u{b8cc}. \u{c124}\u{ce58} \u{c900}\u{be44}\u{ac00} \u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn update_restart_warning_scan(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "A scan is currently in progress. Restarting will interrupt it.",
+        "\u{5f53}\u{524d}\u{6709}\u{6b63}\u{5728}\u{8fdb}\u{884c}\u{7684}\u{626b}\u{63cf}\u{ff0c}\u{91cd}\u{542f}\u{5c06}\u{4e2d}\u{65ad}\u{8be5}\u{626b}\u{63cf}\u{3002}",
+        "\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{304c}\u{5b9f}\u{884c}\u{4e2d}\u{3067}\u{3059}\u{3002}\u{518d}\u{8d77}\u{52d5}\u{3059}\u{308b}\u{3068}\u{4e2d}\u{65ad}\u{3055}\u{308c}\u{307e}\u{3059}\u{3002}",
+        "\u{d604}\u{c7ac} \u{c2a4}\u{ce94}\u{c774} \u{c9c4}\u{d589} \u{c911}\u{c785}\u{b2c8}\u{b2e4}. \u{c7ac}\u{c2dc}\u{c791}\u{d558}\u{ba74} \u{c2a4}\u{ce94}\u{c774} \u{c911}\u{b2e8}\u{b429}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub fn update_restart_warning_marks(count: usize, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!(
+            "{count} marked item(s) have not been committed yet. Restarting \
+             will discard uncommitted marks."
+        ),
+        Locale::Zh => format!(
+            "\u{5f53}\u{524d}\u{6709} {count} \u{4e2a}\u{672a}\u{63d0}\u{4ea4}\u{7684}\u{5df2}\u{6807}\u{8bb0}\u{9879}\u{ff0c}\u{91cd}\u{542f}\u{5c06}\u{6e05}\u{7a7a}\u{8fd9}\u{4e9b}\u{6807}\u{8bb0}\u{3002}"
+        ),
+        Locale::Ja => format!(
+            "\u{672a}\u{78ba}\u{5b9a}\u{306e}\u{30de}\u{30fc}\u{30af}\u{304c} {count} \u{4ef6}\u{3042}\u{308a}\u{307e}\u{3059}\u{3002}\u{518d}\u{8d77}\u{52d5}\u{3059}\u{308b}\u{3068}\u{30de}\u{30fc}\u{30af}\u{306f}\u{7834}\u{68c4}\u{3055}\u{308c}\u{307e}\u{3059}\u{3002}"
+        ),
+        Locale::Ko => format!(
+            "\u{c544}\u{c9c1} \u{c801}\u{c6a9}\u{d558}\u{c9c0} \u{c54a}\u{c740} \u{d45c}\u{c2dc} \u{d56d}\u{baa9}\u{c774} {count}\u{ac1c} \u{c788}\u{c2b5}\u{b2c8}\u{b2e4}. \u{c7ac}\u{c2dc}\u{c791}\u{d558}\u{ba74} \u{d45c}\u{c2dc}\u{ac00} \u{cd08}\u{ae30}\u{d654}\u{b429}\u{b2c8}\u{b2e4}."
+        ),
+    }
+}
+
+pub const fn update_manual_command_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run this command to upgrade with your current package manager:",
+        "\u{8bf7}\u{4f7f}\u{7528}\u{5f53}\u{524d}\u{5b89}\u{88c5}\u{65b9}\u{5f0f}\u{5bf9}\u{5e94}\u{7684}\u{547d}\u{4ee4}\u{5347}\u{7ea7}\u{ff1a}",
+        "\u{73fe}\u{5728}\u{306e}\u{30d1}\u{30c3}\u{30b1}\u{30fc}\u{30b8}\u{30de}\u{30cd}\u{30fc}\u{30b8}\u{30e3}\u{3067}\u{6b21}\u{306e}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{5b9f}\u{884c}\u{3057}\u{3066}\u{66f4}\u{65b0}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}:",
+        "\u{d604}\u{c7ac} \u{d328}\u{d0a4}\u{c9c0} \u{ad00}\u{b9ac}\u{c790}\u{b85c} \u{c5c5}\u{adf8}\u{b808}\u{c774}\u{b4dc}\u{d558}\u{b824}\u{ba74} \u{b2e4}\u{c74c} \u{ba85}\u{b839}\u{c744} \u{c2e4}\u{d589}\u{d558}\u{c138}\u{c694}:",
+    )
+}
+
+pub const fn update_view_btn(locale: Locale) -> &'static str {
+    update_banner_view(locale)
+}
+
 // ── webhook settings (multi-endpoint CRUD & tutorial) ───────────────────
 
 pub const fn webhook_title(locale: Locale) -> &'static str {

@@ -58,6 +58,8 @@ pub mod trash_adapter;
 pub mod tree;
 pub mod treemap;
 #[cfg(feature = "service")]
+pub mod updater;
+#[cfg(feature = "service")]
 pub mod watchdog;
 #[cfg(feature = "service")]
 pub mod watchdog_config;

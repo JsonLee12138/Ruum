@@ -10,7 +10,7 @@ if [ "${RUUM_ASKPASS_CMD-}" = "ssh-askpass" ]; then
 fi
 
 case "${1-}" in
-    help|-h|--help|scan|ssh|config|watchdog|analyze|mcp|extract-scanner|ssh-askpass)
+    help|-h|--help|scan|ssh|config|watchdog|analyze|mcp|extract-scanner|ssh-askpass|update|space|run-script)
         exec "$APPDIR/usr/bin/ruum" "$@"
         ;;
     *)

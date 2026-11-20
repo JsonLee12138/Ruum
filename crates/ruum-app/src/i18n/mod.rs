@@ -533,6 +533,61 @@ mod tests {
             assert!(!common::menu_docker(locale).is_empty());
             assert!(!pages::docker_page_title(locale).is_empty());
             assert!(!pages::docker_source_ssh("prod", locale).is_empty());
+            assert!(!common::tray_check_updates(locale).is_empty());
+            assert!(!common::tray_update_available("0.9.0", locale).is_empty());
+            assert!(!pages::rail_update(locale).is_empty());
+            assert!(!pages::rail_update_available("0.9.0", locale).is_empty());
+            assert!(!pages::rail_update_downloading(locale).is_empty());
+            assert!(!pages::rail_update_ready("0.9.0", locale).is_empty());
+            assert!(!pages::settings_tab_updates(locale).is_empty());
+            assert!(!pages::updates_title(locale).is_empty());
+            assert!(!pages::updates_desc(locale).is_empty());
+            assert!(!pages::updates_check_now(locale).is_empty());
+            assert!(!pages::updates_auto_check(locale).is_empty());
+            assert!(!pages::updates_channel_stable(locale).is_empty());
+            assert!(!pages::updates_channel_beta(locale).is_empty());
+            assert!(!pages::updates_send_client_id(locale).is_empty());
+            assert!(!pages::updates_privacy_note(locale).is_empty());
+            assert!(
+                !pages::update_banner_available("0.9.0", locale).is_empty()
+            );
+            assert!(!pages::update_banner_ready("0.9.0", locale).is_empty());
+            assert!(!pages::update_banner_view(locale).is_empty());
+            assert!(!pages::update_modal_title(locale).is_empty());
+            assert!(!pages::update_download_and_update(locale).is_empty());
+            assert!(!pages::update_later(locale).is_empty());
+            assert!(!pages::update_skip_version("0.9.0", locale).is_empty());
+            assert!(!pages::update_copy_command(locale).is_empty());
+            assert!(!pages::update_open_release(locale).is_empty());
+            assert!(!pages::update_open_github_release(locale).is_empty());
+            assert!(!pages::update_hide(locale).is_empty());
+            assert!(!pages::update_cancel(locale).is_empty());
+            assert!(!pages::update_restart_and_install(locale).is_empty());
+            assert!(!pages::update_retry(locale).is_empty());
+            assert!(!pages::update_restart_warning_marks(2, locale).is_empty());
+            assert!(!pages::update_restart_warning_scan(locale).is_empty());
+            assert!(!messages::update_command_copied(locale).is_empty());
+
+            assert_ne!(
+                pages::settings_tab_updates(locale),
+                pages::settings_tab_updates(Locale::En)
+            );
+            assert_ne!(
+                pages::update_modal_title(locale),
+                pages::update_modal_title(Locale::En)
+            );
+            assert_ne!(
+                pages::update_download_and_update(locale),
+                pages::update_download_and_update(Locale::En)
+            );
+            assert_ne!(
+                pages::update_restart_and_install(locale),
+                pages::update_restart_and_install(Locale::En)
+            );
+            assert_ne!(
+                pages::update_banner_view(locale),
+                pages::update_banner_view(Locale::En)
+            );
         }
         assert!(
             messages::cleanup_started_notif_body(2, 1_500_000, Locale::Zh)

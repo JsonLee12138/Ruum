@@ -7655,3 +7655,562 @@ fn injected_csd_confirm_windows_preserve_buttons_and_safe_close(
     );
     drop(remote_host);
 }
+
+fn mock_update_result(
+    version: &str,
+    install_kind: ruum_core::updater::InstallKind,
+    can_self_update: bool,
+) -> std::sync::Arc<ruum_core::updater::UpdateCheckResult> {
+    use std::collections::BTreeMap;
+
+    use ruum_core::storage::UpdateChannel;
+    use ruum_core::updater::{Manifest, ManifestAsset, UpdateCheckResult};
+
+    let mut assets = BTreeMap::new();
+    let asset = ManifestAsset {
+        filename: format!("ruum-{version}-aarch64-macos.zip"),
+        path: format!("releases/v{version}/ruum-{version}-aarch64-macos.zip"),
+        fallback_url: format!(
+            "https://github.com/JsonLee12138/Ruum/releases/download/\
+             v{version}/ruum-{version}-aarch64-macos.zip"
+        ),
+        sha256: "a".repeat(64),
+        size: 12_345_678,
+    };
+    assets.insert("macos-aarch64-app_zip".to_owned(), asset.clone());
+
+    std::sync::Arc::new(UpdateCheckResult {
+        current_version: env!("CARGO_PKG_VERSION").to_owned(),
+        latest_version: version.to_owned(),
+        update_available: true,
+        channel: UpdateChannel::Stable,
+        install_kind,
+        manifest: Manifest {
+            schema_version: 1,
+            version: version.to_owned(),
+            tag: format!("v{version}"),
+            channel: "stable".to_owned(),
+            published_at: "2026-11-20T00:00:00Z".to_owned(),
+            release_url: format!(
+                "https://github.com/JsonLee12138/Ruum/releases/tag/v{version}"
+            ),
+            notes: "### Features\n- Added `ruum update` self-updater\n* \
+                    Faster treemap rendering"
+                .to_owned(),
+            assets,
+        },
+        selected_asset_key: Some("macos-aarch64-app_zip".to_owned()),
+        selected_asset: Some(asset),
+        upgrade_command: match install_kind {
+            ruum_core::updater::InstallKind::LinuxSystemPackage => {
+                "yay -S ruum-bin".to_owned()
+            }
+            ruum_core::updater::InstallKind::WindowsPortable => {
+                "irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex"
+                    .to_owned()
+            }
+            _ => "curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh"
+                .to_owned(),
+        },
+        can_self_update,
+        used_fallback: false,
+    })
+}
+
+#[gpui_kit::test]
+fn settings_updates_tab_toggles_preferences_and_persists_to_isolated_db(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{StorageDb, UpdateChannel};
+    use ruum_core::updater::InstallKind;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("isolated cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let (view, cx) = view_over(temp.path(), cx);
+
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.update_install_kind = InstallKind::MacAppBundle;
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    let tab = cx
+        .debug_bounds("setting-tab-updates")
+        .expect("setting-tab-updates");
+    cx.simulate_click(tab.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    assert_eq!(
+        read(&view, cx, |app| app.settings_category),
+        crate::state::SettingsCategory::Updates
+    );
+    assert!(cx.debug_bounds("setting-updates-section").is_some());
+    assert!(cx.debug_bounds("setting-update-check-btn").is_some());
+    assert!(cx.debug_bounds("setting-update-auto-check").is_some());
+    assert!(cx.debug_bounds("setting-update-channel").is_some());
+    assert!(cx.debug_bounds("setting-update-send-client-id").is_some());
+    assert!(cx.debug_bounds("setting-update-privacy-note").is_some());
+
+    let auto_check_box = cx
+        .debug_bounds("setting-update-auto-check")
+        .expect("auto check checkbox");
+    cx.simulate_click(auto_check_box.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    let send_id_box = cx
+        .debug_bounds("setting-update-send-client-id")
+        .expect("send client id checkbox");
+    cx.simulate_click(send_id_box.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    update(&view, cx, |app, cx| {
+        app.set_update_channel(UpdateChannel::Beta, cx);
+    });
+    draw(cx);
+
+    let db = StorageDb::open(&db_path).expect("reopen isolated db");
+    let persisted = db.load_update_settings().expect("load update settings");
+    assert!(!persisted.auto_check);
+    assert!(!persisted.send_client_id);
+    assert_eq!(persisted.channel, UpdateChannel::Beta);
+}
+
+#[gpui_kit::test]
+fn icon_rail_update_entry_tracks_active_states_and_opens_modal(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::UpdateUiState;
+    use ruum_core::updater::InstallKind;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Hidden when Idle / Checking / UpToDate / Error.
+    assert!(cx.debug_bounds("rail-update").is_none());
+
+    for hidden_state in [
+        UpdateUiState::Checking,
+        UpdateUiState::UpToDate {
+            checked_at_secs: 1_700_000_000,
+        },
+        UpdateUiState::Error {
+            message: "network error".to_owned(),
+            info: None,
+        },
+    ] {
+        update(&view, cx, |app, cx| {
+            app.update_state = hidden_state;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("rail-update").is_none());
+    }
+
+    // Visible when Available (unskipped), Downloading, ReadyToInstall, Installing.
+    let info = mock_update_result("0.9.0", InstallKind::MacAppBundle, true);
+    for visible_state in [
+        UpdateUiState::Available {
+            info: std::sync::Arc::clone(&info),
+        },
+        UpdateUiState::Downloading {
+            info: std::sync::Arc::clone(&info),
+            downloaded: 500,
+            total: 1000,
+        },
+        UpdateUiState::ReadyToInstall {
+            info: std::sync::Arc::clone(&info),
+            artifact_path: temp.path().join("ruum.zip"),
+        },
+        UpdateUiState::Installing {
+            info: std::sync::Arc::clone(&info),
+        },
+    ] {
+        update(&view, cx, |app, cx| {
+            app.update_state = visible_state;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("rail-update").is_some());
+        assert!(cx.debug_bounds("rail-update-dot").is_some());
+    }
+
+    // Clicking rail-update opens update-modal.
+    let btn = cx.debug_bounds("rail-update").expect("rail-update");
+    cx.simulate_click(btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.update_modal_open));
+    assert!(cx.debug_bounds("update-modal").is_some());
+}
+
+#[gpui_kit::test]
+fn update_banner_shows_once_per_version_is_non_blocking_and_respects_guards(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::UpdateUiState;
+    use ruum_core::confirm::RemoteConnectConfirmRequest;
+    use ruum_core::updater::InstallKind;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let info_v1 = mock_update_result("0.9.0", InstallKind::MacAppBundle, true);
+
+    update(&view, cx, |app, cx| {
+        app.update_state = UpdateUiState::Available {
+            info: std::sync::Arc::clone(&info_v1),
+        };
+        cx.notify();
+    });
+    draw(cx);
+
+    // Shown on Explore and does NOT steal keyboard focus from `app.focus`.
+    assert!(cx.debug_bounds("update-banner").is_some());
+    assert!(cx.debug_bounds("update-banner-view").is_some());
+    assert!(cx.debug_bounds("update-banner-close").is_some());
+    let root_focused = cx.update(|window, cx| {
+        view.read_with(cx, |app, _| app.focus.is_focused(window))
+    });
+    assert!(root_focused, "update banner must not steal keyboard focus");
+
+    // Suppressed when Review, Running, or modals are active.
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Running;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Explore;
+        app.confirm_open = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.confirm_open = false;
+        app.volumes_open = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.volumes_open = false;
+        app.remote_docker_modal_open = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.remote_docker_modal_open = false;
+        app.enqueue_remote_connect_confirm(
+            RemoteConnectConfirmRequest {
+                target_label: "prod".to_owned(),
+                alias: Some("prod".to_owned()),
+                host: "10.0.0.2".to_owned(),
+                port: 22,
+                username: "deploy".to_owned(),
+                auth_mode: "private_key".to_owned(),
+                tool_name: "scan_directory".to_owned(),
+            },
+            None,
+            None,
+            cx,
+        );
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.deny_remote_connect(cx);
+        app.generated_script_dialog =
+            Some(crate::state::GeneratedScriptDialog {
+                profile_id: "p1".to_owned(),
+                alias: "prod".to_owned(),
+                script_path: temp.path().join("clean.sh"),
+                item_count: 1,
+                reclaim_bytes: 1024,
+            });
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+
+    // Clear suppression and verify clicking `x` dismisses for 0.9.0 only.
+    update(&view, cx, |app, cx| {
+        app.generated_script_dialog = None;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_some());
+
+    let close_btn = cx
+        .debug_bounds("update-banner-close")
+        .expect("update-banner-close");
+    cx.simulate_click(close_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_none());
+    assert_eq!(
+        read(&view, cx, |app| {
+            app.update_banner_dismissed_version.clone()
+        }),
+        Some("0.9.0".to_owned())
+    );
+
+    // Newer version 0.9.1 shows banner again; clicking View opens modal.
+    let info_v2 = mock_update_result("0.9.1", InstallKind::MacAppBundle, true);
+    update(&view, cx, |app, cx| {
+        app.update_state = UpdateUiState::Available { info: info_v2 };
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-banner").is_some());
+
+    let view_btn = cx
+        .debug_bounds("update-banner-view")
+        .expect("update-banner-view");
+    cx.simulate_click(view_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.update_modal_open));
+    assert!(cx.debug_bounds("update-modal").is_some());
+    assert!(cx.debug_bounds("update-banner").is_none());
+}
+
+#[gpui_kit::test]
+fn update_modal_renders_all_states_hideable_download_marks_warning_and_skip(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::state::UpdateUiState;
+    use ruum_core::removal::Target;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::updater::InstallKind;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("isolated cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let (view, cx) = view_over(temp.path(), cx);
+
+    let self_info =
+        mock_update_result("0.9.5", InstallKind::MacAppBundle, true);
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.update_install_kind = InstallKind::MacAppBundle;
+        app.update_state = UpdateUiState::Available {
+            info: std::sync::Arc::clone(&self_info),
+        };
+        app.open_update_modal(cx);
+    });
+    draw(cx);
+
+    assert!(cx.debug_bounds("update-modal").is_some());
+    assert!(cx.debug_bounds("update-changelog-scroll").is_some());
+    assert!(cx.debug_bounds("update-changelog-heading-0").is_some());
+    assert!(cx.debug_bounds("update-changelog-item-1").is_some());
+    assert!(cx.debug_bounds("update-download-btn").is_some());
+    assert!(cx.debug_bounds("update-later-btn").is_some());
+    assert!(cx.debug_bounds("update-skip-btn").is_some());
+
+    // Guide-only install kind renders Copy Command + Open Release instead of
+    // Download & Update.
+    let pkg_info =
+        mock_update_result("0.9.5", InstallKind::LinuxSystemPackage, false);
+    update(&view, cx, |app, cx| {
+        app.update_install_kind = InstallKind::LinuxSystemPackage;
+        app.update_state = UpdateUiState::Available { info: pkg_info };
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-download-btn").is_none());
+    assert!(cx.debug_bounds("update-copy-cmd-btn").is_some());
+    assert!(cx.debug_bounds("update-open-release-btn").is_some());
+
+    // Downloading state: progress bar + Hide keeps download running in bg.
+    let cancel_flag = std::sync::Arc::new(AtomicBool::new(false));
+    update(&view, cx, |app, cx| {
+        app.update_install_kind = InstallKind::MacAppBundle;
+        app.update_download_cancel = Some(std::sync::Arc::clone(&cancel_flag));
+        app.update_state = UpdateUiState::Downloading {
+            info: std::sync::Arc::clone(&self_info),
+            downloaded: 4_000_000,
+            total: 10_000_000,
+        };
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-progress-bar").is_some());
+    assert!(cx.debug_bounds("update-hide-btn").is_some());
+    assert!(cx.debug_bounds("update-cancel-btn").is_some());
+
+    let hide_btn = cx.debug_bounds("update-hide-btn").expect("hide btn");
+    cx.simulate_click(hide_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.update_modal_open));
+    assert!(!cancel_flag.load(Ordering::Relaxed));
+    assert!(matches!(
+        read(&view, cx, |app| app.update_state.clone()),
+        UpdateUiState::Downloading { .. }
+    ));
+    assert!(cx.debug_bounds("rail-update").is_some());
+
+    // Reopen and cancel download -> reverts to Available and flips flag.
+    update(&view, cx, Ruum::open_update_modal);
+    draw(cx);
+    let cancel_btn = cx.debug_bounds("update-cancel-btn").expect("cancel btn");
+    cx.simulate_click(cancel_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cancel_flag.load(Ordering::Relaxed));
+    assert!(matches!(
+        read(&view, cx, |app| app.update_state.clone()),
+        UpdateUiState::Available { .. }
+    ));
+
+    // ReadyToInstall with active marks renders restart warning.
+    update(&view, cx, |app, cx| {
+        app.marks.toggle(Target {
+            path: temp.path().join("junk"),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.update_state = UpdateUiState::ReadyToInstall {
+            info: std::sync::Arc::clone(&self_info),
+            artifact_path: temp.path().join("ruum.zip"),
+        };
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-restart-install-btn").is_some());
+    assert!(cx.debug_bounds("update-restart-warning").is_some());
+
+    // Error state shows error box + Retry + Open GitHub Release.
+    update(&view, cx, |app, cx| {
+        app.update_state = UpdateUiState::Error {
+            message: "SHA-256 mismatch".to_owned(),
+            info: Some(std::sync::Arc::clone(&self_info)),
+        };
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-error-box").is_some());
+    assert!(cx.debug_bounds("update-retry-btn").is_some());
+    assert!(cx.debug_bounds("update-open-release-btn").is_some());
+
+    // Skip version persists to isolated DB and hides rail-update & banner.
+    update(&view, cx, |app, cx| {
+        app.update_state = UpdateUiState::Available {
+            info: std::sync::Arc::clone(&self_info),
+        };
+        cx.notify();
+    });
+    draw(cx);
+    let skip_btn = cx.debug_bounds("update-skip-btn").expect("skip btn");
+    cx.simulate_click(skip_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    assert!(!read(&view, cx, |app| app.update_modal_open));
+    assert!(cx.debug_bounds("rail-update").is_none());
+    assert!(cx.debug_bounds("update-banner").is_none());
+    let db = StorageDb::open(&db_path).expect("reopen db");
+    let saved = db.load_update_settings().expect("load saved");
+    assert_eq!(saved.skipped_version.as_deref(), Some("0.9.5"));
+}
+
+#[gpui_kit::test]
+fn update_ui_renders_cleanly_across_all_four_locales_and_runtime_reopen(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::Locale;
+    use crate::state::UpdateUiState;
+    use ruum_core::updater::InstallKind;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let info = mock_update_result("0.9.9", InstallKind::MacAppBundle, true);
+
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+        crate::with_runtime_mut(cx, |rt| {
+            rt.update_install_kind = InstallKind::MacAppBundle;
+            rt.update_state = UpdateUiState::Downloading {
+                info: std::sync::Arc::clone(&info),
+                downloaded: 256_000,
+                total: 1_024_000,
+            };
+        });
+        crate::open_or_navigate_main_window(None, cx);
+    });
+    cx.run_until_parked();
+
+    let win1 = cx
+        .read(|cx| cx.global::<crate::AppRuntime>().main_window)
+        .expect("win1");
+    win1.update(cx, |app, _, cx| {
+        assert!(matches!(
+            app.update_state,
+            UpdateUiState::Downloading {
+                downloaded: 256_000,
+                total: 1_024_000,
+                ..
+            }
+        ));
+        for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+            app.set_locale(locale);
+            app.navigate_rail(Screen::Settings, cx);
+            app.set_settings_category(
+                crate::state::SettingsCategory::Updates,
+                cx,
+            );
+            app.open_update_modal(cx);
+            cx.notify();
+        }
+    })
+    .expect("win1 update");
+    cx.run_until_parked();
+
+    // Close main window to tray and reopen: update progress persists!
+    win1.update(cx, |_, window, cx| {
+        window.remove_window();
+        crate::with_runtime_mut(cx, |rt| rt.main_window = None);
+    })
+    .expect("close win1");
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        crate::open_or_navigate_main_window(None, cx);
+    });
+    cx.run_until_parked();
+
+    let win2 = cx
+        .read(|cx| cx.global::<crate::AppRuntime>().main_window)
+        .expect("win2");
+    win2.update(cx, |app, _, _| {
+        assert!(matches!(
+            app.update_state,
+            UpdateUiState::Downloading {
+                downloaded: 256_000,
+                total: 1_024_000,
+                ..
+            }
+        ));
+    })
+    .expect("win2 update");
+}

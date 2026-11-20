@@ -967,3 +967,13 @@ pub fn script_discarded(alias: &str, locale: Locale) -> String {
         ),
     }
 }
+
+pub const fn update_command_copied(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Upgrade command copied to clipboard",
+        "\u{5347}\u{7ea7}\u{547d}\u{4ee4}\u{5df2}\u{590d}\u{5236}\u{5230}\u{526a}\u{8d34}\u{677f}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30b0}\u{30ec}\u{30fc}\u{30c9}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{30b3}\u{30d4}\u{30fc}\u{3057}\u{307e}\u{3057}\u{305f}",
+        "\u{c5c5}\u{adf8}\u{b808}\u{c774}\u{b4dc} \u{ba85}\u{b839}\u{c744} \u{d074}\u{b9bd}\u{bcf4}\u{b4dc}\u{c5d0} \u{bcf5}\u{c0ac}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}",
+    )
+}

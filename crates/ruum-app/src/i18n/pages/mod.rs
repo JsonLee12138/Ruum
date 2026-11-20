@@ -43,6 +43,64 @@ pub const fn rail_watchdog(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn rail_update(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Updates",
+        "\u{68c0}\u{67e5}\u{66f4}\u{65b0}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8}",
+    )
+}
+
+pub fn rail_update_available(version: &str, locale: Locale) -> String {
+    let ver = version.trim().trim_start_matches('v');
+    match locale {
+        Locale::En => format!("Update available (v{ver})"),
+        Locale::Zh => {
+            format!("\u{53d1}\u{73b0}\u{65b0}\u{7248}\u{672c} (v{ver})")
+        }
+        Locale::Ja => {
+            format!(
+                "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{304c}\u{3042}\u{308a}\u{307e}\u{3059} (v{ver})"
+            )
+        }
+        Locale::Ko => {
+            format!(
+                "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{ac00}\u{b2a5} (v{ver})"
+            )
+        }
+    }
+}
+
+pub const fn rail_update_downloading(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Downloading update\u{2026}",
+        "\u{6b63}\u{5728}\u{4e0b}\u{8f7d}\u{66f4}\u{65b0}\u{2026}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{3092}\u{30c0}\u{30a6}\u{30f3}\u{30ed}\u{30fc}\u{30c9}\u{4e2d}\u{2026}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{b2e4}\u{c6b4}\u{b85c}\u{b4dc} \u{c911}\u{2026}",
+    )
+}
+
+pub fn rail_update_ready(version: &str, locale: Locale) -> String {
+    let ver = version.trim().trim_start_matches('v');
+    match locale {
+        Locale::En => format!("Update v{ver} ready to install"),
+        Locale::Zh => {
+            format!("\u{66f4}\u{65b0} v{ver} \u{5df2}\u{5c31}\u{7eea}")
+        }
+        Locale::Ja => format!(
+            "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8} v{ver} \u{306e}\u{6e96}\u{5099}\u{5b8c}\u{4e86}"
+        ),
+        Locale::Ko => {
+            format!(
+                "\u{c5c5}\u{b370}\u{c774}\u{d2b8} v{ver} \u{c124}\u{ce58} \u{c900}\u{be44} \u{c644}\u{b8cc}"
+            )
+        }
+    }
+}
+
 pub const fn rail_settings(is_macos: bool, locale: Locale) -> &'static str {
     if is_macos {
         pick(

@@ -7,7 +7,10 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::input::{InputEvent, InputState};
@@ -47,8 +50,8 @@ use ruum_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use ruum_core::space::{SpaceInfo, device_for, space_info, volume_root_for};
 use ruum_core::ssh_session::SshSession;
 use ruum_core::storage::{
-    AiConfig, AppSettings, AuthMode, SshProfile, StorageDb, WebhookConfig,
-    WebhookEndpoint,
+    AiConfig, AppSettings, AuthMode, SshProfile, StorageDb, UpdateChannel,
+    UpdateSettings, WebhookConfig, WebhookEndpoint,
 };
 use ruum_core::terminal_launcher::{TerminalEnv, TerminalFactory};
 #[cfg(test)]
@@ -56,6 +59,13 @@ use ruum_core::terminal_launcher::{TerminalLaunchPlan, TerminalOs};
 use ruum_core::tree::{Metric, Node, path_of};
 use ruum_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
+};
+use ruum_core::updater::{
+    ApplyOutcome, DEFAULT_GITHUB_REPO, InstallKind, UpdateArch,
+    UpdateCheckRequest, UpdateCheckResult, UpdateEnv, UpdateFactory,
+    check_for_updates, download_and_verify_asset,
+    resolve_effective_public_key_for_url, resolve_update_base_url,
+    validate_update_url,
 };
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::{AiCliProvider, CleanupProposal};
@@ -1010,6 +1020,136 @@ pub enum SettingsCategory {
     Webhook,
     Ai,
     Cli,
+    Updates,
+}
+
+/// UI state machine for in-app update checks, downloads, and installation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UpdateUiState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate {
+        checked_at_secs: u64,
+    },
+    Available {
+        info: Arc<UpdateCheckResult>,
+    },
+    Downloading {
+        info: Arc<UpdateCheckResult>,
+        downloaded: u64,
+        total: u64,
+    },
+    ReadyToInstall {
+        info: Arc<UpdateCheckResult>,
+        artifact_path: PathBuf,
+    },
+    Installing {
+        info: Arc<UpdateCheckResult>,
+    },
+    Error {
+        message: String,
+        info: Option<Arc<UpdateCheckResult>>,
+    },
+}
+
+impl UpdateUiState {
+    /// Return the associated [`UpdateCheckResult`] metadata when present.
+    #[must_use]
+    pub const fn info(&self) -> Option<&Arc<UpdateCheckResult>> {
+        match self {
+            Self::Available { info }
+            | Self::Downloading { info, .. }
+            | Self::ReadyToInstall { info, .. }
+            | Self::Installing { info } => Some(info),
+            Self::Error { info, .. } => info.as_ref(),
+            Self::Idle | Self::Checking | Self::UpToDate { .. } => None,
+        }
+    }
+
+    /// Return whether an available update version was explicitly skipped.
+    #[must_use]
+    pub fn is_skipped(&self, settings: &UpdateSettings) -> bool {
+        match self {
+            Self::Available { info } => {
+                settings.skipped_version.as_deref()
+                    == Some(info.latest_version.as_str())
+            }
+            Self::Idle
+            | Self::Checking
+            | Self::UpToDate { .. }
+            | Self::Downloading { .. }
+            | Self::ReadyToInstall { .. }
+            | Self::Installing { .. }
+            | Self::Error { .. } => false,
+        }
+    }
+
+    /// Whether the left icon rail should reveal the dedicated update button.
+    #[must_use]
+    pub fn should_show_rail_entry(&self, settings: &UpdateSettings) -> bool {
+        match self {
+            Self::Available { .. } => !self.is_skipped(settings),
+            Self::Downloading { .. }
+            | Self::ReadyToInstall { .. }
+            | Self::Installing { .. } => true,
+            Self::Idle
+            | Self::Checking
+            | Self::UpToDate { .. }
+            | Self::Error { .. } => false,
+        }
+    }
+
+    /// Return the active unskipped version string for tray menu updates.
+    #[must_use]
+    pub fn available_version_if_unskipped(
+        &self,
+        settings: &UpdateSettings,
+    ) -> Option<&str> {
+        if self.should_show_rail_entry(settings) {
+            self.info().map(|i| i.latest_version.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Whether the first-seen-per-version non-blocking banner should display.
+    #[must_use]
+    pub fn should_show_banner(
+        &self,
+        settings: &UpdateSettings,
+        dismissed_version: Option<&str>,
+    ) -> bool {
+        match self {
+            Self::Available { info } if !self.is_skipped(settings) => {
+                dismissed_version != Some(info.latest_version.as_str())
+            }
+            Self::ReadyToInstall { info, .. } => {
+                dismissed_version != Some(info.latest_version.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether opening `Check for Updates` should show the update modal
+    /// immediately instead of jumping to `Settings::Updates` to re-check.
+    #[must_use]
+    pub fn should_open_modal_directly(
+        &self,
+        settings: &UpdateSettings,
+    ) -> bool {
+        match self {
+            Self::Available { .. } => !self.is_skipped(settings),
+            Self::Downloading { .. }
+            | Self::ReadyToInstall { .. }
+            | Self::Installing { .. }
+            | Self::Error { info: Some(_), .. } => true,
+            Self::Idle
+            | Self::Checking
+            | Self::UpToDate { .. }
+            | Self::Error { info: None, .. } => false,
+        }
+    }
 }
 
 /// Unique key identifying a host tab in the Explore top bar.
@@ -1506,6 +1646,22 @@ pub struct Ruum {
     pub cli_install_status: Option<CliInstallStatus>,
     /// True while installing or uninstalling the `ruum` CLI command.
     pub cli_updating: bool,
+    /// Current software update state machine.
+    pub update_state: UpdateUiState,
+    /// Whether the centered software update card modal is open.
+    pub update_modal_open: bool,
+    /// Version whose non-blocking bottom-right update banner was dismissed.
+    pub update_banner_dismissed_version: Option<String>,
+    /// Persisted update check preferences (`update_settings` table).
+    pub update_settings: UpdateSettings,
+    /// Detected OS installation form for self-update or command guidance.
+    pub update_install_kind: InstallKind,
+    /// Shared cancellation token for an in-flight background asset download.
+    pub update_download_cancel: Option<Arc<AtomicBool>>,
+    /// Most recent update check/download/install error message.
+    pub update_last_error: Option<String>,
+    /// Focus handle for the centered update modal dialog.
+    pub update_focus: FocusHandle,
     #[cfg(test)]
     pub cli_install_env: Option<CliInstallEnv>,
     #[cfg(test)]
@@ -1639,6 +1795,8 @@ impl Ruum {
             ai_proposal,
             ssh_profiles,
             watchdog_home_space,
+            update_settings,
+            update_install_kind,
         ) = if cfg!(test) {
             (
                 None,
@@ -1652,12 +1810,14 @@ impl Ruum {
                 None,
                 Vec::new(),
                 None,
+                UpdateSettings::default(),
+                InstallKind::Development,
             )
         } else {
             let db_path = ruum_watchdog::ruum_db_path();
             let cred_store = shared_cred_store
                 .or_else(|| LazyCredentialStore::open_default().ok());
-            let (app_s, wd_c, wd_s, wh_c, wh_list, ai_c, ai_p, profiles) =
+            let (app_s, wd_c, wd_s, wh_c, wh_list, ai_c, ai_p, profiles, upd_s) =
                 db_path
                     .as_deref()
                     .and_then(|p| StorageDb::open(p).ok())
@@ -1672,6 +1832,7 @@ impl Ruum {
                                 AiConfig::default(),
                                 None,
                                 Vec::new(),
+                                UpdateSettings::default(),
                             )
                         },
                         |db| {
@@ -1691,13 +1852,27 @@ impl Ruum {
                                     s.parse_proposal().ok().flatten()
                                 }),
                                 db.list_ssh_profiles().unwrap_or_default(),
+                                db.load_update_settings().unwrap_or_default(),
                             )
                         },
                     );
             let home_space = home.as_deref().and_then(|h| space_info(h).ok());
+            let install_kind = UpdateFactory::create()
+                .detect_install_kind(&UpdateEnv::current());
             (
-                db_path, cred_store, app_s, wd_c, wd_s, wh_c, wh_list, ai_c,
-                ai_p, profiles, home_space,
+                db_path,
+                cred_store,
+                app_s,
+                wd_c,
+                wd_s,
+                wh_c,
+                wh_list,
+                ai_c,
+                ai_p,
+                profiles,
+                home_space,
+                upd_s,
+                install_kind,
             )
         };
         let power_choice = if cfg!(test) {
@@ -1902,6 +2077,14 @@ impl Ruum {
             watchdog_service_status: None,
             cli_install_status: None,
             cli_updating: false,
+            update_state: UpdateUiState::Idle,
+            update_modal_open: false,
+            update_banner_dismissed_version: None,
+            update_settings,
+            update_install_kind,
+            update_download_cancel: None,
+            update_last_error: None,
+            update_focus: cx.focus_handle(),
             #[cfg(test)]
             cli_install_env: None,
             #[cfg(test)]
@@ -3886,6 +4069,458 @@ impl Ruum {
             });
         })
         .detach();
+    }
+
+    // ── software updates ────────────────────────────────────────────────
+
+    fn sync_update_runtime(&self, cx: &mut App) {
+        crate::sync_runtime_update_state(
+            self.update_state.clone(),
+            self.update_settings.clone(),
+            self.update_install_kind,
+            self.update_banner_dismissed_version.clone(),
+            self.update_download_cancel.clone(),
+            self.update_last_error.clone(),
+            cx,
+        );
+    }
+
+    fn persist_update_settings(&mut self) {
+        self.update_settings.updated_at_secs =
+            u64::try_from(now_seconds()).unwrap_or(0);
+        if self.db_path.is_none() {
+            return;
+        }
+        if let Ok(db) = self.open_db() {
+            let _ = db.save_update_settings(&self.update_settings);
+        }
+    }
+
+    /// Open the centered software update card modal.
+    pub fn open_update_modal(&mut self, cx: &mut Context<'_, Self>) {
+        self.crumb_menu = None;
+        self.power_menu = None;
+        self.show_help = false;
+        self.update_modal_open = true;
+        self.focus_request = Some(FocusTarget::UpdateDialog);
+        cx.notify();
+    }
+
+    /// Close the centered software update card modal without cancelling an
+    /// active background download.
+    pub fn close_update_modal(&mut self, cx: &mut Context<'_, Self>) {
+        if self.update_modal_open {
+            self.update_modal_open = false;
+            self.focus_request = Some(FocusTarget::Root);
+            cx.notify();
+        }
+    }
+
+    /// Dismiss the first-seen-per-version non-blocking banner for the current
+    /// update version.
+    pub fn dismiss_update_banner(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(info) = self.update_state.info() {
+            self.update_banner_dismissed_version =
+                Some(info.latest_version.clone());
+            self.sync_update_runtime(cx);
+            cx.notify();
+        }
+    }
+
+    /// Apply a completed update check result onto `Ruum` and `AppRuntime`.
+    pub fn apply_update_check_outcome(
+        &mut self,
+        outcome: Result<(UpdateSettings, UpdateCheckResult), String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match outcome {
+            Ok((settings, result)) => {
+                self.update_settings = settings;
+                self.update_install_kind = result.install_kind;
+                self.update_last_error = None;
+                if result.update_available {
+                    self.update_state = UpdateUiState::Available {
+                        info: Arc::new(result),
+                    };
+                } else {
+                    self.update_state = UpdateUiState::UpToDate {
+                        checked_at_secs: self
+                            .update_settings
+                            .last_checked_at_secs,
+                    };
+                }
+            }
+            Err(err) => {
+                let prev_info = self.update_state.info().cloned();
+                self.update_last_error = Some(err.clone());
+                self.update_state = UpdateUiState::Error {
+                    message: err,
+                    info: prev_info,
+                };
+            }
+        }
+        self.sync_update_runtime(cx);
+        cx.notify();
+    }
+
+    /// Trigger an immediate update check off the UI thread.
+    pub fn check_for_updates_now(&mut self, cx: &mut Context<'_, Self>) {
+        if matches!(
+            self.update_state,
+            UpdateUiState::Checking
+                | UpdateUiState::Downloading { .. }
+                | UpdateUiState::Installing { .. }
+        ) {
+            return;
+        }
+        self.update_state = UpdateUiState::Checking;
+        self.update_last_error = None;
+        self.sync_update_runtime(cx);
+        cx.notify();
+
+        let db_path = self.db_path.clone();
+        let settings = self.update_settings.clone();
+        let install_kind = self.update_install_kind;
+        let lang = locale_code(self.locale);
+
+        let task = cx.background_executor().spawn(async move {
+            run_update_check_blocking(
+                db_path.as_deref(),
+                &settings,
+                install_kind,
+                lang,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            cx.update(|cx| {
+                let fallback_outcome = outcome.clone();
+                if this
+                    .update(cx, |app, cx| {
+                        app.apply_update_check_outcome(outcome, cx);
+                    })
+                    .is_err()
+                {
+                    let is_open = crate::update_open_main_window_checked(
+                        cx,
+                        |app, cx| {
+                            app.apply_update_check_outcome(
+                                fallback_outcome.clone(),
+                                cx,
+                            );
+                        },
+                    );
+                    if !is_open {
+                        apply_update_check_to_runtime(fallback_outcome, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Start downloading and verifying the selected update asset after explicit
+    /// user action (`Download & Update`).
+    pub fn start_update_download(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(info) = self.update_state.info().cloned() else {
+            return;
+        };
+        if matches!(
+            self.update_state,
+            UpdateUiState::Downloading { .. }
+                | UpdateUiState::Installing { .. }
+        ) {
+            return;
+        }
+        if !info.can_self_update {
+            return;
+        }
+        let Some(asset) = info.selected_asset.clone() else {
+            let msg = "No release package matches this platform".to_owned();
+            self.update_last_error = Some(msg.clone());
+            self.update_state = UpdateUiState::Error {
+                message: msg,
+                info: Some(info),
+            };
+            self.sync_update_runtime(cx);
+            cx.notify();
+            return;
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let quitting = crate::runtime_update_quitting(cx);
+        self.update_download_cancel = Some(Arc::clone(&cancel));
+        self.update_last_error = None;
+        self.update_state = UpdateUiState::Downloading {
+            info: Arc::clone(&info),
+            downloaded: 0,
+            total: asset.size,
+        };
+        self.sync_update_runtime(cx);
+        cx.notify();
+
+        let base_url = resolve_update_base_url();
+        let dest_dir = std::env::temp_dir().join("ruum-updates");
+        let progress_downloaded = Arc::new(AtomicU64::new(0));
+        let progress_total = Arc::new(AtomicU64::new(asset.size));
+        let done_slot: Arc<Mutex<Option<Result<PathBuf, String>>>> =
+            Arc::new(Mutex::new(None));
+        let signal = Arc::new(crate::AsyncSignal::default());
+
+        let dl_atomic = Arc::clone(&progress_downloaded);
+        let tot_atomic = Arc::clone(&progress_total);
+        let dl_done = Arc::clone(&done_slot);
+        let dl_signal = Arc::clone(&signal);
+        let dl_cancel = Arc::clone(&cancel);
+
+        let spawn_res = std::thread::Builder::new()
+            .name("ruum-update-dl".to_owned())
+            .spawn(move || {
+                let mut last_wake = Instant::now();
+                let res = download_and_verify_asset(
+                    &base_url,
+                    &asset,
+                    &dest_dir,
+                    &dl_cancel,
+                    |dl, total| {
+                        if let Some(ref q) = quitting
+                            && q.load(Ordering::Relaxed)
+                        {
+                            dl_cancel.store(true, Ordering::Release);
+                        }
+                        dl_atomic.store(dl, Ordering::Relaxed);
+                        tot_atomic.store(total, Ordering::Relaxed);
+                        if last_wake.elapsed() >= Duration::from_millis(80)
+                            || (total > 0 && dl >= total)
+                        {
+                            last_wake = Instant::now();
+                            dl_signal.notify();
+                        }
+                    },
+                )
+                .map_err(|e| e.to_string());
+                if let Ok(mut guard) = dl_done.lock() {
+                    *guard = Some(res);
+                }
+                dl_signal.notify();
+            });
+
+        if let Err(err) = spawn_res {
+            let msg = err.to_string();
+            self.update_download_cancel = None;
+            self.update_last_error = Some(msg.clone());
+            self.update_state = UpdateUiState::Error {
+                message: msg,
+                info: Some(info),
+            };
+            self.sync_update_runtime(cx);
+            cx.notify();
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                signal.wait().await;
+                let done = done_slot.lock().ok().and_then(|mut g| g.take());
+                let dl = progress_downloaded.load(Ordering::Relaxed);
+                let total = progress_total.load(Ordering::Relaxed);
+                let cancelled = cancel.load(Ordering::Relaxed);
+
+                let finished = done.is_some();
+                cx.update(|cx| {
+                    let apply = |app: &mut Self, cx: &mut Context<'_, Self>| {
+                        apply_download_progress_or_result(
+                            app,
+                            &info,
+                            dl,
+                            total,
+                            cancelled,
+                            done.clone(),
+                            cx,
+                        );
+                    };
+                    if this.update(cx, apply).is_err() {
+                        let updated =
+                            crate::update_open_main_window_checked(cx, apply);
+                        if !updated {
+                            apply_download_to_runtime(
+                                &info, dl, total, cancelled, done, cx,
+                            );
+                        }
+                    }
+                });
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Cancel an active update download and return to `Available`.
+    pub fn cancel_update_download(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(cancel) = self.update_download_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        if let UpdateUiState::Downloading { info, .. } = &self.update_state {
+            self.update_state = UpdateUiState::Available {
+                info: Arc::clone(info),
+            };
+        }
+        self.sync_update_runtime(cx);
+        cx.notify();
+    }
+
+    /// Apply a verified downloaded update package and quit when restart is
+    /// required.
+    pub fn apply_ready_update(&mut self, cx: &mut Context<'_, Self>) {
+        let UpdateUiState::ReadyToInstall {
+            info,
+            artifact_path,
+        } = &self.update_state
+        else {
+            return;
+        };
+        let info = Arc::clone(info);
+        let artifact_path = artifact_path.clone();
+        let kind = self.update_install_kind;
+        let manifest = info.manifest.clone();
+
+        self.update_state = UpdateUiState::Installing {
+            info: Arc::clone(&info),
+        };
+        self.sync_update_runtime(cx);
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let env = UpdateEnv::current();
+            let adapter = UpdateFactory::create();
+            let runner = ruum_core::ai_cli::DefaultCommandRunner;
+            adapter
+                .apply_update(&env, kind, &artifact_path, &manifest, &runner)
+                .map_err(|e| e.to_string())
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            cx.update(|cx| match res {
+                Ok(
+                    ApplyOutcome::RestartRequired { .. }
+                    | ApplyOutcome::InstallerLaunched { .. },
+                ) => {
+                    crate::app_menu::request_quit(cx);
+                }
+                Ok(ApplyOutcome::ManualActionRequired { .. }) => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.update_state = UpdateUiState::Available {
+                            info: Arc::clone(&info),
+                        };
+                        app.sync_update_runtime(cx);
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.update_last_error = Some(err.clone());
+                        app.update_state = UpdateUiState::Error {
+                            message: err,
+                            info: Some(Arc::clone(&info)),
+                        };
+                        app.sync_update_runtime(cx);
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Skip the currently offered update version and persist to `ruum.db`.
+    pub fn skip_update_version(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(version) =
+            self.update_state.info().map(|i| i.latest_version.clone())
+        else {
+            self.close_update_modal(cx);
+            return;
+        };
+        self.update_settings.skipped_version = Some(version.clone());
+        self.update_banner_dismissed_version = Some(version);
+        self.update_modal_open = false;
+        self.focus_request = Some(FocusTarget::Root);
+        self.persist_update_settings();
+        self.sync_update_runtime(cx);
+        cx.notify();
+    }
+
+    /// Switch the preferred update channel (`Stable` / `Beta`) and persist.
+    pub fn set_update_channel(
+        &mut self,
+        channel: UpdateChannel,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.update_settings.channel == channel {
+            return;
+        }
+        self.update_settings.channel = channel;
+        self.persist_update_settings();
+        self.sync_update_runtime(cx);
+        cx.notify();
+    }
+
+    /// Toggle automatic background update checking and persist.
+    pub fn set_update_auto_check(
+        &mut self,
+        auto_check: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.update_settings.auto_check == auto_check {
+            return;
+        }
+        self.update_settings.auto_check = auto_check;
+        self.persist_update_settings();
+        self.sync_update_runtime(cx);
+        cx.notify();
+    }
+
+    /// Toggle sending the anonymous `UUIDv4` install ID and persist.
+    pub fn set_update_send_client_id(
+        &mut self,
+        send_client_id: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.update_settings.send_client_id == send_client_id {
+            return;
+        }
+        self.update_settings.send_client_id = send_client_id;
+        self.persist_update_settings();
+        self.sync_update_runtime(cx);
+        cx.notify();
+    }
+
+    /// Copy the recommended CLI or package-manager upgrade command.
+    pub fn copy_update_command(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(cmd) =
+            self.update_state.info().map(|i| i.upgrade_command.clone())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(cmd));
+        self.push_toast(
+            crate::i18n::messages::update_command_copied(self.locale),
+            Status::Success,
+            cx,
+        );
+    }
+
+    /// Open the validated GitHub Release page in the system browser.
+    pub fn open_update_release_page(&self, cx: &App) {
+        let raw_url = self.update_state.info().map_or_else(
+            || format!("https://github.com/{DEFAULT_GITHUB_REPO}/releases"),
+            |i| i.manifest.release_url.clone(),
+        );
+        if let Ok(parsed) = validate_update_url(&raw_url) {
+            cx.open_url(parsed.as_str());
+        }
     }
 
     /// Test AI CLI connectivity off the UI thread (separate from model fetch).
@@ -7491,6 +8126,9 @@ impl Ruum {
             Some(FocusTarget::RemoteConnectDialog) => {
                 window.focus(&self.remote_connect_focus, cx);
             }
+            Some(FocusTarget::UpdateDialog) => {
+                window.focus(&self.update_focus, cx);
+            }
             None => {}
         }
     }
@@ -8761,6 +9399,12 @@ impl Ruum {
             }
             return;
         }
+        if self.update_modal_open {
+            if key == "escape" {
+                self.close_update_modal(cx);
+            }
+            return;
+        }
 
         // The volume picker modal owns its keys while open: arrows move, Enter
         // picks, Escape closes, and nothing behind acts.
@@ -9418,6 +10062,8 @@ pub enum FocusTarget {
     Dialog,
     /// The remote SSH connect confirmation dialog.
     RemoteConnectDialog,
+    /// The centered software update card modal.
+    UpdateDialog,
 }
 
 impl Render for Ruum {
@@ -9453,6 +10099,243 @@ impl Render for Ruum {
         }
         crate::views::root(self, window, cx)
     }
+}
+
+/// Canonical lowercase language tag sent to the update service.
+#[must_use]
+pub const fn locale_code(locale: crate::i18n::Locale) -> &'static str {
+    match locale {
+        crate::i18n::Locale::En => "en",
+        crate::i18n::Locale::Zh => "zh",
+        crate::i18n::Locale::Ja => "ja",
+        crate::i18n::Locale::Ko => "ko",
+    }
+}
+
+fn is_loopback_base_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.starts_with("http://127.0.0.1")
+        || trimmed.starts_with("http://localhost")
+        || trimmed.starts_with("http://[::1]")
+}
+
+/// Execute a blocking signed manifest update check and persist `last_checked_at_secs`.
+pub fn run_update_check_blocking(
+    db_path: Option<&Path>,
+    settings: &UpdateSettings,
+    install_kind: InstallKind,
+    lang: &str,
+) -> Result<(UpdateSettings, UpdateCheckResult), String> {
+    let base_url = resolve_update_base_url();
+    if cfg!(test) && !is_loopback_base_url(&base_url) {
+        return Err("update checks disabled in test builds".to_owned());
+    }
+    let pubkey_b64 = resolve_effective_public_key_for_url(&base_url);
+    let db = if let Some(path) = db_path {
+        StorageDb::open(path).ok()
+    } else if !cfg!(test) {
+        StorageDb::open_default().ok()
+    } else {
+        None
+    };
+
+    let client_id = if settings.send_client_id {
+        if let Some(ref d) = db {
+            d.ensure_update_client_id().ok()
+        } else if !settings.client_id.trim().is_empty() {
+            Some(settings.client_id.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let env = UpdateEnv::current();
+    let os = env.os.unwrap_or_else(UpdateFactory::current_os);
+    let arch = env.arch.unwrap_or_else(UpdateArch::current);
+
+    let result = check_for_updates(&UpdateCheckRequest {
+        channel: settings.channel,
+        current_version: env!("CARGO_PKG_VERSION"),
+        os,
+        arch,
+        install_kind,
+        lang,
+        entry: "gui",
+        client_id: client_id.as_deref(),
+        base_url: &base_url,
+        public_key_b64: &pubkey_b64,
+        github_repo: DEFAULT_GITHUB_REPO,
+        github_fallback_base: None,
+    })
+    .map_err(|e| e.to_string())?;
+
+    let now = u64::try_from(now_seconds()).unwrap_or(0);
+    let mut updated_settings = settings.clone();
+    if let Some(cid) = client_id {
+        updated_settings.client_id = cid;
+    }
+    updated_settings.last_checked_at_secs = now;
+    updated_settings.updated_at_secs = now;
+    if let Some(ref d) = db {
+        let _ = d.save_update_settings(&updated_settings);
+    }
+
+    Ok((updated_settings, result))
+}
+
+/// Apply an update check outcome directly to `AppRuntime` when no window is open.
+pub fn apply_update_check_to_runtime(
+    outcome: Result<(UpdateSettings, UpdateCheckResult), String>,
+    cx: &mut App,
+) {
+    crate::with_runtime_mut(cx, |rt| match outcome {
+        Ok((settings, result)) => {
+            rt.update_settings = settings;
+            rt.update_install_kind = result.install_kind;
+            rt.update_last_error = None;
+            rt.update_state = if result.update_available {
+                UpdateUiState::Available {
+                    info: Arc::new(result),
+                }
+            } else {
+                UpdateUiState::UpToDate {
+                    checked_at_secs: rt.update_settings.last_checked_at_secs,
+                }
+            };
+        }
+        Err(err) => {
+            let prev_info = rt.update_state.info().cloned();
+            rt.update_last_error = Some(err.clone());
+            rt.update_state = UpdateUiState::Error {
+                message: err,
+                info: prev_info,
+            };
+        }
+    });
+    crate::refresh_tray_update_status(cx);
+}
+
+enum DownloadTransition {
+    Finished {
+        state: UpdateUiState,
+        last_error: Option<String>,
+    },
+    Progress {
+        downloaded: u64,
+        total: u64,
+    },
+}
+
+fn classify_download_update(
+    info: &Arc<UpdateCheckResult>,
+    downloaded: u64,
+    total: u64,
+    cancelled: bool,
+    done: Option<Result<PathBuf, String>>,
+) -> DownloadTransition {
+    match done {
+        Some(Ok(artifact_path)) => DownloadTransition::Finished {
+            state: UpdateUiState::ReadyToInstall {
+                info: Arc::clone(info),
+                artifact_path,
+            },
+            last_error: None,
+        },
+        Some(Err(err)) => {
+            if cancelled {
+                DownloadTransition::Finished {
+                    state: UpdateUiState::Available {
+                        info: Arc::clone(info),
+                    },
+                    last_error: None,
+                }
+            } else {
+                DownloadTransition::Finished {
+                    state: UpdateUiState::Error {
+                        message: err.clone(),
+                        info: Some(Arc::clone(info)),
+                    },
+                    last_error: Some(err),
+                }
+            }
+        }
+        None => DownloadTransition::Progress { downloaded, total },
+    }
+}
+
+fn apply_download_transition_fields(
+    update_state: &mut UpdateUiState,
+    update_download_cancel: &mut Option<Arc<AtomicBool>>,
+    update_last_error: &mut Option<String>,
+    info: &Arc<UpdateCheckResult>,
+    transition: DownloadTransition,
+) {
+    match transition {
+        DownloadTransition::Finished { state, last_error } => {
+            *update_download_cancel = None;
+            if let Some(err) = last_error {
+                *update_last_error = Some(err);
+            } else {
+                *update_last_error = None;
+            }
+            *update_state = state;
+        }
+        DownloadTransition::Progress { downloaded, total } => {
+            if matches!(update_state, UpdateUiState::Downloading { .. }) {
+                *update_state = UpdateUiState::Downloading {
+                    info: Arc::clone(info),
+                    downloaded,
+                    total,
+                };
+            }
+        }
+    }
+}
+
+fn apply_download_progress_or_result(
+    app: &mut Ruum,
+    info: &Arc<UpdateCheckResult>,
+    downloaded: u64,
+    total: u64,
+    cancelled: bool,
+    done: Option<Result<PathBuf, String>>,
+    cx: &mut Context<'_, Ruum>,
+) {
+    let transition =
+        classify_download_update(info, downloaded, total, cancelled, done);
+    apply_download_transition_fields(
+        &mut app.update_state,
+        &mut app.update_download_cancel,
+        &mut app.update_last_error,
+        info,
+        transition,
+    );
+    app.sync_update_runtime(cx);
+    cx.notify();
+}
+
+fn apply_download_to_runtime(
+    info: &Arc<UpdateCheckResult>,
+    downloaded: u64,
+    total: u64,
+    cancelled: bool,
+    done: Option<Result<PathBuf, String>>,
+    cx: &mut App,
+) {
+    let transition =
+        classify_download_update(info, downloaded, total, cancelled, done);
+    crate::with_runtime_mut(cx, |rt| {
+        apply_download_transition_fields(
+            &mut rt.update_state,
+            &mut rt.update_download_cancel,
+            &mut rt.update_last_error,
+            info,
+            transition,
+        );
+    });
+    crate::refresh_tray_update_status(cx);
 }
 
 /// Run local AI analysis on an already-fetched remote [`Snapshot`] using pure

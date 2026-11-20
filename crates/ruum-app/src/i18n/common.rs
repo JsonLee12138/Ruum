@@ -32,6 +32,16 @@ pub const fn menu_install_cli(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn menu_check_updates(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Check for Updates\u{2026}",
+        "检查更新\u{2026}",
+        "アップデートを確認\u{2026}",
+        "업데이트 확인\u{2026}",
+    )
+}
+
 pub const fn menu_hide_app(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -157,6 +167,20 @@ pub const fn tray_watchdog(locale: Locale) -> &'static str {
 
 pub const fn tray_settings(locale: Locale) -> &'static str {
     menu_settings(locale)
+}
+
+pub const fn tray_check_updates(locale: Locale) -> &'static str {
+    menu_check_updates(locale)
+}
+
+pub fn tray_update_available(version: &str, locale: Locale) -> String {
+    let ver = version.trim().trim_start_matches('v');
+    match locale {
+        Locale::En => format!("Update Available (v{ver})\u{2026}"),
+        Locale::Zh => format!("发现新版本 (v{ver})\u{2026}"),
+        Locale::Ja => format!("アップデートあり (v{ver})\u{2026}"),
+        Locale::Ko => format!("업데이트 가능 (v{ver})\u{2026}"),
+    }
 }
 
 pub const fn tray_check_disk_space(locale: Locale) -> &'static str {

@@ -52,6 +52,8 @@ mod menu_actions {
             OpenSettings,
             /// Install or update the `ruum` CLI command in PATH.
             InstallCliCommand,
+            /// Check for application updates or open the update dialog.
+            CheckForUpdates,
             /// Show or focus the main window.
             ShowMainWindow,
             /// Toggle fullscreen mode for the active main window.
@@ -103,6 +105,7 @@ pub fn set_confirm_only(cx: &mut App, confirm_only: bool) {
 /// Mark the application as explicitly quitting and exit GPUI's event loop.
 pub fn request_quit(cx: &mut App) {
     update_lifecycle(cx, |lifecycle| lifecycle.quitting = true);
+    crate::cancel_update_tasks_on_quit(cx);
     cx.quit();
 }
 
@@ -199,6 +202,10 @@ fn build_menus(locale: Locale) -> [Menu; 4] {
             MenuItem::action(
                 common::menu_install_cli(locale),
                 InstallCliCommand,
+            ),
+            MenuItem::action(
+                common::menu_check_updates(locale),
+                CheckForUpdates,
             ),
             MenuItem::separator(),
             MenuItem::os_submenu(
@@ -308,7 +315,20 @@ mod tests {
                 assert!(!common::menu_file(locale).is_empty());
                 assert!(!common::menu_view(locale).is_empty());
                 assert!(!common::menu_go(locale).is_empty());
+                assert!(!common::menu_check_updates(locale).is_empty());
             }
+            assert_ne!(
+                common::menu_check_updates(Locale::Zh),
+                common::menu_check_updates(Locale::En)
+            );
+            assert_ne!(
+                common::menu_check_updates(Locale::Ja),
+                common::menu_check_updates(Locale::En)
+            );
+            assert_ne!(
+                common::menu_check_updates(Locale::Ko),
+                common::menu_check_updates(Locale::En)
+            );
             assert_ne!(
                 common::menu_file(Locale::Zh),
                 common::menu_file(Locale::En)

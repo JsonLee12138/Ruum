@@ -1,9 +1,9 @@
 //! Unified `SQLite` storage layer (`ruum.db`) for `ruum-core`.
 //!
-//! Owns `app_settings`, `ssh_profiles`, `webhook_config`, `ai_config`, and
-//! `ai_state` inside `<config_dir>/ruum/ruum.db` using `WAL` journal mode and
-//! `busy_timeout = 5000`. Watchdog tables (`watchdog_config` and
-//! `watchdog_state`) remain strictly owned by
+//! Owns `app_settings`, `ssh_profiles`, `webhook_config`, `ai_config`,
+//! `ai_state`, and `update_settings` inside `<config_dir>/ruum/ruum.db` using
+//! `WAL` journal mode and `busy_timeout = 5000`. Watchdog tables
+//! (`watchdog_config` and `watchdog_state`) remain strictly owned by
 //! [`ruum_watchdog::WatchdogConfigService`], exposed via [`StorageDb::watchdog`].
 
 use std::collections::BTreeMap;
@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -124,6 +125,17 @@ CREATE TABLE IF NOT EXISTS ai_config (
 CREATE TABLE IF NOT EXISTS ai_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_proposal_json TEXT,
+    updated_at_secs INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS update_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    auto_check INTEGER NOT NULL DEFAULT 1,
+    channel TEXT NOT NULL DEFAULT 'stable' CHECK (channel IN ('stable', 'beta')),
+    client_id TEXT NOT NULL DEFAULT '',
+    send_client_id INTEGER NOT NULL DEFAULT 1,
+    skipped_version TEXT,
+    last_checked_at_secs INTEGER NOT NULL DEFAULT 0,
     updated_at_secs INTEGER NOT NULL DEFAULT 0
 );
 ";
@@ -594,6 +606,100 @@ impl AiState {
             self.updated_at_secs = now_secs;
         }
         Ok(Some(proposal))
+    }
+}
+
+/// Release channel for application and CLI update checks.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    /// Canonical lowercase representation stored in `SQLite` and query params.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+impl fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for UpdateChannel {
+    type Err = io::Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "stable" => Ok(Self::Stable),
+            "beta" => Ok(Self::Beta),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown update channel `{other}`; expected stable or beta"
+                ),
+            )),
+        }
+    }
+}
+
+/// Persistent update preferences and state stored in `update_settings`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    pub auto_check: bool,
+    pub channel: UpdateChannel,
+    pub client_id: String,
+    pub send_client_id: bool,
+    pub skipped_version: Option<String>,
+    pub last_checked_at_secs: u64,
+    pub updated_at_secs: u64,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            channel: UpdateChannel::Stable,
+            client_id: String::new(),
+            send_client_id: true,
+            skipped_version: None,
+            last_checked_at_secs: 0,
+            updated_at_secs: 0,
+        }
+    }
+}
+
+impl UpdateSettings {
+    /// Normalize string fields (`skipped_version` empty string -> `None`).
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        let skipped_version = self
+            .skipped_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        Self {
+            auto_check: self.auto_check,
+            channel: self.channel,
+            client_id: self.client_id.trim().to_owned(),
+            send_client_id: self.send_client_id,
+            skipped_version,
+            last_checked_at_secs: self.last_checked_at_secs,
+            updated_at_secs: self.updated_at_secs,
+        }
     }
 }
 
@@ -1911,6 +2017,122 @@ impl StorageDb {
             Ok(remaining)
         })
     }
+
+    /// Load `update_settings`, returning defaults if no row has been saved yet.
+    pub fn load_update_settings(&self) -> io::Result<UpdateSettings> {
+        let row = self.with_conn_retry(|conn| {
+            conn.query_row(
+                "SELECT auto_check, channel, client_id, send_client_id, \
+                 skipped_version, last_checked_at_secs, updated_at_secs \
+                 FROM update_settings WHERE id = 1",
+                [],
+                |row| {
+                    let auto_check: i64 = row.get(0)?;
+                    let channel_raw: String = row.get(1)?;
+                    let client_id: String = row.get(2)?;
+                    let send_client_id: i64 = row.get(3)?;
+                    let skipped_version: Option<String> = row.get(4)?;
+                    let last_checked_at_secs: i64 = row.get(5)?;
+                    let updated_at_secs: i64 = row.get(6)?;
+                    let channel = UpdateChannel::from_str(&channel_raw)
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    Ok(UpdateSettings {
+                        auto_check: auto_check != 0,
+                        channel,
+                        client_id,
+                        send_client_id: send_client_id != 0,
+                        skipped_version,
+                        last_checked_at_secs: sqlite_i64_to_u64(
+                            last_checked_at_secs,
+                        ),
+                        updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
+                    })
+                },
+            )
+            .optional()
+        })?;
+        Ok(row.unwrap_or_default().normalized())
+    }
+
+    /// Persist normalized `update_settings`.
+    pub fn save_update_settings(
+        &self,
+        settings: &UpdateSettings,
+    ) -> io::Result<()> {
+        let norm = settings.normalized();
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO update_settings (
+                    id, auto_check, channel, client_id, send_client_id,
+                    skipped_version, last_checked_at_secs, updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    auto_check = excluded.auto_check,
+                    channel = excluded.channel,
+                    client_id = excluded.client_id,
+                    send_client_id = excluded.send_client_id,
+                    skipped_version = excluded.skipped_version,
+                    last_checked_at_secs = excluded.last_checked_at_secs,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![
+                    i64::from(norm.auto_check),
+                    norm.channel.as_str(),
+                    norm.client_id,
+                    i64::from(norm.send_client_id),
+                    norm.skipped_version,
+                    u64_to_sqlite_i64(norm.last_checked_at_secs),
+                    u64_to_sqlite_i64(norm.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Return the persisted anonymous `client_id`, lazily generating and
+    /// persisting a `UUIDv4` once if it is currently empty.
+    pub fn ensure_update_client_id(&self) -> io::Result<String> {
+        let candidate = uuid::Uuid::new_v4().to_string();
+        let now = now_unix_secs();
+        self.with_conn_retry(|conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT client_id FROM update_settings WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing
+                && !id.trim().is_empty()
+            {
+                tx.commit()?;
+                return Ok(id.trim().to_owned());
+            }
+            tx.execute(
+                "INSERT INTO update_settings (id, client_id, updated_at_secs)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    client_id = excluded.client_id,
+                    updated_at_secs = excluded.updated_at_secs
+                 WHERE TRIM(update_settings.client_id) = ''",
+                params![candidate, u64_to_sqlite_i64(now)],
+            )?;
+            let persisted: String = tx.query_row(
+                "SELECT client_id FROM update_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(persisted.trim().to_owned())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1963,6 +2185,7 @@ mod tests {
                 "ai_state",
                 "app_settings",
                 "ssh_profiles",
+                "update_settings",
                 "webhook_config",
                 "webhook_endpoints",
             ]
@@ -2314,12 +2537,23 @@ mod tests {
             "INSERT INTO webhook_config (id) VALUES (2)",
             "INSERT INTO ai_config (id) VALUES (2)",
             "INSERT INTO ai_state (id) VALUES (2)",
+            "INSERT INTO update_settings (id) VALUES (2)",
         ] {
             assert!(
                 conn.execute(singleton_insert, []).is_err(),
                 "singleton check should reject: {singleton_insert}"
             );
         }
+
+        assert!(
+            conn.execute(
+                "INSERT INTO update_settings (id, channel) \
+                 VALUES (1, 'nightly')",
+                [],
+            )
+            .is_err(),
+            "update_settings channel CHECK constraint must reject invalid value"
+        );
 
         assert!(
             conn.execute(
@@ -2927,5 +3161,140 @@ mod tests {
         assert_eq!(rem.items[0].path, p2);
         let loaded = db.load_ai_state().unwrap();
         assert_eq!(loaded.updated_at_secs, 1_700_000_777);
+    }
+
+    #[test]
+    fn update_settings_defaults_normalization_and_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = StorageDb::open(temp.path().join("ruum.db")).unwrap();
+
+        let defaults = db.load_update_settings().unwrap();
+        assert_eq!(defaults, UpdateSettings::default());
+        assert!(defaults.auto_check);
+        assert_eq!(defaults.channel, UpdateChannel::Stable);
+        assert!(defaults.client_id.is_empty());
+        assert!(defaults.send_client_id);
+        assert_eq!(defaults.skipped_version, None);
+        assert_eq!(defaults.last_checked_at_secs, 0);
+        assert_eq!(defaults.updated_at_secs, 0);
+
+        assert_eq!(
+            "stable".parse::<UpdateChannel>().unwrap(),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            "BETA".parse::<UpdateChannel>().unwrap(),
+            UpdateChannel::Beta
+        );
+        assert!("nightly".parse::<UpdateChannel>().is_err());
+        assert_eq!(UpdateChannel::Stable.to_string(), "stable");
+        assert_eq!(UpdateChannel::Beta.to_string(), "beta");
+
+        let custom = UpdateSettings {
+            auto_check: false,
+            channel: UpdateChannel::Beta,
+            client_id: "  cid-123  ".to_owned(),
+            send_client_id: false,
+            skipped_version: Some("   ".to_owned()),
+            last_checked_at_secs: 1_700_000_100,
+            updated_at_secs: 1_700_000_200,
+        };
+        db.save_update_settings(&custom).unwrap();
+
+        let loaded = db.load_update_settings().unwrap();
+        assert_eq!(
+            loaded,
+            UpdateSettings {
+                auto_check: false,
+                channel: UpdateChannel::Beta,
+                client_id: "cid-123".to_owned(),
+                send_client_id: false,
+                skipped_version: None,
+                last_checked_at_secs: 1_700_000_100,
+                updated_at_secs: 1_700_000_200,
+            }
+        );
+
+        let with_skip = UpdateSettings {
+            skipped_version: Some(" 0.3.0-beta.1 ".to_owned()),
+            updated_at_secs: 1_700_000_300,
+            ..loaded
+        };
+        db.save_update_settings(&with_skip).unwrap();
+        assert_eq!(
+            db.load_update_settings()
+                .unwrap()
+                .skipped_version
+                .as_deref(),
+            Some("0.3.0-beta.1")
+        );
+    }
+
+    #[test]
+    fn ensure_update_client_id_is_lazy_valid_uuid_v4_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = StorageDb::open(temp.path().join("ruum.db")).unwrap();
+
+        // Loading before ensure leaves client_id empty.
+        assert!(db.load_update_settings().unwrap().client_id.is_empty());
+
+        let first = db.ensure_update_client_id().unwrap();
+        let parsed = uuid::Uuid::parse_str(&first).expect("valid UUID");
+        assert_eq!(parsed.get_version_num(), 4);
+
+        let second = db.ensure_update_client_id().unwrap();
+        assert_eq!(second, first);
+
+        // Concurrent callers converge on the exact same UUIDv4.
+        let db_path = temp.path().join("ruum.db");
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let p = db_path.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let d = StorageDb::open(&p).unwrap();
+                b.wait();
+                d.ensure_update_client_id().unwrap()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), first);
+        }
+    }
+
+    #[test]
+    fn save_update_settings_and_ensure_client_id_retry_on_sqlite_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let db = StorageDb::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+        }
+
+        let mut ensured = String::new();
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            ensured = db.ensure_update_client_id().unwrap();
+        });
+        assert_eq!(
+            uuid::Uuid::parse_str(&ensured).unwrap().get_version_num(),
+            4
+        );
+
+        let updated = UpdateSettings {
+            auto_check: false,
+            channel: UpdateChannel::Beta,
+            client_id: ensured.clone(),
+            send_client_id: false,
+            skipped_version: Some("0.2.3".to_owned()),
+            last_checked_at_secs: 1_700_000_800,
+            updated_at_secs: 1_700_000_801,
+        };
+        with_contended_write_lock(&db_path, Duration::from_millis(120), || {
+            db.save_update_settings(&updated).unwrap();
+        });
+        assert_eq!(db.load_update_settings().unwrap(), updated);
+        assert_eq!(db.ensure_update_client_id().unwrap(), ensured);
     }
 }

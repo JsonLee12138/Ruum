@@ -15,6 +15,8 @@ cask "ruum" do
   desc "GPUI treemap explorer for disk usage"
   homepage "https://github.com/@REPO@"
 
+  auto_updates true
+
   livecheck do
     url :url
     strategy :github_latest

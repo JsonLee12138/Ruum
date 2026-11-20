@@ -110,6 +110,16 @@ pub mod size {
     pub const ICON_RAIL: Rems = Rems(3.25);
     /// Floating toast notification max width.
     pub const TOAST: Rems = Rems(26.0);
+    /// Bottom offset of floating toast and non-blocking update banner.
+    pub const TOAST_BOTTOM: Rems = Rems(3.5);
+    /// Bottom offset when update banner stacks above an active toast.
+    pub const UPDATE_BANNER_STACKED_BOTTOM: Rems = Rems(7.0);
+    /// Width of the software update card modal.
+    pub const UPDATE_MODAL: Rems = Rems(36.0);
+    /// Maximum height of the scrollable changelog block inside update modal.
+    pub const CHANGELOG_MAX_H: Rems = Rems(16.0);
+    /// Accent indicator dot size on the left icon rail update button.
+    pub const UPDATE_DOT: Rems = Rems(0.4375);
     /// Bounded width of the horizontally scrollable host tag strip in top bar.
     pub const HOST_TABS_MAX: Rems = Rems(18.0);
     /// Minimum width reserved for the Explore top bar's navigation group

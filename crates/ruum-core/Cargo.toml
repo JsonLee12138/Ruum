@@ -20,6 +20,7 @@ service = [
     "dep:aes-gcm",
     "dep:anyhow",
     "dep:base64",
+    "dep:ed25519-dalek",
     "dep:hmac",
     "dep:interprocess",
     "dep:keyring",
@@ -27,6 +28,7 @@ service = [
     "dep:rsa",
     "dep:rusqlite",
     "dep:ruum-watchdog",
+    "dep:semver",
     "dep:ssh-key",
     "dep:ureq",
     "dep:url",
@@ -40,6 +42,7 @@ anyhow = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dunce = { workspace = true }
+ed25519-dalek = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 interprocess = { workspace = true, optional = true }
 keyring = { workspace = true, optional = true }
@@ -49,6 +52,7 @@ rsa = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 ruum-watchdog = { workspace = true, optional = true }
+semver = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

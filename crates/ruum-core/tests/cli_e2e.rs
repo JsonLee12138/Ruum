@@ -135,6 +135,7 @@ impl Sandbox {
             .env("NO_COLOR", "1")
             .env("RUUM_TEST_ROOT_SECRET_HEX", SENTINEL_FORBID_KEYCHAIN)
             .env("RUUM_DISABLE_OS_NOTIFICATIONS", "1")
+            .env("RUUM_NO_UPDATE_CHECK", "1")
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("RUUM_GUI_BIN")
@@ -2429,4 +2430,199 @@ fn cli_run_script_bridges_ssh_session_pipes_payload_and_clears_pending() {
         );
         assert_eq!(fs::read_to_string(&local_marker).unwrap(), "--yes");
     }
+}
+
+#[test]
+fn cli_config_update_get_set_and_zero_keychain_reads() {
+    let sb = Sandbox::new();
+
+    let help = sb.run(&["help"]);
+    assert!(help.status.success());
+    assert!(stdout_str(&help).contains("ruum update"));
+
+    let cfg_help = sb.run(&["config", "--help"]);
+    assert!(cfg_help.status.success());
+    assert!(stdout_str(&cfg_help).contains("ruum config update"));
+
+    let get_def = sb.run(&["config", "update", "get", "--json"]);
+    assert!(get_def.status.success(), "{}", stderr_str(&get_def));
+    let def_json: Value = serde_json::from_str(&stdout_str(&get_def)).unwrap();
+    assert_eq!(def_json["auto_check"], true);
+    assert_eq!(def_json["channel"], "stable");
+    assert_eq!(def_json["send_client_id"], true);
+    assert!(def_json["skipped_version"].is_null());
+
+    // Pre-populate skipped_version so --clear-skipped is tested end-to-end.
+    let db = StorageDb::open(sb.db_path()).unwrap();
+    let mut seeded = db.load_update_settings().unwrap();
+    seeded.skipped_version = Some("9.0.0".to_owned());
+    db.save_update_settings(&seeded).unwrap();
+    drop(db);
+
+    let set_out = sb.run(&[
+        "config",
+        "update",
+        "set",
+        "--auto-check",
+        "false",
+        "--channel",
+        "beta",
+        "--send-client-id",
+        "false",
+        "--clear-skipped",
+        "--json",
+    ]);
+    assert!(set_out.status.success(), "{}", stderr_str(&set_out));
+    let set_json: Value = serde_json::from_str(&stdout_str(&set_out)).unwrap();
+    assert_eq!(set_json["auto_check"], false);
+    assert_eq!(set_json["channel"], "beta");
+    assert_eq!(set_json["send_client_id"], false);
+    assert!(set_json["skipped_version"].is_null());
+
+    let get_text = sb.run(&["config", "update", "get"]);
+    assert!(get_text.status.success(), "{}", stderr_str(&get_text));
+    let text = stdout_str(&get_text);
+    assert!(text.contains("auto_check = false"));
+    assert!(text.contains("channel = beta"));
+    assert!(text.contains("send_client_id = false"));
+}
+
+#[test]
+fn cli_update_check_json_mock_server_and_signature_verification() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    let sb = Sandbox::new();
+    let seed = [11_u8; 32];
+    let sk = SigningKey::from_bytes(&seed);
+    let pk_b64 = BASE64.encode(sk.verifying_key().to_bytes());
+
+    let manifest_payload = json!({
+        "schema_version": 1,
+        "version": "9.9.9",
+        "tag": "v9.9.9",
+        "channel": "stable",
+        "published_at": "2026-11-20T00:00:00Z",
+        "release_url": "https://github.com/JsonLee12138/Ruum/releases/tag/v9.9.9",
+        "notes": "### What's New\n- Fast updates",
+        "assets": {
+            "macos-aarch64-app_zip": {
+                "filename": "ruum-9.9.9-aarch64-macos.zip",
+                "path": "releases/v9.9.9/ruum-9.9.9-aarch64-macos.zip",
+                "fallback_url": "https://github.com/JsonLee12138/Ruum/releases/download/v9.9.9/ruum-9.9.9-aarch64-macos.zip",
+                "sha256": "a".repeat(64),
+                "size": 2048
+            },
+            "linux-x86_64-tarball": {
+                "filename": "ruum-9.9.9-x86_64-linux.tar.gz",
+                "path": "releases/v9.9.9/ruum-9.9.9-x86_64-linux.tar.gz",
+                "fallback_url": "https://github.com/JsonLee12138/Ruum/releases/download/v9.9.9/ruum-9.9.9-x86_64-linux.tar.gz",
+                "sha256": "b".repeat(64),
+                "size": 2048
+            },
+            "windows-x86_64-portable_zip": {
+                "filename": "ruum-9.9.9-x86_64-windows.zip",
+                "path": "releases/v9.9.9/ruum-9.9.9-x86_64-windows.zip",
+                "fallback_url": "https://github.com/JsonLee12138/Ruum/releases/download/v9.9.9/ruum-9.9.9-x86_64-windows.zip",
+                "sha256": "c".repeat(64),
+                "size": 2048
+            }
+        }
+    });
+    let raw_bytes = serde_json::to_vec_pretty(&manifest_payload).unwrap();
+    let sig_b64 = BASE64.encode(sk.sign(&raw_bytes).to_bytes());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let raw_clone = raw_bytes;
+    let sig_clone = sig_b64;
+    let srv = thread::spawn(move || {
+        let mut captured = Vec::new();
+        for idx in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            let mut full = first;
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).unwrap_or(0);
+                if n == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                full.push_str(&line);
+            }
+            captured.push(full);
+            let used_sig = if idx == 2 { "AAAA" } else { sig_clone.as_str() };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 X-Ruum-Signature: {used_sig}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                raw_clone.len()
+            );
+            let inner = reader.into_inner();
+            inner.write_all(head.as_bytes()).unwrap();
+            inner.write_all(&raw_clone).unwrap();
+            inner.flush().unwrap();
+        }
+        captured
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    // 1. Default check sends X-Ruum-Client-Id and returns update JSON.
+    let out1 = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .env("RUUM_TEST_UPDATE_PUBLIC_KEY", &pk_b64)
+        .args(["update", "check", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update check --json");
+    assert!(
+        out1.status.success(),
+        "ruum update check failed: {}",
+        stderr_str(&out1)
+    );
+    let res1: Value = serde_json::from_str(&stdout_str(&out1)).unwrap();
+    assert_eq!(res1["update_available"], true);
+    assert_eq!(res1["latest_version"], "9.9.9");
+    assert_eq!(res1["channel"], "stable");
+    assert!(!res1["upgrade_command"].as_str().unwrap_or("").is_empty());
+
+    // 2. Disabling send_client_id omits X-Ruum-Client-Id and --channel beta
+    //    is forwarded.
+    assert!(
+        sb.run(&["config", "update", "set", "--send-client-id", "false"])
+            .status
+            .success()
+    );
+    let out2 = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .env("RUUM_TEST_UPDATE_PUBLIC_KEY", &pk_b64)
+        .args(["update", "--channel", "beta", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update --channel beta --json");
+    assert!(out2.status.success(), "{}", stderr_str(&out2));
+
+    // 3. Invalid signature must fail non-zero.
+    let out3 = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .env("RUUM_TEST_UPDATE_PUBLIC_KEY", &pk_b64)
+        .args(["update", "check", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update check bad sig");
+    assert!(!out3.status.success());
+
+    let reqs = srv.join().unwrap();
+    assert!(reqs[0].contains("GET /v1/check?channel=stable"));
+    assert!(reqs[0].to_ascii_lowercase().contains("x-ruum-client-id:"));
+    assert!(reqs[1].contains("GET /v1/check?channel=beta"));
+    assert!(!reqs[1].to_ascii_lowercase().contains("x-ruum-client-id:"));
 }

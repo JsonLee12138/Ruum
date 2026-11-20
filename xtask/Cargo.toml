@@ -8,7 +8,12 @@ publish = false
 description = "Check and packaging entry points for ruum: one command per gate"
 
 [dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
 ruum-core.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2 = "0.10"
 
 [dev-dependencies]

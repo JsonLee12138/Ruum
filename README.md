@@ -29,6 +29,21 @@ Find what is filling a disk, mark what should go, and clean it up safely — wit
 
 ## Installation & Initial Setup
 
+### Quick Install (One-Line Installer)
+
+- **macOS & Linux** (installs the desktop app + `ruum` CLI, verified with SHA-256):
+  ```sh
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh
+  # Headless / server CLI only:
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh -s -- --cli-only
+  ```
+- **Windows (PowerShell)**:
+  ```powershell
+  irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
+  ```
+
+> **In-app & CLI updates:** Desktop installs check for signed updates automatically in the background (configurable in **Settings › Updates**, Stable or Beta channel; no silent downloads before clicking **Download & Update**). On headless servers, run `ruum update check` to verify releases and print the exact upgrade command.
+
 ### macOS
 
 Install via Homebrew (macOS 11 or newer, Apple Silicon `aarch64-macos` & Intel `x86_64-macos`):
@@ -314,6 +329,9 @@ ruum [OPTIONS] [PATH]                  # scan PATH (defaults to ~)
 ruum ssh HOST [OPTIONS] [PATH]         # inspect a remote host over SSH (read-only)
 ruum mcp [--read-only]                 # run stdio MCP server
 ruum watchdog [--once]                 # run disk watchdog daemon (or single check)
+ruum update [check] [--channel stable|beta] [--json]
+                                       # check signed releases & print upgrade command
+ruum config update get|set [...]       # inspect or configure update preferences
 ruum extract-scanner ARCH OUTPUT       # extract embedded Linux helper (x86_64 | aarch64)
 ```
 

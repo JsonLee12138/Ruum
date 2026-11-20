@@ -27,7 +27,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, HostTabKey, PANEL_REMS, Ruum, Screen, panel_width,
+    ColorMode, Crumb, HostTabKey, PANEL_REMS, Ruum, Screen, UpdateUiState,
+    panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -210,6 +211,12 @@ pub fn root(
     }
     if let Some(dialog) = script_generated_dialog(app, cx) {
         root = root.child(dialog);
+    }
+    if let Some(banner) = update_banner_overlay(app, cx) {
+        root = root.child(banner);
+    }
+    if app.update_modal_open {
+        root = root.child(crate::rail_pages::update_modal(app, cx));
     }
     if let Some(toast) = toast_overlay(app, cx) {
         root = root.child(toast);
@@ -2311,7 +2318,7 @@ fn toast_overlay(app: &Ruum, cx: &Context<'_, Ruum>) -> Option<Stateful<Div>> {
             .debug_selector(|| "toast-notification".into())
             .occlude()
             .absolute()
-            .bottom(Rems(3.5))
+            .bottom(size::TOAST_BOTTOM)
             .right(space::MD)
             .max_w(size::TOAST)
             .flex()
@@ -2348,6 +2355,117 @@ fn toast_overlay(app: &Ruum, cx: &Context<'_, Ruum>) -> Option<Stateful<Div>> {
                     .hover(|s| s.bg(theme.normal_fill()))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.dismiss_toast(cx);
+                    }))
+                    .child(
+                        gpui_omarchy::icon(IconName::Close)
+                            .size(icon::SM)
+                            .text_color(theme.secondary),
+                    ),
+            ),
+    )
+}
+
+/// First-seen-per-version non-blocking update notification banner (Layer 1).
+fn update_banner_overlay(
+    app: &Ruum,
+    cx: &Context<'_, Ruum>,
+) -> Option<Stateful<Div>> {
+    if app.update_modal_open
+        || matches!(app.screen, Screen::Review | Screen::Running)
+        || app.confirm_open
+        || app.volumes_open
+        || app.remote_docker_modal_open
+        || app.remote_connect_confirm.is_some()
+        || app.generated_script_dialog.is_some()
+    {
+        return None;
+    }
+    if !app.update_state.should_show_banner(
+        &app.update_settings,
+        app.update_banner_dismissed_version.as_deref(),
+    ) {
+        return None;
+    }
+    let info = app.update_state.info()?;
+    let locale = app.locale;
+    let theme = cx.omarchy().clone();
+    let label = match &app.update_state {
+        UpdateUiState::ReadyToInstall { .. } => {
+            crate::i18n::pages::update_banner_ready(
+                &info.latest_version,
+                locale,
+            )
+        }
+        _ => crate::i18n::pages::update_banner_available(
+            &info.latest_version,
+            locale,
+        ),
+    };
+    let bottom_offset = if app.notice.is_some() {
+        size::UPDATE_BANNER_STACKED_BOTTOM
+    } else {
+        size::TOAST_BOTTOM
+    };
+
+    Some(
+        div()
+            .id("update-banner")
+            .debug_selector(|| "update-banner".into())
+            .occlude()
+            .absolute()
+            .bottom(bottom_offset)
+            .right(space::MD)
+            .max_w(size::TOAST)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .px(space::MD)
+            .py(space::SM)
+            .rounded(space::XS)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.accent.opacity(0.6))
+            .shadow_lg()
+            .child(
+                gpui_omarchy::icon(IconName::Download)
+                    .size(icon::MD)
+                    .flex_shrink_0()
+                    .text_color(theme.accent),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(text::BODY)
+                    .text_color(theme.bright)
+                    .child(label),
+            )
+            .child(
+                div().debug_selector(|| "update-banner-view".into()).child(
+                    button(
+                        "update-banner-view",
+                        crate::i18n::pages::update_banner_view(locale),
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.dismiss_update_banner(cx);
+                            this.open_update_modal(cx);
+                        },
+                    )),
+                ),
+            )
+            .child(
+                div()
+                    .id("update-banner-close")
+                    .debug_selector(|| "update-banner-close".into())
+                    .cursor_pointer()
+                    .p(space::XXS)
+                    .rounded(space::XXS)
+                    .hover(|s| s.bg(theme.normal_fill()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dismiss_update_banner(cx);
                     }))
                     .child(
                         gpui_omarchy::icon(IconName::Close)

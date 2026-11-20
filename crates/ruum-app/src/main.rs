@@ -74,7 +74,10 @@ pub(crate) fn resolve_cli_exe() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ruum"))
 }
 
-gpui_kit::assets::icon_assets!(ExtraIconAssets, [Container]);
+gpui_kit::assets::icon_assets!(
+    ExtraIconAssets,
+    [Container, Download, RefreshCw]
+);
 
 struct RuumAssets;
 
@@ -216,6 +219,13 @@ fn run() -> Result<()> {
             .and_then(|db| db.watchdog().ok())
             .and_then(|svc| svc.load_config().ok())
             .unwrap_or_default();
+        let initial_update_settings = StorageDb::open_default()
+            .ok()
+            .and_then(|db| db.load_update_settings().ok())
+            .unwrap_or_default();
+        let initial_install_kind = ruum_core::updater::UpdateFactory::create()
+            .detect_install_kind(&ruum_core::updater::UpdateEnv::current());
+        let update_quitting = Arc::new(AtomicBool::new(false));
         let shared_cred_store =
             ruum_core::credentials::LazyCredentialStore::open_default().ok();
         cx.set_global(AppRuntime {
@@ -234,7 +244,14 @@ fn run() -> Result<()> {
             last_watchdog_poll: None,
             background_analysis_in_flight: false,
             service_sync_in_flight: false,
-            watchdog_config: initial_watchdog_config,
+            watchdog_config: initial_watchdog_config.clone(),
+            update_state: state::UpdateUiState::Idle,
+            update_settings: initial_update_settings,
+            update_install_kind: initial_install_kind,
+            update_banner_dismissed_version: None,
+            update_download_cancel: None,
+            update_last_error: None,
+            update_quitting: Arc::clone(&update_quitting),
         });
         if !cfg!(test)
             && let Some(store) = shared_cred_store
@@ -271,12 +288,24 @@ fn run() -> Result<()> {
                 app.install_or_update_cli(cx);
             });
         });
+        cx.on_action(|_: &app_menu::CheckForUpdates, cx| {
+            trigger_check_for_updates_from_menu_or_tray(cx);
+        });
         cx.on_action(|_: &app_menu::ShowMainWindow, cx| {
             open_or_navigate_main_window(None, cx);
         });
 
         let window = open_main_window(cx, Some(title_root));
         with_runtime_mut(cx, |rt| rt.main_window = Some(window));
+        if !cfg!(test) {
+            spawn_startup_update_and_sync(
+                window,
+                initial_watchdog_config.background_service,
+                initial_install_kind,
+                update_quitting,
+                cx,
+            );
+        }
 
         // Install tray icon on the next GUI loop turn once platform status
         // bar integration is initialized. Failure keeps tray inactive so
@@ -290,6 +319,7 @@ fn run() -> Result<()> {
                     app_menu::set_tray_active(cx, true);
                     with_runtime_mut(cx, |rt| rt.tray = Some(tray));
                     refresh_tray_status(cx);
+                    refresh_tray_update_status(cx);
                 }
                 Err(err) => {
                     eprintln!("ruum: tray icon unavailable: {err}");
@@ -1349,6 +1379,13 @@ pub(crate) struct AppRuntime {
     background_analysis_in_flight: bool,
     pub(crate) service_sync_in_flight: bool,
     watchdog_config: ruum_watchdog::WatchdogConfig,
+    pub(crate) update_state: state::UpdateUiState,
+    pub(crate) update_settings: ruum_core::storage::UpdateSettings,
+    pub(crate) update_install_kind: ruum_core::updater::InstallKind,
+    pub(crate) update_banner_dismissed_version: Option<String>,
+    pub(crate) update_download_cancel: Option<Arc<AtomicBool>>,
+    pub(crate) update_last_error: Option<String>,
+    pub(crate) update_quitting: Arc<AtomicBool>,
 }
 
 impl Global for AppRuntime {}
@@ -1389,17 +1426,24 @@ pub(crate) fn install_test_runtime(
         background_analysis_in_flight: false,
         service_sync_in_flight: false,
         watchdog_config: ruum_watchdog::WatchdogConfig::default(),
+        update_state: state::UpdateUiState::Idle,
+        update_settings: ruum_core::storage::UpdateSettings::default(),
+        update_install_kind: ruum_core::updater::InstallKind::Development,
+        update_banner_dismissed_version: None,
+        update_download_cancel: None,
+        update_last_error: None,
+        update_quitting: Arc::new(AtomicBool::new(false)),
     });
 }
 
 #[derive(Debug, Default)]
-struct AsyncSignal {
+pub(crate) struct AsyncSignal {
     pending: AtomicBool,
     waker: Mutex<Option<std::task::Waker>>,
 }
 
 impl AsyncSignal {
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.pending.store(true, Ordering::Release);
         if let Ok(mut guard) = self.waker.lock()
             && let Some(waker) = guard.take()
@@ -1408,7 +1452,7 @@ impl AsyncSignal {
         }
     }
 
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         std::future::poll_fn(|cx| {
             if self.pending.swap(false, Ordering::AcqRel) {
                 std::task::Poll::Ready(())
@@ -1525,11 +1569,29 @@ fn open_main_window(
     cx: &mut App,
     title_root_override: Option<PathBuf>,
 ) -> WindowHandle<Ruum> {
-    let (launch, shared_cred_store) = {
+    let (
+        launch,
+        shared_cred_store,
+        rt_update_state,
+        rt_update_settings,
+        rt_update_install_kind,
+        rt_update_banner_dismissed,
+        rt_update_cancel,
+        rt_update_last_error,
+    ) = {
         let rt = cx
             .try_global::<AppRuntime>()
             .expect("AppRuntime installed before opening main window");
-        (rt.launch.clone(), rt.cred_store.clone())
+        (
+            rt.launch.clone(),
+            rt.cred_store.clone(),
+            rt.update_state.clone(),
+            rt.update_settings.clone(),
+            rt.update_install_kind,
+            rt.update_banner_dismissed_version.clone(),
+            rt.update_download_cancel.clone(),
+            rt.update_last_error.clone(),
+        )
     };
     let home = std::env::home_dir();
     let title_root = title_root_override.unwrap_or_else(|| launch.root.clone());
@@ -1596,6 +1658,13 @@ fn open_main_window(
                         )
                     };
                     app.power_choice = launch.power;
+                    app.update_state = rt_update_state;
+                    app.update_settings = rt_update_settings;
+                    app.update_install_kind = rt_update_install_kind;
+                    app.update_banner_dismissed_version =
+                        rt_update_banner_dismissed;
+                    app.update_download_cancel = rt_update_cancel;
+                    app.update_last_error = rt_update_last_error;
                     if let Some(screen) = launch.initial_screen {
                         app.apply_target_screen(screen, cx);
                     }
@@ -1720,7 +1789,7 @@ pub(crate) fn open_or_navigate_main_window(
     cx.activate(true);
 }
 
-fn update_open_main_window<F>(cx: &mut App, f: F)
+pub(crate) fn update_open_main_window_checked<F>(cx: &mut App, f: F) -> bool
 where
     F: FnOnce(&mut Ruum, &mut gpui_kit::Context<'_, Ruum>),
 {
@@ -1731,8 +1800,179 @@ where
         .filter(|h| windows.contains(&(*h).into()))
         .or_else(|| windows.into_iter().find_map(|win| win.downcast::<Ruum>()));
     if let Some(handle) = existing {
-        let _ = handle.update(cx, |app, _, cx| f(app, cx));
+        return handle.update(cx, |app, _, cx| f(app, cx)).is_ok();
     }
+    false
+}
+
+fn update_open_main_window<F>(cx: &mut App, f: F)
+where
+    F: FnOnce(&mut Ruum, &mut gpui_kit::Context<'_, Ruum>),
+{
+    let _ = update_open_main_window_checked(cx, f);
+}
+
+pub(crate) fn sync_runtime_update_state(
+    update_state: state::UpdateUiState,
+    update_settings: ruum_core::storage::UpdateSettings,
+    update_install_kind: ruum_core::updater::InstallKind,
+    update_banner_dismissed_version: Option<String>,
+    update_download_cancel: Option<Arc<AtomicBool>>,
+    update_last_error: Option<String>,
+    cx: &mut App,
+) {
+    with_runtime_mut(cx, |rt| {
+        rt.update_state = update_state;
+        rt.update_settings = update_settings;
+        rt.update_install_kind = update_install_kind;
+        rt.update_banner_dismissed_version = update_banner_dismissed_version;
+        rt.update_download_cancel = update_download_cancel;
+        rt.update_last_error = update_last_error;
+    });
+    refresh_tray_update_status(cx);
+}
+
+pub(crate) fn refresh_tray_update_status(cx: &App) {
+    if let Some(rt) = cx.try_global::<AppRuntime>()
+        && let Some(tray) = &rt.tray
+    {
+        let version = rt
+            .update_state
+            .available_version_if_unskipped(&rt.update_settings);
+        tray.set_update_available(version);
+    }
+}
+
+pub(crate) fn runtime_update_quitting(cx: &App) -> Option<Arc<AtomicBool>> {
+    cx.try_global::<AppRuntime>()
+        .map(|rt| Arc::clone(&rt.update_quitting))
+}
+
+pub(crate) fn cancel_update_tasks_on_quit(cx: &App) {
+    if let Some(rt) = cx.try_global::<AppRuntime>() {
+        rt.update_quitting.store(true, Ordering::Release);
+        if let Some(cancel) = &rt.update_download_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn trigger_check_for_updates_from_menu_or_tray(cx: &mut App) {
+    open_or_navigate_main_window(None, cx);
+    update_open_main_window(cx, |app, cx| {
+        if app
+            .update_state
+            .should_open_modal_directly(&app.update_settings)
+        {
+            app.open_update_modal(cx);
+        } else {
+            app.navigate_rail(Screen::Settings, cx);
+            app.set_settings_category(state::SettingsCategory::Updates, cx);
+            app.check_for_updates_now(cx);
+        }
+    });
+}
+
+fn spawn_startup_update_and_sync(
+    main_window: WindowHandle<Ruum>,
+    watchdog_bg_service: bool,
+    install_kind: ruum_core::updater::InstallKind,
+    quitting: Arc<AtomicBool>,
+    cx: &App,
+) {
+    if cfg!(test) {
+        return;
+    }
+    let weak_ruum =
+        main_window.entity(cx).ok().map(|entity| entity.downgrade());
+    let cli_exe = resolve_cli_exe();
+    let lang = state::locale_code(i18n::Locale::current());
+    let (tx, rx) = channel();
+    let signal = Arc::new(AsyncSignal::default());
+    let thread_signal = Arc::clone(&signal);
+
+    let _ = std::thread::Builder::new()
+        .name("ruum-startup-update".to_owned())
+        .spawn(move || {
+            // [RISK-NOTE 7] Sync installed Windows CLI copy after updates and
+            // keep background watchdog service running when enabled.
+            let _ = ruum_core::updater::sync_installed_windows_cli_if_needed();
+            if watchdog_bg_service {
+                let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                    Duration::from_secs(5),
+                );
+                if !matches!(
+                    ruum_core::watchdog::service_status(&runner),
+                    Ok(ruum_core::watchdog::ServiceStatus::Active)
+                ) {
+                    let _ =
+                        ruum_core::watchdog::install_service(&runner, &cli_exe);
+                }
+            }
+
+            if ruum_core::updater::is_auto_check_disabled() {
+                return;
+            }
+
+            for _ in 0..20 {
+                if quitting.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if quitting.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let Ok(db) = StorageDb::open_default() else {
+                return;
+            };
+            let settings = db.load_update_settings().unwrap_or_default();
+            if !ruum_core::updater::should_auto_check(
+                &settings,
+                now_unix_secs(),
+            ) {
+                return;
+            }
+            let outcome = state::run_update_check_blocking(
+                Some(db.db_path()),
+                &settings,
+                install_kind,
+                lang,
+            );
+            if tx.send(outcome).is_ok() {
+                thread_signal.notify();
+            }
+        });
+
+    cx.spawn(async move |cx| {
+        signal.wait().await;
+        let Ok(outcome) = rx.try_recv() else {
+            return;
+        };
+        cx.update(|cx| {
+            if app_menu::is_quitting(cx) {
+                return;
+            }
+            let fallback = outcome.clone();
+            let applied_to_weak = weak_ruum.as_ref().is_some_and(|weak| {
+                weak.update(cx, |app, cx| {
+                    app.apply_update_check_outcome(outcome, cx);
+                })
+                .is_ok()
+            });
+            if !applied_to_weak {
+                let updated_open =
+                    update_open_main_window_checked(cx, |app, cx| {
+                        app.apply_update_check_outcome(fallback.clone(), cx);
+                    });
+                if !updated_open {
+                    state::apply_update_check_to_runtime(fallback, cx);
+                }
+            }
+        });
+    })
+    .detach();
 }
 
 fn drain_tray_actions(cx: &mut App) {
@@ -1757,6 +1997,9 @@ fn drain_tray_actions(cx: &mut App) {
             }
             tray_menu::TrayAction::OpenSettings => {
                 open_or_navigate_main_window(Some(Screen::Settings), cx);
+            }
+            tray_menu::TrayAction::CheckForUpdates => {
+                trigger_check_for_updates_from_menu_or_tray(cx);
             }
             tray_menu::TrayAction::CheckDiskSpaceNow => {
                 trigger_tray_space_check(cx);
@@ -2601,6 +2844,18 @@ mod argument_tests {
             RuumAssets
                 .load(IconName::Container.path().as_ref())
                 .expect("container icon lookup")
+                .is_some()
+        );
+        assert!(
+            RuumAssets
+                .load(IconName::Download.path().as_ref())
+                .expect("download icon lookup")
+                .is_some()
+        );
+        assert!(
+            RuumAssets
+                .load(IconName::RefreshCw.path().as_ref())
+                .expect("refresh-cw icon lookup")
                 .is_some()
         );
         assert!(

@@ -29,6 +29,21 @@
 
 ## インストールと初期設定
 
+### クイックインストール（ワンライン）
+
+- **macOS & Linux**（デスクトップアプリと `ruum` CLI を SHA-256 検証付きで導入）：
+  ```sh
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh
+  # ヘッドレス／サーバー向け CLI のみ：
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh -s -- --cli-only
+  ```
+- **Windows（PowerShell）**：
+  ```powershell
+  irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
+  ```
+
+> **アプリ内自動更新と CLI チェック：** デスクトップ版は起動後に署名済みリリースをバックグラウンドで確認します（**設定 › アップデート** から Stable / Beta の切り替えや自動確認のオン・オフが可能。**ダウンロードして更新** を押すまで本体はダウンロードされません）。ヘッドレスサーバーでは `ruum update check` で署名検証とアップグレードコマンドを確認できます。
+
 ### macOS
 
 Homebrew でインストールできます（macOS 11 以降、Apple Silicon `aarch64-macos` および Intel `x86_64-macos` 対応）：
@@ -314,6 +329,9 @@ ruum [オプション] [PATH]                # PATH をスキャン（省略時�
 ruum ssh HOST [オプション] [PATH]       # SSH 経由でリモートホストを分析（読み取り専用）
 ruum mcp [--read-only]                 # stdio MCP サーバーを起動
 ruum watchdog [--once]                 # ウォッチドッグ常駐監視（または単発チェック）
+ruum update [check] [--channel stable|beta] [--json]
+                                       # 署名済みリリースを確認しアップグレードコマンドを表示
+ruum config update get|set [...]       # アップデート設定の確認・変更
 ruum extract-scanner ARCH OUTPUT       # 同梱の静的 Linux スキャナを抽出（x86_64 | aarch64）
 ```
 

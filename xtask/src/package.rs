@@ -1,11 +1,15 @@
 //! Cross-platform packaging staging, Homebrew cask rendering, and SHA-256
 //! checksum generation.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufReader, Read as _};
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 
 const DESKTOP_TEMPLATE: &str = include_str!("../../packaging/ruum.desktop.in");
@@ -26,6 +30,7 @@ subcommands:
   windows-stage  --arch <x86_64|aarch64> --out <dir> [--exe <path>] [--gui-exe <path>] [--scanner-pack <path>] [--version <V>]
   homebrew-cask  --version <V> --arm64-sha256 <H1> --x64-sha256 <H2> --repo <owner/repo> --out <path> [--signed]
   checksums      --dir <dist_dir>
+  manifest       --version <V> --tag <T> --channel <stable|beta> --repo <owner/repo> --dir <dist> --notes-file <path> --out <path> [--sign-key-env <ENV>] [--published-at <iso8601>]
 ";
 
 /// Target release architecture.
@@ -104,12 +109,259 @@ pub struct HomebrewCaskOptions {
     pub signed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Stable,
+    Beta,
+}
+
+impl Channel {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "stable" => Ok(Self::Stable),
+            "beta" => Ok(Self::Beta),
+            other => Err(format!(
+                "unsupported channel `{other}` (expected stable or beta)"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestOptions {
+    pub version: String,
+    pub tag: String,
+    pub channel: Channel,
+    pub repo: String,
+    pub dir: PathBuf,
+    pub notes_file: PathBuf,
+    pub out: PathBuf,
+    pub sign_key_env: Option<String>,
+    pub published_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManifestAsset {
+    pub filename: String,
+    pub path: String,
+    pub fallback_url: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReleaseManifest {
+    pub schema_version: u32,
+    pub version: String,
+    pub tag: String,
+    pub channel: String,
+    pub published_at: String,
+    pub release_url: String,
+    pub notes: String,
+    pub assets: BTreeMap<String, ManifestAsset>,
+}
+
+/// Signs raw manifest UTF-8 bytes with a base64-encoded 32-byte Ed25519 seed.
+pub fn sign_manifest_bytes(
+    bytes: &[u8],
+    seed_b64: &str,
+) -> Result<String, String> {
+    let decoded = BASE64
+        .decode(seed_b64.trim())
+        .map_err(|err| format!("invalid base64 signing key: {err}"))?;
+    let seed: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        format!(
+            "Ed25519 signing seed must be 32 bytes, got {} bytes",
+            v.len()
+        )
+    })?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let sig = signing_key.sign(bytes);
+    Ok(BASE64.encode(sig.to_bytes()))
+}
+
+/// Verifies raw manifest UTF-8 bytes against a base64 signature and public key.
+#[cfg(test)]
+pub fn verify_manifest_bytes(
+    bytes: &[u8],
+    sig_b64: &str,
+    pub_b64: &str,
+) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+    let pub_decoded = BASE64
+        .decode(pub_b64.trim())
+        .map_err(|err| format!("invalid base64 public key: {err}"))?;
+    let pub_bytes: [u8; 32] =
+        pub_decoded.try_into().map_err(|v: Vec<u8>| {
+            format!(
+                "Ed25519 public key must be 32 bytes, got {} bytes",
+                v.len()
+            )
+        })?;
+    let verifying_key = VerifyingKey::from_bytes(&pub_bytes)
+        .map_err(|err| format!("invalid Ed25519 public key: {err}"))?;
+
+    let sig_decoded = BASE64
+        .decode(sig_b64.trim())
+        .map_err(|err| format!("invalid base64 signature: {err}"))?;
+    let sig_bytes: [u8; 64] =
+        sig_decoded.try_into().map_err(|v: Vec<u8>| {
+            format!("Ed25519 signature must be 64 bytes, got {} bytes", v.len())
+        })?;
+    let signature = Signature::from_bytes(&sig_bytes);
+
+    verifying_key
+        .verify(bytes, &signature)
+        .map_err(|err| format!("Ed25519 signature verification failed: {err}"))
+}
+
+/// Builds `manifest.json`, writes it to `opts.out`, and optionally signs it
+/// using the environment variable specified in `opts.sign_key_env`.
+pub fn build_and_write_manifest(
+    opts: &ManifestOptions,
+) -> Result<ReleaseManifest, String> {
+    let env_seed = match &opts.sign_key_env {
+        Some(name) => std::env::var(name)
+            .ok()
+            .map(|val| val.trim().to_owned())
+            .filter(|val| !val.is_empty()),
+        None => None,
+    };
+    build_manifest_with_signing_key(opts, env_seed.as_deref())
+}
+
+/// Builds and writes `manifest.json`, writing `<out>.sig` when `signing_seed`
+/// is `Some`.
+pub fn build_manifest_with_signing_key(
+    opts: &ManifestOptions,
+    signing_seed: Option<&str>,
+) -> Result<ReleaseManifest, String> {
+    let parsed_ver = semver::Version::parse(opts.version.trim())
+        .map_err(|err| format!("invalid SemVer `{}`: {err}", opts.version))?;
+    let version = parsed_ver.to_string();
+
+    let tag = opts.tag.trim();
+    if tag.is_empty()
+        || tag.chars().any(char::is_whitespace)
+        || tag.contains("..")
+        || tag.contains('/')
+        || tag.contains('\\')
+    {
+        return Err(format!("invalid release tag `{}`", opts.tag));
+    }
+
+    let repo = validate_repo(&opts.repo)?;
+    let notes_raw = fs::read_to_string(&opts.notes_file).map_err(|err| {
+        format!("cannot read {}: {err}", opts.notes_file.display())
+    })?;
+    let notes = notes_raw.trim().to_owned();
+
+    let sums_path = opts.dir.join("SHA256SUMS");
+    let recorded_sums = if sums_path.is_file() {
+        parse_sha256sums(&sums_path)?
+    } else {
+        HashMap::new()
+    };
+
+    let mut assets = BTreeMap::new();
+    for (key, filename) in known_asset_specs(&version) {
+        let asset_path = opts.dir.join(&filename);
+        if !asset_path.is_file() {
+            continue;
+        }
+        let meta = fs::metadata(&asset_path).map_err(|err| {
+            format!("cannot stat {}: {err}", asset_path.display())
+        })?;
+        let sha256 = sha256_file(&asset_path)?;
+        if let Some(expected) = recorded_sums.get(&filename)
+            && expected != &sha256
+        {
+            return Err(format!(
+                "SHA256SUMS mismatch for {filename}: expected {expected}, computed {sha256}"
+            ));
+        }
+        assets.insert(
+            key.to_owned(),
+            ManifestAsset {
+                path: format!("releases/{tag}/{filename}"),
+                fallback_url: format!(
+                    "https://github.com/{repo}/releases/download/{tag}/{filename}"
+                ),
+                filename,
+                sha256,
+                size: meta.len(),
+            },
+        );
+    }
+
+    if assets.is_empty() {
+        return Err(format!(
+            "no known release assets for version `{version}` found in {}",
+            opts.dir.display()
+        ));
+    }
+
+    let published_at = opts
+        .published_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                crate::release::unix_secs_to_rfc3339(
+                    crate::release::now_unix_secs(),
+                )
+            },
+            ToOwned::to_owned,
+        );
+
+    let manifest = ReleaseManifest {
+        schema_version: 1,
+        version,
+        tag: tag.to_owned(),
+        channel: opts.channel.as_str().to_owned(),
+        published_at,
+        release_url: format!("https://github.com/{repo}/releases/tag/{tag}"),
+        notes,
+        assets,
+    };
+
+    let mut json = serde_json::to_string_pretty(&manifest)
+        .map_err(|err| format!("failed to serialize manifest: {err}"))?;
+    json.push('\n');
+
+    if let Some(parent) = opts.out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent)?;
+    }
+    write_file(&opts.out, &json)?;
+
+    if let Some(seed_b64) = signing_seed.filter(|s| !s.trim().is_empty()) {
+        let sig_b64 = sign_manifest_bytes(json.as_bytes(), seed_b64)?;
+        let mut sig_os = opts.out.as_os_str().to_os_string();
+        sig_os.push(".sig");
+        let sig_path = PathBuf::from(sig_os);
+        write_file(&sig_path, &sig_b64)?;
+    }
+
+    Ok(manifest)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Subcommand {
     LinuxStage(LinuxStageOptions),
     WindowsStage(WindowsStageOptions),
     HomebrewCask(HomebrewCaskOptions),
     Checksums { dir: PathBuf },
+    Manifest(ManifestOptions),
 }
 
 pub fn package(args: &[String]) -> Result<(), String> {
@@ -143,6 +395,11 @@ pub fn package(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        Subcommand::Manifest(opts) => {
+            build_and_write_manifest(&opts)?;
+            println!("{}", opts.out.display());
+            Ok(())
+        }
     }
 }
 
@@ -161,6 +418,7 @@ fn parse_args(args: &[String]) -> Result<Subcommand, String> {
         "checksums" => {
             parse_checksums(rest).map(|dir| Subcommand::Checksums { dir })
         }
+        "manifest" => parse_manifest(rest).map(Subcommand::Manifest),
         other => {
             Err(format!("unknown package subcommand `{other}`\n\n{USAGE}"))
         }
@@ -306,6 +564,182 @@ fn parse_checksums(args: &[String]) -> Result<PathBuf, String> {
         }
     }
     dir.ok_or_else(|| "--dir is required".into())
+}
+
+fn parse_manifest(args: &[String]) -> Result<ManifestOptions, String> {
+    let mut version = None;
+    let mut tag = None;
+    let mut channel = None;
+    let mut repo = None;
+    let mut dir = None;
+    let mut notes_file = None;
+    let mut out = None;
+    let mut sign_key_env = None;
+    let mut published_at = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--version" => {
+                version = Some(next_arg(&mut iter, "--version")?.to_owned());
+            }
+            "--tag" => tag = Some(next_arg(&mut iter, "--tag")?.to_owned()),
+            "--channel" => {
+                channel =
+                    Some(Channel::parse(next_arg(&mut iter, "--channel")?)?);
+            }
+            "--repo" => repo = Some(next_arg(&mut iter, "--repo")?.to_owned()),
+            "--dir" => dir = Some(PathBuf::from(next_arg(&mut iter, "--dir")?)),
+            "--notes-file" => {
+                notes_file =
+                    Some(PathBuf::from(next_arg(&mut iter, "--notes-file")?));
+            }
+            "--out" => out = Some(PathBuf::from(next_arg(&mut iter, "--out")?)),
+            "--sign-key-env" => {
+                sign_key_env =
+                    Some(next_arg(&mut iter, "--sign-key-env")?.to_owned());
+            }
+            "--published-at" => {
+                published_at =
+                    Some(next_arg(&mut iter, "--published-at")?.to_owned());
+            }
+            other => return Err(format!("unknown manifest option `{other}`")),
+        }
+    }
+    Ok(ManifestOptions {
+        version: version.ok_or("--version is required")?,
+        tag: tag.ok_or("--tag is required")?,
+        channel: channel.ok_or("--channel is required")?,
+        repo: repo.ok_or("--repo is required")?,
+        dir: dir.ok_or("--dir is required")?,
+        notes_file: notes_file.ok_or("--notes-file is required")?,
+        out: out.ok_or("--out is required")?,
+        sign_key_env,
+        published_at,
+    })
+}
+
+fn validate_repo(raw: &str) -> Result<&str, String> {
+    let repo = raw.trim();
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Err(format!("--repo `{repo}` must look like owner/repo"));
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || repo.chars().any(char::is_whitespace)
+    {
+        return Err(format!("--repo `{repo}` must look like owner/repo"));
+    }
+    Ok(repo)
+}
+
+fn known_asset_specs(version: &str) -> [(&'static str, String); 20] {
+    [
+        (
+            "macos-aarch64-app_zip",
+            format!("ruum-{version}-aarch64-macos.zip"),
+        ),
+        (
+            "macos-aarch64-dmg",
+            format!("ruum-{version}-aarch64-macos.dmg"),
+        ),
+        (
+            "macos-aarch64-pkg",
+            format!("ruum-{version}-aarch64-macos.pkg"),
+        ),
+        (
+            "macos-x86_64-app_zip",
+            format!("ruum-{version}-x86_64-macos.zip"),
+        ),
+        (
+            "macos-x86_64-dmg",
+            format!("ruum-{version}-x86_64-macos.dmg"),
+        ),
+        (
+            "macos-x86_64-pkg",
+            format!("ruum-{version}-x86_64-macos.pkg"),
+        ),
+        (
+            "windows-x86_64-inno",
+            format!("ruum-{version}-x86_64-windows-setup.exe"),
+        ),
+        (
+            "windows-x86_64-msi",
+            format!("ruum-{version}-x86_64-windows.msi"),
+        ),
+        (
+            "windows-x86_64-portable_zip",
+            format!("ruum-{version}-x86_64-windows.zip"),
+        ),
+        (
+            "windows-aarch64-inno",
+            format!("ruum-{version}-aarch64-windows-setup.exe"),
+        ),
+        (
+            "windows-aarch64-msi",
+            format!("ruum-{version}-aarch64-windows.msi"),
+        ),
+        (
+            "windows-aarch64-portable_zip",
+            format!("ruum-{version}-aarch64-windows.zip"),
+        ),
+        (
+            "linux-x86_64-appimage",
+            format!("ruum-{version}-x86_64.AppImage"),
+        ),
+        (
+            "linux-x86_64-tarball",
+            format!("ruum-{version}-x86_64-linux.tar.gz"),
+        ),
+        (
+            "linux-x86_64-deb",
+            format!("ruum-{version}-x86_64-linux.deb"),
+        ),
+        (
+            "linux-x86_64-rpm",
+            format!("ruum-{version}-x86_64-linux.rpm"),
+        ),
+        (
+            "linux-aarch64-appimage",
+            format!("ruum-{version}-aarch64.AppImage"),
+        ),
+        (
+            "linux-aarch64-tarball",
+            format!("ruum-{version}-aarch64-linux.tar.gz"),
+        ),
+        (
+            "linux-aarch64-deb",
+            format!("ruum-{version}-aarch64-linux.deb"),
+        ),
+        (
+            "linux-aarch64-rpm",
+            format!("ruum-{version}-aarch64-linux.rpm"),
+        ),
+    ]
+}
+
+fn parse_sha256sums(path: &Path) -> Result<HashMap<String, String>, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let mut map = HashMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let Some(hex) = parts.next() else {
+            continue;
+        };
+        let Some(rest) = parts.next() else {
+            continue;
+        };
+        let name = rest.trim_start();
+        if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            map.insert(name.to_owned(), hex.to_ascii_lowercase());
+        }
+    }
+    Ok(map)
 }
 
 /// Normalizes a `SemVer` version string into an MSI `Major.Minor.Patch` string.
@@ -608,6 +1042,7 @@ pub fn generate_checksums(dir: &Path) -> Result<Vec<(String, String)>, String> {
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == "SHA256SUMS"
+            || name.starts_with("manifest.json")
             || name.ends_with(".sha256")
             || name.starts_with('.')
         {
@@ -790,6 +1225,37 @@ mod tests {
         let sums =
             parse_args(&str_args(&["checksums", "--dir", "dist"])).unwrap();
         assert!(matches!(sums, Subcommand::Checksums { .. }));
+
+        let manifest = parse_args(&str_args(&[
+            "manifest",
+            "--version",
+            "0.2.2",
+            "--tag",
+            "v0.2.2",
+            "--channel",
+            "stable",
+            "--repo",
+            "JsonLee12138/Ruum",
+            "--dir",
+            "dist",
+            "--notes-file",
+            "notes.md",
+            "--out",
+            "dist/manifest.json",
+            "--sign-key-env",
+            "RUUM_UPDATE_SIGNING_KEY",
+            "--published-at",
+            "2026-11-20T03:21:19Z",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            manifest,
+            Subcommand::Manifest(ManifestOptions {
+                channel: Channel::Stable,
+                sign_key_env: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -907,6 +1373,7 @@ mod tests {
         assert!(apprun.contains(
             "export LD_LIBRARY_PATH=\"$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\""
         ));
+        assert!(apprun.contains("update|space|run-script"));
 
         #[cfg(unix)]
         {
@@ -962,6 +1429,11 @@ mod tests {
         ));
         assert!(iss_x64.contains("ruum-gui.exe"));
         assert!(iss_x64.contains("AppUserModelID: \"io.github.tobi.ruum\""));
+        assert!(iss_x64.contains("CloseApplications=yes"));
+        assert!(
+            iss_x64.contains("CloseApplicationsFilter=ruum.exe,ruum-gui.exe")
+        );
+        assert!(iss_x64.contains("RestartApplications=yes"));
         assert!(!iss_x64.contains("ruum-scan-linux.pack"));
         assert!(!iss_x64.contains('@'));
 
@@ -1003,6 +1475,7 @@ mod tests {
         .unwrap();
         assert!(unsigned.contains(&"a".repeat(64)));
         assert!(unsigned.contains(&h2));
+        assert!(unsigned.contains("auto_updates true"));
         assert!(unsigned.contains("com.apple.quarantine"));
         assert!(!unsigned.contains('@'));
 
@@ -1015,6 +1488,7 @@ mod tests {
             signed: true,
         })
         .unwrap();
+        assert!(signed.contains("auto_updates true"));
         assert!(!signed.contains("com.apple.quarantine"));
         assert!(!signed.contains("caveats"));
     }
@@ -1026,6 +1500,8 @@ mod tests {
         fs::write(tmp.path().join("a-first.dmg"), b"world").unwrap();
         fs::write(tmp.path().join("stale.sha256"), b"ignore").unwrap();
         fs::write(tmp.path().join("SHA256SUMS"), b"ignore").unwrap();
+        fs::write(tmp.path().join("manifest.json"), b"ignore").unwrap();
+        fs::write(tmp.path().join("manifest.json.sig"), b"ignore").unwrap();
 
         let entries = generate_checksums(tmp.path()).unwrap();
         assert_eq!(entries.len(), 2);
@@ -1235,5 +1711,181 @@ mod tests {
                 .any(|line| line.ends_with("usr/bin/ruum")),
             "patchelf must never touch usr/bin/ruum: {log_contents}"
         );
+    }
+
+    #[test]
+    fn builds_manifest_and_verifies_ed25519_raw_byte_signature() {
+        let tmp = TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+
+        let ver = "0.2.2-beta.1";
+        let tag = "v0.2.2-beta.1";
+        let sample_files = [
+            (
+                "macos-aarch64-app_zip",
+                format!("ruum-{ver}-aarch64-macos.zip"),
+            ),
+            ("macos-aarch64-dmg", format!("ruum-{ver}-aarch64-macos.dmg")),
+            ("macos-aarch64-pkg", format!("ruum-{ver}-aarch64-macos.pkg")),
+            (
+                "macos-x86_64-app_zip",
+                format!("ruum-{ver}-x86_64-macos.zip"),
+            ),
+            ("macos-x86_64-dmg", format!("ruum-{ver}-x86_64-macos.dmg")),
+            ("macos-x86_64-pkg", format!("ruum-{ver}-x86_64-macos.pkg")),
+            (
+                "windows-x86_64-inno",
+                format!("ruum-{ver}-x86_64-windows-setup.exe"),
+            ),
+            (
+                "windows-x86_64-msi",
+                format!("ruum-{ver}-x86_64-windows.msi"),
+            ),
+            (
+                "windows-x86_64-portable_zip",
+                format!("ruum-{ver}-x86_64-windows.zip"),
+            ),
+            (
+                "windows-aarch64-inno",
+                format!("ruum-{ver}-aarch64-windows-setup.exe"),
+            ),
+            (
+                "windows-aarch64-msi",
+                format!("ruum-{ver}-aarch64-windows.msi"),
+            ),
+            (
+                "windows-aarch64-portable_zip",
+                format!("ruum-{ver}-aarch64-windows.zip"),
+            ),
+            (
+                "linux-x86_64-appimage",
+                format!("ruum-{ver}-x86_64.AppImage"),
+            ),
+            (
+                "linux-x86_64-tarball",
+                format!("ruum-{ver}-x86_64-linux.tar.gz"),
+            ),
+            ("linux-x86_64-deb", format!("ruum-{ver}-x86_64-linux.deb")),
+            ("linux-x86_64-rpm", format!("ruum-{ver}-x86_64-linux.rpm")),
+            (
+                "linux-aarch64-appimage",
+                format!("ruum-{ver}-aarch64.AppImage"),
+            ),
+            (
+                "linux-aarch64-tarball",
+                format!("ruum-{ver}-aarch64-linux.tar.gz"),
+            ),
+            ("linux-aarch64-deb", format!("ruum-{ver}-aarch64-linux.deb")),
+            ("linux-aarch64-rpm", format!("ruum-{ver}-aarch64-linux.rpm")),
+        ];
+        for (key, name) in &sample_files {
+            fs::write(dist.join(name), format!("payload:{key}")).unwrap();
+        }
+        generate_checksums(&dist).unwrap();
+
+        let notes_path = tmp.path().join("notes.md");
+        fs::write(&notes_path, "### Fixes\n\n- Retry SQLite busy errors.\n")
+            .unwrap();
+        let out_path = dist.join("manifest.json");
+
+        let manifest = build_and_write_manifest(&ManifestOptions {
+            version: ver.into(),
+            tag: tag.into(),
+            channel: Channel::Beta,
+            repo: "JsonLee12138/Ruum".into(),
+            dir: dist.clone(),
+            notes_file: notes_path,
+            out: out_path.clone(),
+            sign_key_env: None,
+            published_at: Some("2026-11-20T03:21:19Z".into()),
+        })
+        .unwrap();
+
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.version, ver);
+        assert_eq!(manifest.tag, tag);
+        assert_eq!(manifest.channel, "beta");
+        assert_eq!(manifest.published_at, "2026-11-20T03:21:19Z");
+        assert_eq!(
+            manifest.release_url,
+            "https://github.com/JsonLee12138/Ruum/releases/tag/v0.2.2-beta.1"
+        );
+        assert_eq!(manifest.assets.len(), 20);
+        let dmg = &manifest.assets["macos-aarch64-dmg"];
+        assert_eq!(dmg.filename, format!("ruum-{ver}-aarch64-macos.dmg"));
+        assert_eq!(dmg.path, format!("releases/{tag}/{}", dmg.filename));
+        assert_eq!(
+            dmg.fallback_url,
+            format!(
+                "https://github.com/JsonLee12138/Ruum/releases/download/{tag}/{}",
+                dmg.filename
+            )
+        );
+        assert_eq!(dmg.size, "payload:macos-aarch64-dmg".len() as u64);
+
+        let raw_bytes = fs::read(&out_path).unwrap();
+        let seed = [7_u8; 32];
+        let seed_b64 = BASE64.encode(seed);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let pub_b64 = BASE64.encode(signing_key.verifying_key().to_bytes());
+
+        let sig_b64 = sign_manifest_bytes(&raw_bytes, &seed_b64).unwrap();
+        verify_manifest_bytes(&raw_bytes, &sig_b64, &pub_b64).unwrap();
+
+        let mut tampered = raw_bytes;
+        tampered[0] = b'{';
+        tampered.push(b' ');
+        assert!(verify_manifest_bytes(&tampered, &sig_b64, &pub_b64).is_err());
+
+        let signed_out = tmp.path().join("signed-manifest.json");
+        let signed_opts = ManifestOptions {
+            version: ver.into(),
+            tag: tag.into(),
+            channel: Channel::Beta,
+            repo: "JsonLee12138/Ruum".into(),
+            dir: dist.clone(),
+            notes_file: tmp.path().join("notes.md"),
+            out: signed_out.clone(),
+            sign_key_env: None,
+            published_at: Some("2026-11-20T03:21:19Z".into()),
+        };
+        build_manifest_with_signing_key(&signed_opts, Some(&seed_b64)).unwrap();
+        let signed_raw = fs::read(&signed_out).unwrap();
+        let sidecar_sig =
+            fs::read_to_string(tmp.path().join("signed-manifest.json.sig"))
+                .unwrap();
+        verify_manifest_bytes(&signed_raw, &sidecar_sig, &pub_b64).unwrap();
+
+        // Re-running checksums must ignore manifest.json* files.
+        fs::write(dist.join("manifest.json.sig"), &sidecar_sig).unwrap();
+        fs::write(dist.join("manifest.json.tmp"), b"temp").unwrap();
+        let re_sums = generate_checksums(&dist).unwrap();
+        assert_eq!(re_sums.len(), 20);
+
+        // Mismatched SHA256SUMS must be rejected.
+        fs::write(
+            dist.join("SHA256SUMS"),
+            format!("{}  ruum-{ver}-aarch64-macos.dmg\n", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(build_and_write_manifest(&signed_opts).is_err());
+    }
+
+    #[test]
+    fn release_workflow_integrates_update_manifest_and_r2_sync() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        assert!(workflow.contains(
+            "RUUM_UPDATE_BASE_URL: ${{ vars.RUUM_UPDATE_BASE_URL }}"
+        ));
+        assert!(workflow.contains(
+            "RUUM_UPDATE_PUBLIC_KEY: ${{ vars.RUUM_UPDATE_PUBLIC_KEY }}"
+        ));
+        assert!(workflow.contains("cargo xtask release-notes"));
+        assert!(workflow.contains("cargo xtask package manifest"));
+        assert!(workflow.contains("RUUM_UPDATE_SIGNING_KEY"));
+        assert!(workflow.contains("wrangler r2 object put"));
+        assert!(workflow.contains("--remote"));
+        assert!(workflow.contains("channels/$CHANNEL/manifest.json"));
     }
 }

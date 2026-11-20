@@ -29,6 +29,21 @@
 
 ## 安装与初始配置
 
+### 一键快速安装
+
+- **macOS 与 Linux**（自动安装桌面端与 `ruum` CLI 并执行 SHA-256 校验）：
+  ```sh
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh
+  # 仅安装无头 / 服务器端 CLI：
+  curl -fsSL https://ruum-updates.jsonlee12138.com/install.sh | sh -s -- --cli-only
+  ```
+- **Windows（PowerShell）**：
+  ```powershell
+  irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
+  ```
+
+> **应用内自更新与 CLI 检测：** 桌面端会在后台静默检查已签名版本（可在 **设置 › 更新** 中切换 Stable / Beta 通道或关闭自动检查；点击 **下载并更新** 前绝不偷跑下载）。无头服务器可运行 `ruum update check` 验签查看新版本说明与精确升级命令。
+
 ### macOS
 
 通过 Homebrew 安装（支持 Apple Silicon `aarch64-macos` 与 Intel `x86_64-macos`，需 macOS 11 及以上）：
@@ -314,6 +329,9 @@ ruum [选项] [PATH]                     # 扫描 PATH（省略时默认扫描 ~
 ruum ssh HOST [选项] [PATH]            # 通过 SSH 只读分析远程主机
 ruum mcp [--read-only]                 # 启动 stdio MCP 服务器
 ruum watchdog [--once]                 # 启动磁盘守护轮询（或单次检测）
+ruum update [check] [--channel stable|beta] [--json]
+                                       # 检查已签名更新并输出升级命令
+ruum config update get|set [...]       # 查看或修改更新偏好设置
 ruum extract-scanner ARCH OUTPUT       # 提取内嵌静态 Linux 扫描器（x86_64 | aarch64）
 ```
 

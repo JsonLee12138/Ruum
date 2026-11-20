@@ -88,6 +88,9 @@ jobs:
         run: cargo xtask test
 
       - name: Build
+        env:
+          RUUM_UPDATE_BASE_URL: ${{ vars.RUUM_UPDATE_BASE_URL }}
+          RUUM_UPDATE_PUBLIC_KEY: ${{ vars.RUUM_UPDATE_PUBLIC_KEY }}
         run: |
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           cargo xtask portable
@@ -308,6 +311,8 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           ARCH: ${{ matrix.arch }}
+          RUUM_UPDATE_BASE_URL: ${{ vars.RUUM_UPDATE_BASE_URL }}
+          RUUM_UPDATE_PUBLIC_KEY: ${{ vars.RUUM_UPDATE_PUBLIC_KEY }}
         run: |
           trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
           args=(--all --require-scanner-pack)
@@ -415,6 +420,9 @@ jobs:
         run: cargo xtask test
 
       - name: Build
+        env:
+          RUUM_UPDATE_BASE_URL: ${{ vars.RUUM_UPDATE_BASE_URL }}
+          RUUM_UPDATE_PUBLIC_KEY: ${{ vars.RUUM_UPDATE_PUBLIC_KEY }}
         run: |
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           cargo xtask scanner-pack --strict --out target/scanner/ruum-scan-linux.pack
@@ -840,14 +848,58 @@ jobs:
           fi
           cargo xtask package homebrew-cask "${cask_args[@]}"
 
+      - name: Release notes and manifest
+        id: release_meta
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REPO: ${{ github.repository }}
+          RUUM_UPDATE_SIGNING_KEY: ${{ secrets.RUUM_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ "$TAG" == *-* ]]; then
+            channel="beta"
+          else
+            channel="stable"
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+          has_notes=true
+          notes_file="release-notes.md"
+          if ! cargo xtask release-notes --version "$VERSION" --out "$notes_file"; then
+            echo "::notice::Version $VERSION not found in CHANGELOG.md; falling back to GitHub generated notes"
+            has_notes=false
+            printf 'Release %s\n' "$TAG" > manifest-notes.md
+            notes_file="manifest-notes.md"
+          fi
+          echo "has_notes=$has_notes" >> "$GITHUB_OUTPUT"
+
+          cargo xtask package manifest \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --channel "$channel" \
+            --repo "$REPO" \
+            --dir dist \
+            --notes-file "$notes_file" \
+            --out dist/manifest.json \
+            --sign-key-env RUUM_UPDATE_SIGNING_KEY
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
+          HAS_NOTES: ${{ steps.release_meta.outputs.has_notes }}
         run: |
-          create_flags=(--draft --verify-tag --title "ruum $VERSION" --generate-notes)
+          create_flags=(--draft --verify-tag --title "ruum $VERSION")
+          if [ "$HAS_NOTES" = "true" ]; then
+            create_flags+=(--notes-file release-notes.md)
+          else
+            create_flags+=(--generate-notes)
+          fi
           edit_flags=(--draft=false)
+          if [ "$HAS_NOTES" = "true" ]; then
+            edit_flags+=(--notes-file release-notes.md)
+          fi
           if [[ "$TAG" == *-* ]]; then
             create_flags+=(--prerelease)
             edit_flags+=(--prerelease --latest=false)
@@ -874,3 +926,52 @@ jobs:
             echo "gh workflow run sync.yml --repo JsonLee12138/homebrew-tap"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Cloudflare R2
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          CHANNEL: ${{ steps.release_meta.outputs.channel }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ACCOUNT_ID" ]; then
+            echo "::notice::Cloudflare R2 credentials not configured; skipping R2 upload"
+            exit 0
+          fi
+          export CLOUDFLARE_API_TOKEN="$CF_API_TOKEN"
+          export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID"
+
+          content_type_for() {
+            case "$1" in
+              *.json) echo "application/json; charset=utf-8" ;;
+              *.sig|*.sha256|SHA256SUMS|*.rb) echo "text/plain; charset=utf-8" ;;
+              *.zip) echo "application/zip" ;;
+              *.tar.gz) echo "application/gzip" ;;
+              *) echo "application/octet-stream" ;;
+            esac
+          }
+
+          for file in dist/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            ct=$(content_type_for "$name")
+            npx --yes wrangler r2 object put \
+              "ruum-releases/releases/$TAG/$name" \
+              --file "$file" \
+              --content-type "$ct" \
+              --remote
+          done
+
+          npx --yes wrangler r2 object put \
+            "ruum-releases/channels/$CHANNEL/manifest.json" \
+            --file "dist/manifest.json" \
+            --content-type "application/json; charset=utf-8" \
+            --remote
+
+          if [ -f "dist/manifest.json.sig" ]; then
+            npx --yes wrangler r2 object put \
+              "ruum-releases/channels/$CHANNEL/manifest.json.sig" \
+              --file "dist/manifest.json.sig" \
+              --content-type "text/plain; charset=utf-8" \
+              --remote
+          fi

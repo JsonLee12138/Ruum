@@ -17,8 +17,9 @@ use gpui_kit::{
     radians, relative, svg,
 };
 use gpui_omarchy::{
-    ActiveTheme, ButtonVariant, IconName, button, checkbox, dialog_button,
-    dialog_description, dialog_popup, dialog_title, with_tooltip,
+    ActiveTheme, ButtonVariant, ChoiceItem, IconName, button, button_group,
+    checkbox, dialog_button, dialog_description, dialog_popup, dialog_title,
+    with_tooltip,
 };
 use ruum_core::cli_install::CliInstallStatus;
 use ruum_core::docker_adapter::{
@@ -26,7 +27,8 @@ use ruum_core::docker_adapter::{
 };
 use ruum_core::removal::RemovalMode;
 use ruum_core::size::human_bytes;
-use ruum_core::storage::AuthMode;
+use ruum_core::storage::{AuthMode, UpdateChannel};
+use ruum_core::updater::UpdateCheckResult;
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::AiCliProvider;
 
@@ -34,7 +36,7 @@ use crate::palette;
 use crate::power::PowerEfficiency;
 use crate::state::{
     CleanupConfirmModal, DockerGroupKind, RemoteConnectConfirmModal, Ruum,
-    Screen, SettingsCategory,
+    Screen, SettingsCategory, UpdateUiState,
 };
 use crate::ui::{icon, size, space, text};
 
@@ -184,7 +186,7 @@ fn spinning_loader(
 fn rail_button(
     id: &'static str,
     icon_name: IconName,
-    tooltip_text: &'static str,
+    tooltip_text: impl Into<SharedString>,
     active: bool,
     on_click: impl Fn(&mut Ruum, &mut Window, &mut Context<'_, Ruum>) + 'static,
     cx: &Context<'_, Ruum>,
@@ -224,6 +226,59 @@ fn rail_button(
             .child(gpui_omarchy::icon(icon_name))
             .on_click(cx.listener(move |this, _, window, cx| {
                 on_click(this, window, cx);
+            })),
+        tooltip_text,
+    )
+}
+
+fn rail_update_button(
+    tooltip_text: SharedString,
+    active: bool,
+    cx: &Context<'_, Ruum>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let bg_color = if active {
+        theme.accent.opacity(0.18)
+    } else {
+        theme.accent.opacity(0.0)
+    };
+    let fg_color = if active { theme.bright } else { theme.accent };
+    let border_color = if active {
+        theme.accent.opacity(0.4)
+    } else {
+        theme.accent.opacity(0.0)
+    };
+
+    with_tooltip(
+        div()
+            .id("rail-update")
+            .debug_selector(|| "rail-update".into())
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(Rems(2.25))
+            .rounded(space::XS)
+            .bg(bg_color)
+            .border_1()
+            .border_color(border_color)
+            .text_color(fg_color)
+            .cursor_pointer()
+            .hover(|this| this.bg(theme.accent.opacity(0.1)))
+            .child(gpui_omarchy::icon(IconName::Download))
+            .child(
+                div()
+                    .id("rail-update-dot")
+                    .debug_selector(|| "rail-update-dot".into())
+                    .absolute()
+                    .top(space::XS)
+                    .right(space::XS)
+                    .size(size::UPDATE_DOT)
+                    .rounded_full()
+                    .bg(theme.accent),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_update_modal(cx);
             })),
         tooltip_text,
     )
@@ -301,19 +356,61 @@ pub fn icon_rail(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
                     cx,
                 )),
         )
-        .child(div().flex().flex_col().items_center().child(rail_button(
-            "rail-settings",
-            IconName::Settings,
-            crate::i18n::pages::rail_settings(
-                cfg!(target_os = "macos"),
-                locale,
-            ),
-            is_settings,
-            |this, _, cx| {
-                this.navigate_rail(Screen::Settings, cx);
-            },
-            cx,
-        )))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(space::SM)
+                .when(
+                    app.update_state
+                        .should_show_rail_entry(&app.update_settings),
+                    |col| {
+                        let tooltip: SharedString = match &app.update_state {
+                            UpdateUiState::Downloading { .. } => {
+                                crate::i18n::pages::rail_update_downloading(
+                                    locale,
+                                )
+                                .into()
+                            }
+                            UpdateUiState::ReadyToInstall { info, .. } => {
+                                crate::i18n::pages::rail_update_ready(
+                                    &info.latest_version,
+                                    locale,
+                                )
+                                .into()
+                            }
+                            UpdateUiState::Available { info }
+                            | UpdateUiState::Installing { info } => {
+                                crate::i18n::pages::rail_update_available(
+                                    &info.latest_version,
+                                    locale,
+                                )
+                                .into()
+                            }
+                            _ => crate::i18n::pages::rail_update(locale).into(),
+                        };
+                        col.child(rail_update_button(
+                            tooltip,
+                            app.update_modal_open,
+                            cx,
+                        ))
+                    },
+                )
+                .child(rail_button(
+                    "rail-settings",
+                    IconName::Settings,
+                    crate::i18n::pages::rail_settings(
+                        cfg!(target_os = "macos"),
+                        locale,
+                    ),
+                    is_settings,
+                    |this, _, cx| {
+                        this.navigate_rail(Screen::Settings, cx);
+                    },
+                    cx,
+                )),
+        )
 }
 
 fn ssh_profiles_card(
@@ -2872,7 +2969,7 @@ fn settings_nav_tab(
 /// Settings configuration page with Zed/VS Code style categorized sidebar.
 pub fn settings_page(
     app: &Ruum,
-    window: &Window,
+    window: &mut Window,
     cx: &mut Context<'_, Ruum>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
@@ -2929,6 +3026,14 @@ pub fn settings_page(
             crate::i18n::pages::settings_tab_cli(locale),
             app.settings_category == SettingsCategory::Cli,
             cx,
+        ))
+        .child(settings_nav_tab(
+            "setting-tab-updates",
+            SettingsCategory::Updates,
+            IconName::Download,
+            crate::i18n::pages::settings_tab_updates(locale),
+            app.settings_category == SettingsCategory::Updates,
+            cx,
         ));
 
     let section_body = match app.settings_category {
@@ -2939,6 +3044,7 @@ pub fn settings_page(
         SettingsCategory::Webhook => webhook_settings_section(app, window, cx),
         SettingsCategory::Ai => ai_settings_section(app, window, cx),
         SettingsCategory::Cli => cli_settings_section(app, cx),
+        SettingsCategory::Updates => updates_settings_section(app, window, cx),
     };
 
     let save_bar = div()
@@ -4858,4 +4964,1159 @@ fn docker_footer(
             cx,
         ))
         .child(action_slot)
+}
+
+fn updates_settings_section(
+    app: &Ruum,
+    window: &mut Window,
+    cx: &mut Context<'_, Ruum>,
+) -> AnyElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let is_checking = matches!(app.update_state, UpdateUiState::Checking);
+    let busy = matches!(
+        app.update_state,
+        UpdateUiState::Checking
+            | UpdateUiState::Downloading { .. }
+            | UpdateUiState::Installing { .. }
+    );
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    let last_checked_text = if app.update_settings.last_checked_at_secs > 0 {
+        let then = i64::try_from(app.update_settings.last_checked_at_secs)
+            .unwrap_or(0);
+        crate::i18n::common::ago(now_secs, then, locale)
+    } else {
+        crate::i18n::pages::updates_last_checked_never(locale).to_owned()
+    };
+
+    let (status_text, status_color, show_view_btn) = match &app.update_state {
+        UpdateUiState::Idle => (String::new(), theme.secondary, false),
+        UpdateUiState::Checking => (
+            crate::i18n::pages::updates_checking(locale).to_owned(),
+            theme.secondary,
+            false,
+        ),
+        UpdateUiState::UpToDate { .. } => (
+            crate::i18n::pages::updates_up_to_date(locale).to_owned(),
+            theme.success,
+            false,
+        ),
+        UpdateUiState::Available { info } => (
+            crate::i18n::pages::rail_update_available(
+                &info.latest_version,
+                locale,
+            ),
+            theme.accent,
+            true,
+        ),
+        UpdateUiState::Downloading { .. } => (
+            crate::i18n::pages::rail_update_downloading(locale).to_owned(),
+            theme.accent,
+            true,
+        ),
+        UpdateUiState::ReadyToInstall { info, .. } => (
+            crate::i18n::pages::rail_update_ready(&info.latest_version, locale),
+            theme.success,
+            true,
+        ),
+        UpdateUiState::Installing { .. } => (
+            crate::i18n::pages::update_installing_status(locale).to_owned(),
+            theme.accent,
+            true,
+        ),
+        UpdateUiState::Error { message, .. } => {
+            (message.clone(), theme.danger, true)
+        }
+    };
+
+    let entity_auto = cx.entity().downgrade();
+    let entity_chan = cx.entity().downgrade();
+    let entity_cid = cx.entity().downgrade();
+    let auto_check_on = app.update_settings.auto_check;
+    let send_cid_on = app.update_settings.send_client_id;
+    let selected_channel = match app.update_settings.channel {
+        UpdateChannel::Stable => 0,
+        UpdateChannel::Beta => 1,
+    };
+
+    let channel_group = div()
+        .debug_selector(|| "setting-update-channel".into())
+        .child(button_group(
+            "setting-update-channel",
+            vec![
+                ChoiceItem::new(
+                    "stable",
+                    crate::i18n::pages::updates_channel_stable(locale),
+                ),
+                ChoiceItem::new(
+                    "beta",
+                    crate::i18n::pages::updates_channel_beta(locale),
+                ),
+            ],
+            Some(selected_channel),
+            move |index, _, cx| {
+                let channel = if index == 1 {
+                    UpdateChannel::Beta
+                } else {
+                    UpdateChannel::Stable
+                };
+                let _ = entity_chan.update(cx, |this, cx| {
+                    this.set_update_channel(channel, cx);
+                });
+            },
+            window,
+            cx,
+        ));
+
+    div()
+        .id("setting-updates-section")
+        .debug_selector(|| "setting-updates-section".into())
+        .w_full()
+        .child(
+            dialog_popup(cx)
+                .w_full()
+                .child(dialog_title(
+                    crate::i18n::pages::updates_title(locale),
+                    cx,
+                ))
+                .child(dialog_description(
+                    crate::i18n::pages::updates_desc(locale),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::SM)
+                        .p(space::MD)
+                        .rounded(space::XS)
+                        .border_1()
+                        .border_color(theme.divider())
+                        .bg(theme.normal_fill())
+                        .child(update_meta_row(
+                            crate::i18n::pages::updates_current_version_label(
+                                locale,
+                            ),
+                            format!("v{}", env!("CARGO_PKG_VERSION")),
+                            true,
+                            &theme,
+                        ))
+                        .child(update_meta_row(
+                            crate::i18n::pages::updates_install_kind_label(
+                                locale,
+                            ),
+                            crate::i18n::pages::install_kind_label(
+                                app.update_install_kind,
+                                locale,
+                            )
+                            .to_owned(),
+                            false,
+                            &theme,
+                        ))
+                        .child(update_meta_row(
+                            crate::i18n::pages::updates_last_checked_label(
+                                locale,
+                            ),
+                            last_checked_text,
+                            false,
+                            &theme,
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(space::MD)
+                                .pt(space::XS)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_size(text::CAPTION)
+                                        .text_color(status_color)
+                                        .child(status_text),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(space::SM)
+                                        .when(show_view_btn, |row| {
+                                            row.child(
+                                                div()
+                                                    .debug_selector(|| {
+                                                        "setting-update-view-btn"
+                                                            .into()
+                                                    })
+                                                    .child(
+                                                        button(
+                                                            "setting-update-view-btn",
+                                                            crate::i18n::pages::update_view_btn(locale),
+                                                            ButtonVariant::Secondary,
+                                                            cx,
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            |this, _, _, cx| {
+                                                                this.open_update_modal(cx);
+                                                            },
+                                                        )),
+                                                    ),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .debug_selector(|| {
+                                                    "setting-update-check-btn"
+                                                        .into()
+                                                })
+                                                .child(
+                                                    action_button_with_spinner(
+                                                        "setting-update-check-btn",
+                                                        "setting-update-check-spin",
+                                                        crate::i18n::pages::updates_check_now(locale),
+                                                        is_checking,
+                                                        ButtonVariant::Primary,
+                                                        cx,
+                                                    )
+                                                    .disabled(busy)
+                                                    .on_click(cx.listener(
+                                                        |this, _, _, cx| {
+                                                            this.check_for_updates_now(cx);
+                                                        },
+                                                    )),
+                                                ),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::MD)
+                        .pt(space::SM)
+                        .child(
+                            div()
+                                .debug_selector(|| {
+                                    "setting-update-auto-check".into()
+                                })
+                                .child(
+                                    checkbox(
+                                        "setting-update-auto-check",
+                                        crate::i18n::pages::updates_auto_check(
+                                            locale,
+                                        ),
+                                        if auto_check_on {
+                                            CheckboxState::Checked
+                                        } else {
+                                            CheckboxState::Unchecked
+                                        },
+                                        cx,
+                                    )
+                                    .tab_stop(false)
+                                    .on_change(move |_, _, _, cx| {
+                                        let _ = entity_auto.update(
+                                            cx,
+                                            |this, cx| {
+                                                let next =
+                                                    !this.update_settings.auto_check;
+                                                this.set_update_auto_check(
+                                                    next, cx,
+                                                );
+                                            },
+                                        );
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(space::XS)
+                                .child(
+                                    div()
+                                        .text_color(theme.secondary)
+                                        .child(
+                                            crate::i18n::pages::updates_channel_label(
+                                                locale,
+                                            ),
+                                        ),
+                                )
+                                .child(channel_group),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| {
+                                    "setting-update-send-client-id".into()
+                                })
+                                .child(
+                                    checkbox(
+                                        "setting-update-send-client-id",
+                                        crate::i18n::pages::updates_send_client_id(
+                                            locale,
+                                        ),
+                                        if send_cid_on {
+                                            CheckboxState::Checked
+                                        } else {
+                                            CheckboxState::Unchecked
+                                        },
+                                        cx,
+                                    )
+                                    .tab_stop(false)
+                                    .on_change(move |_, _, _, cx| {
+                                        let _ = entity_cid.update(
+                                            cx,
+                                            |this, cx| {
+                                                let next = !this
+                                                    .update_settings
+                                                    .send_client_id;
+                                                this.set_update_send_client_id(
+                                                    next, cx,
+                                                );
+                                            },
+                                        );
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("setting-update-privacy-note")
+                                .debug_selector(|| {
+                                    "setting-update-privacy-note".into()
+                                })
+                                .p(space::SM)
+                                .rounded(space::XS)
+                                .border_1()
+                                .border_color(theme.divider())
+                                .bg(theme.normal_fill())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(
+                                    crate::i18n::pages::updates_privacy_note(
+                                        locale,
+                                    ),
+                                ),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+fn update_meta_row(
+    label: &'static str,
+    value: String,
+    mono: bool,
+    theme: &gpui_omarchy::Theme,
+) -> Div {
+    let mut val_el = div().text_color(theme.bright).child(value);
+    if mono {
+        val_el = val_el.font_family(theme.mono_font.clone());
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::MD)
+        .child(div().text_color(theme.secondary).child(label))
+        .child(val_el)
+}
+
+/// Centered software update card modal (Layer 2).
+pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::MD)
+        .child(dialog_title(
+            crate::i18n::pages::update_modal_title(locale),
+            cx,
+        ))
+        .child(
+            div().debug_selector(|| "update-modal-close".into()).child(
+                gpui_omarchy::icon_button(
+                    "update-modal-close",
+                    IconName::Close,
+                    crate::i18n::pages::docker_close_button(locale),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.close_update_modal(cx);
+                        this.apply_focus(window, cx);
+                    },
+                )),
+            ),
+        );
+
+    let mut body = div().flex().flex_col().gap(space::MD).min_w_0();
+
+    if let Some(info) = app.update_state.info() {
+        body = body.child(update_release_summary_card(info, locale, &theme));
+        body = body.child(update_changelog_box(
+            &info.manifest.notes,
+            locale,
+            &theme,
+        ));
+    }
+
+    match &app.update_state {
+        UpdateUiState::Idle => {
+            body = body.child(dialog_description(
+                format!(
+                    "{} v{}",
+                    crate::i18n::pages::updates_current_version_label(locale),
+                    env!("CARGO_PKG_VERSION")
+                ),
+                cx,
+            ));
+        }
+        UpdateUiState::Checking => {
+            body =
+                body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::SM)
+                        .child(spinning_loader(
+                            "update-modal-check-spin",
+                            theme.accent,
+                        ))
+                        .child(div().text_color(theme.secondary).child(
+                            crate::i18n::pages::updates_checking(locale),
+                        )),
+                );
+        }
+        UpdateUiState::UpToDate { .. } => {
+            body = body.child(
+                div()
+                    .text_color(theme.success)
+                    .child(crate::i18n::pages::updates_up_to_date(locale)),
+            );
+        }
+        UpdateUiState::Available { info } if !info.can_self_update => {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .p(space::SM)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.divider())
+                    .bg(theme.normal_fill())
+                    .child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(
+                                crate::i18n::pages::update_manual_command_hint(
+                                    locale,
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme.mono_font.clone())
+                            .text_size(text::CAPTION)
+                            .text_color(theme.bright)
+                            .child(info.upgrade_command.clone()),
+                    ),
+            );
+        }
+        UpdateUiState::Available { .. } => {}
+        UpdateUiState::Downloading {
+            downloaded, total, ..
+        } => {
+            let fraction = if *total > 0 {
+                (*downloaded as f32 / *total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let pct = if *total > 0 {
+                ((*downloaded as f64 / *total as f64) * 100.0).round() as u64
+            } else {
+                0
+            };
+            let progress_label = if *total > 0 {
+                format!(
+                    "{} / {} ({pct}%)",
+                    human_bytes(*downloaded),
+                    human_bytes(*total)
+                )
+            } else {
+                human_bytes(*downloaded)
+            };
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .text_size(text::CAPTION)
+                            .child(div().text_color(theme.secondary).child(
+                                crate::i18n::pages::rail_update_downloading(
+                                    locale,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .font_family(theme.mono_font.clone())
+                                    .text_color(theme.bright)
+                                    .child(progress_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("update-progress-bar")
+                            .debug_selector(|| "update-progress-bar".into())
+                            .w_full()
+                            .h(size::METER)
+                            .bg(theme.foreground.opacity(0.08))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(fraction))
+                                    .bg(theme.accent),
+                            ),
+                    ),
+            );
+        }
+        UpdateUiState::ReadyToInstall { .. } => {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::XS)
+                    .p(space::SM)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.success.opacity(0.45))
+                    .bg(theme.success.opacity(0.08))
+                    .child(
+                        gpui_omarchy::icon(IconName::CircleCheck)
+                            .size(icon::MD)
+                            .flex_shrink_0()
+                            .text_color(theme.success),
+                    )
+                    .child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.bright)
+                            .child(crate::i18n::pages::update_verified_badge(
+                                locale,
+                            )),
+                    ),
+            );
+            let active_scan = app.scan.is_some() || app.remote_scan.is_some();
+            let marks_count = app.marks.len();
+            if active_scan || marks_count > 0 {
+                let mut warn_box = div()
+                    .id("update-restart-warning")
+                    .debug_selector(|| "update-restart-warning".into())
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(space::SM)
+                    .p(space::SM)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.warning.opacity(0.45))
+                    .bg(theme.warning.opacity(0.08))
+                    .child(
+                        gpui_omarchy::icon(IconName::TriangleAlert)
+                            .size(icon::MD)
+                            .flex_shrink_0()
+                            .text_color(theme.warning),
+                    );
+                let mut warn_lines =
+                    div().flex().flex_col().gap(space::XXS).flex_1();
+                if active_scan {
+                    warn_lines = warn_lines.child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.bright)
+                            .child(
+                                crate::i18n::pages::update_restart_warning_scan(
+                                    locale,
+                                ),
+                            ),
+                    );
+                }
+                if marks_count > 0 {
+                    warn_lines = warn_lines.child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.bright)
+                            .child(
+                                crate::i18n::pages::update_restart_warning_marks(
+                                    marks_count,
+                                    locale,
+                                ),
+                            ),
+                    );
+                }
+                warn_box = warn_box.child(warn_lines);
+                body = body.child(warn_box);
+            }
+        }
+        UpdateUiState::Installing { .. } => {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::SM)
+                    .child(spinning_loader("update-install-spin", theme.accent))
+                    .child(div().text_color(theme.bright).child(
+                        crate::i18n::pages::update_installing_status(locale),
+                    )),
+            );
+        }
+        UpdateUiState::Error { message, .. } => {
+            body = body.child(
+                div()
+                    .id("update-error-box")
+                    .debug_selector(|| "update-error-box".into())
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(space::SM)
+                    .p(space::SM)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.danger.opacity(0.45))
+                    .bg(theme.danger.opacity(0.08))
+                    .child(
+                        gpui_omarchy::icon(IconName::CircleX)
+                            .size(icon::MD)
+                            .flex_shrink_0()
+                            .text_color(theme.danger),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.bright)
+                            .child(message.clone()),
+                    ),
+            );
+        }
+    }
+
+    let footer = update_modal_footer(app, cx);
+
+    let popup = dialog_popup(cx)
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(space::MD)
+        .child(header)
+        .child(body)
+        .child(footer);
+
+    let card = div()
+        .id("update-modal")
+        .debug_selector(|| "update-modal".into())
+        .track_focus(&app.update_focus)
+        .flex()
+        .flex_col()
+        .w(size::UPDATE_MODAL)
+        .max_w_full()
+        .max_h_full()
+        .child(popup);
+
+    let close = cx.entity().downgrade();
+    div()
+        .id("update-modal-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(theme.background.opacity(0.68))
+        .child(crate::views::centred_popup(card, move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.close_update_modal(cx);
+                this.apply_focus(window, cx);
+            });
+        }))
+}
+
+fn update_release_summary_card(
+    info: &UpdateCheckResult,
+    locale: crate::i18n::Locale,
+    theme: &gpui_omarchy::Theme,
+) -> Div {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .p(space::SM)
+        .rounded(space::XS)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.normal_fill())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::MD)
+                .child(
+                    div()
+                        .font_family(theme.mono_font.clone())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.accent)
+                        .child(format!(
+                            "v{} \u{2192} v{}",
+                            info.current_version, info.latest_version
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(crate::i18n::pages::update_published_at(
+                            &info.manifest.published_at,
+                            locale,
+                        )),
+                ),
+        );
+    if let Some(asset) = &info.selected_asset {
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::MD)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(
+                    div()
+                        .font_family(theme.mono_font.clone())
+                        .child(asset.filename.clone()),
+                )
+                .child(div().child(human_bytes(asset.size))),
+        );
+    }
+    card
+}
+
+fn update_changelog_box(
+    notes: &str,
+    locale: crate::i18n::Locale,
+    theme: &gpui_omarchy::Theme,
+) -> Stateful<Div> {
+    let mut scroll = div()
+        .id("update-changelog-scroll")
+        .debug_selector(|| "update-changelog-scroll".into())
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .max_h(size::CHANGELOG_MAX_H)
+        .overflow_y_scroll()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .p(space::SM)
+        .rounded(space::XS)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.surface);
+
+    if notes.trim().is_empty() {
+        return scroll.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::update_changelog_empty(locale)),
+        );
+    }
+
+    for (idx, raw_line) in notes.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(heading) = line
+            .strip_prefix("### ")
+            .or_else(|| line.strip_prefix("## "))
+            .or_else(|| line.strip_prefix("# "))
+        {
+            scroll = scroll.child(
+                div()
+                    .debug_selector(move || {
+                        format!("update-changelog-heading-{idx}")
+                    })
+                    .pt(space::XXS)
+                    .text_size(text::BODY)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.accent)
+                    .child(heading.trim().to_owned()),
+            );
+        } else if let Some(item) =
+            line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))
+        {
+            scroll = scroll.child(
+                div()
+                    .debug_selector(move || {
+                        format!("update-changelog-item-{idx}")
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(space::XS)
+                    .pl(space::SM)
+                    .child(div().text_color(theme.accent).child("\u{2022}"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(render_inline_markdown(item.trim(), theme)),
+                    ),
+            );
+        } else {
+            scroll = scroll.child(render_inline_markdown(line, theme));
+        }
+    }
+
+    scroll
+}
+
+fn render_inline_markdown(text: &str, theme: &gpui_omarchy::Theme) -> Div {
+    if !text.contains('`') {
+        return div()
+            .text_size(text::BODY)
+            .text_color(theme.foreground)
+            .child(text.to_owned());
+    }
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(space::XXS);
+
+    for (idx, seg) in text.split('`').enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        if idx % 2 == 1 {
+            row = row.child(
+                div()
+                    .font_family(theme.mono_font.clone())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.bright)
+                    .bg(theme.normal_fill())
+                    .px(space::XXS)
+                    .rounded(space::XXS)
+                    .child(seg.to_owned()),
+            );
+        } else {
+            for word in seg.split_whitespace() {
+                row = row.child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.foreground)
+                        .child(word.to_owned()),
+                );
+            }
+        }
+    }
+
+    row
+}
+
+fn update_modal_footer(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
+    let locale = app.locale;
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .gap(space::SM);
+
+    match &app.update_state {
+        UpdateUiState::Available { info } => {
+            let ver = info.latest_version.clone();
+            row = row.child(
+                div().debug_selector(|| "update-skip-btn".into()).child(
+                    dialog_button(
+                        "update-skip-btn",
+                        crate::i18n::pages::update_skip_version(&ver, locale),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.skip_update_version(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+            );
+            row = row.child(
+                div().debug_selector(|| "update-later-btn".into()).child(
+                    dialog_button(
+                        "update-later-btn",
+                        crate::i18n::pages::update_later(locale),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.dismiss_update_banner(cx);
+                            this.close_update_modal(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+            );
+            if info.can_self_update {
+                row = row.child(
+                    div()
+                        .debug_selector(|| "update-download-btn".into())
+                        .child(
+                            dialog_button(
+                                "update-download-btn",
+                                crate::i18n::pages::update_download_and_update(
+                                    locale,
+                                ),
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.start_update_download(cx);
+                                },
+                            )),
+                        ),
+                );
+            } else {
+                row = row
+                    .child(
+                        div()
+                            .debug_selector(|| "update-open-release-btn".into())
+                            .child(
+                                dialog_button(
+                                    "update-open-release-btn",
+                                    crate::i18n::pages::update_open_release(
+                                        locale,
+                                    ),
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.open_update_release_page(cx);
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "update-copy-cmd-btn".into())
+                            .child(
+                                dialog_button(
+                                    "update-copy-cmd-btn",
+                                    crate::i18n::pages::update_copy_command(
+                                        locale,
+                                    ),
+                                    ButtonVariant::Primary,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.copy_update_command(cx);
+                                    }),
+                                ),
+                            ),
+                    );
+            }
+        }
+        UpdateUiState::Downloading { .. } => {
+            row = row
+                .child(
+                    div().debug_selector(|| "update-cancel-btn".into()).child(
+                        dialog_button(
+                            "update-cancel-btn",
+                            crate::i18n::pages::update_cancel(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.cancel_update_download(cx);
+                            },
+                        )),
+                    ),
+                )
+                .child(
+                    div().debug_selector(|| "update-hide-btn".into()).child(
+                        dialog_button(
+                            "update-hide-btn",
+                            crate::i18n::pages::update_hide(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.close_update_modal(cx);
+                                this.apply_focus(window, cx);
+                            },
+                        )),
+                    ),
+                );
+        }
+        UpdateUiState::ReadyToInstall { .. } => {
+            row = row
+                .child(
+                    div().debug_selector(|| "update-later-btn".into()).child(
+                        dialog_button(
+                            "update-later-btn",
+                            crate::i18n::pages::update_later(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.dismiss_update_banner(cx);
+                                this.close_update_modal(cx);
+                                this.apply_focus(window, cx);
+                            },
+                        )),
+                    ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "update-restart-install-btn".into())
+                        .child(
+                            dialog_button(
+                                "update-restart-install-btn",
+                                crate::i18n::pages::update_restart_and_install(
+                                    locale,
+                                ),
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.apply_ready_update(cx);
+                                },
+                            )),
+                        ),
+                );
+        }
+        UpdateUiState::Installing { .. } => {
+            row = row.child(
+                dialog_button(
+                    "update-installing-btn",
+                    crate::i18n::pages::update_restart_and_install(locale),
+                    ButtonVariant::Primary,
+                    cx,
+                )
+                .disabled(true),
+            );
+        }
+        UpdateUiState::Error { info, .. } => {
+            let can_retry_download =
+                info.as_ref().is_some_and(|i| i.can_self_update);
+            row = row
+                .child(
+                    div()
+                        .debug_selector(|| "update-open-release-btn".into())
+                        .child(
+                            dialog_button(
+                                "update-open-release-btn",
+                                crate::i18n::pages::update_open_github_release(
+                                    locale,
+                                ),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.open_update_release_page(cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div().debug_selector(|| "update-retry-btn".into()).child(
+                        dialog_button(
+                            "update-retry-btn",
+                            crate::i18n::pages::update_retry(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                if can_retry_download {
+                                    this.start_update_download(cx);
+                                } else {
+                                    this.check_for_updates_now(cx);
+                                }
+                            },
+                        )),
+                    ),
+                );
+        }
+        UpdateUiState::Idle
+        | UpdateUiState::Checking
+        | UpdateUiState::UpToDate { .. } => {
+            let checking = matches!(app.update_state, UpdateUiState::Checking);
+            row = row
+                .child(
+                    div().debug_selector(|| "update-later-btn".into()).child(
+                        dialog_button(
+                            "update-later-btn",
+                            crate::i18n::pages::docker_close_button(locale),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.close_update_modal(cx);
+                                this.apply_focus(window, cx);
+                            },
+                        )),
+                    ),
+                )
+                .child(
+                    div().debug_selector(|| "update-retry-btn".into()).child(
+                        dialog_button(
+                            "update-retry-btn",
+                            crate::i18n::pages::updates_check_now(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .disabled(checking)
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.check_for_updates_now(cx);
+                            },
+                        )),
+                    ),
+                );
+        }
+    }
+
+    row
 }

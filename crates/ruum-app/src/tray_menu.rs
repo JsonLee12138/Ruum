@@ -23,6 +23,7 @@ const ID_OPEN_RUUM: &str = "ruum.tray.open_ruum";
 const ID_OPEN_REMOTE: &str = "ruum.tray.open_remote";
 const ID_OPEN_WATCHDOG: &str = "ruum.tray.open_watchdog";
 const ID_OPEN_SETTINGS: &str = "ruum.tray.open_settings";
+const ID_CHECK_UPDATES: &str = "ruum.tray.check_updates";
 const ID_CHECK_DISK: &str = "ruum.tray.check_disk";
 const ID_RUN_AI: &str = "ruum.tray.run_ai";
 const ID_REVIEW_PROPOSAL: &str = "ruum.tray.review_proposal";
@@ -53,6 +54,8 @@ pub enum TrayAction {
     OpenWatchdog,
     /// Open the `Settings` page in the main window.
     OpenSettings,
+    /// Open update modal or check for updates in `Settings::Updates`.
+    CheckForUpdates,
     /// Run an immediate O(1) disk space check.
     CheckDiskSpaceNow,
     /// Trigger an immediate AI cleanup analysis.
@@ -69,6 +72,7 @@ pub struct TrayMenu {
     locale: Locale,
     tray: TrayIcon,
     status_item: MenuItem,
+    check_updates_item: MenuItem,
     review_proposal_item: MenuItem,
     rx: Receiver<TrayAction>,
 }
@@ -123,6 +127,12 @@ impl TrayMenu {
             true,
             None,
         );
+        let check_updates_item = MenuItem::with_id(
+            ID_CHECK_UPDATES,
+            common::tray_check_updates(locale),
+            true,
+            None,
+        );
         let check_disk_item = MenuItem::with_id(
             ID_CHECK_DISK,
             common::tray_check_disk_space(locale),
@@ -159,6 +169,7 @@ impl TrayMenu {
             &remote_item,
             &watchdog_item,
             &settings_item,
+            &check_updates_item,
             &sep2,
             &check_disk_item,
             &run_ai_item,
@@ -188,6 +199,7 @@ impl TrayMenu {
             locale,
             tray,
             status_item,
+            check_updates_item,
             review_proposal_item,
             rx,
         })
@@ -207,6 +219,13 @@ impl TrayMenu {
         let _ = self
             .tray
             .set_tooltip(Some(format!("ruum \u{2014} {label}")));
+    }
+
+    /// Update the tray check-for-updates menu item label for an available
+    /// release version (or reset to `Check for Updates…` when `None`).
+    pub fn set_update_available(&self, version: Option<&str>) {
+        let label = format_check_updates_label(version, self.locale);
+        self.check_updates_item.set_text(&label);
     }
 
     /// Pop the next queued [`TrayAction`], if any.
@@ -290,6 +309,7 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
         ID_OPEN_REMOTE => Some(TrayAction::OpenRemote),
         ID_OPEN_WATCHDOG => Some(TrayAction::OpenWatchdog),
         ID_OPEN_SETTINGS => Some(TrayAction::OpenSettings),
+        ID_CHECK_UPDATES => Some(TrayAction::CheckForUpdates),
         ID_CHECK_DISK => Some(TrayAction::CheckDiskSpaceNow),
         ID_RUN_AI => Some(TrayAction::RunAiAnalysisNow),
         ID_REVIEW_PROPOSAL => Some(TrayAction::ReviewLatestProposal),
@@ -306,6 +326,18 @@ pub fn format_status_label(
     locale: Locale,
 ) -> String {
     common::tray_status_label(free_bytes, watchdog_enabled, locale)
+}
+
+/// Format the localized tray menu item label for software updates.
+#[must_use]
+pub fn format_check_updates_label(
+    version: Option<&str>,
+    locale: Locale,
+) -> String {
+    match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(ver) => common::tray_update_available(ver, locale),
+        None => common::tray_check_updates(locale).to_owned(),
+    }
 }
 
 fn build_treemap_icon(size: u32) -> anyhow::Result<Icon> {
@@ -681,9 +713,40 @@ mod tests {
             action_for_menu_id(ID_REVIEW_PROPOSAL),
             Some(TrayAction::ReviewLatestProposal)
         );
+        assert_eq!(
+            action_for_menu_id(ID_CHECK_UPDATES),
+            Some(TrayAction::CheckForUpdates)
+        );
         assert_eq!(action_for_menu_id(ID_QUIT), Some(TrayAction::Quit));
         assert_eq!(action_for_menu_id(ID_STATUS), None);
         assert_eq!(action_for_menu_id("unknown"), None);
+    }
+
+    #[test]
+    fn check_updates_label_formats_available_version_across_locales() {
+        assert_eq!(
+            format_check_updates_label(None, Locale::En),
+            "Check for Updates\u{2026}"
+        );
+        assert_eq!(
+            format_check_updates_label(Some("0.3.0"), Locale::En),
+            "Update Available (v0.3.0)\u{2026}"
+        );
+        assert_eq!(
+            format_check_updates_label(Some("v0.3.0"), Locale::En),
+            "Update Available (v0.3.0)\u{2026}"
+        );
+        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            let idle = format_check_updates_label(None, locale);
+            let avail = format_check_updates_label(Some("0.3.0"), locale);
+            assert!(avail.contains("v0.3.0"));
+            assert_ne!(idle, avail);
+            assert_ne!(idle, format_check_updates_label(None, Locale::En));
+            assert_ne!(
+                avail,
+                format_check_updates_label(Some("0.3.0"), Locale::En)
+            );
+        }
     }
 
     #[test]

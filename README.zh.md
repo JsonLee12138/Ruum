@@ -42,7 +42,7 @@
   irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
   ```
 
-> **应用内自更新与 CLI 检测：** 桌面端会在后台静默检查已签名版本（可在 **设置 › 更新** 中切换 Stable / Beta 通道或关闭自动检查；点击 **下载并更新** 前绝不偷跑下载）。无头服务器可运行 `ruum update check` 验签查看新版本说明与精确升级命令。
+> **应用内更新与 CLI 检测：** 桌面端会在后台自动检查新版本（可在 **设置 › 更新** 中切换 **稳定版（Stable）** / **测试版（Beta）** 通道或关闭自动检查；点击 **下载并更新** 前绝不会下载安装包）。**设置 › 更新** 中的 **发送匿名使用统计** 开关可随时关闭（也可执行 `ruum config update set --send-client-id false`），全程零 IP 地址、零用户路径记录。无头服务器可运行 `ruum update check` 检查新版本说明并获取精确升级命令。Linux AppImage 同时支持内置应用内更新（Stable / Beta）以及配套 `.AppImage.zsync` 文件供 `AppImageUpdate` / `Gear Lever` 增量更新（固定追踪稳定版 `latest`）。
 
 ### macOS
 
@@ -79,7 +79,7 @@ brew tap JsonLee12138/tap && brew install --cask ruum
   ```
 - **Debian / Ubuntu（`.deb`）：** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL（`.rpm`）：** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage：** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
+- **AppImage：** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`（支持应用内自动更新，并附带 `.AppImage.zsync` 供 `AppImageUpdate` / `Gear Lever` 追踪稳定版 `latest` 增量更新）。
 - **便携压缩包（`.tar.gz`）：** 解压 `ruum-*-x86_64-linux.tar.gz` 后运行 `./install.sh`（或直接将 `ruum` 放到 `PATH` 中）。
 
 **Hyprland 浮动窗口规则：** Hyprland 默认平铺新窗口，建议为 `ruum`（窗口类名为 `ruum`）配置宽松的浮动规则：
@@ -103,17 +103,17 @@ windowrule = size 1400 900, class:^(ruum)$
 
 源码编译需要 **Rust 1.97 或更高版本**（仓库根目录的 `rust-toolchain.toml` 已锁定版本，通过 [rustup](https://rustup.rs) 会自动拉取）。
 
-- **macOS 与 Linux**（Linux 需在支持 Vulkan GPU 的 Wayland 或 X11 会话下运行；若需在 Linux 二进制中内嵌静态 SSH 扫描器，请同时安装两个 `musl` 标准库目标）：
+- **macOS 与 Linux**（Linux 需在支持 Vulkan GPU 的 Wayland 或 X11 会话下运行；macOS 与 Linux 均通过安装以下两个 `musl` 标准库目标，在 `make install` / `make bundle` 时自动内嵌静态 Linux SSH 扫描器，无需外部 C 交叉编译器）：
   ```sh
-  # 仅 Linux 需要（用于内嵌静态 SSH 辅助程序，无需外部 C 交叉编译器）：
+  # macOS 与 Linux 通用（用于内嵌静态 Linux SSH 扫描器，无需外部 C 交叉编译器）：
   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
   git clone https://github.com/JsonLee12138/Ruum.git
   cd Ruum
   make install
   ```
-  - **Linux：** `make install` 会安装 `~/.local/bin/ruum`、桌面入口文件（为目录添加**打开方式**入口，不会篡改默认文件管理器）以及 `ruum.svg` 图标；系统级安装可使用 `sudo make install PREFIX=/usr/local`，卸载运行 `make uninstall`。
-  - **macOS：** `make install` 会构建并安装 `~/Applications/ruum.app`，同时软链至 `~/.local/bin/ruum`（需要 Xcode 或 Command Line Tools）。
+  - **Linux：** `make install` 会构建并安装内嵌静态扫描器的 `~/.local/bin/ruum`、`~/.local/bin/ruum-gui`、桌面入口文件（为目录添加**打开方式**入口，不会篡改默认文件管理器）以及 `ruum.svg` 图标；系统级安装可使用 `sudo make install PREFIX=/usr/local`，卸载运行 `make uninstall`。
+  - **macOS：** `make install` 会构建并安装 `~/Applications/ruum.app`（已安装 `musl` 目标时会自动内嵌 `Contents/Resources/ruum-scan-linux.pack`），同时软链至 `~/.local/bin/ruum`（需要 Xcode 或 Command Line Tools）。若在 macOS 上跳过 `musl` 目标，`make install` 会提示警告但正常完成，远程 SSH 将自动降级复用远端缓存或服务端安装的 `ruum-scan`。
   - 若 `PATH` 中有其他旧版本覆盖了 `~/.local/bin/ruum`，请将 `export PATH="$HOME/.local/bin:$PATH"` 写入您的 Shell 配置文件。
 - **Windows**（需 MSVC 工具链 / Visual Studio Build Tools C++ 工作负载）：
   ```powershell
@@ -136,7 +136,7 @@ gh attestation verify <已下载的文件> --repo JsonLee12138/Ruum
 1. 打开 **设置**（macOS 按 `⌘,`，Linux / Windows 按 `Ctrl+,`，或点击左侧图标导航栏底部的齿轮图标）。
 2. 在 **命令行工具** 区域点击 **安装 CLI 命令**（macOS 也可通过顶部菜单栏 **ruum › 安装命令行工具…** 触发）。
 
-执行后：macOS 会链接至 `/usr/local/bin/ruum`，Linux 会链接至 `~/.local/bin/ruum`，Windows 会将 `ruum.exe` 复制到 `%LOCALAPPDATA%\Programs\ruum\bin` 并写入用户环境变量 `Path`，随后即可在任意终端或 AI Agent 中调用 `ruum`、`ruum ssh`、`ruum watchdog` 与 `ruum mcp`。
+执行后：macOS 会链接至 `/usr/local/bin/ruum`，Linux 会链接至 `~/.local/bin/ruum`，Windows 会将 `ruum.exe`（连同同级 `ruum-gui.exe`）复制到 `%LOCALAPPDATA%\Programs\ruum\bin` 并写入用户环境变量 `Path`，随后即可在任意终端或 AI Agent 中调用 `ruum`、`ruum ssh`、`ruum watchdog` 与 `ruum mcp`。后续 Windows 端通过应用内更新升级时，也会自动保持 `%LOCALAPPDATA%\Programs\ruum\bin` 中的 `ruum.exe`、`ruum-gui.exe` 与 `ruum-scan-linux.pack` 同步。
 
 ---
 
@@ -205,12 +205,12 @@ ruum ssh dev --check /var/log  # 无窗口模式：部署辅助扫描器并输�
 
 ### 远程扫描器部署机制
 
-- **Linux 打包版本（`make build` / `cargo xtask portable`）：** 主二进制末尾直接内嵌了静态编译的 `x86_64` 与 `aarch64` `musl` Linux 扫描器。连接 SSH 时会自动检测服务器操作系统与 CPU 架构，仅在缓存缺失或损坏时将匹配二进制上传至远程 `~/.cache/ruum/ssh/<sha256>/`（带校验和验证与原子替换，无需 `sudo`、不改系统包、不依赖远程 `glibc` 版本）。也可手动提取扫描器：
+- **官方发布版本（macOS、Windows 与 Linux）及带 `musl` 目标的源码构建：** 均内置静态编译的 `x86_64` 与 `aarch64` `musl` Linux 扫描器（Linux 直接附加在主二进制末尾；macOS 与 Windows 打包在随附资源 `ruum-scan-linux.pack` 中）。连接 SSH 时会自动检测服务器操作系统与 CPU 架构，并在缓存缺失或损坏时通过 SSH 自动上传并校验匹配二进制至远程 `~/.cache/ruum/ssh/<sha256>/ruum-scan`（原子替换，无需 `sudo`、不改系统包、不依赖远程 `glibc` 版本）。也可手动提取扫描器：
   ```sh
   ruum extract-scanner x86_64 ./ruum-scan
   ruum extract-scanner aarch64 ./ruum-scan-arm64
   ```
-- **开发构建、macOS 或 Windows 桌面端：** 请先在远程服务器的 `PATH` 或 `~/.local/bin/ruum-scan` 安装轻量无 GUI 依赖的 **ruum-scan** 辅助程序：
+- **开发构建或未带 `musl` 目标的本地源码构建：** 连接远程主机时会自动检测远端 `PATH` 或 `~/.local/bin/ruum-scan`，若缺失则自动复用远端已有的 `~/.cache/ruum/ssh/*/ruum-scan` 缓存；若目标服务器上尚未安装过任何扫描器，可先安装轻量无 GUI 依赖的 **ruum-scan** 辅助程序：
   ```sh
   # 在远程服务器的代码目录中执行：
   make install-scan
@@ -327,12 +327,14 @@ ruum ssh dev --check /var/log  # 无窗口模式：部署辅助扫描器并输�
 ```sh
 ruum [选项] [PATH]                     # 扫描 PATH（省略时默认扫描 ~）
 ruum ssh HOST [选项] [PATH]            # 通过 SSH 只读分析远程主机
+ruum run-script SCRIPT [--profile ID_OR_ALIAS] [--yes] [--pause]
+                                       # 确认并执行导出的清理脚本
 ruum mcp [--read-only]                 # 启动 stdio MCP 服务器
 ruum watchdog [--once]                 # 启动磁盘守护轮询（或单次检测）
 ruum update [check] [--channel stable|beta] [--json]
-                                       # 检查已签名更新并输出升级命令
+                                       # 检查更新并输出升级命令
 ruum config update get|set [...]       # 查看或修改更新偏好设置
-ruum extract-scanner ARCH OUTPUT       # 提取内嵌静态 Linux 扫描器（x86_64 | aarch64）
+ruum extract-scanner ARCH OUTPUT       # 提取静态 Linux 扫描器（x86_64 | aarch64；支持内嵌或 ruum-scan-linux.pack）
 ```
 
 | 参数 | 说明 |

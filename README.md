@@ -42,7 +42,7 @@ Find what is filling a disk, mark what should go, and clean it up safely — wit
   irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
   ```
 
-> **In-app & CLI updates:** Desktop installs check for signed updates automatically in the background (configurable in **Settings › Updates**, Stable or Beta channel; no silent downloads before clicking **Download & Update**). On headless servers, run `ruum update check` to verify releases and print the exact upgrade command.
+> **In-app & CLI updates:** Desktop installs check for new versions automatically in the background (configured in **Settings › Updates**, supporting **Stable** and **Beta** channels; nothing is downloaded until you click **Download & Update**). You can toggle the optional **Share anonymous usage statistics** setting in **Settings › Updates** (or via `ruum config update set --send-client-id false`) — zero IP addresses or user paths are logged. On headless servers, run `ruum update check` to inspect available releases and print the exact upgrade command. Linux AppImage supports both built-in in-app updates (Stable/Beta) and `.AppImage.zsync` incremental updates in tools like `AppImageUpdate` or `Gear Lever` (tracking Stable `latest`).
 
 ### macOS
 
@@ -79,7 +79,7 @@ Download a package from the [latest release](https://github.com/JsonLee12138/Ruu
   ```
 - **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage:** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
+- **AppImage:** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage` (supports built-in in-app updates, and includes `.AppImage.zsync` for `AppImageUpdate` / `Gear Lever` tracking Stable `latest`).
 - **Portable tarball:** unpack `ruum-*-x86_64-linux.tar.gz` and run `./install.sh` (or copy `ruum` onto your `PATH`).
 
 **Hyprland floating window rule:** Hyprland tiles new windows by default; ruum works best in a roomy floating window (`class` is `ruum`):
@@ -103,17 +103,17 @@ On Windows 10 or 11 (`x86_64` or `aarch64`), download from the [latest release](
 
 Building requires **Rust 1.97 or newer** (pinned in `rust-toolchain.toml` via [rustup](https://rustup.rs)).
 
-- **macOS & Linux** (Linux also requires a Wayland or X11 session with a Vulkan-capable GPU, plus the `musl` stdlib targets for embedded static SSH helpers):
+- **macOS & Linux** (Linux also requires a Wayland or X11 session with a Vulkan-capable GPU; both macOS and Linux use the `musl` stdlib targets below to embed static Linux SSH scanners during `make install` / `make bundle` with no C cross-compiler required):
   ```sh
-  # Linux only (for embedded static SSH helpers, no C cross-compiler required):
+  # Both macOS & Linux (embeds static Linux SSH helpers, no C cross-compiler required):
   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
   git clone https://github.com/JsonLee12138/Ruum.git
   cd Ruum
   make install
   ```
-  - On **Linux**, `make install` installs `~/.local/bin/ruum`, a desktop entry (adding an **Open with** handler for directories without changing your default file manager), and the `ruum.svg` icon. Use `sudo make install PREFIX=/usr/local` for system-wide installation, or `make uninstall` to remove everything it placed.
-  - On **macOS**, `make install` builds and installs `~/Applications/ruum.app` and symlinks `~/.local/bin/ruum` (requires Xcode or Command Line Tools).
+  - On **Linux**, `make install` embeds the static scanners into `~/.local/bin/ruum` and installs `~/.local/bin/ruum-gui`, a desktop entry (adding an **Open with** handler for directories without changing your default file manager), and the `ruum.svg` icon. Use `sudo make install PREFIX=/usr/local` for system-wide installation, or `make uninstall` to remove everything it placed.
+  - On **macOS**, `make install` builds and installs `~/Applications/ruum.app` (including `Contents/Resources/ruum-scan-linux.pack` when the `musl` targets are installed) and symlinks `~/.local/bin/ruum` (requires Xcode or Command Line Tools). If those `musl` targets are omitted on macOS, `make install` prints a warning and still succeeds, and remote SSH falls back to cached or server-installed `ruum-scan`.
   - If an older binary earlier on `PATH` shadows `~/.local/bin/ruum`, add `export PATH="$HOME/.local/bin:$PATH"` to your shell configuration.
 - **Windows** (MSVC toolchain / Visual Studio Build Tools with C++ workload):
   ```powershell
@@ -136,7 +136,7 @@ If you installed the desktop app from a `.dmg`, `.zip`, or portable archive, reg
 1. Open **Settings** (`⌘,` on macOS, `Ctrl+,` on Linux & Windows, or click the gear icon in the Left Icon Rail).
 2. Under **Command-Line Tool**, click **Install CLI Command** (also accessible from the macOS menu bar via **ruum › Install CLI Command…**).
 
-This registers `/usr/local/bin/ruum` on macOS, `~/.local/bin/ruum` on Linux, or copies `ruum.exe` into `%LOCALAPPDATA%\Programs\ruum\bin` and updates your user `Path` on Windows — enabling `ruum`, `ruum ssh`, `ruum watchdog`, and `ruum mcp` from any shell or AI agent.
+This registers `/usr/local/bin/ruum` on macOS, `~/.local/bin/ruum` on Linux, or copies `ruum.exe` (along with sibling `ruum-gui.exe`) into `%LOCALAPPDATA%\Programs\ruum\bin` and updates your user `Path` on Windows — enabling `ruum`, `ruum ssh`, `ruum watchdog`, and `ruum mcp` from any shell or AI agent. When the Windows app updates, it also keeps `ruum.exe`, `ruum-gui.exe`, and `ruum-scan-linux.pack` in `%LOCALAPPDATA%\Programs\ruum\bin` in sync.
 
 ---
 
@@ -205,12 +205,12 @@ You can also connect from inside the app via **Sources & Drives › Connect SSH*
 
 ### How Remote Scanner Deployment Works
 
-- **Linux packaged builds (`make build` / `cargo xtask portable`):** bundle static `x86_64` and `aarch64` `musl` Linux scanners inside the executable. On connect, ruum checks the server's OS/CPU and uploads the matching helper to `~/.cache/ruum/ssh/<sha256>/` (checksum-verified, no `sudo`, no system package changes, no dependency on remote `glibc`). You can also extract a binary manually:
+- **Official release builds (macOS, Windows, and Linux) & source builds with `musl` targets:** include static `x86_64` and `aarch64` `musl` Linux scanners (appended as an executable trailer on Linux; bundled as `ruum-scan-linux.pack` on macOS and Windows). On connect, ruum checks the server's OS/CPU and automatically uploads and checksum-verifies the matching helper at `~/.cache/ruum/ssh/<sha256>/ruum-scan` over SSH (no `sudo`, no system package changes, no dependency on remote `glibc`). You can also extract a binary manually:
   ```sh
   ruum extract-scanner x86_64 ./ruum-scan
   ruum extract-scanner aarch64 ./ruum-scan-arm64
   ```
-- **Development, macOS, or Windows desktop builds:** install the small headless helper (`ruum-scan`, no GUI dependencies) on the remote server's `PATH` or `~/.local/bin/ruum-scan`:
+- **Development builds & source builds without `musl` targets:** automatically fall back to `ruum-scan` on `PATH` or `~/.local/bin/ruum-scan`, or reuse a previously cached `~/.cache/ruum/ssh/*/ruum-scan` on the remote host when present. If none exists on the server yet, install the small headless helper (`ruum-scan`, no GUI dependencies) there:
   ```sh
   # On the remote server inside a checkout:
   make install-scan
@@ -327,12 +327,14 @@ If `CleanupConfirmAdapter` or OS native authentication fails, times out, or has 
 ```sh
 ruum [OPTIONS] [PATH]                  # scan PATH (defaults to ~)
 ruum ssh HOST [OPTIONS] [PATH]         # inspect a remote host over SSH (read-only)
+ruum run-script SCRIPT [--profile ID_OR_ALIAS] [--yes] [--pause]
+                                       # review and run a generated cleanup script
 ruum mcp [--read-only]                 # run stdio MCP server
 ruum watchdog [--once]                 # run disk watchdog daemon (or single check)
 ruum update [check] [--channel stable|beta] [--json]
-                                       # check signed releases & print upgrade command
+                                       # check for updates & print upgrade command
 ruum config update get|set [...]       # inspect or configure update preferences
-ruum extract-scanner ARCH OUTPUT       # extract embedded Linux helper (x86_64 | aarch64)
+ruum extract-scanner ARCH OUTPUT       # extract static Linux scanner (x86_64 | aarch64; embedded or ruum-scan-linux.pack)
 ```
 
 | Flag | Description |

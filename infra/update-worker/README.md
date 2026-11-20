@@ -5,10 +5,10 @@ Cloudflare Worker + private R2 (`ruum-releases`) edge distribution proxy and ins
 ## Endpoints
 
 - `GET /health` — Health check (`{"ok":true,"service":"ruum-update-worker"}`).
-- `GET /v1/check?channel=<stable|beta>&os=<os>&arch=<arch>&pkg=<pkg>&ver=<ver>&lang=<lang>&entry=<gui|cli>` — Edge-cached (5 min) raw byte-for-byte passthrough of `channels/<channel>/manifest.json` with `X-Ruum-Signature` from `channels/<channel>/manifest.json.sig`. Emits single-line sanitized `update_check` JSON logs on every request (cache hit or miss).
-- `GET /v1/download/<path>` — Streams R2 objects under `releases/` with `Range`, `If-None-Match` (`304`), `ETag`, and `Cache-Control: public, max-age=31536000, immutable`.
-- `GET /install.sh` — Dynamic macOS/Linux installer supporting `--cli-only`, `--version`, `--channel`, `--prefix`, `--yes`, and `RUUM_INSTALL_DIR`.
-- `GET /install.ps1` — Dynamic Windows PowerShell installer supporting `-Channel`, `-Version`, `-InstallDir`, SHA256 verification, and User `Path` registration.
+- `GET /v1/check?channel=<stable|beta>&os=<os>&arch=<arch>&pkg=<pkg>&ver=<ver>&lang=<lang>&entry=<gui|cli>` — Edge-cached (`300s` / 5 min) raw byte-for-byte passthrough (`200`) of `channels/<channel>/manifest.json` with `X-Ruum-Signature` and `X-Ruum-Channel` from `channels/<channel>/manifest.json.sig`. When no release is published yet on `<channel>` (both `manifest.json` and `.sig` are absent), returns **`204 No Content`** (`X-Ruum-Channel`, `Cache-Control: public, max-age=60`) and logs `no_release: true`; when only one of the pair exists (incomplete publication) or the signature is invalid, fails closed with **`502`**. Emits single-line sanitized `update_check` JSON logs on every request (cache hit, miss, or `no_release`).
+- `GET /v1/download/<path>` — Streams R2 objects under `releases/` — including installers, `.AppImage`, `.AppImage.zsync` delta metadata (for `AppImageUpdate` / `Gear Lever`), `.sha256`, and `SHA256SUMS` — with `Accept-Ranges: bytes`, `Range` (`206`), `If-None-Match` (`304`), `ETag`, and `Cache-Control: public, max-age=31536000, immutable`.
+- `GET /install.sh` — Dynamic macOS/Linux installer supporting `--cli-only`, `--version`, `--channel`, `--prefix`, `--yes`, and `RUUM_INSTALL_DIR` (exits cleanly with `"no release published yet for channel '<channel>'"` if `/v1/check` returns `204`).
+- `GET /install.ps1` — Dynamic Windows PowerShell installer supporting `-Channel`, `-Version`, `-InstallDir`, SHA256 verification, and User `Path` registration (exits cleanly with `"no release published yet for channel '<channel>'"` if `/v1/check` returns `204`).
 
 ## Local Tests
 

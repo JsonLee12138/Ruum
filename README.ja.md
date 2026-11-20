@@ -42,7 +42,7 @@
   irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
   ```
 
-> **アプリ内自動更新と CLI チェック：** デスクトップ版は起動後に署名済みリリースをバックグラウンドで確認します（**設定 › アップデート** から Stable / Beta の切り替えや自動確認のオン・オフが可能。**ダウンロードして更新** を押すまで本体はダウンロードされません）。ヘッドレスサーバーでは `ruum update check` で署名検証とアップグレードコマンドを確認できます。
+> **アプリ内更新と CLI チェック：** デスクトップ版はバックグラウンドで新しいバージョンを自動確認します（**設定 › アップデート** で **安定版（Stable）** / **ベータ版（Beta）** チャンネルの切り替えや自動確認のオン・オフが可能。**ダウンロードして更新** をクリックするまで本体はダウンロードされません）。**設定 › アップデート** の **匿名の利用統計を送信する**（または `ruum config update set --send-client-id false`）はいつでもオフにでき、IP アドレスやユーザーパスは一切記録されません。ヘッドレスサーバーでは `ruum update check` で新バージョンの確認とアップグレードコマンドの表示ができます。Linux AppImage はアプリ内アップデート（Stable / Beta）と、`AppImageUpdate` / `Gear Lever` 向けの `.AppImage.zsync` 差分更新（安定版 `latest` を追跡）の双方に対応しています。
 
 ### macOS
 
@@ -79,7 +79,7 @@ brew tap JsonLee12138/tap && brew install --cask ruum
   ```
 - **Debian / Ubuntu（`.deb`）：** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL（`.rpm`）：** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage：** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
+- **AppImage：** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`（アプリ内自動更新に対応し、`AppImageUpdate` / `Gear Lever` が安定版 `latest` を追跡するための `.AppImage.zsync` も同梱しています）。
 - **ポータブルアーカイブ（`.tar.gz`）：** `ruum-*-x86_64-linux.tar.gz` を展開し、`./install.sh` を実行します（または `ruum` を `PATH` の通ったディレクトリへコピーします）。
 
 **Hyprland のフローティングウィンドウ設定：** Hyprland は新規ウィンドウを既定でタイリングするため、`ruum`（ウィンドウクラス `ruum`）には十分なサイズのフローティング設定を推奨します：
@@ -103,17 +103,17 @@ Windows 10 / 11（`x86_64` および `aarch64`）向けに [最新リリース�
 
 ビルドには **Rust 1.97 以降** が必要です（[rustup](https://rustup.rs) 使用時はリポジトリ直下の `rust-toolchain.toml` により自動的に切り替わります）。
 
-- **macOS & Linux**（Linux では Vulkan 対応 GPU を備えた Wayland または X11 セッションが必要です。また、組み込み静的 SSH スキャナ用に 2 つの `musl` ターゲットを追加します）：
+- **macOS & Linux**（Linux では Vulkan 対応 GPU を備えた Wayland または X11 セッションが必要です。macOS・Linux ともに以下の 2 つの `musl` ターゲットを追加すると、`make install` / `make bundle` 時に C クロスコンパイラなしで静的 Linux SSH スキャナを自動同梱できます）：
   ```sh
-  # Linux のみ（組み込み静的 SSH ヘルパー用、C クロスコンパイラ不要）：
+  # macOS & Linux 共通（静的 Linux SSH スキャナを同梱するため、C クロスコンパイラ不要）：
   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
   git clone https://github.com/JsonLee12138/Ruum.git
   cd Ruum
   make install
   ```
-  - **Linux：** `make install` は `~/.local/bin/ruum`、デスクトップエントリ（既定のファイルマネージャーを変更せずディレクトリの**アプリで開く**候補に追加）、`ruum.svg` アイコンを配置します。システム全体へ入れる場合は `sudo make install PREFIX=/usr/local`、削除する場合は `make uninstall` を実行してください。
-  - **macOS：** `make install` は `~/Applications/ruum.app` をビルド・配置し、`~/.local/bin/ruum` にシンボリックリンクを作成します（Xcode または Command Line Tools が必要です）。
+  - **Linux：** `make install` は静的スキャナを同梱した `~/.local/bin/ruum`、`~/.local/bin/ruum-gui`、デスクトップエントリ（既定のファイルマネージャーを変更せずディレクトリの**アプリで開く**候補に追加）、`ruum.svg` アイコンを配置します。システム全体へ入れる場合は `sudo make install PREFIX=/usr/local`、削除する場合は `make uninstall` を実行してください。
+  - **macOS：** `make install` は `~/Applications/ruum.app` をビルド・配置し（`musl` ターゲット導入済みなら `Contents/Resources/ruum-scan-linux.pack` も同梱）、`~/.local/bin/ruum` にシンボリックリンクを作成します（Xcode または Command Line Tools が必要です）。macOS で `musl` ターゲットを省略した場合、`make install` は警告を表示したうえでそのまま完了し、リモート SSH はリモートキャッシュまたはサーバー上の `ruum-scan` にフォールバックします。
   - `PATH` 上の古いバイナリが `~/.local/bin/ruum` より優先される場合は、シェル設定ファイルに `export PATH="$HOME/.local/bin:$PATH"` を追記してください。
 - **Windows**（MSVC ツールチェーン／C++ ワークロード付き Visual Studio Build Tools が必要です）：
   ```powershell
@@ -136,7 +136,7 @@ gh attestation verify <ダウンロードしたファイル> --repo JsonLee12138
 1. **設定** を開きます（macOS は `⌘,`、Linux / Windows は `Ctrl+,`、または左端アイコンレールの歯車アイコンをクリック）。
 2. **コマンドラインツール** セクションで **CLI コマンドをインストール** をクリックします（macOS の上部メニューバー **ruum › CLI コマンドをインストール…** からも実行可能）。
 
-これにより、macOS では `/usr/local/bin/ruum`、Linux では `~/.local/bin/ruum` が登録され、Windows では `ruum.exe` が `%LOCALAPPDATA%\Programs\ruum\bin` にコピーされてユーザー環境変数 `Path` に追加されます。以降のターミナルや AI エージェントから `ruum`、`ruum ssh`、`ruum watchdog`、`ruum mcp` を直接呼び出せます。
+これにより、macOS では `/usr/local/bin/ruum`、Linux では `~/.local/bin/ruum` が登録され、Windows では `ruum.exe`（および同階層の `ruum-gui.exe`）が `%LOCALAPPDATA%\Programs\ruum\bin` にコピーされてユーザー環境変数 `Path` に追加されます。以降のターミナルや AI エージェントから `ruum`、`ruum ssh`、`ruum watchdog`、`ruum mcp` を直接呼び出せます。また Windows 版のアプリ内アップデート時には、`%LOCALAPPDATA%\Programs\ruum\bin` 内の `ruum.exe`、`ruum-gui.exe`、`ruum-scan-linux.pack` も自動的に同期されます。
 
 ---
 
@@ -205,12 +205,12 @@ ruum ssh dev --check /var/log  # GUI なしでヘルパーを配置してサマ�
 
 ### リモートスキャナの自動配置の仕組み
 
-- **Linux パッケージビルド（`make build` / `cargo xtask portable`）：** 実行ファイル内部に静的リンクされた `x86_64` および `aarch64` `musl` 版 Linux スキャナを同梱しています。接続時にサーバーの OS と CPU アーキテクチャを判定し、キャッシュがない・一致しない場合のみ対応ヘルパーをリモートの `~/.cache/ruum/ssh/<sha256>/` へアップロードします（チェックサム検証とアトミック置換、`sudo` 不要・システムパッケージ改変なし・リモート `glibc` 非依存）。手動抽出も可能です：
+- **公式リリースビルド（macOS・Windows・Linux）および `musl` ターゲット付きソースビルド：** 静的リンクされた `x86_64` および `aarch64` `musl` 版 Linux スキャナを同梱しています（Linux は実行ファイル末尾に埋め込み、macOS・Windows は同梱リソース `ruum-scan-linux.pack` に収録）。接続時にサーバーの OS と CPU アーキテクチャを判定し、キャッシュがない・一致しない場合のみ対応ヘルパーを SSH 経由で `~/.cache/ruum/ssh/<sha256>/ruum-scan` へ自動アップロード・検証します（チェックサム検証とアトミック置換、`sudo` 不要・システムパッケージ改変なし・リモート `glibc` 非依存）。手動抽出も可能です：
   ```sh
   ruum extract-scanner x86_64 ./ruum-scan
   ruum extract-scanner aarch64 ./ruum-scan-arm64
   ```
-- **開発ビルド、macOS・Windows デスクトップ版：** リモートサーバーの `PATH` または `~/.local/bin/ruum-scan` に GUI 依存のない軽量バイナリ `ruum-scan` をあらかじめインストールしてください：
+- **開発ビルドおよび `musl` ターゲットなしのソースビルド：** リモートサーバーの `PATH` または `~/.local/bin/ruum-scan`、あるいは既存の `~/.cache/ruum/ssh/*/ruum-scan` キャッシュを自動的に再利用・フォールバックします。サーバー上にまだスキャナがない場合のみ、GUI 依存のない軽量バイナリ `ruum-scan` をインストールしてください：
   ```sh
   # リモートサーバー上のリポジトリ内で実行：
   make install-scan
@@ -327,12 +327,14 @@ ruum ssh dev --check /var/log  # GUI なしでヘルパーを配置してサマ�
 ```sh
 ruum [オプション] [PATH]                # PATH をスキャン（省略時は ~）
 ruum ssh HOST [オプション] [PATH]       # SSH 経由でリモートホストを分析（読み取り専用）
+ruum run-script SCRIPT [--profile ID_OR_ALIAS] [--yes] [--pause]
+                                       # 生成されたクリーンアップスクリプトを確認・実行
 ruum mcp [--read-only]                 # stdio MCP サーバーを起動
 ruum watchdog [--once]                 # ウォッチドッグ常駐監視（または単発チェック）
 ruum update [check] [--channel stable|beta] [--json]
-                                       # 署名済みリリースを確認しアップグレードコマンドを表示
+                                       # アップデートを確認しアップグレードコマンドを表示
 ruum config update get|set [...]       # アップデート設定の確認・変更
-ruum extract-scanner ARCH OUTPUT       # 同梱の静的 Linux スキャナを抽出（x86_64 | aarch64）
+ruum extract-scanner ARCH OUTPUT       # 静的 Linux スキャナを抽出（x86_64 | aarch64；埋め込みまたは ruum-scan-linux.pack）
 ```
 
 | フラグ | 説明 |

@@ -42,7 +42,7 @@
   irm https://ruum-updates.jsonlee12138.com/install.ps1 | iex
   ```
 
-> **앱 내 자동 업데이트 및 CLI 확인:** 데스크톱 앱은 백그라운드에서 서명된 릴리스를 조용히 확인합니다(**설정 › 업데이트**에서 Stable / Beta 채널 전환 및 자동 확인 설정 가능, **다운로드 및 업데이트**를 누르기 전에는 패키지를 미리 내려받지 않습니다). 헤드리스 서버에서는 `ruum update check`로 서명 검증 및 정확한 업그레이드 명령을 확인할 수 있습니다.
+> **앱 내 업데이트 및 CLI 확인:** 데스크톱 앱은 백그라운드에서 새 버전을 자동으로 확인합니다(**설정 › 업데이트**에서 **안정 버전(Stable)** / **베타(Beta)** 채널 전환 및 자동 확인 설정 가능, **다운로드 및 업데이트**를 클릭하기 전까지는 내려받지 않습니다). **설정 › 업데이트**의 **익명 사용 통계 공유** 토글(또는 `ruum config update set --send-client-id false`)로 언제든 통계 전송을 끌 수 있으며 IP 주소나 사용자 경로는 전혀 기록되지 않습니다. 헤드리스 서버에서는 `ruum update check`로 새 버전 정보와 정확한 업그레이드 명령을 확인할 수 있습니다. Linux AppImage는 앱 내 자동 업데이트(Stable / Beta)와 `AppImageUpdate` / `Gear Lever`용 `.AppImage.zsync` 증분 업데이트(안정 버전 `latest` 추적)를 모두 지원합니다.
 
 ### macOS
 
@@ -79,7 +79,7 @@ brew tap JsonLee12138/tap && brew install --cask ruum
   ```
 - **Debian / Ubuntu (`.deb`):** `sudo apt install ./ruum-*-x86_64-linux.deb`
 - **Fedora / RHEL (`.rpm`):** `sudo dnf install ./ruum-*-x86_64-linux.rpm`
-- **AppImage:** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage`
+- **AppImage:** `chmod +x ruum-*-x86_64.AppImage && ./ruum-*-x86_64.AppImage` (앱 내 자동 업데이트를 지원하며, `AppImageUpdate` / `Gear Lever`에서 안정 버전 `latest`를 추적할 수 있도록 `.AppImage.zsync` 파일도 함께 제공됩니다).
 - **포터블 압축 파일(`.tar.gz`):** `ruum-*-x86_64-linux.tar.gz`를 풀고 `./install.sh`를 실행하거나 `ruum`을 `PATH` 경로에 복사합니다.
 
 **Hyprland 플로팅 창 규칙:** Hyprland는 기본적으로 새 창을 타일링하므로 `ruum`(창 클래스 `ruum`)에 넉넉한 플로팅 창 규칙을 지정하는 것을 권장합니다:
@@ -103,17 +103,17 @@ Windows 10 및 11(`x86_64`, `aarch64`)용 파일은 [최신 릴리스 페이지]
 
 소스 빌드에는 **Rust 1.97 이상**이 필요합니다([rustup](https://rustup.rs) 환경에서는 루트의 `rust-toolchain.toml` 버전이 자동 적용됩니다).
 
-- **macOS & Linux**(Linux는 Vulkan 지원 GPU가 있는 Wayland/X11 세션이 필요하며, 내장 정적 SSH 스캐너 빌드를 위해 두 `musl` 타깃을 추가합니다):
+- **macOS & Linux**(Linux는 Vulkan 지원 GPU가 있는 Wayland/X11 세션이 필요하며, macOS와 Linux 모두 아래 두 `musl` 타깃을 설치하면 별도의 C 크로스 컴파일러 없이 `make install` / `make bundle` 시 정적 Linux SSH 스캐너를 함께 내장할 수 있습니다):
   ```sh
-  # Linux 전용 (내장 정적 SSH 도우미 빌드용, 별도 C 크로스 컴파일러 불필요):
+  # macOS & Linux 공통 (정적 Linux SSH 스캐너 내장용, 별도 C 크로스 컴파일러 불필요):
   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
   git clone https://github.com/JsonLee12138/Ruum.git
   cd Ruum
   make install
   ```
-  - **Linux:** `make install`은 `~/.local/bin/ruum`, 데스크톱 항목(기본 파일 관리자를 바꾸지 않고 디렉터리의 **다른 프로그램으로 열기** 항목 추가), `ruum.svg` 아이콘을 설치합니다. 시스템 전역 설치는 `sudo make install PREFIX=/usr/local`, 제거는 `make uninstall`을 사용하세요.
-  - **macOS:** `make install`은 `~/Applications/ruum.app`을 빌드·설치하고 `~/.local/bin/ruum`에 심볼릭 링크를 만듭니다(Xcode 또는 Command Line Tools 필요).
+  - **Linux:** `make install`은 정적 스캐너가 내장된 `~/.local/bin/ruum`, `~/.local/bin/ruum-gui`, 데스크톱 항목(기본 파일 관리자를 바꾸지 않고 디렉터리의 **다른 프로그램으로 열기** 항목 추가), `ruum.svg` 아이콘을 설치합니다. 시스템 전역 설치는 `sudo make install PREFIX=/usr/local`, 제거는 `make uninstall`을 사용하세요.
+  - **macOS:** `make install`은 `~/Applications/ruum.app`을 빌드·설치하고(`musl` 타깃이 있으면 `Contents/Resources/ruum-scan-linux.pack` 포함), `~/.local/bin/ruum`에 심볼릭 링크를 만듭니다(Xcode 또는 Command Line Tools 필요). macOS에서 `musl` 타깃을 생략하면 `make install`이 경고를 출력한 뒤 정상 완료되며, 원격 SSH 연결 시 원격 캐시 또는 서버에 설치된 `ruum-scan`으로 폴백합니다.
   - `PATH` 앞부분의 구버전이 `~/.local/bin/ruum`을 가리는 경우 셸 설정에 `export PATH="$HOME/.local/bin:$PATH"`를 추가하세요.
 - **Windows**(C++ 워크로드가 포함된 MSVC 도구 모음 / Visual Studio Build Tools 필요):
   ```powershell
@@ -136,7 +136,7 @@ gh attestation verify <다운로드한-파일> --repo JsonLee12138/Ruum
 1. **설정**을 엽니다(macOS는 `⌘,`, Linux/Windows는 `Ctrl+,`, 또는 왼쪽 아이콘 레일의 톱니바퀴 아이콘 클릭).
 2. **명령줄 도구** 항목에서 **CLI 명령 설치**를 클릭합니다(macOS 상단 메뉴 바의 **ruum › CLI 명령 설치…**에서도 실행 가능).
 
-실행하면 macOS는 `/usr/local/bin/ruum`, Linux는 `~/.local/bin/ruum`에 연결하고, Windows는 `ruum.exe`를 `%LOCALAPPDATA%\Programs\ruum\bin`에 복사한 뒤 사용자 `Path`에 등록하여 어떤 터미널이나 AI 에이전트에서도 `ruum`, `ruum ssh`, `ruum watchdog`, `ruum mcp`를 바로 사용할 수 있게 됩니다.
+실행하면 macOS는 `/usr/local/bin/ruum`, Linux는 `~/.local/bin/ruum`에 연결하고, Windows는 `ruum.exe`(및 같은 폴더의 `ruum-gui.exe`)를 `%LOCALAPPDATA%\Programs\ruum\bin`에 복사한 뒤 사용자 `Path`에 등록하여 어떤 터미널이나 AI 에이전트에서도 `ruum`, `ruum ssh`, `ruum watchdog`, `ruum mcp`를 바로 사용할 수 있게 됩니다. 이후 Windows 앱을 인앱 업데이트할 때도 `%LOCALAPPDATA%\Programs\ruum\bin` 안의 `ruum.exe`, `ruum-gui.exe`, `ruum-scan-linux.pack`이 자동으로 함께 동기화됩니다.
 
 ---
 
@@ -205,12 +205,12 @@ ruum ssh dev --check /var/log  # GUI 창 없이 CLI 요약만 출력
 
 ### 원격 스캐너 배포 방식
 
-- **Linux 패키지 빌드(`make build` / `cargo xtask portable`):** 실행 파일 내부에 정적 링크된 `x86_64` 및 `aarch64` `musl` Linux 스캐너를 내장하고 있습니다. 연결 시 원격 OS와 CPU 아키텍처를 확인해 캐시가 없거나 다를 때만 해당 도우미를 원격 `~/.cache/ruum/ssh/<sha256>/`에 업로드합니다(체크섬 검증 및 원자적 교체, `sudo` 불필요, 시스템 패키지 변경 없음, 원격 `glibc` 무의존). 수동 추출도 가능합니다:
+- **공식 릴리스 빌드(macOS, Windows, Linux) 및 `musl` 타깃 포함 소스 빌드:** 정적 링크된 `x86_64` 및 `aarch64` `musl` Linux 스캐너를 내장하고 있습니다(Linux는 실행 파일 끝에 추가되며, macOS와 Windows는 번들 리소스 `ruum-scan-linux.pack`으로 제공). 연결 시 원격 OS와 CPU 아키텍처를 확인해 캐시가 없거나 다를 때만 해당 도우미를 SSH로 원격 `~/.cache/ruum/ssh/<sha256>/ruum-scan`에 자동 업로드하고 검증합니다(체크섬 검증 및 원자적 교체, `sudo` 불필요, 시스템 패키지 변경 없음, 원격 `glibc` 무의존). 수동 추출도 가능합니다:
   ```sh
   ruum extract-scanner x86_64 ./ruum-scan
   ruum extract-scanner aarch64 ./ruum-scan-arm64
   ```
-- **개발 빌드, macOS 및 Windows 데스크톱 빌드:** 먼저 원격 서버의 `PATH` 또는 `~/.local/bin/ruum-scan`에 GUI 의존성이 없는 경량 헤드리스 도우미 `ruum-scan`을 설치하세요:
+- **개발 빌드 및 `musl` 타깃이 없는 소스 빌드:** 원격 서버의 `PATH` 또는 `~/.local/bin/ruum-scan`으로 폴백하거나 원격에 이미 저장된 `~/.cache/ruum/ssh/*/ruum-scan` 캐시를 자동으로 재사용합니다. 서버에 아직 스캐너가 없다면 GUI 의존성이 없는 경량 헤드리스 도우미 `ruum-scan`을 설치하세요:
   ```sh
   # 원격 서버의 체크아웃 디렉터리에서 실행:
   make install-scan
@@ -327,12 +327,14 @@ ruum ssh dev --check /var/log  # GUI 창 없이 CLI 요약만 출력
 ```sh
 ruum [옵션] [PATH]                     # PATH 스캔(생략 시 ~ 기본값)
 ruum ssh HOST [옵션] [PATH]            # SSH로 원격 호스트 분석(읽기 전용)
+ruum run-script SCRIPT [--profile ID_OR_ALIAS] [--yes] [--pause]
+                                       # 생성된 정리 스크립트 검토 및 실행
 ruum mcp [--read-only]                 # stdio MCP 서버 실행
 ruum watchdog [--once]                 # 디스크 워치독 데몬(또는 1회 점검) 실행
 ruum update [check] [--channel stable|beta] [--json]
-                                       # 서명된 릴리스 확인 및 업그레이드 명령 출력
+                                       # 업데이트 확인 및 업그레이드 명령 출력
 ruum config update get|set [...]       # 업데이트 설정 조회 및 변경
-ruum extract-scanner ARCH OUTPUT       # 내장 Linux 정적 스캐너 추출(x86_64 | aarch64)
+ruum extract-scanner ARCH OUTPUT       # 정적 Linux 스캐너 추출(x86_64 | aarch64; 내장 또는 ruum-scan-linux.pack)
 ```
 
 | 플래그 | 설명 |

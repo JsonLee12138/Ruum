@@ -2,6 +2,16 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.3-beta.3] - 2026-11-20
+
+### Fixes
+
+- **core,updater:** Normalize AppImage `LD_LIBRARY_PATH` and `$APPDIR/usr/lib` matching with pure `/` POSIX semantics instead of host `Path::join`, fixing Windows unit test failures and ensuring cross-host separator consistency.
+
+### Tooling
+
+- **xtask,ci:** Add `cargo xtask cross-lint` (`cargo-xwin` Windows MSVC cross-clippy over the full workspace) and `cargo xtask release-tag` (enforcing clean tree, `--locked`, lint, optional cross-lint, and passing GitHub Actions `CI` before tagging/pushing).
+
 ## [0.2.3-beta.2] - 2026-11-20
 
 ### Fixes

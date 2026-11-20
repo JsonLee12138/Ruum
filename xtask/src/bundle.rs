@@ -22,7 +22,9 @@ const BUNDLE_ID: &str = "io.github.tobi.ruum";
 /// What the binary is built for at least; `LSMinimumSystemVersion` in
 /// `packaging/macos/Info.plist.in` says the same, and GPUI needs 10.15.7.
 const DEPLOYMENT_TARGET: &str = "11.0";
-const HDIUTIL_BACKOFFS_MS: [u64; 5] = [500, 1000, 2000, 4000, 8000];
+/// Backoff schedule (6 retries, 31s total) for `hdiutil create/verify` against
+/// transient `diskimages-help` / `diskimagesiod` lock contention on `macos-15`.
+const HDIUTIL_BACKOFFS_MS: [u64; 6] = [1000, 2000, 4000, 8000, 8000, 8000];
 
 const DISTRIBUTION_TEMPLATE: &str =
     include_str!("../../packaging/macos/Distribution.xml.in");
@@ -822,7 +824,7 @@ mod tests {
         );
         assert!(third_ok.is_ok());
         assert_eq!(attempts, 3);
-        assert_eq!(sleeps, vec![500, 1000]);
+        assert_eq!(sleeps, vec![1000, 2000]);
 
         sleeps.clear();
         attempts = 0;
@@ -840,7 +842,7 @@ mod tests {
         );
         assert_eq!(
             exhausted.expect_err("exhausted retries must fail"),
-            "persistent error #6"
+            "persistent error #7"
         );
         assert_eq!(attempts, HDIUTIL_BACKOFFS_MS.len() + 1);
         assert_eq!(sleeps, HDIUTIL_BACKOFFS_MS);

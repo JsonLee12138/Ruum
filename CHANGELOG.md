@@ -2,6 +2,19 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.3-beta.2] - 2026-11-20
+
+### Fixes
+
+- **core,remote:** Fall back to cached `~/.cache/ruum/ssh/*/ruum-scan` helpers when local builds omit the embedded Linux scanner pack, surface clearer missing-scanner diagnostics, and sync `ruum-scan-linux.pack` alongside Windows CLI updates.
+- **core,worker,app:** Treat empty release channels (`204 No Content` / `manifest not found`) as up to date instead of an error, and translate update errors into localized user-friendly messages across `en`/`zh`/`ja`/`ko`.
+- **app:** Simplify **Settings › Updates** copy by removing internal protocol/crypto jargon and the technical privacy note card.
+
+### Packaging & Docs
+
+- **release:** Embed `gh-releases-zsync` update metadata in Linux AppImages (`appimagetool -u`) and publish `.AppImage.zsync` alongside `.AppImage` while keeping built-in in-app updates intact (with clean relaunch env handling).
+- **docs:** Sync `README` guides (`en`/`zh`/`ja`/`ko`) and `infra/update-worker/README.md` for tri-platform scanner packs, AppImage `zsync`, and empty-channel behavior.
+
 ## [0.2.3-beta.1] - 2026-11-20
 
 ### Features

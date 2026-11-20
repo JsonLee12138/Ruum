@@ -209,6 +209,8 @@ pub struct UpdateEnv {
     pub arch: Option<UpdateArch>,
     pub exe_path: PathBuf,
     pub appimage_env: Option<PathBuf>,
+    pub appdir_env: Option<PathBuf>,
+    pub ld_library_path: Option<String>,
     pub inno_installed: Option<bool>,
     pub msi_installed: Option<bool>,
     pub is_cli_binary: bool,
@@ -251,6 +253,10 @@ impl UpdateEnv {
             arch: Some(UpdateArch::current()),
             exe_path,
             appimage_env: non_empty_path_env("APPIMAGE"),
+            appdir_env: non_empty_path_env("APPDIR"),
+            ld_library_path: std::env::var("LD_LIBRARY_PATH")
+                .ok()
+                .filter(|s| !s.is_empty()),
             inno_installed: None,
             msi_installed: None,
             is_cli_binary,
@@ -308,6 +314,7 @@ trait DetachedSpawner: Send + Sync {
         program: &Path,
         args: &[&str],
         envs: &[(&str, &str)],
+        remove_envs: &[&str],
         hide_window: bool,
     ) -> io::Result<()>;
 }
@@ -320,6 +327,7 @@ impl DetachedSpawner for DefaultDetachedSpawner {
         program: &Path,
         args: &[&str],
         envs: &[(&str, &str)],
+        remove_envs: &[&str],
         hide_window: bool,
     ) -> io::Result<()> {
         let mut cmd = Command::new(program);
@@ -327,6 +335,9 @@ impl DetachedSpawner for DefaultDetachedSpawner {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        for key in remove_envs {
+            cmd.env_remove(key);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -572,6 +583,7 @@ impl MacOsUpdateAdapter {
                 Path::new("open"),
                 &["-n", app_str.as_ref()],
                 &[],
+                &[],
                 false,
             )
             .is_ok();
@@ -741,8 +753,19 @@ impl LinuxUpdateAdapter {
                     );
                 }
 
+                let (relaunch_envs, remove_envs) = appimage_relaunch_env(env);
+                let env_refs: Vec<(&str, &str)> = relaunch_envs
+                    .iter()
+                    .map(|(k, v)| (*k, v.as_str()))
+                    .collect();
                 let spawned_relaunch = spawner
-                    .spawn_detached(appimage_path, &[], &[], false)
+                    .spawn_detached(
+                        appimage_path,
+                        &[],
+                        &env_refs,
+                        &remove_envs,
+                        false,
+                    )
                     .is_ok();
                 Ok(ApplyOutcome::RestartRequired {
                     message: format!(
@@ -870,7 +893,7 @@ impl LinuxUpdateAdapter {
                     env.exe_path.clone()
                 };
                 let spawned_relaunch = spawner
-                    .spawn_detached(&relaunch_target, &[], &[], false)
+                    .spawn_detached(&relaunch_target, &[], &[], &[], false)
                     .is_ok();
 
                 Ok(ApplyOutcome::RestartRequired {
@@ -892,6 +915,49 @@ impl LinuxUpdateAdapter {
             }
         }
     }
+}
+
+fn strip_appdir_ld_library_path(raw: &str, appdir: &Path) -> Option<String> {
+    let stale_dir = appdir.join("usr/lib");
+    let stale_norm = stale_dir.to_string_lossy();
+    let stale_trimmed = stale_norm.trim_end_matches('/');
+    let kept: Vec<&str> = raw
+        .split(':')
+        .filter(|entry| {
+            !entry.is_empty() && entry.trim_end_matches('/') != stale_trimmed
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(":"))
+    }
+}
+
+fn appimage_relaunch_env(
+    env: &UpdateEnv,
+) -> (Vec<(&'static str, String)>, Vec<&'static str>) {
+    let mut set_envs = Vec::new();
+    let mut remove_envs = vec!["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
+    if let (Some(appdir), Some(raw_ld)) =
+        (env.appdir_env.as_deref(), env.ld_library_path.as_deref())
+    {
+        let stale_dir = appdir.join("usr/lib");
+        let stale_norm = stale_dir.to_string_lossy();
+        let stale_trimmed = stale_norm.trim_end_matches('/');
+        let has_stale = raw_ld
+            .split(':')
+            .any(|entry| entry.trim_end_matches('/') == stale_trimmed);
+        if has_stale {
+            match strip_appdir_ld_library_path(raw_ld, appdir) {
+                Some(cleaned) => {
+                    set_envs.push(("LD_LIBRARY_PATH", cleaned));
+                }
+                None => remove_envs.push("LD_LIBRARY_PATH"),
+            }
+        }
+    }
+    (set_envs, remove_envs)
 }
 
 impl UpdateAdapter for LinuxUpdateAdapter {
@@ -1112,6 +1178,7 @@ impl WindowsUpdateAdapter {
                     downloaded_file,
                     &["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
                     &[],
+                    &[],
                     false,
                 ) {
                     if was_running {
@@ -1172,6 +1239,7 @@ impl WindowsUpdateAdapter {
                         ("RUUM_MSI_PATH", msi_str.as_ref()),
                         ("RUUM_GUI_EXE", gui_str.as_ref()),
                     ],
+                    &[],
                     true,
                 ) {
                     if was_running {
@@ -1339,7 +1407,7 @@ pub struct UpdateCheckResult {
     pub update_available: bool,
     pub channel: UpdateChannel,
     pub install_kind: InstallKind,
-    pub manifest: Manifest,
+    pub manifest: Option<Manifest>,
     pub selected_asset_key: Option<String>,
     pub selected_asset: Option<ManifestAsset>,
     pub upgrade_command: String,
@@ -1649,8 +1717,21 @@ fn build_http_agent(timeout_secs: u64) -> ureq::Agent {
 
 enum WorkerFetchResult {
     Verified(Manifest),
+    NoRelease,
     FallbackEligible(io::Error),
     Fatal(io::Error),
+}
+
+#[derive(Deserialize)]
+struct WorkerErrorBody {
+    error: Option<String>,
+}
+
+fn is_no_release_404_body(body: &[u8]) -> bool {
+    serde_json::from_slice::<WorkerErrorBody>(body)
+        .ok()
+        .and_then(|parsed| parsed.error)
+        .is_some_and(|err| err.trim() == "manifest not found")
 }
 
 fn fetch_worker_manifest(
@@ -1678,9 +1759,26 @@ fn fetch_worker_manifest(
         request = request.header("X-Ruum-Client-Id", cid);
     }
 
-    match request.call() {
+    match request.config().http_status_as_error(false).build().call() {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            if status == 204 {
+                return WorkerFetchResult::NoRelease;
+            }
+            if status == 404 {
+                let body_bytes = resp
+                    .into_body()
+                    .with_config()
+                    .limit(16 * 1024)
+                    .read_to_vec()
+                    .unwrap_or_default();
+                if is_no_release_404_body(&body_bytes) {
+                    return WorkerFetchResult::NoRelease;
+                }
+                return WorkerFetchResult::Fatal(io::Error::other(
+                    "worker returned HTTP 404",
+                ));
+            }
             if (500..=599).contains(&status) {
                 return WorkerFetchResult::FallbackEligible(io::Error::other(
                     format!("worker returned HTTP {status}"),
@@ -1811,8 +1909,38 @@ pub fn check_for_updates(
     req: &UpdateCheckRequest<'_>,
 ) -> io::Result<UpdateCheckResult> {
     let agent = build_http_agent(REQUEST_TIMEOUT_SECS);
+    let env_for_cmd = UpdateEnv {
+        os: Some(req.os),
+        arch: Some(req.arch),
+        ..UpdateEnv::current()
+    };
+    let adapter = UpdateFactory::create_for(req.os);
+    let can_self_update =
+        adapter.can_self_update(&env_for_cmd, req.install_kind);
+
     let (manifest, used_fallback) = match fetch_worker_manifest(&agent, req) {
         WorkerFetchResult::Verified(m) => (m, false),
+        WorkerFetchResult::NoRelease => {
+            let upgrade_command = adapter.recommended_upgrade_command(
+                &env_for_cmd,
+                req.install_kind,
+                req.base_url,
+                None,
+            );
+            return Ok(UpdateCheckResult {
+                current_version: req.current_version.to_owned(),
+                latest_version: req.current_version.to_owned(),
+                update_available: false,
+                channel: req.channel,
+                install_kind: req.install_kind,
+                manifest: None,
+                selected_asset_key: None,
+                selected_asset: None,
+                upgrade_command,
+                can_self_update,
+                used_fallback: false,
+            });
+        }
         WorkerFetchResult::Fatal(e) => return Err(e),
         WorkerFetchResult::FallbackEligible(primary_err) => {
             if req.channel != UpdateChannel::Stable {
@@ -1835,14 +1963,6 @@ pub fn check_for_updates(
         .as_ref()
         .and_then(|k| manifest.assets.get(k))
         .cloned();
-    let env_for_cmd = UpdateEnv {
-        os: Some(req.os),
-        arch: Some(req.arch),
-        ..UpdateEnv::current()
-    };
-    let adapter = UpdateFactory::create_for(req.os);
-    let can_self_update =
-        adapter.can_self_update(&env_for_cmd, req.install_kind);
     let upgrade_command = adapter.recommended_upgrade_command(
         &env_for_cmd,
         req.install_kind,
@@ -1856,7 +1976,7 @@ pub fn check_for_updates(
         update_available,
         channel: req.channel,
         install_kind: req.install_kind,
-        manifest,
+        manifest: Some(manifest),
         selected_asset_key,
         selected_asset,
         upgrade_command,
@@ -2378,6 +2498,14 @@ pub fn sync_windows_cli_with(
         {
             let _ = atomic_install_file(&src_gui, &dst_gui, false);
         }
+        let src_pack = src_dir.join(crate::payload::PACK_FILE_NAME);
+        let dst_pack = bin_dir.join(crate::payload::PACK_FILE_NAME);
+        if src_pack.is_file()
+            && (!dst_pack.is_file()
+                || sha256_file(&src_pack).ok() != sha256_file(&dst_pack).ok())
+        {
+            let _ = atomic_install_file(&src_pack, &dst_pack, false);
+        }
     }
 
     if was_running {
@@ -2803,7 +2931,14 @@ mod tests {
         }
     }
 
-    type SpawnCall = (PathBuf, Vec<String>, Vec<(String, String)>, bool);
+    #[derive(Clone, Debug)]
+    struct SpawnCall {
+        program: PathBuf,
+        args: Vec<String>,
+        envs: Vec<(String, String)>,
+        remove_envs: Vec<String>,
+        hide_window: bool,
+    }
     type ScriptedHttpResponse = (String, Vec<(String, String)>, Vec<u8>);
 
     #[derive(Default)]
@@ -2824,16 +2959,22 @@ mod tests {
             program: &Path,
             args: &[&str],
             envs: &[(&str, &str)],
+            remove_envs: &[&str],
             hide_window: bool,
         ) -> io::Result<()> {
-            self.calls.lock().unwrap().push((
-                program.to_path_buf(),
-                args.iter().map(|s| (*s).to_string()).collect(),
-                envs.iter()
+            self.calls.lock().unwrap().push(SpawnCall {
+                program: program.to_path_buf(),
+                args: args.iter().map(|s| (*s).to_string()).collect(),
+                envs: envs
+                    .iter()
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                     .collect(),
+                remove_envs: remove_envs
+                    .iter()
+                    .map(|k| (*k).to_string())
+                    .collect(),
                 hide_window,
-            ));
+            });
             if self.fail_spawn {
                 return Err(io::Error::other("mock spawn failed"));
             }
@@ -3298,6 +3439,7 @@ mod tests {
                 .contains("x-ruum-client-id: cid-xyz")
         );
         assert!(res.update_available);
+        assert!(res.manifest.is_some());
         assert_eq!(res.latest_version, "0.3.0");
         assert!(!res.used_fallback);
         assert_eq!(
@@ -3352,8 +3494,120 @@ mod tests {
             gh_reqs[1].contains("/releases/latest/download/manifest.json.sig")
         );
         assert!(fb_res.used_fallback);
+        assert!(fb_res.manifest.is_some());
         assert!(fb_res.update_available);
         assert!(fb_res.upgrade_command.contains("--cli-only"));
+    }
+
+    #[test]
+    fn check_for_updates_treats_204_and_legacy_404_as_no_release() {
+        let (_sk, pk_b64) = test_keypair();
+
+        // 1. 204 No Content -> Ok(up-to-date, manifest = None) for both channels.
+        let (p204, srv204) = spawn_scripted_http(vec![
+            ("204 No Content".to_owned(), vec![], Vec::new()),
+            (
+                "404 Not Found".to_owned(),
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/json".to_owned(),
+                )],
+                br#"{"error":"manifest not found"}"#.to_vec(),
+            ),
+            (
+                "404 Not Found".to_owned(),
+                vec![("Content-Type".to_owned(), "text/html".to_owned())],
+                b"<html>Not Found</html>".to_vec(),
+            ),
+            (
+                "502 Bad Gateway".to_owned(),
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/json".to_owned(),
+                )],
+                br#"{"error":"incomplete manifest publication"}"#.to_vec(),
+            ),
+        ]);
+        let base = format!("http://127.0.0.1:{p204}");
+
+        let res_204 = check_for_updates(&UpdateCheckRequest {
+            channel: UpdateChannel::Stable,
+            current_version: "0.2.2",
+            os: UpdateOs::MacOs,
+            arch: UpdateArch::Aarch64,
+            install_kind: InstallKind::MacAppBundle,
+            lang: "en",
+            entry: "gui",
+            client_id: None,
+            base_url: &base,
+            public_key_b64: &pk_b64,
+            github_repo: DEFAULT_GITHUB_REPO,
+            github_fallback_base: None,
+        })
+        .unwrap();
+        assert!(!res_204.update_available);
+        assert_eq!(res_204.latest_version, "0.2.2");
+        assert!(res_204.manifest.is_none());
+        assert!(res_204.selected_asset.is_none());
+        assert!(res_204.selected_asset_key.is_none());
+        assert!(!res_204.used_fallback);
+
+        // 2. Legacy Worker 404 {"error":"manifest not found"} -> NoRelease.
+        let res_legacy_404 = check_for_updates(&UpdateCheckRequest {
+            channel: UpdateChannel::Beta,
+            current_version: "0.2.2",
+            os: UpdateOs::Linux,
+            arch: UpdateArch::X86_64,
+            install_kind: InstallKind::LinuxAppImage,
+            lang: "en",
+            entry: "cli",
+            client_id: None,
+            base_url: &base,
+            public_key_b64: &pk_b64,
+            github_repo: DEFAULT_GITHUB_REPO,
+            github_fallback_base: None,
+        })
+        .unwrap();
+        assert!(!res_legacy_404.update_available);
+        assert!(res_legacy_404.manifest.is_none());
+
+        // 3. Genuine HTML 404 (wrong URL / reverse proxy) must still error.
+        let err_404 = check_for_updates(&UpdateCheckRequest {
+            channel: UpdateChannel::Stable,
+            current_version: "0.2.2",
+            os: UpdateOs::Linux,
+            arch: UpdateArch::X86_64,
+            install_kind: InstallKind::CliStandalone,
+            lang: "en",
+            entry: "cli",
+            client_id: None,
+            base_url: &base,
+            public_key_b64: &pk_b64,
+            github_repo: DEFAULT_GITHUB_REPO,
+            github_fallback_base: None,
+        })
+        .unwrap_err();
+        assert!(err_404.to_string().contains("404"), "{err_404}");
+
+        // 4. Incomplete publication 502 on beta fails instead of faking up-to-date.
+        let err_502 = check_for_updates(&UpdateCheckRequest {
+            channel: UpdateChannel::Beta,
+            current_version: "0.2.2",
+            os: UpdateOs::Linux,
+            arch: UpdateArch::X86_64,
+            install_kind: InstallKind::CliStandalone,
+            lang: "en",
+            entry: "cli",
+            client_id: None,
+            base_url: &base,
+            public_key_b64: &pk_b64,
+            github_repo: DEFAULT_GITHUB_REPO,
+            github_fallback_base: None,
+        })
+        .unwrap_err();
+        assert!(err_502.to_string().contains("502"), "{err_502}");
+
+        srv204.join().unwrap();
     }
 
     #[test]
@@ -3511,7 +3765,7 @@ mod tests {
             b"new-gui"
         );
         assert!(!tmp.path().join("Applications/ruum.app.bak").exists());
-        assert_eq!(spawner.calls()[0].0, PathBuf::from("open"));
+        assert_eq!(spawner.calls()[0].program, PathBuf::from("open"));
 
         let wd_calls = runner.calls();
         let unload_idx = wd_calls
@@ -3594,7 +3848,17 @@ mod tests {
         fs::create_dir_all(&cli_bin_dir).unwrap();
         fs::write(app_dir.join("ruum.exe"), b"new-cli-bytes").unwrap();
         fs::write(app_dir.join("ruum-gui.exe"), b"new-gui-bytes").unwrap();
+        fs::write(
+            app_dir.join(crate::payload::PACK_FILE_NAME),
+            b"new-pack-bytes",
+        )
+        .unwrap();
         fs::write(cli_bin_dir.join("ruum.exe"), b"old-cli-bytes").unwrap();
+        fs::write(
+            cli_bin_dir.join(crate::payload::PACK_FILE_NAME),
+            b"old-pack-bytes",
+        )
+        .unwrap();
 
         let pid_path = tmp.path().join("watchdog.pid");
         fs::write(&pid_path, "4242\n").unwrap();
@@ -3636,6 +3900,10 @@ mod tests {
         assert_eq!(
             fs::read(cli_bin_dir.join("ruum-gui.exe")).unwrap(),
             b"new-gui-bytes"
+        );
+        assert_eq!(
+            fs::read(cli_bin_dir.join(crate::payload::PACK_FILE_NAME)).unwrap(),
+            b"new-pack-bytes"
         );
         let calls = runner.calls();
         assert!(calls.iter().any(|c| c.0 == Path::new("taskkill")));
@@ -3679,15 +3947,15 @@ mod tests {
         assert!(matches!(msi_res, ApplyOutcome::InstallerLaunched { .. }));
 
         let spawned = spawner.calls();
-        assert_eq!(spawned[0].0, setup_exe);
+        assert_eq!(spawned[0].program, setup_exe);
         assert_eq!(
-            spawned[0].1,
+            spawned[0].args,
             vec!["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]
         );
-        assert_eq!(spawned[1].0, PathBuf::from("powershell.exe"));
-        assert!(spawned[1].3); // CREATE_NO_WINDOW hidden waiter
-        assert!(spawned[1].2.iter().any(|(k, _)| k == "RUUM_OLD_PID"));
-        assert!(spawned[1].2.iter().any(|(k, _)| k == "RUUM_MSI_PATH"));
+        assert_eq!(spawned[1].program, PathBuf::from("powershell.exe"));
+        assert!(spawned[1].hide_window); // CREATE_NO_WINDOW hidden waiter
+        assert!(spawned[1].envs.iter().any(|(k, _)| k == "RUUM_OLD_PID"));
+        assert!(spawned[1].envs.iter().any(|(k, _)| k == "RUUM_MSI_PATH"));
 
         // Inno spawn failure restarts watchdog if it was stopped.
         let appdata_dir = tmp.path().join("localappdata");
@@ -3752,6 +4020,10 @@ mod tests {
             os: Some(UpdateOs::Linux),
             exe_path: PathBuf::from("/tmp/.mount_abc/usr/bin/ruum-gui"),
             appimage_env: Some(appimage_dst.clone()),
+            appdir_env: Some(PathBuf::from("/tmp/.mount_abc")),
+            ld_library_path: Some(
+                "/tmp/.mount_abc/usr/lib:/opt/custom/lib".to_owned(),
+            ),
             home: Some(linux_home.clone()),
             writable_override: Some(true),
             ..UpdateEnv::default()
@@ -3770,7 +4042,44 @@ mod tests {
             .unwrap();
         assert!(matches!(res, ApplyOutcome::RestartRequired { .. }));
         assert_eq!(fs::read(&appimage_dst).unwrap(), b"new-appimage");
-        assert_eq!(spawner.calls()[0].0, appimage_dst);
+        let ai_spawn = &spawner.calls()[0];
+        assert_eq!(ai_spawn.program, appimage_dst);
+        for var in ["APPDIR", "APPIMAGE", "ARGV0", "OWD"] {
+            assert!(
+                ai_spawn.remove_envs.iter().any(|k| k == var),
+                "missing remove_env {var}"
+            );
+        }
+        assert_eq!(
+            ai_spawn.envs,
+            vec![("LD_LIBRARY_PATH".to_owned(), "/opt/custom/lib".to_owned())]
+        );
+
+        // When LD_LIBRARY_PATH only held $APPDIR/usr/lib, remove it outright.
+        fs::write(&appimage_dl, b"new-appimage-2").unwrap();
+        let solo_ld_env = UpdateEnv {
+            ld_library_path: Some("/tmp/.mount_abc/usr/lib".to_owned()),
+            ..appimage_env
+        };
+        let solo_spawner = MockSpawner::default();
+        adapter
+            .apply_with_spawner(
+                &solo_ld_env,
+                InstallKind::LinuxAppImage,
+                &appimage_dl,
+                &manifest,
+                &MockRunner::default(),
+                &solo_spawner,
+            )
+            .unwrap();
+        let solo_spawn = &solo_spawner.calls()[0];
+        assert!(
+            solo_spawn
+                .remove_envs
+                .iter()
+                .any(|k| k == "LD_LIBRARY_PATH")
+        );
+        assert!(solo_spawn.envs.is_empty());
 
         let ai_calls = appimage_runner.calls();
         let ai_stop = ai_calls

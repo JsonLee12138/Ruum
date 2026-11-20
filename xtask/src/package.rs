@@ -1602,9 +1602,18 @@ mod tests {
         assert!(workflow.contains("bundle-appdir-libs.sh"));
         assert!(workflow.contains("appstreamcli validate-tree"));
         assert!(workflow.contains("xvfb-run"));
+        assert!(workflow.contains("zsync"));
+        assert!(workflow.contains("gh-releases-zsync|"));
+        assert!(workflow.contains("-u \"$update_info\""));
+        assert!(workflow.contains(".AppImage.zsync"));
+        assert!(workflow.contains("readelf -p .upd_info"));
         assert!(workflow.contains(
             "dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}.AppImage"
         ));
+        assert!(workflow.contains(concat!(
+            "dist/ruum-${{ needs.validate.outputs.version }}-",
+            "${{ matrix.arch }}.AppImage.zsync",
+        )));
         assert!(!workflow.contains("-linux.AppImage"));
 
         let readme = include_str!("../../README.md");

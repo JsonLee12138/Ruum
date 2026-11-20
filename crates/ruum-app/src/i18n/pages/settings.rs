@@ -598,11 +598,20 @@ pub const fn updates_title(locale: Locale) -> &'static str {
 pub const fn updates_desc(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Check for signed releases, switch channels, and manage update \
+        "Check for new versions, choose an update channel, and manage update \
          preferences.",
-        "\u{68c0}\u{67e5}\u{7b7e}\u{540d}\u{53d1}\u{5e03}\u{7248}\u{672c}\u{3001}\u{5207}\u{6362}\u{66f4}\u{65b0}\u{901a}\u{9053}\u{5e76}\u{7ba1}\u{7406}\u{66f4}\u{65b0}\u{504f}\u{597d}\u{8bbe}\u{7f6e}\u{3002}",
-        "\u{7f72}\u{540d}\u{6e08}\u{307f}\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{306e}\u{78ba}\u{8a8d}\u{3001}\u{30c1}\u{30e3}\u{30f3}\u{30cd}\u{30eb}\u{5207}\u{308a}\u{66ff}\u{3048}\u{3001}\u{66f4}\u{65b0}\u{8a2d}\u{5b9a}\u{3092}\u{7ba1}\u{7406}\u{3057}\u{307e}\u{3059}\u{3002}",
-        "\u{c11c}\u{ba85}\u{b41c} \u{b9b4}\u{b9ac}\u{c2a4} \u{d655}\u{c778}, \u{cc44}\u{b110} \u{c804}\u{d658} \u{bc0f} \u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{ae30}\u{bcf8} \u{c124}\u{c815}\u{c744} \u{ad00}\u{b9ac}\u{d569}\u{b2c8}\u{b2e4}.",
+        "\u{68c0}\u{67e5}\u{65b0}\u{7248}\u{672c}\u{3001}\u{5207}\u{6362}\
+         \u{66f4}\u{65b0}\u{901a}\u{9053}\u{5e76}\u{7ba1}\u{7406}\u{66f4}\
+         \u{65b0}\u{504f}\u{597d}\u{8bbe}\u{7f6e}\u{3002}",
+        "\u{65b0}\u{3057}\u{3044}\u{30d0}\u{30fc}\u{30b8}\u{30e7}\u{30f3}\
+         \u{306e}\u{78ba}\u{8a8d}\u{3001}\u{30c1}\u{30e3}\u{30f3}\u{30cd}\
+         \u{30eb}\u{5207}\u{308a}\u{66ff}\u{3048}\u{3001}\u{66f4}\u{65b0}\
+         \u{8a2d}\u{5b9a}\u{3092}\u{7ba1}\u{7406}\u{3057}\u{307e}\u{3059}\
+         \u{3002}",
+        "\u{c0c8} \u{bc84}\u{c804} \u{d655}\u{c778}, \u{cc44}\u{b110} \
+         \u{c804}\u{d658} \u{bc0f} \u{c5c5}\u{b370}\u{c774}\u{d2b8} \
+         \u{ae30}\u{bcf8} \u{c124}\u{c815}\u{c744} \u{ad00}\u{b9ac}\u{d569}\
+         \u{b2c8}\u{b2e4}.",
     )
 }
 
@@ -619,10 +628,10 @@ pub const fn updates_current_version_label(locale: Locale) -> &'static str {
 pub const fn updates_install_kind_label(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Install Form:",
-        "\u{5b89}\u{88c5}\u{5f62}\u{6001}\u{ff1a}",
-        "\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}\u{5f62}\u{614b}:",
-        "\u{c124}\u{ce58} \u{d615}\u{d0dc}:",
+        "Installation:",
+        "\u{5b89}\u{88c5}\u{65b9}\u{5f0f}\u{ff1a}",
+        "\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}\u{5f62}\u{5f0f}:",
+        "\u{c124}\u{ce58} \u{bc29}\u{c2dd}:",
     )
 }
 
@@ -792,22 +801,11 @@ pub const fn updates_channel_beta(locale: Locale) -> &'static str {
 pub const fn updates_send_client_id(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Include anonymous install ID",
-        "\u{5305}\u{542b}\u{533f}\u{540d}\u{5b89}\u{88c5} ID",
-        "\u{533f}\u{540d}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb} ID \u{3092}\u{542b}\u{3081}\u{308b}",
-        "\u{c775}\u{ba85} \u{c124}\u{ce58} ID \u{d3ec}\u{d568}",
-    )
-}
-
-pub const fn updates_privacy_note(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Sends only channel, OS, arch, package form, version, language, and \
-         an optional random UUIDv4. No IP addresses, user paths, or file data \
-         are logged.",
-        "\u{4ec5}\u{53d1}\u{9001}\u{901a}\u{9053}\u{3001}\u{64cd}\u{4f5c}\u{7cfb}\u{7edf}\u{3001}\u{67b6}\u{6784}\u{3001}\u{5b89}\u{88c5}\u{5305}\u{5f62}\u{6001}\u{3001}\u{7248}\u{672c}\u{53f7}\u{3001}\u{8bed}\u{8a00}\u{4e0e}\u{53ef}\u{5173}\u{95ed}\u{7684}\u{968f}\u{673a} UUIDv4\u{ff0c}\u{7edd}\u{4e0d}\u{8bb0}\u{5f55} IP \u{5730}\u{5740}\u{3001}\u{7528}\u{6237}\u{8def}\u{5f84}\u{6216}\u{6587}\u{4ef6}\u{6570}\u{636e}\u{3002}",
-        "\u{30c1}\u{30e3}\u{30f3}\u{30cd}\u{30eb}\u{30fb}OS\u{30fb}\u{30a2}\u{30fc}\u{30ad}\u{30c6}\u{30af}\u{30c1}\u{30e3}\u{30fb}\u{30d1}\u{30c3}\u{30b1}\u{30fc}\u{30b8}\u{5f62}\u{614b}\u{30fb}\u{30d0}\u{30fc}\u{30b8}\u{30e7}\u{30f3}\u{30fb}\u{8a00}\u{8a9e}\u{3068}\u{4efb}\u{610f}\u{306e}\u{30e9}\u{30f3}\u{30c0}\u{30e0} UUIDv4 \u{306e}\u{307f}\u{3092}\u{9001}\u{4fe1}\u{3057}\u{307e}\u{3059}\u{3002}IP \u{30a2}\u{30c9}\u{30ec}\u{30b9}\u{3001}\u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{30d1}\u{30b9}\u{3001}\u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{60c5}\u{5831}\u{306f}\u{8a18}\u{9332}\u{3055}\u{308c}\u{307e}\u{305b}\u{3093}\u{3002}",
-        "\u{cc44}\u{b110}, OS, \u{c544}\u{d0a4}\u{d14d}\u{cc98}, \u{d328}\u{d0a4}\u{c9c0} \u{d615}\u{d0dc}, \u{bc84}\u{c804}, \u{c5b8}\u{c5b4} \u{bc0f} \u{c120}\u{d0dd}\u{c801} \u{bb34}\u{c791}\u{c704} UUIDv4\u{b9cc} \u{c804}\u{c1a1}\u{d569}\u{b2c8}\u{b2e4}. IP \u{c8fc}\u{c18c}, \u{c0ac}\u{c6a9}\u{c790} \u{acbd}\u{b85c}, \u{d30c}\u{c77c} \u{b370}\u{c774}\u{d130}\u{b294} \u{ae30}\u{b85d}\u{d558}\u{c9c0} \u{c54a}\u{c2b5}\u{b2c8}\u{b2e4}.",
+        "Share anonymous usage statistics",
+        "\u{53d1}\u{9001}\u{533f}\u{540d}\u{4f7f}\u{7528}\u{7edf}\u{8ba1}",
+        "\u{533f}\u{540d}\u{306e}\u{5229}\u{7528}\u{7d71}\u{8a08}\u{3092}\
+         \u{9001}\u{4fe1}\u{3059}\u{308b}",
+        "\u{c775}\u{ba85} \u{c0ac}\u{c6a9} \u{d1b5}\u{acc4} \u{acf5}\u{c720}",
     )
 }
 
@@ -994,10 +992,18 @@ pub const fn update_installing_status(locale: Locale) -> &'static str {
 pub const fn update_verified_badge(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Ed25519 signature & SHA-256 checksum verified. Ready to install.",
-        "Ed25519 \u{7b7e}\u{540d}\u{4e0e} SHA-256 \u{6821}\u{9a8c}\u{5df2}\u{901a}\u{8fc7}\u{ff0c}\u{53ef}\u{91cd}\u{542f}\u{5b89}\u{88c5}\u{3002}",
-        "Ed25519 \u{7f72}\u{540d}\u{3068} SHA-256 \u{30c1}\u{30a7}\u{30c3}\u{30af}\u{30b5}\u{30e0}\u{3092}\u{691c}\u{8a3c}\u{6e08}\u{307f}\u{3067}\u{3059}\u{3002}",
-        "Ed25519 \u{c11c}\u{ba85} \u{bc0f} SHA-256 \u{ccb4}\u{d06c}\u{c12c} \u{ac80}\u{c99d} \u{c644}\u{b8cc}. \u{c124}\u{ce58} \u{c900}\u{be44}\u{ac00} \u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}.",
+        "Update ready to install. Restart to apply.",
+        "\u{66f4}\u{65b0}\u{5df2}\u{4e0b}\u{8f7d}\u{5c31}\u{7eea}\u{ff0c}\
+         \u{91cd}\u{542f}\u{540e}\u{5373}\u{53ef}\u{5b8c}\u{6210}\u{5b89}\
+         \u{88c5}\u{3002}",
+        "\u{30a2}\u{30c3}\u{30d7}\u{30c7}\u{30fc}\u{30c8}\u{306e}\u{6e96}\
+         \u{5099}\u{304c}\u{3067}\u{304d}\u{307e}\u{3057}\u{305f}\u{3002}\
+         \u{518d}\u{8d77}\u{52d5}\u{3057}\u{3066}\u{9069}\u{7528}\u{3057}\
+         \u{307e}\u{3059}\u{3002}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{c124}\u{ce58} \u{c900}\u{be44}\
+         \u{ac00} \u{c644}\u{b8cc}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}. \
+         \u{c7ac}\u{c2dc}\u{c791}\u{d558}\u{c5ec} \u{c801}\u{c6a9}\u{d558}\
+         \u{c138}\u{c694}.",
     )
 }
 
@@ -1036,6 +1042,321 @@ pub const fn update_manual_command_hint(locale: Locale) -> &'static str {
         "\u{8bf7}\u{4f7f}\u{7528}\u{5f53}\u{524d}\u{5b89}\u{88c5}\u{65b9}\u{5f0f}\u{5bf9}\u{5e94}\u{7684}\u{547d}\u{4ee4}\u{5347}\u{7ea7}\u{ff1a}",
         "\u{73fe}\u{5728}\u{306e}\u{30d1}\u{30c3}\u{30b1}\u{30fc}\u{30b8}\u{30de}\u{30cd}\u{30fc}\u{30b8}\u{30e3}\u{3067}\u{6b21}\u{306e}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{5b9f}\u{884c}\u{3057}\u{3066}\u{66f4}\u{65b0}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}:",
         "\u{d604}\u{c7ac} \u{d328}\u{d0a4}\u{c9c0} \u{ad00}\u{b9ac}\u{c790}\u{b85c} \u{c5c5}\u{adf8}\u{b808}\u{c774}\u{b4dc}\u{d558}\u{b824}\u{ba74} \u{b2e4}\u{c74c} \u{ba85}\u{b839}\u{c744} \u{c2e4}\u{d589}\u{d558}\u{c138}\u{c694}:",
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+/// Map low-level update error strings to localized, actionable user copy.
+pub fn friendly_update_error(raw: &str, locale: Locale) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+
+    if contains_any(&lower, &["timed out", "timeout", "deadline"]) {
+        return pick(
+            locale,
+            "The update request timed out. Check your internet connection and \
+             try again.",
+            "\u{68c0}\u{67e5}\u{6216}\u{4e0b}\u{8f7d}\u{66f4}\u{65b0}\u{8d85}\
+             \u{65f6}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{8fde}\
+             \u{63a5}\u{540e}\u{91cd}\u{8bd5}\u{3002}",
+            "\u{66f4}\u{65b0}\u{306e}\u{78ba}\u{8a8d}\u{307e}\u{305f}\u{306f}\
+             \u{30c0}\u{30a6}\u{30f3}\u{30ed}\u{30fc}\u{30c9}\u{304c}\u{30bf}\
+             \u{30a4}\u{30e0}\u{30a2}\u{30a6}\u{30c8}\u{3057}\u{307e}\u{3057}\
+             \u{305f}\u{3002}\u{30a4}\u{30f3}\u{30bf}\u{30fc}\u{30cd}\u{30c3}\
+             \u{30c8}\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\
+             \u{518d}\u{8a66}\u{884c}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\
+             \u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{d655}\u{c778} \u{b610}\u{b294} \
+             \u{b2e4}\u{c6b4}\u{b85c}\u{b4dc} \u{c2dc}\u{ac04}\u{c774} \
+             \u{cd08}\u{acfc}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}. \
+             \u{c778}\u{d130}\u{b137} \u{c5f0}\u{acb0}\u{c744} \u{d655}\u{c778}\
+             \u{d55c} \u{d6c4} \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\
+             \u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "ed25519",
+            "signature",
+            "x-ruum-signature",
+            "sha-256",
+            "sha256",
+            "checksum",
+            "size mismatch",
+            "invalid manifest",
+            "schema_version",
+            "public key",
+        ],
+    ) {
+        return pick(
+            locale,
+            "The update could not be verified and was discarded for your \
+             safety. Please try again or download it from the release page.",
+            "\u{66f4}\u{65b0}\u{6587}\u{4ef6}\u{6821}\u{9a8c}\u{672a}\u{901a}\
+             \u{8fc7}\u{ff0c}\u{4e3a}\u{4fdd}\u{969c}\u{5b89}\u{5168}\u{5df2}\
+             \u{653e}\u{5f03}\u{672c}\u{6b21}\u{66f4}\u{65b0}\u{3002}\u{8bf7}\
+             \u{91cd}\u{8bd5}\u{6216}\u{524d}\u{5f80}\u{53d1}\u{5e03}\u{9875}\
+             \u{4e0b}\u{8f7d}\u{3002}",
+            "\u{66f4}\u{65b0}\u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{306e}\u{691c}\
+             \u{8a3c}\u{306b}\u{5931}\u{6557}\u{3057}\u{305f}\u{305f}\u{3081}\
+             \u{3001}\u{5b89}\u{5168}\u{306e}\u{305f}\u{3081}\u{4e2d}\u{65ad}\
+             \u{3057}\u{307e}\u{3057}\u{305f}\u{3002}\u{518d}\u{8a66}\u{884c}\
+             \u{3059}\u{308b}\u{304b}\u{3001}\u{30ea}\u{30ea}\u{30fc}\u{30b9}\
+             \u{30da}\u{30fc}\u{30b8}\u{304b}\u{3089}\u{30c0}\u{30a6}\u{30f3}\
+             \u{30ed}\u{30fc}\u{30c9}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\
+             \u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{d30c}\u{c77c} \u{ac80}\u{c99d}\
+             \u{c5d0} \u{c2e4}\u{d328}\u{d558}\u{c5ec} \u{c548}\u{c804}\u{c744} \
+             \u{c704}\u{d574} \u{c911}\u{b2e8}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\
+             \u{b2e4}. \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\u{ac70}\u{b098} \
+             \u{b9b4}\u{b9ac}\u{c2a4} \u{d398}\u{c774}\u{c9c0}\u{c5d0}\u{c11c} \
+             \u{b2e4}\u{c6b4}\u{b85c}\u{b4dc}\u{d558}\u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "permission denied",
+            "access is denied",
+            "read-only",
+            "readonly",
+            "not writable",
+            "os error 5",
+            "os error 13",
+        ],
+    ) {
+        return pick(
+            locale,
+            "Ruum cannot write to the application folder. Please download the \
+             installer from the release page to update manually.",
+            "\u{6ca1}\u{6709}\u{6743}\u{9650}\u{5199}\u{5165}\u{5f53}\u{524d}\
+             \u{5e94}\u{7528}\u{5b89}\u{88c5}\u{76ee}\u{5f55}\u{ff0c}\u{8bf7}\
+             \u{524d}\u{5f80}\u{53d1}\u{5e03}\u{9875}\u{624b}\u{52a8}\u{4e0b}\
+             \u{8f7d}\u{5b89}\u{88c5}\u{5305}\u{66f4}\u{65b0}\u{3002}",
+            "\u{30a2}\u{30d7}\u{30ea}\u{30b1}\u{30fc}\u{30b7}\u{30e7}\u{30f3}\
+             \u{30d5}\u{30a9}\u{30eb}\u{30c0}\u{3078}\u{306e}\u{66f8}\u{304d}\
+             \u{8fbc}\u{307f}\u{6a29}\u{9650}\u{304c}\u{3042}\u{308a}\u{307e}\
+             \u{305b}\u{3093}\u{3002}\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{30da}\
+             \u{30fc}\u{30b8}\u{304b}\u{3089}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\
+             \u{30fc}\u{30e9}\u{30fc}\u{3092}\u{30c0}\u{30a6}\u{30f3}\u{30ed}\
+             \u{30fc}\u{30c9}\u{3057}\u{3066}\u{624b}\u{52d5}\u{3067}\u{66f4}\
+             \u{65b0}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+            "\u{c560}\u{d50c}\u{b9ac}\u{cf00}\u{c774}\u{c158} \u{d3f4}\u{b354}\
+             \u{c5d0} \u{c4f8} \u{ad8c}\u{d55c}\u{c774} \u{c5c6}\u{c2b5}\u{b2c8}\
+             \u{b2e4}. \u{b9b4}\u{b9ac}\u{c2a4} \u{d398}\u{c774}\u{c9c0}\u{c5d0}\
+             \u{c11c} \u{c124}\u{ce58} \u{d30c}\u{c77c}\u{c744} \u{b2e4}\u{c6b4}\
+             \u{b85c}\u{b4dc}\u{d558}\u{c5ec} \u{c218}\u{b3d9}\u{c73c}\u{b85c} \
+             \u{c5c5}\u{b370}\u{c774}\u{d2b8}\u{d558}\u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(
+        &lower,
+        &["no space", "disk full", "os error 28", "os error 112"],
+    ) {
+        return pick(
+            locale,
+            "Not enough free disk space to download or install the update. \
+             Free up some space and try again.",
+            "\u{78c1}\u{76d8}\u{53ef}\u{7528}\u{7a7a}\u{95f4}\u{4e0d}\u{8db3}\
+             \u{ff0c}\u{65e0}\u{6cd5}\u{4e0b}\u{8f7d}\u{6216}\u{5b89}\u{88c5}\
+             \u{66f4}\u{65b0}\u{3002}\u{8bf7}\u{6e05}\u{7406}\u{90e8}\u{5206}\
+             \u{7a7a}\u{95f4}\u{540e}\u{91cd}\u{8bd5}\u{3002}",
+            "\u{66f4}\u{65b0}\u{306e}\u{30c0}\u{30a6}\u{30f3}\u{30ed}\u{30fc}\
+             \u{30c9}\u{307e}\u{305f}\u{306f}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\
+             \u{30fc}\u{30eb}\u{306b}\u{5fc5}\u{8981}\u{306a}\u{7a7a}\u{304d}\
+             \u{5bb9}\u{91cf}\u{304c}\u{4e0d}\u{8db3}\u{3057}\u{3066}\u{3044}\
+             \u{307e}\u{3059}\u{3002}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{3092}\
+             \u{78ba}\u{4fdd}\u{3057}\u{3066}\u{518d}\u{8a66}\u{884c}\u{3057}\
+             \u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8}\u{b97c} \u{b2e4}\u{c6b4}\u{b85c}\
+             \u{b4dc}\u{d558}\u{ac70}\u{b098} \u{c124}\u{ce58}\u{d560} \
+             \u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04}\u{c774} \u{bd80}\u{c871}\
+             \u{d569}\u{b2c8}\u{b2e4}. \u{acf5}\u{ac04}\u{c744} \u{d655}\u{bcf4}\
+             \u{d55c} \u{d6c4} \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\
+             \u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(&lower, &["no release package", "no release manifest"]) {
+        return pick(
+            locale,
+            "No compatible update package was found for your system. Please \
+             download it from the release page.",
+            "\u{672a}\u{627e}\u{5230}\u{9002}\u{7528}\u{4e8e}\u{5f53}\u{524d}\
+             \u{7cfb}\u{7edf}\u{7684}\u{66f4}\u{65b0}\u{5b89}\u{88c5}\u{5305}\
+             \u{ff0c}\u{8bf7}\u{524d}\u{5f80}\u{53d1}\u{5e03}\u{9875}\u{4e0b}\
+             \u{8f7d}\u{3002}",
+            "\u{304a}\u{4f7f}\u{3044}\u{306e}\u{30b7}\u{30b9}\u{30c6}\u{30e0}\
+             \u{306b}\u{5bfe}\u{5fdc}\u{3059}\u{308b}\u{66f4}\u{65b0}\u{30d1}\
+             \u{30c3}\u{30b1}\u{30fc}\u{30b8}\u{304c}\u{898b}\u{3064}\u{304b}\
+             \u{308a}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}\
+             \u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{30da}\u{30fc}\u{30b8}\u{304b}\
+             \u{3089}\u{30c0}\u{30a6}\u{30f3}\u{30ed}\u{30fc}\u{30c9}\u{3057}\
+             \u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+            "\u{d604}\u{c7ac} \u{c2dc}\u{c2a4}\u{d15c}\u{c5d0} \u{b9de}\u{b294} \
+             \u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{d328}\u{d0a4}\u{c9c0}\u{b97c} \
+             \u{cc3e}\u{c744} \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \
+             \u{b9b4}\u{b9ac}\u{c2a4} \u{d398}\u{c774}\u{c9c0}\u{c5d0}\u{c11c} \
+             \u{b2e4}\u{c6b4}\u{b85c}\u{b4dc}\u{d558}\u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "returned http 5",
+        ],
+    ) {
+        return pick(
+            locale,
+            "The update server is temporarily unavailable. Please try again \
+             in a few minutes.",
+            "\u{66f4}\u{65b0}\u{670d}\u{52a1}\u{5668}\u{6682}\u{65f6}\u{4e0d}\
+             \u{53ef}\u{7528}\u{ff0c}\u{8bf7}\u{7a0d}\u{540e}\u{518d}\u{8bd5}\
+             \u{3002}",
+            "\u{66f4}\u{65b0}\u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{304c}\u{4e00}\
+             \u{6642}\u{7684}\u{306b}\u{5229}\u{7528}\u{3067}\u{304d}\u{307e}\
+             \u{305b}\u{3093}\u{3002}\u{3057}\u{3070}\u{3089}\u{304f}\u{3057}\
+             \u{3066}\u{304b}\u{3089}\u{518d}\u{8a66}\u{884c}\u{3057}\u{3066}\
+             \u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{c11c}\u{bc84}\u{b97c} \
+             \u{c77c}\u{c2dc}\u{c801}\u{c73c}\u{b85c} \u{c0ac}\u{c6a9}\u{d560} \
+             \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \u{c7a0}\u{c2dc} \
+             \u{d6c4} \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(&lower, &["returned http", "status code", "http 4"]) {
+        return pick(
+            locale,
+            "The update service returned an unexpected response. Please try \
+             again later or open the release page.",
+            "\u{66f4}\u{65b0}\u{670d}\u{52a1}\u{8fd4}\u{56de}\u{5f02}\u{5e38}\
+             \u{54cd}\u{5e94}\u{ff0c}\u{8bf7}\u{7a0d}\u{540e}\u{91cd}\u{8bd5}\
+             \u{6216}\u{6253}\u{5f00}\u{53d1}\u{5e03}\u{9875}\u{3002}",
+            "\u{66f4}\u{65b0}\u{30b5}\u{30fc}\u{30d3}\u{30b9}\u{304b}\u{3089}\
+             \u{4e88}\u{671f}\u{3057}\u{306a}\u{3044}\u{5fdc}\u{7b54}\u{304c}\
+             \u{3042}\u{308a}\u{307e}\u{3057}\u{305f}\u{3002}\u{5f8c}\u{3067}\
+             \u{518d}\u{8a66}\u{884c}\u{3059}\u{308b}\u{304b}\u{3001}\u{30ea}\
+             \u{30ea}\u{30fc}\u{30b9}\u{30da}\u{30fc}\u{30b8}\u{3092}\u{958b}\
+             \u{3044}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{c11c}\u{be44}\u{c2a4}\u{c5d0}\
+             \u{c11c} \u{c608}\u{ae30}\u{ce58} \u{c54a}\u{c740} \u{c751}\u{b2f5}\
+             \u{c744} \u{bc1b}\u{c558}\u{c2b5}\u{b2c8}\u{b2e4}. \u{b098}\u{c911}\
+             \u{c5d0} \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\u{ac70}\u{b098} \
+             \u{b9b4}\u{b9ac}\u{c2a4} \u{d398}\u{c774}\u{c9c0}\u{b97c} \
+             \u{c5ec}\u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "dns",
+            "connect",
+            "network",
+            "tls",
+            "rustls",
+            "certificate",
+            "broken pipe",
+            "eof",
+            "reset",
+            "unreachable",
+            "unavailable",
+            "request failed",
+            "fetch failed",
+            "read failed",
+            "ureq",
+        ],
+    ) {
+        return pick(
+            locale,
+            "Unable to reach the update server. Check your internet \
+             connection or download from the release page.",
+            "\u{65e0}\u{6cd5}\u{8fde}\u{63a5}\u{5230}\u{66f4}\u{65b0}\u{670d}\
+             \u{52a1}\u{5668}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\
+             \u{8fde}\u{63a5}\u{6216}\u{524d}\u{5f80}\u{53d1}\u{5e03}\u{9875}\
+             \u{624b}\u{52a8}\u{4e0b}\u{8f7d}\u{3002}",
+            "\u{66f4}\u{65b0}\u{30b5}\u{30fc}\u{30d0}\u{30fc}\u{306b}\u{63a5}\
+             \u{7d9a}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\
+             \u{305f}\u{3002}\u{30a4}\u{30f3}\u{30bf}\u{30fc}\u{30cd}\u{30c3}\
+             \u{30c8}\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3059}\u{308b}\
+             \u{304b}\u{3001}\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{30da}\u{30fc}\
+             \u{30b8}\u{304b}\u{3089}\u{30c0}\u{30a6}\u{30f3}\u{30ed}\u{30fc}\
+             \u{30c9}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8} \u{c11c}\u{bc84}\u{c5d0} \
+             \u{c5f0}\u{acb0}\u{d560} \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \
+             \u{c778}\u{d130}\u{b137} \u{c5f0}\u{acb0}\u{c744} \u{d655}\u{c778}\
+             \u{d558}\u{ac70}\u{b098} \u{b9b4}\u{b9ac}\u{c2a4} \u{d398}\u{c774}\
+             \u{c9c0}\u{c5d0}\u{c11c} \u{b2e4}\u{c6b4}\u{b85c}\u{b4dc}\u{d558}\
+             \u{c138}\u{c694}.",
+        );
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "extract",
+            "unzip",
+            "installer",
+            "jxa",
+            "appimage",
+            "replace",
+            "rename",
+            "spawn",
+        ],
+    ) {
+        return pick(
+            locale,
+            "Could not install the downloaded update. Please try again or \
+             download the latest version from the release page.",
+            "\u{65e0}\u{6cd5}\u{5b8c}\u{6210}\u{66f4}\u{65b0}\u{5b89}\u{88c5}\
+             \u{ff0c}\u{8bf7}\u{91cd}\u{8bd5}\u{6216}\u{524d}\u{5f80}\u{53d1}\
+             \u{5e03}\u{9875}\u{4e0b}\u{8f7d}\u{6700}\u{65b0}\u{7248}\u{672c}\
+             \u{3002}",
+            "\u{66f4}\u{65b0}\u{3092}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\
+             \u{30eb}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\
+             \u{305f}\u{3002}\u{518d}\u{8a66}\u{884c}\u{3059}\u{308b}\u{304b}\
+             \u{3001}\u{30ea}\u{30ea}\u{30fc}\u{30b9}\u{30da}\u{30fc}\u{30b8}\
+             \u{304b}\u{3089}\u{6700}\u{65b0}\u{7248}\u{3092}\u{30c0}\u{30a6}\
+             \u{30f3}\u{30ed}\u{30fc}\u{30c9}\u{3057}\u{3066}\u{304f}\u{3060}\
+             \u{3055}\u{3044}\u{3002}",
+            "\u{c5c5}\u{b370}\u{c774}\u{d2b8}\u{b97c} \u{c124}\u{ce58}\u{d560} \
+             \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \u{b2e4}\u{c2dc} \
+             \u{c2dc}\u{b3c4}\u{d558}\u{ac70}\u{b098} \u{b9b4}\u{b9ac}\u{c2a4} \
+             \u{d398}\u{c774}\u{c9c0}\u{c5d0}\u{c11c} \u{cd5c}\u{c2e0} \
+             \u{bc84}\u{c804}\u{c744} \u{b2e4}\u{c6b4}\u{b85c}\u{b4dc}\u{d558}\
+             \u{c138}\u{c694}.",
+        );
+    }
+
+    pick(
+        locale,
+        "Could not complete the update. Please try again or open the release \
+         page.",
+        "\u{6682}\u{65f6}\u{65e0}\u{6cd5}\u{5b8c}\u{6210}\u{66f4}\u{65b0}\
+         \u{ff0c}\u{8bf7}\u{7a0d}\u{540e}\u{91cd}\u{8bd5}\u{6216}\u{6253}\
+         \u{5f00}\u{53d1}\u{5e03}\u{9875}\u{3002}",
+        "\u{66f4}\u{65b0}\u{3092}\u{5b8c}\u{4e86}\u{3067}\u{304d}\u{307e}\
+         \u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}\u{5f8c}\u{3067}\
+         \u{518d}\u{8a66}\u{884c}\u{3059}\u{308b}\u{304b}\u{3001}\u{30ea}\
+         \u{30ea}\u{30fc}\u{30b9}\u{30da}\u{30fc}\u{30b8}\u{3092}\u{958b}\
+         \u{3044}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{c5c5}\u{b370}\u{c774}\u{d2b8}\u{b97c} \u{c644}\u{b8cc}\u{d560} \
+         \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \u{b098}\u{c911}\u{c5d0} \
+         \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\u{ac70}\u{b098} \
+         \u{b9b4}\u{b9ac}\u{c2a4} \u{d398}\u{c774}\u{c9c0}\u{b97c} \u{c5ec}\
+         \u{c138}\u{c694}.",
     )
 }
 

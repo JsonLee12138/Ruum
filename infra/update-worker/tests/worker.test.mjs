@@ -229,18 +229,61 @@ test("GET /v1/check rejects invalid channel with 400", async () => {
   assert.equal(res.status, 400);
 });
 
-test("GET /v1/check returns 404 when manifest or sig is missing", async () => {
+test("GET /v1/check returns 204 when both manifest and sig are missing, and 502 when publication is incomplete", async () => {
+  const emptyBucket = createMockR2();
+  globalThis.caches = { default: createMockCache() };
+
+  const reqEmpty = new Request(
+    "https://ruum-updates.example.workers.dev/v1/check?channel=stable&os=macos&arch=aarch64&pkg=app_zip&ver=0.2.2&lang=en&entry=gui",
+    {
+      headers: {
+        "X-Ruum-Client-Id": "cid-empty",
+        "CF-Connecting-IP": "203.0.113.99",
+      },
+    }
+  );
+  reqEmpty.cf = { country: "US" };
+
+  const { res: resEmpty, lines: logsEmpty } = await captureConsoleLogs(() =>
+    worker.fetch(reqEmpty, { RELEASES_BUCKET: emptyBucket }, createExecutionCtx())
+  );
+  assert.equal(resEmpty.status, 204);
+  assert.equal(resEmpty.headers.get("X-Ruum-Channel"), "stable");
+  assert.equal(resEmpty.headers.get("Cache-Control"), "public, max-age=60");
+  assert.equal(await resEmpty.text(), "");
+  assert.equal(logsEmpty.length, 1);
+  const parsedEmptyLog = JSON.parse(logsEmpty[0]);
+  assert.equal(parsedEmptyLog.event, "update_check");
+  assert.equal(parsedEmptyLog.channel, "stable");
+  assert.equal(parsedEmptyLog.cache_hit, false);
+  assert.equal(parsedEmptyLog.no_release, true);
+  assert.equal(logsEmpty[0].includes("203.0.113.99"), false);
+
   const bucketOnlyManifest = createMockR2({
     "channels/beta/manifest.json": { body: RAW_MANIFEST },
   });
-  globalThis.caches = { default: createMockCache() };
-
-  const res = await worker.fetch(
+  const resOnlyManifest = await worker.fetch(
     new Request("https://ruum-updates.example.workers.dev/v1/check?channel=beta"),
     { RELEASES_BUCKET: bucketOnlyManifest },
     createExecutionCtx()
   );
-  assert.equal(res.status, 404);
+  assert.equal(resOnlyManifest.status, 502);
+  assert.deepEqual(await resOnlyManifest.json(), {
+    error: "incomplete manifest publication",
+  });
+
+  const bucketOnlySig = createMockR2({
+    "channels/beta/manifest.json.sig": { body: "deadbeefsig==" },
+  });
+  const resOnlySig = await worker.fetch(
+    new Request("https://ruum-updates.example.workers.dev/v1/check?channel=beta"),
+    { RELEASES_BUCKET: bucketOnlySig },
+    createExecutionCtx()
+  );
+  assert.equal(resOnlySig.status, 502);
+  assert.deepEqual(await resOnlySig.json(), {
+    error: "incomplete manifest publication",
+  });
 });
 
 test("GET /v1/check preserves raw manifest bytes, trims signature newline, normalizes edge cache, and logs on both miss and hit", async () => {
@@ -458,9 +501,30 @@ test("GET /install.sh returns valid POSIX shell script with dynamic origin, --cl
   assert.ok(script.includes("ruum.app/Contents/Resources/ruum-scan-linux.pack"));
   assert.ok(script.includes("sha256"));
   assert.ok(script.includes("fallback_url"));
+  assert.ok(script.includes("no release published yet for channel '$CHANNEL'"));
 
   // Syntax-check generated POSIX shell script using `sh -n`.
   execFileSync("sh", ["-n"], { input: script, encoding: "utf8" });
+
+  // Verify empty 204 response from /v1/check yields clean error instead of parsing failure.
+  let emptyErr = null;
+  try {
+    execFileSync(
+      "sh",
+      [
+        "-c",
+        'TMPBIN=$(mktemp -d); trap "rm -rf \\"$TMPBIN\\"" EXIT; printf "#!/bin/sh\\nexit 0\\n" > "$TMPBIN/curl"; chmod +x "$TMPBIN/curl"; PATH="$TMPBIN:$PATH" sh',
+      ],
+      { input: script, encoding: "utf8" }
+    );
+  } catch (err) {
+    emptyErr = err;
+  }
+  assert.ok(emptyErr, "install.sh must fail when /v1/check returns empty 204 body");
+  assert.match(
+    String(emptyErr.stderr ?? ""),
+    /no release published yet for channel 'stable'/
+  );
 
   // Verify the embedded POSIX awk JSON extractor parses RAW_MANIFEST accurately.
   const fnMatch = script.match(
@@ -531,6 +595,7 @@ test("GET /install.ps1 returns PowerShell script with dynamic origin, nested zip
   assert.ok(script.includes("ruum-scan-linux.pack"));
   assert.ok(script.includes("Programs\\ruum\\bin"));
   assert.ok(script.includes("SetEnvironmentVariable"));
+  assert.ok(script.includes("no release published yet for channel '$Channel'"));
 
   assert.equal(lines.length, 1);
   assert.deepEqual(JSON.parse(lines[0]), {

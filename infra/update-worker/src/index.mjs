@@ -335,13 +335,18 @@ MANIFEST_JSON=\$(fetch_text "\$CHECK_URL") || {
   exit 1
 }
 
+CLEAN_REQ_VER=\${REQ_VERSION#v}
+if [ -z "\$MANIFEST_JSON" ] && [ -z "\$CLEAN_REQ_VER" ]; then
+  echo "error: no release published yet for channel '\$CHANNEL'" >&2
+  exit 1
+fi
+
 MANIFEST_VERSION=\$(printf '%s' "\$MANIFEST_JSON" | extract_json_field "" "version")
 ASSET_PATH=\$(printf '%s' "\$MANIFEST_JSON" | extract_json_field "\$ASSET_KEY" "path")
 FALLBACK_URL=\$(printf '%s' "\$MANIFEST_JSON" | extract_json_field "\$ASSET_KEY" "fallback_url")
 EXPECTED_SHA256=\$(printf '%s' "\$MANIFEST_JSON" | extract_json_field "\$ASSET_KEY" "sha256" | tr 'A-F' 'a-f')
 ASSET_FILENAME=\$(printf '%s' "\$MANIFEST_JSON" | extract_json_field "\$ASSET_KEY" "filename")
 
-CLEAN_REQ_VER=\${REQ_VERSION#v}
 if [ -n "\$CLEAN_REQ_VER" ] && [ "\$CLEAN_REQ_VER" != "\$MANIFEST_VERSION" ]; then
   TARGET_VERSION="\$CLEAN_REQ_VER"
   if [ "\$OS" = "macos" ]; then
@@ -516,6 +521,12 @@ $Manifest = Invoke-RestMethod -Uri $CheckUrl -UseBasicParsing
 $AssetKey = "windows-$Arch-portable_zip"
 
 $CleanReqVer = $Version.TrimStart("v")
+if (-not $Manifest -or [string]::IsNullOrWhiteSpace([string]$Manifest)) {
+  if ([string]::IsNullOrWhiteSpace($CleanReqVer)) {
+    throw "no release published yet for channel '$Channel'"
+  }
+  $Manifest = [pscustomobject]@{ version = ""; assets = [pscustomobject]@{} }
+}
 $TargetVersion = $Manifest.version
 $AssetPath = $null
 $FallbackUrl = $null
@@ -662,8 +673,19 @@ async function handleCheck(request, url, env, ctx) {
     bucket.get(sigKey),
   ]);
 
+  if (!manifestObj && !sigObj) {
+    logEvent({ ...telemetry, cache_hit: false, no_release: true });
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "X-Ruum-Channel": channel,
+        "Cache-Control": "public, max-age=60",
+      },
+    });
+  }
+
   if (!manifestObj || !sigObj) {
-    return jsonResponse({ error: "manifest not found" }, 404);
+    return jsonResponse({ error: "incomplete manifest publication" }, 502);
   }
 
   // Raw bytes passthrough: never parse & re-serialize manifest.json so Ed25519 signature stays valid.

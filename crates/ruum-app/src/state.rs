@@ -4382,9 +4382,19 @@ impl Ruum {
             return;
         };
         let info = Arc::clone(info);
+        let Some(manifest) = info.manifest.clone() else {
+            let msg = "No release manifest available".to_owned();
+            self.update_last_error = Some(msg.clone());
+            self.update_state = UpdateUiState::Error {
+                message: msg,
+                info: Some(info),
+            };
+            self.sync_update_runtime(cx);
+            cx.notify();
+            return;
+        };
         let artifact_path = artifact_path.clone();
         let kind = self.update_install_kind;
-        let manifest = info.manifest.clone();
 
         self.update_state = UpdateUiState::Installing {
             info: Arc::clone(&info),
@@ -4512,12 +4522,21 @@ impl Ruum {
         );
     }
 
+    /// Resolve the release page URL for the current update state, falling
+    /// back to the repository releases index when no manifest is present.
+    #[must_use]
+    pub fn resolved_update_release_url(&self) -> String {
+        let fallback =
+            format!("https://github.com/{DEFAULT_GITHUB_REPO}/releases");
+        self.update_state
+            .info()
+            .and_then(|i| i.manifest.as_ref())
+            .map_or(fallback, |m| m.release_url.clone())
+    }
+
     /// Open the validated GitHub Release page in the system browser.
     pub fn open_update_release_page(&self, cx: &App) {
-        let raw_url = self.update_state.info().map_or_else(
-            || format!("https://github.com/{DEFAULT_GITHUB_REPO}/releases"),
-            |i| i.manifest.release_url.clone(),
-        );
+        let raw_url = self.resolved_update_release_url();
         if let Ok(parsed) = validate_update_url(&raw_url) {
             cx.open_url(parsed.as_str());
         }

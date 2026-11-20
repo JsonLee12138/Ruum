@@ -1757,19 +1757,28 @@ fn cmd_update(args: &[OsString]) -> Result<()> {
             "Update available: v{} -> v{} ({})",
             result.current_version, result.latest_version, result.channel
         );
-        println!("Published: {}", result.manifest.published_at);
-        if let Some(asset) = &result.selected_asset {
-            println!(
-                "Package: {} ({})",
-                asset.filename,
-                human_bytes(asset.size)
-            );
+        if let Some(manifest) = &result.manifest {
+            println!("Published: {}", manifest.published_at);
+            if let Some(asset) = &result.selected_asset {
+                println!(
+                    "Package: {} ({})",
+                    asset.filename,
+                    human_bytes(asset.size)
+                );
+            }
+            if !manifest.notes.trim().is_empty() {
+                println!("\n{}", manifest.notes.trim());
+            }
+            println!("\nUpgrade command:\n  {}", result.upgrade_command);
+            println!("Release page: {}", manifest.release_url);
+        } else {
+            println!("\nUpgrade command:\n  {}", result.upgrade_command);
         }
-        if !result.manifest.notes.trim().is_empty() {
-            println!("\n{}", result.manifest.notes.trim());
-        }
-        println!("\nUpgrade command:\n  {}", result.upgrade_command);
-        println!("Release page: {}", result.manifest.release_url);
+    } else if result.manifest.is_none() {
+        println!(
+            "ruum v{} is up to date ({}, no published release yet)",
+            result.current_version, result.channel
+        );
     } else {
         println!(
             "ruum v{} is up to date ({}, latest v{})",

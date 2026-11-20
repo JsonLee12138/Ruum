@@ -542,12 +542,33 @@ mod tests {
             assert!(!pages::settings_tab_updates(locale).is_empty());
             assert!(!pages::updates_title(locale).is_empty());
             assert!(!pages::updates_desc(locale).is_empty());
+            assert!(!pages::updates_install_kind_label(locale).is_empty());
             assert!(!pages::updates_check_now(locale).is_empty());
             assert!(!pages::updates_auto_check(locale).is_empty());
             assert!(!pages::updates_channel_stable(locale).is_empty());
             assert!(!pages::updates_channel_beta(locale).is_empty());
             assert!(!pages::updates_send_client_id(locale).is_empty());
-            assert!(!pages::updates_privacy_note(locale).is_empty());
+            assert!(!pages::update_verified_badge(locale).is_empty());
+
+            assert!(!pages::updates_desc(locale).contains("signed"));
+            assert!(!pages::updates_desc(locale).contains("\u{7b7e}\u{540d}"));
+            assert!(!pages::updates_desc(locale).contains("\u{7f72}\u{540d}"));
+            assert!(!pages::updates_desc(locale).contains("\u{c11c}\u{ba85}"));
+            assert!(
+                !pages::updates_install_kind_label(locale)
+                    .contains("Install Form")
+            );
+            assert!(
+                !pages::updates_install_kind_label(locale)
+                    .contains("\u{5f62}\u{6001}")
+            );
+            assert!(
+                !pages::updates_install_kind_label(locale)
+                    .contains("\u{d615}\u{d0dc}")
+            );
+            assert!(!pages::updates_send_client_id(locale).contains("ID"));
+            assert!(!pages::update_verified_badge(locale).contains("Ed25519"));
+            assert!(!pages::update_verified_badge(locale).contains("SHA-256"));
             assert!(
                 !pages::update_banner_available("0.9.0", locale).is_empty()
             );
@@ -597,5 +618,39 @@ mod tests {
             messages::cleanup_started_notif_body(2, 1_500_000, Locale::Zh)
                 .contains("请稍等")
         );
+    }
+
+    #[test]
+    fn friendly_update_error_localizes_categories_without_raw_codes() {
+        let raw_samples = [
+            "worker request timed out: Global",
+            "SHA-256 mismatch: expected aaa, got bbb",
+            "manifest Ed25519 signature verification failed: bad sig",
+            "Permission denied (os error 13)",
+            "No space left on device (os error 28)",
+            "No release package matches this platform",
+            "worker returned HTTP 503",
+            "worker returned HTTP 404",
+            "primary update service unavailable for beta channel (dns error)",
+            "failed to extract zip archive",
+            "unexpected internal error",
+        ];
+
+        for raw in raw_samples {
+            let en = pages::friendly_update_error(raw, Locale::En);
+            for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+                let text = pages::friendly_update_error(raw, locale);
+                assert!(!text.is_empty());
+                assert!(!text.contains("HTTP 503"));
+                assert!(!text.contains("HTTP 404"));
+                assert!(!text.contains("Ed25519"));
+                assert!(!text.contains("SHA-256"));
+                assert!(!text.contains("os error"));
+                assert!(!text.contains("ureq"));
+                if locale != Locale::En {
+                    assert_ne!(text, en);
+                }
+            }
+        }
     }
 }

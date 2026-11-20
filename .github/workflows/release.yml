@@ -82,7 +82,7 @@ jobs:
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev \
             desktop-file-utils rpm cpio patchelf appstream xvfb \
-            mesa-vulkan-drivers
+            mesa-vulkan-drivers zsync
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -182,10 +182,17 @@ jobs:
 
           appstreamcli validate-tree "$pkg_stage/AppDir"
 
-          ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
+          update_info="gh-releases-zsync|${GITHUB_REPOSITORY%/*}|${GITHUB_REPOSITORY#*/}|latest|ruum-*-${ARCH}.AppImage.zsync"
+          (cd dist && ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
             "$RUNNER_TEMP/appimage/appimagetool-${ARCH}.AppImage" \
-            "$pkg_stage/AppDir" "dist/$appimage_name.AppImage"
+            -u "$update_info" \
+            "$pkg_stage/AppDir" "${appimage_name}.AppImage")
           chmod +x "dist/$appimage_name.AppImage"
+          test -f "dist/$appimage_name.AppImage.zsync"
+          grep -q "^URL: ${appimage_name}\.AppImage$" \
+            "dist/$appimage_name.AppImage.zsync"
+          readelf -p .upd_info "dist/$appimage_name.AppImage" \
+            | grep -qF "$update_info"
 
           # Verify the embedded ruum-scan trailer survived all package formats.
           deb_member=$(dpkg-deb --fsys-tarfile "dist/$name.deb" | tar -tf - \
@@ -234,6 +241,7 @@ jobs:
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.deb
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}-linux.rpm
             dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}.AppImage
+            dist/ruum-${{ needs.validate.outputs.version }}-${{ matrix.arch }}.AppImage.zsync
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

@@ -28,7 +28,7 @@ use ruum_core::docker_adapter::{
 use ruum_core::removal::RemovalMode;
 use ruum_core::size::human_bytes;
 use ruum_core::storage::{AuthMode, UpdateChannel};
-use ruum_core::updater::UpdateCheckResult;
+use ruum_core::updater::{Manifest, UpdateCheckResult};
 use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::AiCliProvider;
 
@@ -5027,9 +5027,12 @@ fn updates_settings_section(
             theme.accent,
             true,
         ),
-        UpdateUiState::Error { message, .. } => {
-            (message.clone(), theme.danger, true)
-        }
+        UpdateUiState::Error { message, .. } => (
+            crate::i18n::pages::friendly_update_error(message, locale)
+                .to_owned(),
+            theme.danger,
+            true,
+        ),
     };
 
     let entity_auto = cx.entity().downgrade();
@@ -5282,25 +5285,6 @@ fn updates_settings_section(
                                         );
                                     }),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .id("setting-update-privacy-note")
-                                .debug_selector(|| {
-                                    "setting-update-privacy-note".into()
-                                })
-                                .p(space::SM)
-                                .rounded(space::XS)
-                                .border_1()
-                                .border_color(theme.divider())
-                                .bg(theme.normal_fill())
-                                .text_size(text::CAPTION)
-                                .text_color(theme.secondary)
-                                .child(
-                                    crate::i18n::pages::updates_privacy_note(
-                                        locale,
-                                    ),
-                                ),
                         ),
                 ),
         )
@@ -5362,13 +5346,13 @@ pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
 
     let mut body = div().flex().flex_col().gap(space::MD).min_w_0();
 
-    if let Some(info) = app.update_state.info() {
-        body = body.child(update_release_summary_card(info, locale, &theme));
-        body = body.child(update_changelog_box(
-            &info.manifest.notes,
-            locale,
-            &theme,
-        ));
+    if let Some(info) = app.update_state.info()
+        && let Some(manifest) = &info.manifest
+    {
+        body = body
+            .child(update_release_summary_card(info, manifest, locale, &theme));
+        body =
+            body.child(update_changelog_box(&manifest.notes, locale, &theme));
     }
 
     match &app.update_state {
@@ -5592,6 +5576,8 @@ pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
             );
         }
         UpdateUiState::Error { message, .. } => {
+            let friendly =
+                crate::i18n::pages::friendly_update_error(message, locale);
             body = body.child(
                 div()
                     .id("update-error-box")
@@ -5616,7 +5602,7 @@ pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                             .flex_1()
                             .text_size(text::CAPTION)
                             .text_color(theme.bright)
-                            .child(message.clone()),
+                            .child(friendly),
                     ),
             );
         }
@@ -5660,10 +5646,12 @@ pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
 
 fn update_release_summary_card(
     info: &UpdateCheckResult,
+    manifest: &Manifest,
     locale: crate::i18n::Locale,
     theme: &gpui_omarchy::Theme,
 ) -> Div {
     let mut card = div()
+        .debug_selector(|| "update-release-summary-card".into())
         .flex()
         .flex_col()
         .gap(space::XS)
@@ -5694,7 +5682,7 @@ fn update_release_summary_card(
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
                         .child(crate::i18n::pages::update_published_at(
-                            &info.manifest.published_at,
+                            &manifest.published_at,
                             locale,
                         )),
                 ),

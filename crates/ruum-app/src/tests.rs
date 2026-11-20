@@ -7685,7 +7685,7 @@ fn mock_update_result(
         update_available: true,
         channel: UpdateChannel::Stable,
         install_kind,
-        manifest: Manifest {
+        manifest: Some(Manifest {
             schema_version: 1,
             version: version.to_owned(),
             tag: format!("v{version}"),
@@ -7698,7 +7698,7 @@ fn mock_update_result(
                     Faster treemap rendering"
                 .to_owned(),
             assets,
-        },
+        }),
         selected_asset_key: Some("macos-aarch64-app_zip".to_owned()),
         selected_asset: Some(asset),
         upgrade_command: match install_kind {
@@ -7752,7 +7752,7 @@ fn settings_updates_tab_toggles_preferences_and_persists_to_isolated_db(
     assert!(cx.debug_bounds("setting-update-auto-check").is_some());
     assert!(cx.debug_bounds("setting-update-channel").is_some());
     assert!(cx.debug_bounds("setting-update-send-client-id").is_some());
-    assert!(cx.debug_bounds("setting-update-privacy-note").is_some());
+    assert!(cx.debug_bounds("setting-update-privacy-note").is_none());
 
     let auto_check_box = cx
         .debug_bounds("setting-update-auto-check")
@@ -8213,4 +8213,106 @@ fn update_ui_renders_cleanly_across_all_four_locales_and_runtime_reopen(
         ));
     })
     .expect("win2 update");
+}
+
+#[gpui_kit::test]
+fn update_modal_handles_none_manifest_and_friendly_errors_across_locales(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::Locale;
+    use crate::state::UpdateUiState;
+    use ruum_core::storage::UpdateSettings;
+    use ruum_core::updater::{InstallKind, UpdateCheckResult};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    let base = mock_update_result("0.9.8", InstallKind::MacAppBundle, true);
+    let no_manifest = std::sync::Arc::new(UpdateCheckResult {
+        manifest: None,
+        ..(*base).clone()
+    });
+
+    // Empty channel / no-release check result transitions cleanly to UpToDate.
+    let no_release = UpdateCheckResult {
+        update_available: false,
+        manifest: None,
+        selected_asset_key: None,
+        selected_asset: None,
+        ..(*base).clone()
+    };
+    update(&view, cx, |app, cx| {
+        app.apply_update_check_outcome(
+            Ok((UpdateSettings::default(), no_release)),
+            cx,
+        );
+    });
+    draw(cx);
+    assert!(matches!(
+        read(&view, cx, |app| app.update_state.clone()),
+        UpdateUiState::UpToDate { .. }
+    ));
+    assert!(read(&view, cx, |app| app.update_last_error.clone()).is_none());
+
+    // Available with manifest = None skips summary/changelog and falls back to
+    // the repository releases URL.
+    update(&view, cx, |app, cx| {
+        app.update_state = UpdateUiState::Available {
+            info: std::sync::Arc::clone(&no_manifest),
+        };
+        app.open_update_modal(cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-modal").is_some());
+    assert!(cx.debug_bounds("update-release-summary-card").is_none());
+    assert!(cx.debug_bounds("update-changelog-scroll").is_none());
+    assert_eq!(
+        read(&view, cx, crate::state::Ruum::resolved_update_release_url),
+        format!(
+            "https://github.com/{}/releases",
+            ruum_core::updater::DEFAULT_GITHUB_REPO
+        )
+    );
+
+    // ReadyToInstall with manifest = None guards apply_ready_update cleanly.
+    update(&view, cx, |app, cx| {
+        app.update_state = UpdateUiState::ReadyToInstall {
+            info: std::sync::Arc::clone(&no_manifest),
+            artifact_path: temp.path().join("ruum.zip"),
+        };
+        app.apply_ready_update(cx);
+    });
+    draw(cx);
+    assert!(matches!(
+        read(&view, cx, |app| app.update_state.clone()),
+        UpdateUiState::Error { .. }
+    ));
+    assert!(cx.debug_bounds("update-error-box").is_some());
+
+    // Error state renders across all 4 locales in both Settings and Modal
+    // while keeping raw diagnostic in app.update_last_error.
+    update(&view, cx, |app, cx| {
+        app.apply_update_check_outcome(
+            Err("worker returned HTTP 503".to_owned()),
+            cx,
+        );
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Updates, cx);
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.update_last_error.clone()).as_deref(),
+        Some("worker returned HTTP 503")
+    );
+
+    for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("setting-updates-section").is_some());
+        assert!(cx.debug_bounds("setting-update-privacy-note").is_none());
+        assert!(cx.debug_bounds("update-error-box").is_some());
+    }
 }

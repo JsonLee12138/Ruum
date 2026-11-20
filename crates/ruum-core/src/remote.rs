@@ -35,6 +35,18 @@ const REMOTE_COMMAND: &str = concat!(
     r#"elif [ -x "$HOME/.local/bin/ruum-scan" ]; then "#,
     r#"exec "$HOME/.local/bin/ruum-scan" --stdio-v1; "#,
     "else ",
+    r#"cached=""; "#,
+    r#"for f in "${XDG_CACHE_HOME:-$HOME/.cache}/ruum/ssh/"*/ruum-scan; "#,
+    "do ",
+    r#"if [ -x "$f" ] && [ -f "$f" ]; then "#,
+    r#"if [ -z "$cached" ] || [ "$f" -nt "$cached" ]; then "#,
+    r#"cached="$f"; "#,
+    "fi; ",
+    "fi; ",
+    "done; ",
+    r#"if [ -n "$cached" ]; then "#,
+    r#"exec "$cached" --stdio-v1; "#,
+    "fi; ",
     r#"echo "ruum-scan is not installed on this server." >&2; "#,
     r#"echo "On the server, run make install-scan "#,
     r#"from the ruum checkout." >&2; "#,
@@ -680,7 +692,17 @@ fn read_diagnostics(mut input: impl io::Read) -> String {
         .to_owned()
 }
 
+#[cfg(test)]
 fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
+    ssh_error_with_context(host, details, fallback, true)
+}
+
+fn ssh_error_with_context(
+    host: &str,
+    details: &str,
+    fallback: &io::Error,
+    has_embedded_archive: bool,
+) -> io::Error {
     let fallback_msg = fallback.to_string();
     let reason = if details.is_empty() {
         fallback_msg.clone()
@@ -692,10 +714,13 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
         && (lower_reason.contains("not found")
             || lower_reason.contains("no such file")
             || lower_reason.contains("not recognized"));
+    let missing_ruum_scan = lower_reason.contains("ruum-scan")
+        && (lower_reason.contains("not installed")
+            || lower_reason.contains("not found")
+            || lower_reason.contains("no such file"));
     let handshake_err = reason.contains("unexpected SSH deployment handshake")
         || reason.contains("incomplete SSH deployment handshake")
-        || (!reason.contains("not installed")
-            && !reason.contains("not found")
+        || (!missing_ruum_scan
             && fallback_msg.contains("unexpected SSH deployment handshake"));
     let hint = if reason.contains("Permission denied")
         || reason.contains("Authentication failed")
@@ -718,11 +743,20 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
              ~/.config/fish/config.fish, ~/.bashrc, or ~/.zshenv) for \
              non-interactive SSH stdout output."
         )
-    } else if reason.contains("not installed") || reason.contains("not found") {
-        format!(
-            "Install ruum-scan ON {host}, not on this computer. \
-             Run make install-scan from the checkout on the server."
-        )
+    } else if missing_ruum_scan {
+        if has_embedded_archive {
+            format!(
+                "Install ruum-scan ON {host}, not on this computer. \
+                 Run make install-scan from the checkout on the server."
+            )
+        } else {
+            format!(
+                "This local build does not embed the Linux ruum-scan scanner \
+                 pack (for example, a build without Linux musl targets). \
+                 Install ruum-scan ON {host}, not on this computer: run \
+                 `make install-scan` from the ruum checkout on {host}."
+            )
+        }
     } else {
         "No incomplete scan is shown. Retry, or choose another root.".into()
     };
@@ -932,6 +966,7 @@ impl<T: Send + 'static> RemoteJob<T> {
         let (tx, result) = mpsc::channel();
         let progress = Shared::default();
         let live = progress.clone();
+        let has_embedded_archive = archive.is_some();
         std::thread::spawn(move || {
             let mut input = BufReader::new(stdout);
             let response = (|| {
@@ -976,12 +1011,18 @@ impl<T: Send + 'static> RemoteJob<T> {
             let outcome = match (response, status) {
                 (Ok(response), Ok(status)) if status.success() => Ok(response),
                 (Err(error), _) | (_, Err(error)) => {
-                    Err(ssh_error(&host, &details, &error))
+                    Err(ssh_error_with_context(
+                        &host,
+                        &details,
+                        &error,
+                        has_embedded_archive,
+                    ))
                 }
-                (_, Ok(status)) => Err(ssh_error(
+                (_, Ok(status)) => Err(ssh_error_with_context(
                     &host,
                     &details,
                     &io::Error::other(format!("SSH exited with {status}")),
+                    has_embedded_archive,
                 )),
             };
             let _ = tx.send(outcome);
@@ -2379,6 +2420,141 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_falls_back_to_newest_executable_cached_scanner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let default_cache = home.join(".cache/ruum/ssh");
+        let old_dir = default_cache.join("1111");
+        let new_dir = default_cache.join("2222");
+        let nonexec_dir = default_cache.join("3333");
+        let xdg_cache = dir.path().join("xdg_cache");
+        let xdg_dir = xdg_cache.join("ruum/ssh/4444");
+        for p in [&old_dir, &new_dir, &nonexec_dir, &xdg_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        let now = SystemTime::now();
+        let old_helper = old_dir.join("ruum-scan");
+        std::fs::write(
+            &old_helper,
+            "#!/bin/sh\nIFS= read -r req\nprintf 'CACHE_OLD|%s|%s\\n' \"${1-}\" \"$req\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &old_helper,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old_helper)
+            .unwrap()
+            .set_modified(now - Duration::from_mins(2))
+            .unwrap();
+
+        let new_helper = new_dir.join("ruum-scan");
+        std::fs::write(
+            &new_helper,
+            "#!/bin/sh\nIFS= read -r req\nprintf 'CACHE_NEW|%s|%s\\n' \"${1-}\" \"$req\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &new_helper,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&new_helper)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(30))
+            .unwrap();
+
+        let nonexec_helper = nonexec_dir.join("ruum-scan");
+        std::fs::write(&nonexec_helper, "#!/bin/sh\nprintf 'NONEXEC\\n'\n")
+            .unwrap();
+        std::fs::set_permissions(
+            &nonexec_helper,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let xdg_helper = xdg_dir.join("ruum-scan");
+        std::fs::write(
+            &xdg_helper,
+            "#!/bin/sh\nIFS= read -r req\nprintf 'CACHE_XDG|%s|%s\\n' \"${1-}\" \"$req\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &xdg_helper,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        for shell in available_unix_shells() {
+            // 1. Uses newest executable under $HOME/.cache/ruum/ssh/*/ruum-scan.
+            let mut child = Command::new(&shell)
+                .args(["-c", REMOTE_COMMAND])
+                .env("HOME", &home)
+                .env_remove("XDG_CACHE_HOME")
+                .env("PATH", "/nonexistent")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"discover_version\":1}\n");
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "shell={shell} stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "CACHE_NEW|--stdio-v1|{\"discover_version\":1}\n",
+                "shell={shell}"
+            );
+
+            // 2. Respects XDG_CACHE_HOME when set.
+            let mut xdg_child = Command::new(&shell)
+                .args(["-c", REMOTE_COMMAND])
+                .env("HOME", &home)
+                .env("XDG_CACHE_HOME", &xdg_cache)
+                .env("PATH", "/nonexistent")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = xdg_child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"ok\":true}\n");
+            let xdg_out = xdg_child.wait_with_output().unwrap();
+            assert!(
+                xdg_out.status.success(),
+                "shell={shell} stderr={}",
+                String::from_utf8_lossy(&xdg_out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&xdg_out.stdout),
+                "CACHE_XDG|--stdio-v1|{\"ok\":true}\n",
+                "shell={shell}"
+            );
+        }
+    }
+
     #[test]
     fn ssh_error_classifies_handshake_pollution_and_missing_bin_sh() {
         for msg in [
@@ -2437,6 +2613,30 @@ mod tests {
         .to_string();
         assert!(auth.contains("verify your credentials"), "{auth}");
         assert!(!auth.contains("config.fish"), "{auth}");
+
+        let no_pack_scan = ssh_error_with_context(
+            "prod",
+            "ruum-scan is not installed on this server.",
+            &io::Error::other("SSH exited with 127"),
+            false,
+        )
+        .to_string();
+        assert!(no_pack_scan.contains("musl"), "{no_pack_scan}");
+        assert!(no_pack_scan.contains("make install-scan"), "{no_pack_scan}");
+        assert!(no_pack_scan.contains("prod"), "{no_pack_scan}");
+
+        let missing_sha = ssh_error_with_context(
+            "prod",
+            "sh: 1: sha256sum: not found",
+            &io::Error::other("SSH exited with 127"),
+            true,
+        )
+        .to_string();
+        assert!(
+            missing_sha.contains("sha256sum: not found"),
+            "{missing_sha}"
+        );
+        assert!(!missing_sha.contains("Install ruum-scan"), "{missing_sha}");
     }
 
     #[test]

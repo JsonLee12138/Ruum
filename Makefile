@@ -124,6 +124,13 @@ install:
 	@echo "  $(APPS)/ruum.app"
 	@echo "  $(BINDIR)/ruum -> the app's binary"
 	$(call check_install_path,ruum)
+	@if [ ! -f "$(APPS)/ruum.app/Contents/Resources/ruum-scan-linux.pack" ]; then \
+	    echo; \
+	    echo "warning: $(APPS)/ruum.app/Contents/Resources/ruum-scan-linux.pack is missing."; \
+	    echo "         Remote SSH auto-deployment requires the Linux musl targets."; \
+	    echo "         Run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl"; \
+	    echo "         Then re-run \`make install\` to embed the remote scanner pack."; \
+	fi
 
 uninstall:
 	rm -rf "$(APPS)/ruum.app"

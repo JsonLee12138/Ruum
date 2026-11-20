@@ -2626,3 +2626,111 @@ fn cli_update_check_json_mock_server_and_signature_verification() {
     assert!(reqs[1].contains("GET /v1/check?channel=beta"));
     assert!(!reqs[1].to_ascii_lowercase().contains("x-ruum-client-id:"));
 }
+
+#[test]
+fn cli_update_check_treats_204_and_legacy_404_as_up_to_date() {
+    let sb = Sandbox::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = thread::spawn(move || {
+        let responses = [
+            "HTTP/1.1 204 No Content\r\nX-Ruum-Channel: stable\r\n\
+             Connection: close\r\n\r\n"
+                .to_owned(),
+            "HTTP/1.1 204 No Content\r\nX-Ruum-Channel: stable\r\n\
+             Connection: close\r\n\r\n"
+                .to_owned(),
+            concat!(
+                "HTTP/1.1 404 Not Found\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 30\r\nConnection: close\r\n\r\n",
+                r#"{"error":"manifest not found"}"#,
+            )
+            .to_owned(),
+            concat!(
+                "HTTP/1.1 404 Not Found\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 21\r\nConnection: close\r\n\r\n",
+                r#"{"error":"not found"}"#,
+            )
+            .to_owned(),
+        ];
+        for resp in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut reader = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).unwrap_or(0);
+                if n == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let inner = reader.into_inner();
+            inner.write_all(resp.as_bytes()).unwrap();
+            inner.flush().unwrap();
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let out_204_json = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .args(["update", "check", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update check --json on 204");
+    assert!(
+        out_204_json.status.success(),
+        "{}",
+        stderr_str(&out_204_json)
+    );
+    let json_204: Value =
+        serde_json::from_str(&stdout_str(&out_204_json)).unwrap();
+    assert_eq!(json_204["update_available"], false);
+    assert!(json_204["manifest"].is_null());
+    assert_eq!(json_204["latest_version"], env!("CARGO_PKG_VERSION"));
+
+    let out_204_text = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .args(["update", "check"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update check text on 204");
+    assert!(
+        out_204_text.status.success(),
+        "{}",
+        stderr_str(&out_204_text)
+    );
+    assert!(stdout_str(&out_204_text).contains("is up to date"));
+
+    let out_legacy_404 = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .args(["update", "check", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update check --json on legacy 404");
+    assert!(
+        out_legacy_404.status.success(),
+        "{}",
+        stderr_str(&out_legacy_404)
+    );
+    let json_404: Value =
+        serde_json::from_str(&stdout_str(&out_legacy_404)).unwrap();
+    assert_eq!(json_404["update_available"], false);
+    assert!(json_404["manifest"].is_null());
+
+    let out_real_404 = sb
+        .cmd()
+        .env("RUUM_UPDATE_BASE_URL", &base_url)
+        .args(["update", "check", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum update check --json on genuine 404");
+    assert!(!out_real_404.status.success());
+
+    srv.join().unwrap();
+}

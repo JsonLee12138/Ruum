@@ -7,6 +7,7 @@
 //! signal CI gives.
 
 mod bundle;
+mod cross_lint;
 mod package;
 mod portable;
 mod release;
@@ -19,6 +20,8 @@ usage: cargo xtask <task>
 
 tasks:
   lint      fmt --check, then clippy over the workspace with -D warnings
+  cross-lint [--target <triple>]
+            Windows MSVC clippy cross-check via cargo-xwin (default: x86_64-pc-windows-msvc)
   fmt       rustfmt --check over the workspace
   fmt-fix   rustfmt in place
   clippy    clippy --workspace --all-targets -- -D warnings
@@ -45,6 +48,7 @@ tasks:
               manifest --version <V> --tag <T> --channel <stable|beta> --repo <owner/repo> --dir <dist> --notes-file <path> --out <path> [--sign-key-env <ENV>] [--published-at <iso8601>]
   release-notes --version <V> [--changelog CHANGELOG.md] [--out <path>]
   release-prep  <version> [--changelog CHANGELOG.md] [--dry-run]
+  release-tag   <version> [--remote <name>] [--push] [--skip-ci-check]
 ";
 
 fn main() -> ExitCode {
@@ -52,17 +56,19 @@ fn main() -> ExitCode {
     let task = args.first().map_or("lint", String::as_str);
 
     let outcome = match task {
-        "lint" => fmt(false).and_then(|()| clippy()),
+        "lint" => lint(),
+        "cross-lint" => cross_lint::run(&args[1..]),
         "fmt" => fmt(false),
         "fmt-fix" => fmt(true),
         "clippy" => clippy(),
         "test" => test(),
-        "ci" => fmt(false).and_then(|()| clippy()).and_then(|()| test()),
+        "ci" => lint().and_then(|()| test()),
         "bundle" => bundle::bundle(&args[1..]),
         "package" => package::package(&args[1..]),
         "portable" => portable::build(),
         "release-notes" => release::release_notes(&args[1..]),
         "release-prep" => release::release_prep(&args[1..]),
+        "release-tag" => release::release_tag(&args[1..]),
         "scanner-pack" => scanner_pack::run(&args[1..]),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
@@ -81,6 +87,10 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+pub(crate) fn lint() -> Result<(), String> {
+    fmt(false).and_then(|()| clippy())
 }
 
 fn fmt(fix: bool) -> Result<(), String> {

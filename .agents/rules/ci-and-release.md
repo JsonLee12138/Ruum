@@ -7,8 +7,12 @@ Hard-won guardrails from Ruum's tri-platform GitHub Actions (`CI` and `Release`)
 
 ## 1. Pre-Push & Pre-Tag Gate
 - Ensure `Cargo.toml` workspace `version` matches the pushed release tag `vX.Y.Z` verbatim before creating or moving a tag.
-- Verify `Cargo.lock` is in sync (`--locked`), run local gates (`cargo xtask ci` or `cargo xtask lint` + `cargo test --workspace`), and audit dependency features across targets (`cargo tree --offline --target all -e features`) so no unintended C `-sys` build dependency (e.g., `libdbus-sys`) slips into Linux CI/Release builds.
-- Remember that `cargo xtask clippy` (`clippy --workspace --all-targets --all-features -- -D warnings`) aborts at the first failing compilation unit (`lib` before `tests/*.rs`); audit integration test `#[cfg(...)]` symmetry manually and via cross-target checks when fixing any lint.
+- Verify `Cargo.lock` is in sync (`--locked`), run local gates (`cargo xtask ci` or `cargo xtask lint` + `cargo test --workspace`), run `cargo xtask cross-lint` (or `make cross-lint`) on macOS to catch Windows `#[cfg]` / clippy regressions before pushing, and audit dependency features across targets (`cargo tree --offline --target all -e features`) so no unintended C `-sys` build dependency (e.g., `libdbus-sys`) slips into Linux CI/Release builds.
+- Remember that `cargo xtask clippy` (`clippy --workspace --all-targets --all-features -- -D warnings`) aborts at the first failing compilation unit (`lib` before `tests/*.rs`); audit integration test `#[cfg(...)]` symmetry manually and via `cargo xtask cross-lint` when fixing any lint.
+- **Two-Stage CI-Before-Tag Release Flow (`cargo xtask release-tag`)**:
+  1. Push code changes to `main` first and wait until GitHub Actions `CI` passes across Linux, macOS, and Windows (`x86_64` & `aarch64`).
+  2. Run `cargo xtask release-prep <version>` (updates `Cargo.toml` + `CHANGELOG.md`), sync `Cargo.lock`, and commit.
+  3. Run `cargo xtask release-tag <version> --push` (validates SemVer, clean tree, `Cargo.toml` + `CHANGELOG.md`, `--locked`, `cargo xtask lint`, `cross-lint` when available, and `gh run list` green `CI` status walking back past release-only commits) to create and push `v<version>` safely.
 
 ## 2. macOS Packaging (`xtask/src/bundle.rs` & `.github/workflows/release.yml`)
 - Guard `hdiutil create`, `.dmg` `codesign`, and `hdiutil verify` with exponential backoff retries (`HDIUTIL_BACKOFFS_MS` / `sleep` loop in `release.yml`) because Spotlight and `diskimagesiod` (`diskimages-helper`) on `macos-15` can hold transient exclusive locks (`Resource temporarily unavailable` / `EBUSY` / `EAGAIN`) for ~4–5s immediately after image creation.

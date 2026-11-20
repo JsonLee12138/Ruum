@@ -13,6 +13,30 @@ const PREP_USAGE: &str = "\
 usage: cargo xtask release-prep <version> [--changelog CHANGELOG.md] [--dry-run]
 ";
 
+const TAG_USAGE: &str = "\
+usage: cargo xtask release-tag <version> [--remote <name>] [--push] [--skip-ci-check]
+";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReleaseTagOptions {
+    pub version: String,
+    pub remote: String,
+    pub push: bool,
+    pub skip_ci_check: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GhCiRun {
+    pub database_id: u64,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    pub url: String,
+    #[serde(default)]
+    pub event: String,
+}
+
 /// Extracts the Markdown release notes body for `version` from `changelog`.
 pub fn extract_release_notes(
     changelog: &str,
@@ -340,6 +364,389 @@ pub fn release_prep(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parses CLI options for `cargo xtask release-tag`.
+pub fn parse_release_tag_args(
+    args: &[String],
+) -> Result<Option<ReleaseTagOptions>, String> {
+    let mut version: Option<String> = None;
+    let mut remote = "origin".to_owned();
+    let mut push = false;
+    let mut skip_ci_check = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--remote" => {
+                next_arg(&mut iter, "--remote")?.clone_into(&mut remote);
+            }
+            "--push" => push = true,
+            "--skip-ci-check" => skip_ci_check = true,
+            "-h" | "--help" | "help" => {
+                println!("{TAG_USAGE}");
+                return Ok(None);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown release-tag option `{other}`"));
+            }
+            positional => {
+                if version.is_some() {
+                    return Err(format!(
+                        "unexpected extra positional argument `{positional}`"
+                    ));
+                }
+                version = Some(positional.to_owned());
+            }
+        }
+    }
+
+    let raw_version = version.ok_or("<version> is required")?;
+    let parsed = semver::Version::parse(raw_version.trim())
+        .map_err(|err| format!("invalid SemVer `{raw_version}`: {err}"))?;
+    Ok(Some(ReleaseTagOptions {
+        version: parsed.to_string(),
+        remote,
+        push,
+        skip_ci_check,
+    }))
+}
+
+/// Reads `[workspace.package].version` from `Cargo.toml` text.
+pub fn read_workspace_version(cargo_toml: &str) -> Result<String, String> {
+    let mut in_workspace_pkg = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_workspace_pkg = trimmed == "[workspace.package]";
+            continue;
+        }
+        if !in_workspace_pkg {
+            continue;
+        }
+        let Some((key, rhs)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "version" {
+            continue;
+        }
+        let val = rhs.trim();
+        if let Some(rest) = val.strip_prefix('"')
+            && let Some((ver, _)) = rest.split_once('"')
+        {
+            return Ok(ver.to_owned());
+        }
+        if let Some(rest) = val.strip_prefix('\'')
+            && let Some((ver, _)) = rest.split_once('\'')
+        {
+            return Ok(ver.to_owned());
+        }
+    }
+    Err("could not find `version = \"...\"` under `[workspace.package]`".into())
+}
+
+/// Verifies that `[workspace.package].version` matches `expected_version`.
+pub fn verify_workspace_version(
+    cargo_toml: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    let actual = read_workspace_version(cargo_toml)?;
+    if actual != expected_version {
+        return Err(format!(
+            "Cargo.toml [workspace.package].version is `{actual}`, \
+             expected `{expected_version}`"
+        ));
+    }
+    Ok(())
+}
+
+fn is_release_only_path(raw: &str) -> bool {
+    let normalized = raw.replace('\\', "/");
+    let mut path = normalized.as_str();
+    while let Some(stripped) = path.strip_prefix("./") {
+        path = stripped;
+    }
+    if path.is_empty() {
+        return false;
+    }
+    matches!(
+        path,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "cliff.toml"
+            | "LICENSE"
+            | ".gitignore"
+            | ".editorconfig"
+    ) || Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        || path.starts_with("docs/")
+        || path.starts_with(".agents/")
+        || path.starts_with(".artifacts/")
+}
+
+/// Returns `true` when every changed path is a release/doc/metadata file.
+pub fn is_release_only_paths(paths: &[String]) -> bool {
+    !paths.is_empty() && paths.iter().all(|p| is_release_only_path(p))
+}
+
+/// Selects a passing CI workflow run from `gh run list --json ...` output.
+pub fn select_ci_run_verdict(
+    runs_json: &str,
+    commit_sha: &str,
+) -> Result<GhCiRun, String> {
+    let runs: Vec<GhCiRun> =
+        serde_json::from_str(runs_json).map_err(|err| {
+            format!("could not parse `gh run list` JSON output: {err}")
+        })?;
+    if runs.is_empty() {
+        return Err(format!(
+            "no CI workflow runs found for commit `{commit_sha}`; push to \
+             remote and wait for CI, or pass --skip-ci-check"
+        ));
+    }
+
+    let is_completed_success = |run: &&GhCiRun| {
+        run.status.eq_ignore_ascii_case("completed")
+            && run
+                .conclusion
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("success"))
+    };
+
+    if let Some(preferred) = runs.iter().find(|r| {
+        is_completed_success(r)
+            && matches!(r.event.as_str(), "push" | "workflow_dispatch")
+    }) {
+        return Ok(preferred.clone());
+    }
+
+    if let Some(any_success) = runs.iter().find(is_completed_success) {
+        return Ok(any_success.clone());
+    }
+
+    if let Some(active) = runs
+        .iter()
+        .find(|r| !r.status.eq_ignore_ascii_case("completed"))
+    {
+        return Err(format!(
+            "CI run {} for commit `{commit_sha}` has status `{}` ({}); wait \
+             for completion before tagging",
+            active.database_id, active.status, active.url
+        ));
+    }
+
+    let failed = &runs[0];
+    let conclusion = failed.conclusion.as_deref().unwrap_or("unknown");
+    Err(format!(
+        "CI run {} for commit `{commit_sha}` did not succeed (status: `{}`, \
+         conclusion: `{conclusion}`): {}",
+        failed.database_id, failed.status, failed.url
+    ))
+}
+
+fn git_output(repo_root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            format!("could not run `git {}`: {err}", args.join(" "))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn git_tag_exists(repo_root: &Path, tag_name: &str) -> Result<bool, String> {
+    let ref_name = format!("refs/tags/{tag_name}");
+    let status = Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "-q", "--verify", &ref_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("could not run `git rev-parse`: {err}"))?;
+    Ok(status.success())
+}
+
+fn resolve_ci_target_commit(repo_root: &Path) -> Result<String, String> {
+    let list = git_output(
+        repo_root,
+        &["rev-list", "--first-parent", "-n", "11", "HEAD"],
+    )?;
+    for sha in list.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let changed = git_output(
+            repo_root,
+            &[
+                "diff-tree",
+                "--first-parent",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "--root",
+                sha,
+            ],
+        )?;
+        let paths: Vec<String> = changed
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !is_release_only_paths(&paths) {
+            return Ok(sha.to_owned());
+        }
+    }
+    Err(
+        "could not find a code commit within 10 parents of HEAD to verify CI"
+            .into(),
+    )
+}
+
+fn check_gh_ci_for_commit(
+    repo_root: &Path,
+    commit_sha: &str,
+) -> Result<GhCiRun, String> {
+    let output = Command::new("gh")
+        .current_dir(repo_root)
+        .args([
+            "run",
+            "list",
+            "--commit",
+            commit_sha,
+            "--workflow",
+            "CI",
+            "--limit",
+            "10",
+            "--json",
+            "databaseId,status,conclusion,url,event",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            format!(
+                "could not run `gh run list` (install GitHub CLI or pass \
+                 --skip-ci-check): {err}"
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("`gh run list` failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    select_ci_run_verdict(&stdout, commit_sha)
+}
+
+fn run_cargo_check_locked(repo_root: &Path) -> Result<(), String> {
+    let cargo = option_env!("CARGO").unwrap_or("cargo");
+    let args = [
+        "check",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+    ];
+    let display = format!("{cargo} {}", args.join(" "));
+    let status = Command::new(cargo)
+        .current_dir(repo_root)
+        .args(args)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|err| format!("could not start `{display}`: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{display}` failed"))
+    }
+}
+
+/// Entry point for `cargo xtask release-tag`.
+pub fn release_tag(args: &[String]) -> Result<(), String> {
+    let Some(opts) = parse_release_tag_args(args)? else {
+        return Ok(());
+    };
+    let repo_root = workspace_root();
+    let tag_name = format!("v{}", opts.version);
+
+    if git_tag_exists(&repo_root, &tag_name)? {
+        return Err(format!("tag `{tag_name}` already exists locally"));
+    }
+
+    let porcelain = git_output(&repo_root, &["status", "--porcelain"])?;
+    if !porcelain.trim().is_empty() {
+        return Err(
+            "working tree is not clean; commit or stash changes before tagging"
+                .into(),
+        );
+    }
+
+    let cargo_path = repo_root.join("Cargo.toml");
+    let cargo_raw = fs::read_to_string(&cargo_path).map_err(|err| {
+        format!("cannot read {}: {err}", cargo_path.display())
+    })?;
+    verify_workspace_version(&cargo_raw, &opts.version)?;
+
+    let changelog_path = repo_root.join("CHANGELOG.md");
+    let changelog_raw = fs::read_to_string(&changelog_path).map_err(|err| {
+        format!("cannot read {}: {err}", changelog_path.display())
+    })?;
+    extract_release_notes(&changelog_raw, &opts.version)?;
+
+    run_cargo_check_locked(&repo_root)?;
+    crate::lint()?;
+    if crate::cross_lint::is_available() {
+        crate::cross_lint::run_target(crate::cross_lint::DEFAULT_TARGET)?;
+    } else {
+        eprintln!(
+            "xtask release-tag: skipping cross-lint (cargo-xwin, LLVM, or \
+             Windows target not available)"
+        );
+    }
+
+    if !opts.skip_ci_check {
+        let sha = resolve_ci_target_commit(&repo_root)?;
+        let ci_run = check_gh_ci_for_commit(&repo_root, &sha)?;
+        println!(
+            "verified CI run {} ({}, {}) for commit {sha}",
+            ci_run.database_id, ci_run.event, ci_run.url
+        );
+    }
+
+    let branch = if opts.push {
+        let raw =
+            git_output(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let name = raw.trim().to_owned();
+        if name.is_empty() || name == "HEAD" {
+            return Err(
+                "cannot push from detached HEAD; check out a branch first"
+                    .into(),
+            );
+        }
+        Some(name)
+    } else {
+        None
+    };
+
+    git_output(&repo_root, &["tag", &tag_name])?;
+    println!("created tag {tag_name}");
+
+    if let Some(branch_name) = branch {
+        git_output(&repo_root, &["push", &opts.remote, &branch_name])?;
+        let tag_ref = format!("refs/tags/{tag_name}");
+        git_output(&repo_root, &["push", &opts.remote, &tag_ref])?;
+        println!("pushed {branch_name} and {tag_name} to {}", opts.remote);
+    }
+
+    Ok(())
+}
+
 fn try_git_cliff_prepend(changelog: &Path, version: &str) -> bool {
     let repo_root = workspace_root();
     try_git_cliff_prepend_with("git-cliff", &repo_root, changelog, version)
@@ -660,5 +1067,155 @@ anyhow = \"1\"
         let recorded_args = fs::read_to_string(&args_log).unwrap();
         assert!(recorded_args.contains("--config"));
         assert!(recorded_args.contains(&cliff_toml.display().to_string()));
+    }
+
+    #[test]
+    fn parses_release_tag_cli_options() {
+        assert_eq!(
+            parse_release_tag_args(&["0.2.3-beta.3".into()]).unwrap(),
+            Some(ReleaseTagOptions {
+                version: "0.2.3-beta.3".into(),
+                remote: "origin".into(),
+                push: false,
+                skip_ci_check: false,
+            })
+        );
+        assert_eq!(
+            parse_release_tag_args(&[
+                "0.2.3".into(),
+                "--remote".into(),
+                "upstream".into(),
+                "--push".into(),
+                "--skip-ci-check".into(),
+            ])
+            .unwrap(),
+            Some(ReleaseTagOptions {
+                version: "0.2.3".into(),
+                remote: "upstream".into(),
+                push: true,
+                skip_ci_check: true,
+            })
+        );
+        assert_eq!(parse_release_tag_args(&["--help".into()]).unwrap(), None);
+        assert!(parse_release_tag_args(&[]).is_err());
+        assert!(parse_release_tag_args(&["not-semver".into()]).is_err());
+        assert!(
+            parse_release_tag_args(&["0.2.3".into(), "extra".into()]).is_err()
+        );
+        assert!(
+            parse_release_tag_args(&["0.2.3".into(), "--bogus".into()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verifies_workspace_package_version_only() {
+        let sample = "\
+[workspace]
+members = [\"xtask\"]
+
+[workspace.package]
+version = \"0.2.3-beta.3\" # release version
+edition = \"2024\"
+
+[package]
+version = \"9.9.9\"
+";
+        assert_eq!(read_workspace_version(sample).unwrap(), "0.2.3-beta.3");
+        verify_workspace_version(sample, "0.2.3-beta.3").unwrap();
+        assert!(verify_workspace_version(sample, "0.2.3").is_err());
+        assert!(read_workspace_version("[workspace]\n").is_err());
+    }
+
+    #[test]
+    fn classifies_release_only_paths_matching_ci_rules() {
+        assert!(!is_release_only_paths(&[]));
+        assert!(is_release_only_paths(&[
+            "Cargo.toml".into(),
+            "Cargo.lock".into(),
+            "CHANGELOG.md".into(),
+            "README.md".into(),
+            "docs/guide.txt".into(),
+            ".agents/rules/ci-and-release.md".into(),
+            ".artifacts/PLAN.md".into(),
+        ]));
+        assert!(is_release_only_paths(&[
+            "./CHANGELOG.md".into(),
+            "docs\\notes.txt".into(),
+        ]));
+        assert!(!is_release_only_paths(&[
+            "Cargo.toml".into(),
+            "crates/ruum-core/src/updater.rs".into(),
+        ]));
+        assert!(!is_release_only_paths(&[
+            "CHANGELOG.md".into(),
+            "xtask/src/release.rs".into(),
+        ]));
+    }
+
+    #[test]
+    fn selects_ci_run_verdict_from_gh_json() {
+        let sha = "abcdef1234567";
+
+        let empty_err = select_ci_run_verdict("[]", sha).unwrap_err();
+        assert!(empty_err.contains(sha));
+
+        let in_progress = r#"[
+            {
+                "databaseId": 101,
+                "status": "in_progress",
+                "conclusion": null,
+                "url": "https://github.com/org/repo/actions/runs/101",
+                "event": "push"
+            }
+        ]"#;
+        let ip_err = select_ci_run_verdict(in_progress, sha).unwrap_err();
+        assert!(ip_err.contains("in_progress"));
+        assert!(ip_err.contains("runs/101"));
+
+        let failed = r#"[
+            {
+                "databaseId": 102,
+                "status": "completed",
+                "conclusion": "failure",
+                "url": "https://github.com/org/repo/actions/runs/102",
+                "event": "push"
+            }
+        ]"#;
+        let fail_err = select_ci_run_verdict(failed, sha).unwrap_err();
+        assert!(fail_err.contains("failure"));
+        assert!(fail_err.contains("runs/102"));
+
+        let mixed_success = r#"[
+            {
+                "databaseId": 103,
+                "status": "completed",
+                "conclusion": "success",
+                "url": "https://github.com/org/repo/actions/runs/103",
+                "event": "pull_request"
+            },
+            {
+                "databaseId": 104,
+                "status": "completed",
+                "conclusion": "success",
+                "url": "https://github.com/org/repo/actions/runs/104",
+                "event": "push"
+            }
+        ]"#;
+        let chosen = select_ci_run_verdict(mixed_success, sha).unwrap();
+        assert_eq!(chosen.database_id, 104);
+        assert_eq!(chosen.event, "push");
+
+        let pr_only = r#"[
+            {
+                "databaseId": 105,
+                "status": "completed",
+                "conclusion": "success",
+                "url": "https://github.com/org/repo/actions/runs/105",
+                "event": "pull_request"
+            }
+        ]"#;
+        let pr_chosen = select_ci_run_verdict(pr_only, sha).unwrap();
+        assert_eq!(pr_chosen.database_id, 105);
     }
 }

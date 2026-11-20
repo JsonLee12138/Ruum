@@ -50,7 +50,7 @@ define check_install_path
 	fi
 endef
 
-.PHONY: help build run install install-scan uninstall bundle bundle-all lint test test-ssh ci fmt clean
+.PHONY: help build run install install-scan uninstall bundle bundle-all lint cross-lint test test-ssh ci fmt clean
 
 help:
 	@echo "ruum"
@@ -64,6 +64,7 @@ help:
 	@echo "  make bundle-all  macOS: build .app, .zip, .dmg, and .pkg"
 	@echo "  make uninstall   remove what install put there"
 	@echo "  make lint        rustfmt --check and clippy -D warnings"
+	@echo "  make cross-lint  Windows MSVC clippy cross-check via cargo-xwin"
 	@echo "  make test        core and window-harness tests"
 	@echo "  make test-ssh    real localhost SSH tests (Linux: bun, openssh)"
 	@echo "  make ci          lint, then test"
@@ -92,6 +93,9 @@ run: build
 
 lint:
 	$(CARGO) xtask lint
+
+cross-lint:
+	$(CARGO) xtask cross-lint
 
 test:
 	$(CARGO) xtask test

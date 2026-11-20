@@ -917,20 +917,61 @@ impl LinuxUpdateAdapter {
     }
 }
 
-fn strip_appdir_ld_library_path(raw: &str, appdir: &Path) -> Option<String> {
-    let stale_dir = appdir.join("usr/lib");
-    let stale_norm = stale_dir.to_string_lossy();
-    let stale_trimmed = stale_norm.trim_end_matches('/');
-    let kept: Vec<&str> = raw
-        .split(':')
-        .filter(|entry| {
-            !entry.is_empty() && entry.trim_end_matches('/') != stale_trimmed
-        })
-        .collect();
-    if kept.is_empty() {
-        None
+enum LdLibraryPathAction {
+    KeepUnchanged,
+    Set(String),
+    Remove,
+}
+
+fn normalize_posix_path_str(raw: &str) -> String {
+    let replaced = raw.replace('\\', "/");
+    let trimmed = replaced.trim_end_matches('/');
+    if trimmed.is_empty() && replaced.starts_with('/') {
+        "/".to_owned()
     } else {
-        Some(kept.join(":"))
+        trimmed.to_owned()
+    }
+}
+
+// Build `$APPDIR/usr/lib` using pure `/` POSIX semantics rather than host
+// `Path::join` so Windows hosts never inject `\` when matching Linux
+// `LD_LIBRARY_PATH` entries.
+fn appdir_stale_lib_dir(appdir: &Path) -> Option<String> {
+    let base = normalize_posix_path_str(&appdir.to_string_lossy());
+    if base.is_empty() {
+        None
+    } else if base == "/" {
+        Some("/usr/lib".to_owned())
+    } else {
+        Some(format!("{base}/usr/lib"))
+    }
+}
+
+fn clean_appdir_ld_library_path(
+    raw: &str,
+    appdir: &Path,
+) -> LdLibraryPathAction {
+    let Some(stale_dir) = appdir_stale_lib_dir(appdir) else {
+        return LdLibraryPathAction::KeepUnchanged;
+    };
+    let mut found_stale = false;
+    let mut kept = Vec::new();
+    for entry in raw.split(':') {
+        if entry.is_empty() {
+            continue;
+        }
+        if normalize_posix_path_str(entry) == stale_dir {
+            found_stale = true;
+        } else {
+            kept.push(entry);
+        }
+    }
+    if !found_stale {
+        LdLibraryPathAction::KeepUnchanged
+    } else if kept.is_empty() {
+        LdLibraryPathAction::Remove
+    } else {
+        LdLibraryPathAction::Set(kept.join(":"))
     }
 }
 
@@ -942,18 +983,13 @@ fn appimage_relaunch_env(
     if let (Some(appdir), Some(raw_ld)) =
         (env.appdir_env.as_deref(), env.ld_library_path.as_deref())
     {
-        let stale_dir = appdir.join("usr/lib");
-        let stale_norm = stale_dir.to_string_lossy();
-        let stale_trimmed = stale_norm.trim_end_matches('/');
-        let has_stale = raw_ld
-            .split(':')
-            .any(|entry| entry.trim_end_matches('/') == stale_trimmed);
-        if has_stale {
-            match strip_appdir_ld_library_path(raw_ld, appdir) {
-                Some(cleaned) => {
-                    set_envs.push(("LD_LIBRARY_PATH", cleaned));
-                }
-                None => remove_envs.push("LD_LIBRARY_PATH"),
+        match clean_appdir_ld_library_path(raw_ld, appdir) {
+            LdLibraryPathAction::KeepUnchanged => {}
+            LdLibraryPathAction::Set(cleaned) => {
+                set_envs.push(("LD_LIBRARY_PATH", cleaned));
+            }
+            LdLibraryPathAction::Remove => {
+                remove_envs.push("LD_LIBRARY_PATH");
             }
         }
     }
@@ -4059,7 +4095,7 @@ mod tests {
         fs::write(&appimage_dl, b"new-appimage-2").unwrap();
         let solo_ld_env = UpdateEnv {
             ld_library_path: Some("/tmp/.mount_abc/usr/lib".to_owned()),
-            ..appimage_env
+            ..appimage_env.clone()
         };
         let solo_spawner = MockSpawner::default();
         adapter
@@ -4080,6 +4116,33 @@ mod tests {
                 .any(|k| k == "LD_LIBRARY_PATH")
         );
         assert!(solo_spawn.envs.is_empty());
+
+        // Windows-style backslash/mixed-slash APPDIR still strips POSIX
+        // $APPDIR/usr/lib via pure `/` normalization on any host OS.
+        fs::write(&appimage_dl, b"new-appimage-3").unwrap();
+        let mixed_ld_env = UpdateEnv {
+            appdir_env: Some(PathBuf::from(r"\tmp\.mount_abc")),
+            ld_library_path: Some(
+                "/tmp/.mount_abc/usr/lib/:/opt/custom/lib".to_owned(),
+            ),
+            ..appimage_env
+        };
+        let mixed_spawner = MockSpawner::default();
+        adapter
+            .apply_with_spawner(
+                &mixed_ld_env,
+                InstallKind::LinuxAppImage,
+                &appimage_dl,
+                &manifest,
+                &MockRunner::default(),
+                &mixed_spawner,
+            )
+            .unwrap();
+        let mixed_spawn = &mixed_spawner.calls()[0];
+        assert_eq!(
+            mixed_spawn.envs,
+            vec![("LD_LIBRARY_PATH".to_owned(), "/opt/custom/lib".to_owned())]
+        );
 
         let ai_calls = appimage_runner.calls();
         let ai_stop = ai_calls
@@ -4196,5 +4259,57 @@ mod tests {
             ),
             "sudo apt update && sudo apt install --only-upgrade ruum"
         );
+    }
+
+    #[test]
+    fn appimage_relaunch_env_normalizes_mixed_and_trailing_slashes() {
+        let base_expected_remove = vec!["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
+
+        for appdir in [
+            "/tmp/.mount_abc",
+            "/tmp/.mount_abc/",
+            "/tmp/.mount_abc//",
+            r"\tmp\.mount_abc",
+            r"/tmp/.mount_abc\",
+            r"\tmp\.mount_abc\/",
+        ] {
+            let with_custom = UpdateEnv {
+                appdir_env: Some(PathBuf::from(appdir)),
+                ld_library_path: Some(
+                    "/tmp/.mount_abc/usr/lib:/opt/custom/lib".to_owned(),
+                ),
+                ..UpdateEnv::default()
+            };
+            let (set_envs, remove_envs) = appimage_relaunch_env(&with_custom);
+            assert_eq!(
+                set_envs,
+                vec![("LD_LIBRARY_PATH", "/opt/custom/lib".to_owned())],
+                "appdir={appdir}"
+            );
+            assert_eq!(remove_envs, base_expected_remove, "appdir={appdir}");
+
+            let solo_trailing = UpdateEnv {
+                appdir_env: Some(PathBuf::from(appdir)),
+                ld_library_path: Some("/tmp/.mount_abc/usr/lib/".to_owned()),
+                ..UpdateEnv::default()
+            };
+            let (set_solo, remove_solo) = appimage_relaunch_env(&solo_trailing);
+            assert!(set_solo.is_empty(), "appdir={appdir}");
+            assert_eq!(
+                remove_solo,
+                vec!["APPDIR", "APPIMAGE", "ARGV0", "OWD", "LD_LIBRARY_PATH"],
+                "appdir={appdir}"
+            );
+        }
+
+        // Unrelated LD_LIBRARY_PATH stays untouched.
+        let unrelated = UpdateEnv {
+            appdir_env: Some(PathBuf::from(r"/tmp/.mount_abc\")),
+            ld_library_path: Some("/opt/custom/lib:/usr/local/lib".to_owned()),
+            ..UpdateEnv::default()
+        };
+        let (set_unrel, remove_unrel) = appimage_relaunch_env(&unrelated);
+        assert!(set_unrel.is_empty());
+        assert_eq!(remove_unrel, base_expected_remove);
     }
 }

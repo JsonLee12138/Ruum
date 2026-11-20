@@ -2,6 +2,21 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.3] - 2026-11-20
+
+### Features
+
+- **app,core,cli:** Add non-intrusive update UX (rail entry, once-per-version toast, Changelog modal with on-demand download, tray/menu integration, and **Settings › Updates** with `Stable` / `Beta` channels across `en`/`zh`/`ja`/`ko`), Ed25519 + SHA256 verified updater, tri-platform desktop installers, and `ruum update [check]` / `ruum config update`.
+- **release,infra:** Add Cloudflare Worker + private R2 edge distribution (`https://ruum-updates.jsonlee12138.com`), `install.sh` / `install.ps1` installers, signed manifests, and Linux AppImage `gh-releases-zsync` (`.AppImage.zsync`) support.
+
+### Fixes
+
+- **core,remote,updater:** Fall back to cached `~/.cache/ruum/ssh/*/ruum-scan` helpers when local builds omit the embedded Linux scanner pack, sync `ruum-scan-linux.pack` on Windows CLI updates, treat empty release channels (`204 No Content` / `manifest not found`) as up to date, localize update errors, and normalize AppImage `LD_LIBRARY_PATH` cleanup with pure `/` POSIX semantics across all hosts.
+
+### Tooling & Docs
+
+- **xtask,ci,docs:** Add `cargo xtask cross-lint` (`cargo-xwin` Windows MSVC cross-clippy) and `cargo xtask release-tag` (enforcing clean tree, `--locked`, lint, optional cross-lint, and passing `CI` before tagging), and sync `README` (`en`/`zh`/`ja`/`ko`) and `infra/update-worker/README.md`.
+
 ## [0.2.3-beta.3] - 2026-11-20
 
 ### Fixes

@@ -2207,6 +2207,9 @@ fn trigger_background_ai_analysis(cx: &mut App) {
         return;
     }
     let exe = resolve_cli_exe();
+    let shared_cred_store = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.cred_store.clone());
     with_runtime_mut(cx, |rt| rt.background_analysis_in_flight = true);
 
     let task = cx.background_executor().spawn(async move {
@@ -2220,10 +2223,15 @@ fn trigger_background_ai_analysis(cx: &mut App) {
         let ai_cfg = db.load_ai_config().unwrap_or_default();
         let now_secs = now_unix_secs();
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
-        let proposal = ruum_core::ai_cli::run_analysis_for_config(
-            &ai_cfg, &home, &exe, now_secs, &runner,
-        )
-        .map_err(std::io::Error::other)?;
+        let mut ai_ctx = ruum_core::ai_cli::AiExecutionContext::default();
+        if let Some(store) = shared_cred_store {
+            ai_ctx = ai_ctx.with_credential_store(store);
+        }
+        let proposal =
+            ruum_core::ai_cli::run_analysis_with_tree_for_config_with_context(
+                &ai_cfg, &home, &exe, now_secs, None, &runner, &ai_ctx,
+            )
+            .map_err(std::io::Error::other)?;
         let ai_state =
             ruum_core::storage::AiState::from_proposal(&proposal, now_secs)
                 .unwrap_or_default();

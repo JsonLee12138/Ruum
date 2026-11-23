@@ -154,6 +154,18 @@ pub const fn placeholder_model_override(locale: Locale) -> &'static str {
     )
 }
 
+/// Placeholder for direct AI API key masked input in Settings.
+#[must_use]
+pub const fn placeholder_api_key(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Enter API key (leave empty to keep saved)",
+        "\u{8f93}\u{5165} API \u{5bc6}\u{94a5}\u{ff08}\u{7559}\u{7a7a}\u{4fdd}\u{7559}\u{5df2}\u{6709}\u{5bc6}\u{94a5}\u{ff09}",
+        "API \u{30ad}\u{30fc}\u{3092}\u{5165}\u{529b}\u{ff08}\u{7a7a}\u{6b04}\u{3067}\u{4fdd}\u{5b58}\u{6e08}\u{307f}\u{3092}\u{7dad}\u{6301}\u{ff09}",
+        "API \u{d0a4} \u{c785}\u{b825}(\u{be44}\u{c6cc} \u{b450}\u{ba74} \u{ae30}\u{c874} \u{d0a4} \u{c720}\u{c9c0})",
+    )
+}
+
 /// Picker error shown when a relative path is submitted.
 #[must_use]
 pub const fn picker_abs_path(locale: Locale) -> &'static str {

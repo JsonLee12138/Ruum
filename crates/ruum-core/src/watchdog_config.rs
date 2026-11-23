@@ -28,7 +28,7 @@ pub const MIN_COOLDOWN_SECS: u64 = 300;
 /// Default notification / AI analysis cooldown in seconds (6 hours).
 pub const DEFAULT_COOLDOWN_SECS: u64 = 21_600;
 
-/// Supported AI CLI assistants.
+/// Supported AI providers (external CLI assistants and direct API mode).
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
 )]
@@ -39,11 +39,13 @@ pub enum AiCliProvider {
     Agy,
     Codex,
     Custom,
+    Api,
 }
 
 impl AiCliProvider {
     /// All available providers for UI and iteration.
-    pub const ALL: [Self; 4] = [Self::Agy, Self::Pi, Self::Codex, Self::Custom];
+    pub const ALL: [Self; 5] =
+        [Self::Agy, Self::Pi, Self::Codex, Self::Custom, Self::Api];
 
     /// Canonical short identifier.
     #[must_use]
@@ -53,10 +55,11 @@ impl AiCliProvider {
             Self::Agy => "agy",
             Self::Codex => "codex",
             Self::Custom => "custom",
+            Self::Api => "api",
         }
     }
 
-    /// Parse an AI CLI provider from its canonical short identifier.
+    /// Parse an AI provider from its canonical short identifier.
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
         match id.trim().to_ascii_lowercase().as_str() {
@@ -64,6 +67,7 @@ impl AiCliProvider {
             "agy" => Some(Self::Agy),
             "codex" => Some(Self::Codex),
             "custom" => Some(Self::Custom),
+            "api" => Some(Self::Api),
             _ => None,
         }
     }
@@ -74,7 +78,7 @@ impl AiCliProvider {
         self.label_in(Locale::En)
     }
 
-    /// Localized display label for this AI CLI provider.
+    /// Localized display label for this AI provider.
     #[must_use]
     pub const fn label_in(self, locale: Locale) -> &'static str {
         match (self, locale) {
@@ -85,6 +89,67 @@ impl AiCliProvider {
             (Self::Custom, Locale::Zh) => "自定义",
             (Self::Custom, Locale::Ja) => "カスタム",
             (Self::Custom, Locale::Ko) => "사용자 지정",
+            (Self::Api, _) => "API",
+        }
+    }
+}
+
+/// Wire protocol spoken when [`AiCliProvider::Api`] is selected.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub enum ApiProtocol {
+    #[default]
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
+impl ApiProtocol {
+    /// All supported direct API wire protocols.
+    pub const ALL: [Self; 2] = [Self::OpenAi, Self::Anthropic];
+
+    /// Canonical lowercase identifier stored in `SQLite` and JSON.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    /// Parse a wire protocol from its identifier (`openai` or `anthropic`).
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+
+    /// Official default base URL for this wire protocol.
+    #[must_use]
+    pub const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAi => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com",
+        }
+    }
+
+    /// Human-friendly display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        self.label_in(Locale::En)
+    }
+
+    /// Localized display label for this protocol.
+    #[must_use]
+    pub const fn label_in(self, _locale: Locale) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::Anthropic => "Claude",
         }
     }
 }
@@ -697,5 +762,38 @@ mod tests {
         let raw = read_to_string_with_retry(&state_path).unwrap();
         assert!(raw.contains("1700000099"));
         assert_eq!(load_state(&state_path).unwrap(), state2);
+    }
+
+    #[test]
+    fn api_provider_and_protocol_ids_and_defaults() {
+        assert_eq!(AiCliProvider::Api.id(), "api");
+        assert_eq!(AiCliProvider::from_id("API"), Some(AiCliProvider::Api));
+        assert_eq!(AiCliProvider::Api.label_in(Locale::En), "API");
+        assert_eq!(AiCliProvider::Api.label_in(Locale::Zh), "API");
+
+        assert_eq!(ApiProtocol::default(), ApiProtocol::OpenAi);
+        assert_eq!(ApiProtocol::OpenAi.id(), "openai");
+        assert_eq!(ApiProtocol::Anthropic.id(), "anthropic");
+        assert_eq!(ApiProtocol::from_id("OpenAI"), Some(ApiProtocol::OpenAi));
+        assert_eq!(
+            ApiProtocol::from_id("anthropic"),
+            Some(ApiProtocol::Anthropic)
+        );
+        assert_eq!(ApiProtocol::from_id("unknown"), None);
+        assert_eq!(
+            ApiProtocol::OpenAi.default_base_url(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            ApiProtocol::Anthropic.default_base_url(),
+            "https://api.anthropic.com"
+        );
+        for proto in ApiProtocol::ALL {
+            let encoded = serde_json::to_string(&proto).unwrap();
+            assert_eq!(encoded, format!("\"{}\"", proto.id()));
+            let decoded: ApiProtocol = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, proto);
+            assert!(!proto.label_in(Locale::En).is_empty());
+        }
     }
 }

@@ -232,6 +232,76 @@ pub const fn test_cli_connection(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn test_api_connection(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Test API Connection",
+        "\u{6d4b}\u{8bd5} API \u{8fde}\u{63a5}",
+        "API \u{63a5}\u{7d9a}\u{3092}\u{30c6}\u{30b9}\u{30c8}",
+        "API \u{c5f0}\u{acb0} \u{d14c}\u{c2a4}\u{d2b8}",
+    )
+}
+
+pub const fn api_protocol_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "API Protocol:",
+        "API \u{534f}\u{8bae}\u{ff1a}",
+        "API \u{30d7}\u{30ed}\u{30c8}\u{30b3}\u{30eb}:",
+        "API \u{d504}\u{b85c}\u{d1a0}\u{cf5c}:",
+    )
+}
+
+pub const fn api_base_url_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Base URL:",
+        "\u{63a5}\u{53e3}\u{5730}\u{5740}\u{ff08}Base URL\u{ff09}\u{ff1a}",
+        "\u{30d9}\u{30fc}\u{30b9} URL:",
+        "\u{ae30}\u{bcf8} URL:",
+    )
+}
+
+pub const fn api_key_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "API Key:",
+        "API \u{5bc6}\u{94a5}\u{ff1a}",
+        "API \u{30ad}\u{30fc}:",
+        "API \u{d0a4}:",
+    )
+}
+
+pub const fn clear_api_key(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Clear Key",
+        "\u{6e05}\u{9664}\u{5bc6}\u{94a5}",
+        "\u{30ad}\u{30fc}\u{3092}\u{524a}\u{9664}",
+        "\u{d0a4} \u{c9c0}\u{c6b0}\u{ae30}",
+    )
+}
+
+pub const fn api_key_keep_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Leave empty to keep saved API key (or RUUM_AI_API_KEY).",
+        "\u{7559}\u{7a7a}\u{5c06}\u{4fdd}\u{7559}\u{5df2}\u{4fdd}\u{5b58}\u{7684} API \u{5bc6}\u{94a5}\u{ff08}\u{6216}\u{4f7f}\u{7528} RUUM_AI_API_KEY\u{ff09}\u{3002}",
+        "\u{7a7a}\u{6b04}\u{306e}\u{307e}\u{307e}\u{3067}\u{4fdd}\u{5b58}\u{6e08}\u{307f} API \u{30ad}\u{30fc}\u{ff08}\u{307e}\u{305f}\u{306f} RUUM_AI_API_KEY\u{ff09}\u{3092}\u{7dad}\u{6301}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{be44}\u{c6cc} \u{b450}\u{ba74} \u{c800}\u{c7a5}\u{b41c} API \u{d0a4}(\u{b610}\u{b294} RUUM_AI_API_KEY)\u{b97c} \u{c720}\u{c9c0}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn api_key_empty_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Stored encrypted in credential store; leave empty to keep existing.",
+        "\u{5c06}\u{52a0}\u{5bc6}\u{4fdd}\u{5b58}\u{5728}\u{7cfb}\u{7edf}\u{51ed}\u{636e}\u{5e93}\u{4e2d}\u{ff1b}\u{7559}\u{7a7a}\u{4fdd}\u{5b58}\u{4e0d}\u{4f1a}\u{8986}\u{76d6}\u{5df2}\u{6709}\u{5bc6}\u{94a5}\u{3002}",
+        "\u{8a8d}\u{8a3c}\u{60c5}\u{5831}\u{30b9}\u{30c8}\u{30a2}\u{306b}\u{6697}\u{53f7}\u{5316}\u{3057}\u{3066}\u{4fdd}\u{5b58}\u{3055}\u{308c}\u{307e}\u{3059}\u{3002}\u{7a7a}\u{6b04}\u{3067}\u{4fdd}\u{5b58}\u{3059}\u{308b}\u{3068}\u{65e2}\u{5b58}\u{30ad}\u{30fc}\u{3092}\u{7dad}\u{6301}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{c790}\u{aca9} \u{c99d}\u{ba85} \u{c800}\u{c7a5}\u{c18c}\u{c5d0} \u{c554}\u{d638}\u{d654}\u{b418}\u{c5b4} \u{c800}\u{c7a5}\u{b418}\u{ba70} \u{be44}\u{c6cc} \u{b450}\u{ba74} \u{ae30}\u{c874} \u{d0a4}\u{b97c} \u{c720}\u{c9c0}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
 pub const fn fetch_models(locale: Locale) -> &'static str {
     pick(
         locale,

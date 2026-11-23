@@ -2734,3 +2734,257 @@ fn cli_update_check_treats_204_and_legacy_404_as_up_to_date() {
 
     srv.join().unwrap();
 }
+
+#[test]
+fn config_ai_api_flags_redact_secret_and_preserve_lazy_keychain() {
+    let sb = Sandbox::new();
+
+    // Seed an SSH secret so device-credentials.enc exists on disk.
+    let ssh_add = sb.run_with_keychain(&[
+        "config",
+        "ssh",
+        "add",
+        "--alias",
+        "lab",
+        "--host",
+        "10.0.0.9",
+        "--username",
+        "ops",
+        "--auth-mode",
+        "password",
+        "--password",
+        "ssh-pw-999",
+        "--json",
+    ]);
+    assert!(ssh_add.status.success(), "{}", stderr_str(&ssh_add));
+
+    // When provider != api, `config ai get` must NEVER wake the OS keychain.
+    let ai_get_cli = sb.run(&["config", "ai", "get", "--json"]);
+    assert!(
+        ai_get_cli.status.success(),
+        "config ai get under CLI provider must not touch keychain: {}",
+        stderr_str(&ai_get_cli)
+    );
+    let cli_json: Value =
+        serde_json::from_str(&stdout_str(&ai_get_cli)).unwrap();
+    assert_eq!(cli_json["provider"], "agy");
+    assert_eq!(cli_json["api_key_configured"], false);
+
+    // Configure direct API with --api-key-stdin and verify secret redaction.
+    let mut set_cmd = sb.cmd_with_test_keychain();
+    set_cmd
+        .args([
+            "config",
+            "ai",
+            "set",
+            "--provider",
+            "api",
+            "--api-protocol",
+            "anthropic",
+            "--api-base-url",
+            "https://api.xiaomimimo.com/anthropic",
+            "--model",
+            "mimo-v2-flash",
+            "--api-key-stdin",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = set_cmd.spawn().expect("spawn config ai set");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"test-api-key\n")
+        .unwrap();
+    let set_out = child.wait_with_output().unwrap();
+    assert!(set_out.status.success(), "{}", stderr_str(&set_out));
+    let set_stdout = stdout_str(&set_out);
+    assert!(!set_stdout.contains("test-api-key"));
+    let set_json: Value = serde_json::from_str(&set_stdout).unwrap();
+    assert_eq!(set_json["provider"], "api");
+    assert_eq!(set_json["api_protocol"], "anthropic");
+    assert_eq!(
+        set_json["api_base_url"],
+        "https://api.xiaomimimo.com/anthropic"
+    );
+    assert_eq!(set_json["model"], "mimo-v2-flash");
+    assert_eq!(set_json["api_key_configured"], true);
+
+    let get_text = sb.run_with_keychain(&["config", "ai", "get"]);
+    assert!(get_text.status.success(), "{}", stderr_str(&get_text));
+    let text_out = stdout_str(&get_text);
+    assert!(!text_out.contains("test-api-key"));
+    assert!(text_out.contains("api_protocol = anthropic"));
+    assert!(text_out.contains("api_key_configured = true"));
+
+    let cleared = sb.run_with_keychain(&[
+        "config",
+        "ai",
+        "set",
+        "--clear-api-base-url",
+        "--clear-api-key",
+        "--json",
+    ]);
+    assert!(cleared.status.success(), "{}", stderr_str(&cleared));
+    let cleared_json: Value =
+        serde_json::from_str(&stdout_str(&cleared)).unwrap();
+    assert_eq!(cleared_json["api_base_url"], "");
+    assert_eq!(cleared_json["api_key_configured"], false);
+}
+
+#[test]
+fn analyze_direct_api_uses_env_key_without_keychain_and_runs_local_mcp() {
+    let sb = Sandbox::new();
+    let canonical_home =
+        dunce::canonicalize(&sb.home).unwrap_or_else(|_| sb.home.clone());
+    let cache_dir = canonical_home.join(".cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("junk.bin"), vec![5_u8; 4096]).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let scan_root_str = canonical_home.display().to_string();
+    let cache_str = cache_dir.display().to_string();
+
+    let server = thread::spawn(move || {
+        for turn in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    break pos;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + 4 + content_len {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = if turn == 0 {
+                let call_args = json!({ "root": scan_root_str }).to_string();
+                let chunk1 = json!({
+                    "id": "e2e-1",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-e2e",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "find_reclaimable",
+                                    "arguments": call_args
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                });
+                let chunk2 = json!({
+                    "id": "e2e-1",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-e2e",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls"
+                    }]
+                });
+                format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n")
+            } else {
+                let proposal = json!({
+                    "summary": "E2E cache cleanup",
+                    "items": [{
+                        "path": cache_str,
+                        "mode": "trash",
+                        "reason": "e2e cache"
+                    }]
+                })
+                .to_string();
+                let chunk1 = json!({
+                    "id": "e2e-2",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-e2e",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "role": "assistant", "content": proposal },
+                        "finish_reason": null
+                    }]
+                });
+                let chunk2 = json!({
+                    "id": "e2e-2",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-e2e",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n")
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let cfg_set = sb.run(&[
+        "config",
+        "ai",
+        "set",
+        "--provider",
+        "api",
+        "--api-protocol",
+        "openai",
+        "--api-base-url",
+        &format!("http://{addr}/v1"),
+        "--model",
+        "gpt-e2e",
+        "--json",
+    ]);
+    assert!(cfg_set.status.success(), "{}", stderr_str(&cfg_set));
+
+    // Analyze using RUUM_AI_API_KEY fallback with SENTINEL_FORBID_KEYCHAIN.
+    let analyze_out = sb
+        .cmd()
+        .env("HOME", &canonical_home)
+        .env("RUUM_AI_API_KEY", "test-api-key")
+        .args(["analyze", canonical_home.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ruum analyze");
+    assert!(analyze_out.status.success(), "{}", stderr_str(&analyze_out));
+    let prop: Value = serde_json::from_str(&stdout_str(&analyze_out)).unwrap();
+    assert_eq!(prop["items"][0]["path"], cache_dir.display().to_string());
+    assert_eq!(prop["items"][0]["bytes"], 4096);
+
+    server.join().unwrap();
+}

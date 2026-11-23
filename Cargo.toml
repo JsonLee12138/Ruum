@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ruum-adk",
     "crates/ruum-app",
     "crates/ruum-core",
     "crates/ruum-scan",
@@ -16,6 +17,7 @@ license = "GPL-3.0-only"
 repository = "https://github.com/JsonLee12138/Ruum.git"
 
 [workspace.dependencies]
+ruum-adk = { path = "crates/ruum-adk" }
 ruum-core = { path = "crates/ruum-core" }
 ruum-watchdog = { path = "crates/ruum-watchdog" }
 rusqlite = { version = "0.32", features = ["bundled"] }

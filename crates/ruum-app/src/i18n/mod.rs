@@ -364,8 +364,70 @@ mod tests {
             assert!(!messages::script_launch_failed("err", locale).is_empty());
             assert!(!messages::script_reveal_failed("err", locale).is_empty());
             assert!(!messages::script_discarded("prod", locale).is_empty());
+            assert!(!pages::api_protocol_label(locale).is_empty());
+            assert!(!pages::api_base_url_label(locale).is_empty());
+            assert!(!pages::api_key_label(locale).is_empty());
+            assert!(!pages::clear_api_key(locale).is_empty());
+            assert!(!pages::api_key_keep_hint(locale).is_empty());
+            assert!(!pages::api_key_empty_hint(locale).is_empty());
+            assert!(!pages::test_api_connection(locale).is_empty());
+            assert!(!messages::placeholder_api_key(locale).is_empty());
+            assert!(
+                !messages::testing_api_connection("OpenAI", locale).is_empty()
+            );
+            assert!(!messages::api_key_cleared(locale).is_empty());
+            assert_eq!(
+                ruum_core::watchdog_config::AiCliProvider::Api.label_in(locale),
+                "API"
+            );
+            assert_eq!(
+                ruum_core::watchdog_config::ApiProtocol::OpenAi
+                    .label_in(locale),
+                "OpenAI"
+            );
+            assert_eq!(
+                ruum_core::watchdog_config::ApiProtocol::Anthropic
+                    .label_in(locale),
+                "Claude"
+            );
         }
         for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert_ne!(
+                pages::api_protocol_label(locale),
+                pages::api_protocol_label(Locale::En)
+            );
+            assert_ne!(
+                pages::api_base_url_label(locale),
+                pages::api_base_url_label(Locale::En)
+            );
+            assert_ne!(
+                pages::api_key_label(locale),
+                pages::api_key_label(Locale::En)
+            );
+            assert_ne!(
+                pages::clear_api_key(locale),
+                pages::clear_api_key(Locale::En)
+            );
+            assert_ne!(
+                pages::api_key_keep_hint(locale),
+                pages::api_key_keep_hint(Locale::En)
+            );
+            assert_ne!(
+                pages::test_api_connection(locale),
+                pages::test_api_connection(Locale::En)
+            );
+            assert_ne!(
+                messages::placeholder_api_key(locale),
+                messages::placeholder_api_key(Locale::En)
+            );
+            assert_ne!(
+                messages::testing_api_connection("OpenAI", locale),
+                messages::testing_api_connection("OpenAI", Locale::En)
+            );
+            assert_ne!(
+                messages::api_key_cleared(locale),
+                messages::api_key_cleared(Locale::En)
+            );
             assert_ne!(
                 pages::script_generated_title(locale),
                 pages::script_generated_title(Locale::En)

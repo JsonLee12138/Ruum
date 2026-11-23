@@ -17,7 +17,9 @@ use ruum_watchdog::{
     SpaceProbe, SpaceSample, WatchdogEvent, WatchdogEventSink,
 };
 
-use crate::ai_cli::{self, CommandRunner, DefaultCommandRunner};
+use crate::ai_cli::{
+    self, AiExecutionContext, CommandRunner, DefaultCommandRunner,
+};
 use crate::confirm::{
     CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmItem,
     CleanupConfirmRequest, GuiCleanupConfirm,
@@ -92,6 +94,7 @@ pub struct CoreWatchdogEventHandler<'a> {
     notifier: &'a dyn NotificationAdapter,
     locale: Locale,
     ipc_notify_target: Option<(PathBuf, String)>,
+    ai_context: AiExecutionContext,
 }
 
 impl fmt::Debug for CoreWatchdogEventHandler<'_> {
@@ -126,7 +129,15 @@ impl<'a> CoreWatchdogEventHandler<'a> {
             notifier,
             locale: Locale::current(),
             ipc_notify_target: resolve_ipc_target_and_token(),
+            ai_context: AiExecutionContext::default(),
         }
+    }
+
+    /// Override execution context (for example direct API overrides in tests).
+    #[must_use]
+    pub fn with_ai_context(mut self, ai_context: AiExecutionContext) -> Self {
+        self.ai_context = ai_context;
+        self
     }
 
     /// Override localization used for notification titles/bodies.
@@ -206,25 +217,29 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
             return Ok(());
         }
 
-        let proposal = match ai_cli::run_analysis_for_config(
-            &ai_cfg,
-            mount_path,
-            &self.current_exe,
-            *timestamp_secs,
-            self.cmd_runner,
-        ) {
-            Ok(prop) => {
-                let ai_state = AiState::from_proposal(&prop, *timestamp_secs)?;
-                self.db.save_ai_state(&ai_state)?;
-                self.send_ipc_watchdog_update();
-                Some(prop)
-            }
-            Err(err) => {
-                eprintln!("ruum watchdog: AI analysis error: {err}");
-                self.send_ipc_watchdog_update();
-                None
-            }
-        };
+        let proposal =
+            match ai_cli::run_analysis_with_tree_for_config_with_context(
+                &ai_cfg,
+                mount_path,
+                &self.current_exe,
+                *timestamp_secs,
+                None,
+                self.cmd_runner,
+                &self.ai_context,
+            ) {
+                Ok(prop) => {
+                    let ai_state =
+                        AiState::from_proposal(&prop, *timestamp_secs)?;
+                    self.db.save_ai_state(&ai_state)?;
+                    self.send_ipc_watchdog_update();
+                    Some(prop)
+                }
+                Err(err) => {
+                    eprintln!("ruum watchdog: AI analysis error: {err}");
+                    self.send_ipc_watchdog_update();
+                    None
+                }
+            };
 
         if let Some(prop) = proposal.as_ref().filter(|p| !p.items.is_empty()) {
             let confirm_items = prop
@@ -2128,5 +2143,147 @@ mod tests {
             .expect("unconfirmed item remains in ai_state");
         assert_eq!(remaining.items.len(), 1);
         assert_eq!(remaining.items[0].path, item_keep);
+    }
+
+    #[test]
+    fn core_event_handler_runs_direct_api_analysis_and_triggers_confirm() {
+        use crate::ai_cli::AiExecutionContext;
+        use crate::storage::AiConfig;
+        use crate::watchdog_config::{AiCliProvider, ApiProtocol};
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = crate::removal::normalize(temp.path());
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+
+        let target_file = home.join("stale.log");
+        fs::write(&target_file, b"stale-log-bytes").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target_str = target_file.display().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    break pos;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + 4 + content_len {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let proposal = serde_json::json!({
+                "summary": "Direct API cleanup",
+                "items": [{
+                    "path": target_str,
+                    "mode": "permanent",
+                    "reason": "test stale log"
+                }]
+            })
+            .to_string();
+            let chunk1 = serde_json::json!({
+                "id": "wd-1",
+                "object": "chat.completion.chunk",
+                "model": "gpt-wd",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": proposal },
+                    "finish_reason": null
+                }]
+            });
+            let chunk2 = serde_json::json!({
+                "id": "wd-1",
+                "object": "chat.completion.chunk",
+                "model": "gpt-wd",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            let body =
+                format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        db.save_ai_config(&AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Api,
+            api_protocol: ApiProtocol::OpenAi,
+            api_base_url: format!("http://{addr}/v1"),
+            model: Some("gpt-wd".to_owned()),
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let ai_runner = MockRunner::default();
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Confirmed {
+                selected_paths: vec![target_file.clone()],
+                selected_docker_targets: Vec::new(),
+            },
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db,
+            PathBuf::from("/bin/ruum"),
+            &ai_runner,
+            &confirm,
+            &notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None)
+        .with_ai_context(
+            AiExecutionContext::default().with_api_key("test-api-key"),
+        );
+
+        handler
+            .on_event(&WatchdogEvent::LowDiskSpace {
+                timestamp_secs: 1_794_895_300,
+                mount_path: home,
+                available_bytes: 512,
+                total_bytes: 1024,
+                threshold_bytes: 1024 * 1024 * 1024,
+            })
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(ai_runner.runs.lock().unwrap().is_empty());
+        let tagged = notifier.tagged.lock().unwrap();
+        assert_eq!(tagged.len(), 2);
+        assert_eq!(tagged[0].0, NOTIF_TAG_LOW_SPACE);
+        assert_eq!(tagged[1].0, NOTIF_TAG_CLEANUP_DONE);
+        drop(tagged);
+        assert!(!target_file.exists());
+        assert_eq!(db.load_ai_state().unwrap().last_proposal_json, None);
     }
 }

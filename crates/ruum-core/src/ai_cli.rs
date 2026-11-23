@@ -6,19 +6,28 @@
 //! verified through [`crate::removal::plan`] and [`crate::git::state`].
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
 use crate::classify::Category;
+use crate::credentials::LazyCredentialStore;
 use crate::docker_adapter::{
     DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
     validate_targets_against_summary,
 };
 use crate::identity::HostIdentity;
 use crate::insights::{self, Finding};
+use crate::mcp::{McpServer, local_read_only_tool_definitions};
 use crate::remote::Header;
 use crate::removal::RemovalMode;
 use crate::size::human_bytes;
@@ -26,8 +35,17 @@ use crate::storage::AiConfig;
 use crate::trash_adapter::TrashOs;
 use crate::tree::{Node, NodeKind, path_of};
 use crate::watchdog_config::{
-    AiCliProvider, CleanupProposal, ProposalItem, WatchdogConfig,
+    AiCliProvider, ApiProtocol, CleanupProposal, ProposalItem, WatchdogConfig,
 };
+
+/// Environment variable checked as a headless fallback for direct API keys.
+pub const ENV_AI_API_KEY: &str = "RUUM_AI_API_KEY";
+
+/// Returns `true` when `RUUM_AI_API_KEY` is present and non-empty.
+#[must_use]
+pub fn env_api_key_present() -> bool {
+    std::env::var(ENV_AI_API_KEY).is_ok_and(|val| !val.trim().is_empty())
+}
 
 fn ai_config_from_legacy(config: &WatchdogConfig) -> AiConfig {
     AiConfig {
@@ -36,7 +54,7 @@ fn ai_config_from_legacy(config: &WatchdogConfig) -> AiConfig {
         custom_command: config.custom_command.clone(),
         extra_args: config.extra_args.clone(),
         model: config.model.clone(),
-        updated_at_secs: 0,
+        ..AiConfig::default()
     }
 }
 
@@ -656,13 +674,7 @@ pub fn collect_reclaimable_candidates(
     out
 }
 
-/// Generate the strict read-only diagnostic prompt including pre-scanned items.
-#[must_use]
-pub fn build_analysis_prompt_with_candidates(
-    home_dir: &Path,
-    current_exe: &Path,
-    candidates: &[ReclaimCandidateSummary],
-) -> String {
+fn format_candidates_block(candidates: &[ReclaimCandidateSummary]) -> String {
     use std::fmt::Write as _;
 
     let mut cand_block = String::new();
@@ -695,6 +707,17 @@ pub fn build_analysis_prompt_with_candidates(
         }
         cand_block.push('\n');
     }
+    cand_block
+}
+
+/// Generate the strict read-only diagnostic prompt including pre-scanned items.
+#[must_use]
+pub fn build_analysis_prompt_with_candidates(
+    home_dir: &Path,
+    current_exe: &Path,
+    candidates: &[ReclaimCandidateSummary],
+) -> String {
+    let cand_block = format_candidates_block(candidates);
 
     format!(
         "You are an automated disk cleanup advisor for Ruum.\n\
@@ -736,6 +759,49 @@ pub fn build_analysis_prompt_with_candidates(
     )
 }
 
+fn build_direct_api_analysis_prompt(
+    home_dir: &Path,
+    candidates: &[ReclaimCandidateSummary],
+) -> (String, String) {
+    let cand_block = format_candidates_block(candidates);
+    let instruction = format!(
+        "You are an automated disk cleanup advisor for Ruum.\n\
+         The user's target directory is: {home}\n\
+         You have direct in-process read-only local inspection tools attached: \
+         list_volumes, scan_directory, inspect_subtree, find_reclaimable, \
+         check_git_safety, and plan_removal.\n\n\
+         CRITICAL SAFETY CONSTRAINTS:\n\
+         - This is a STRICT READ-ONLY diagnostic session.\n\
+         - Never suggest deleting system paths, the home root, or paths \
+         outside {home}.\n\
+         - Call the attached read-only tools directly if you need to inspect \
+         additional subdirectories, verify git safety, or validate removal \
+         guards.\n\
+         - Prefer analyzing the pre-scanned candidates when sufficient.\n\
+         - Output ONLY a valid JSON object matching the requested schema.",
+        home = home_dir.display(),
+    );
+    let user_prompt = format!(
+        "Analyze reclaimable disk space under {home}.\n\n\
+         {cand_block}\
+         You MUST output ONLY a valid JSON object (either raw JSON or within \
+         a single ```json markdown block) matching this schema:\n\
+         {{\n  \
+           \"summary\": \"Brief explanation of reclaimable space found\",\n  \
+           \"items\": [\n    \
+             {{\n      \
+               \"path\": \"/absolute/path/to/reclaimable/target\",\n      \
+               \"mode\": \"trash\" or \"permanent\",\n      \
+               \"reason\": \"Why this item is safe to clean up\"\n    \
+             }}\n  \
+           ]\n\
+         }}\n\
+         Do not include conversational filler outside the JSON.",
+        home = home_dir.display(),
+    );
+    (instruction, user_prompt)
+}
+
 /// Generate the strict read-only diagnostic prompt for the AI assistant.
 #[must_use]
 pub fn build_analysis_prompt(home_dir: &Path, current_exe: &Path) -> String {
@@ -758,6 +824,13 @@ pub fn build_invocation_for_config(
             AiCliProvider::Custom => {
                 return Err(
                     "custom AI provider selected but no command specified"
+                        .to_string(),
+                );
+            }
+            AiCliProvider::Api => {
+                return Err(
+                    "direct API provider does not use an external CLI \
+                     executable"
                         .to_string(),
                 );
             }
@@ -810,6 +883,10 @@ pub fn build_invocation_for_config(
                 args.push(m.clone());
             }
         }
+        AiCliProvider::Api => {
+            return Err("direct API provider does not build CLI invocations"
+                .to_string());
+        }
     }
 
     if !config.extra_args.trim().is_empty() {
@@ -847,6 +924,12 @@ pub fn probe_cli(
         AiCliProvider::Custom => {
             return Err("custom command is empty".to_string());
         }
+        AiCliProvider::Api => {
+            return Err(
+                "direct API provider does not use an external CLI executable"
+                    .to_string(),
+            );
+        }
     };
     resolve_cli_executable(name)
         .ok_or_else(|| format!("executable `{name}` could not be found"))
@@ -854,6 +937,28 @@ pub fn probe_cli(
 
 /// Run a short non-destructive connection test against an [`AiConfig`].
 pub fn test_connection_for_config(
+    config: &AiConfig,
+    runner: &dyn CommandRunner,
+) -> Result<String, String> {
+    test_connection_for_config_with_context(
+        config,
+        runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Run a short non-destructive connection test against an [`AiConfig`] with an
+/// explicit [`AiExecutionContext`].
+pub fn test_connection_for_config_with_context(
+    config: &AiConfig,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> Result<String, String> {
+    AiBackendFactory::create(config.provider)
+        .test_connection(config, runner, ctx)
+}
+
+fn cli_test_connection(
     config: &AiConfig,
     runner: &dyn CommandRunner,
 ) -> Result<String, String> {
@@ -1253,6 +1358,28 @@ pub fn discover_models_for_config(
     config: &AiConfig,
     runner: &dyn CommandRunner,
 ) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+    discover_models_for_config_with_context(
+        config,
+        runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Discover selectable models for an [`AiConfig`] with an explicit
+/// [`AiExecutionContext`].
+pub fn discover_models_for_config_with_context(
+    config: &AiConfig,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+    AiBackendFactory::create(config.provider)
+        .discover_models(config, runner, ctx)
+}
+
+fn cli_discover_models(
+    config: &AiConfig,
+    runner: &dyn CommandRunner,
+) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
     let custom = config.custom_command.trim();
     match config.provider {
         AiCliProvider::Agy => {
@@ -1340,6 +1467,9 @@ pub fn discover_models_for_config(
                     .to_string(),
             ),
         )),
+        AiCliProvider::Api => {
+            Err("direct API provider must use DirectApiAiAdapter".to_string())
+        }
     }
 }
 
@@ -1351,13 +1481,28 @@ pub fn discover_models(
     discover_models_for_config(&ai_config_from_legacy(config), runner)
 }
 
-/// Probe CLI connectivity and fetch available models for an [`AiConfig`].
+/// Probe connectivity and fetch available models for an [`AiConfig`].
 pub fn test_connection_and_discover_for_config(
     config: &AiConfig,
     runner: &dyn CommandRunner,
 ) -> Result<ConnectionTestResult, String> {
-    let version_message = test_connection_for_config(config, runner)?;
-    match discover_models_for_config(config, runner) {
+    test_connection_and_discover_for_config_with_context(
+        config,
+        runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Probe connectivity and fetch available models for an [`AiConfig`] with an
+/// explicit [`AiExecutionContext`].
+pub fn test_connection_and_discover_for_config_with_context(
+    config: &AiConfig,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> Result<ConnectionTestResult, String> {
+    let adapter = AiBackendFactory::create(config.provider);
+    let version_message = adapter.test_connection(config, runner, ctx)?;
+    match adapter.discover_models(config, runner, ctx) {
         Ok((models, model_note)) => Ok(ConnectionTestResult {
             version_message,
             models,
@@ -1400,6 +1545,35 @@ fn first_line_snippet(text: &str, max_chars: usize) -> String {
 /// Run a lightweight round-trip latency test for a specific AI model using
 /// [`AiConfig`].
 pub fn benchmark_model_for_config(
+    config: &AiConfig,
+    model_override: Option<&str>,
+    runner: &dyn CommandRunner,
+) -> ModelSpeedResult {
+    benchmark_model_for_config_with_context(
+        config,
+        model_override,
+        runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Run a lightweight round-trip latency test for a specific AI model using
+/// [`AiConfig`] and an explicit [`AiExecutionContext`].
+pub fn benchmark_model_for_config_with_context(
+    config: &AiConfig,
+    model_override: Option<&str>,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> ModelSpeedResult {
+    AiBackendFactory::create(config.provider).benchmark_model(
+        config,
+        model_override,
+        runner,
+        ctx,
+    )
+}
+
+fn cli_benchmark_model(
     config: &AiConfig,
     model_override: Option<&str>,
     runner: &dyn CommandRunner,
@@ -2327,6 +2501,56 @@ pub fn run_tree_analysis_for_config(
     now_secs: u64,
     runner: &dyn CommandRunner,
 ) -> Result<CleanupProposal, String> {
+    run_tree_analysis_for_config_with_context(
+        config,
+        root_path,
+        home_path,
+        tree,
+        docker,
+        target_os,
+        now_secs,
+        runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Run AI analysis locally against an in-memory scanned [`Node`] tree with an
+/// explicit [`AiExecutionContext`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "in-memory tree analysis needs explicit root, home, tree, docker, target OS, and execution context"
+)]
+pub fn run_tree_analysis_for_config_with_context(
+    config: &AiConfig,
+    root_path: &Path,
+    home_path: Option<&Path>,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+    target_os: TrashOs,
+    now_secs: u64,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> Result<CleanupProposal, String> {
+    AiBackendFactory::create(config.provider).run_tree_analysis(
+        config, root_path, home_path, tree, docker, target_os, now_secs,
+        runner, ctx,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "in-memory CLI tree analysis needs explicit root, home, tree, docker, and target OS"
+)]
+fn cli_run_tree_analysis(
+    config: &AiConfig,
+    root_path: &Path,
+    home_path: Option<&Path>,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+    target_os: TrashOs,
+    now_secs: u64,
+    runner: &dyn CommandRunner,
+) -> Result<CleanupProposal, String> {
     let candidates = collect_tree_candidates(root_path, tree, docker);
     let prompt = build_tree_analysis_prompt(root_path, target_os, &candidates);
     let invocation = build_invocation_for_config(config, &prompt)?;
@@ -2485,6 +2709,47 @@ pub fn run_analysis_with_tree_for_config(
     existing_tree: Option<&Node>,
     runner: &dyn CommandRunner,
 ) -> Result<CleanupProposal, String> {
+    run_analysis_with_tree_for_config_with_context(
+        config,
+        home_dir,
+        current_exe,
+        now_secs,
+        existing_tree,
+        runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Run an AI diagnostic analysis for an [`AiConfig`] with an explicit
+/// [`AiExecutionContext`].
+pub fn run_analysis_with_tree_for_config_with_context(
+    config: &AiConfig,
+    home_dir: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    existing_tree: Option<&Node>,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> Result<CleanupProposal, String> {
+    AiBackendFactory::create(config.provider).run_analysis_with_tree(
+        config,
+        home_dir,
+        current_exe,
+        now_secs,
+        existing_tree,
+        runner,
+        ctx,
+    )
+}
+
+fn cli_run_analysis_with_tree(
+    config: &AiConfig,
+    home_dir: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    existing_tree: Option<&Node>,
+    runner: &dyn CommandRunner,
+) -> Result<CleanupProposal, String> {
     let candidates =
         collect_reclaimable_candidates(home_dir, existing_tree, now_secs);
     let prompt = build_analysis_prompt_with_candidates(
@@ -2581,6 +2846,653 @@ pub fn run_analysis(
         now_secs,
         runner,
     )
+}
+
+/// Discriminant of the AI execution backend backing a provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiBackendKind {
+    Cli,
+    DirectApi,
+}
+
+/// Execution-time credential and HTTP overrides for AI operations.
+#[derive(Clone, Default)]
+pub struct AiExecutionContext {
+    pub api_key: Option<Zeroizing<String>>,
+    pub credential_store: Option<LazyCredentialStore>,
+    pub allow_insecure_http: bool,
+}
+
+impl AiExecutionContext {
+    /// Override the direct API key (used by GUI drafts and offline tests).
+    #[must_use]
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        let raw = key.into();
+        let trimmed = raw.trim();
+        self.api_key =
+            (!trimmed.is_empty()).then(|| Zeroizing::new(trimmed.to_owned()));
+        self
+    }
+
+    /// Inject a custom [`LazyCredentialStore`] instead of opening the default
+    /// desktop store.
+    #[must_use]
+    pub fn with_credential_store(mut self, store: LazyCredentialStore) -> Self {
+        self.credential_store = Some(store);
+        self
+    }
+
+    /// Allow non-loopback `http://` endpoints when explicitly requested.
+    #[must_use]
+    pub const fn with_allow_insecure_http(mut self, allow: bool) -> Self {
+        self.allow_insecure_http = allow;
+        self
+    }
+}
+
+impl fmt::Debug for AiExecutionContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AiExecutionContext")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("has_credential_store", &self.credential_store.is_some())
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
+}
+
+/// OS/backend-agnostic execution contract for AI probing and analysis.
+pub trait AiExecutionAdapter: Send + Sync {
+    fn kind(&self) -> AiBackendKind;
+
+    fn test_connection(
+        &self,
+        config: &AiConfig,
+        runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<String, String>;
+
+    fn discover_models(
+        &self,
+        config: &AiConfig,
+        runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<(Vec<DiscoveredModel>, Option<String>), String>;
+
+    fn benchmark_model(
+        &self,
+        config: &AiConfig,
+        model_override: Option<&str>,
+        runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> ModelSpeedResult;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "local analysis adapter requires root, exe path, timestamp, optional scanned tree, runner, and context"
+    )]
+    fn run_analysis_with_tree(
+        &self,
+        config: &AiConfig,
+        home_dir: &Path,
+        current_exe: &Path,
+        now_secs: u64,
+        existing_tree: Option<&Node>,
+        runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String>;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "in-memory tree analysis adapter requires root, home, tree, docker, target OS, timestamp, runner, and context"
+    )]
+    fn run_tree_analysis(
+        &self,
+        config: &AiConfig,
+        root_path: &Path,
+        home_path: Option<&Path>,
+        tree: &Node,
+        docker: &DockerProbeStatus,
+        target_os: TrashOs,
+        now_secs: u64,
+        runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String>;
+}
+
+/// Adapter routing `agy`, `pi`, `codex`, and `custom` through external CLIs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CliAiAdapter;
+
+impl AiExecutionAdapter for CliAiAdapter {
+    fn kind(&self) -> AiBackendKind {
+        AiBackendKind::Cli
+    }
+
+    fn test_connection(
+        &self,
+        config: &AiConfig,
+        runner: &dyn CommandRunner,
+        _ctx: &AiExecutionContext,
+    ) -> Result<String, String> {
+        cli_test_connection(config, runner)
+    }
+
+    fn discover_models(
+        &self,
+        config: &AiConfig,
+        runner: &dyn CommandRunner,
+        _ctx: &AiExecutionContext,
+    ) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+        cli_discover_models(config, runner)
+    }
+
+    fn benchmark_model(
+        &self,
+        config: &AiConfig,
+        model_override: Option<&str>,
+        runner: &dyn CommandRunner,
+        _ctx: &AiExecutionContext,
+    ) -> ModelSpeedResult {
+        cli_benchmark_model(config, model_override, runner)
+    }
+
+    fn run_analysis_with_tree(
+        &self,
+        config: &AiConfig,
+        home_dir: &Path,
+        current_exe: &Path,
+        now_secs: u64,
+        existing_tree: Option<&Node>,
+        runner: &dyn CommandRunner,
+        _ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String> {
+        cli_run_analysis_with_tree(
+            config,
+            home_dir,
+            current_exe,
+            now_secs,
+            existing_tree,
+            runner,
+        )
+    }
+
+    fn run_tree_analysis(
+        &self,
+        config: &AiConfig,
+        root_path: &Path,
+        home_path: Option<&Path>,
+        tree: &Node,
+        docker: &DockerProbeStatus,
+        target_os: TrashOs,
+        now_secs: u64,
+        runner: &dyn CommandRunner,
+        _ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String> {
+        cli_run_tree_analysis(
+            config, root_path, home_path, tree, docker, target_os, now_secs,
+            runner,
+        )
+    }
+}
+
+/// Adapter routing [`AiCliProvider::Api`] through `crates/ruum-adk` and an
+/// in-process read-only [`McpServer`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DirectApiAiAdapter;
+
+/// Factory selecting the [`AiExecutionAdapter`] for a configured provider.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AiBackendFactory;
+
+impl AiBackendFactory {
+    /// Return the backend kind corresponding to `provider`.
+    #[must_use]
+    pub const fn kind_for(provider: AiCliProvider) -> AiBackendKind {
+        match provider {
+            AiCliProvider::Pi
+            | AiCliProvider::Agy
+            | AiCliProvider::Codex
+            | AiCliProvider::Custom => AiBackendKind::Cli,
+            AiCliProvider::Api => AiBackendKind::DirectApi,
+        }
+    }
+
+    /// Construct the [`AiExecutionAdapter`] for `provider`.
+    #[must_use]
+    pub fn create(provider: AiCliProvider) -> Box<dyn AiExecutionAdapter> {
+        match Self::kind_for(provider) {
+            AiBackendKind::Cli => Box::new(CliAiAdapter),
+            AiBackendKind::DirectApi => Box::new(DirectApiAiAdapter),
+        }
+    }
+}
+
+fn read_env_api_key() -> Option<Zeroizing<String>> {
+    let val = std::env::var(ENV_AI_API_KEY).ok()?;
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(Zeroizing::new(trimmed.to_owned()))
+}
+
+fn resolve_api_key(
+    ctx: &AiExecutionContext,
+) -> Result<Zeroizing<String>, String> {
+    if let Some(ref key) = ctx.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Ok(Zeroizing::new(trimmed.to_owned()));
+        }
+    }
+    if let Some(ref store) = ctx.credential_store {
+        if let Some(key) = store.get_ai_api_key()? {
+            return Ok(key);
+        }
+        if let Some(env_key) = read_env_api_key() {
+            return Ok(env_key);
+        }
+    } else {
+        if let Some(env_key) = read_env_api_key() {
+            return Ok(env_key);
+        }
+        let store = LazyCredentialStore::open_default()?;
+        if let Some(key) = store.get_ai_api_key()? {
+            return Ok(key);
+        }
+    }
+    Err(
+        "API key is not configured for direct API provider (set it in \
+         Settings, via `ruum config ai set --api-key-stdin`, or via \
+         RUUM_AI_API_KEY)"
+            .to_owned(),
+    )
+}
+
+const fn map_protocol(protocol: ApiProtocol) -> ruum_adk::AiProtocol {
+    match protocol {
+        ApiProtocol::OpenAi => ruum_adk::AiProtocol::OpenAi,
+        ApiProtocol::Anthropic => ruum_adk::AiProtocol::Anthropic,
+    }
+}
+
+fn build_adk_model_config(
+    config: &AiConfig,
+    ctx: &AiExecutionContext,
+    model_override: Option<&str>,
+    timeout: Duration,
+    max_tokens: Option<u32>,
+) -> Result<ruum_adk::AdkModelConfig, String> {
+    let api_key = resolve_api_key(ctx)?;
+    let mut cfg = ruum_adk::AdkModelConfig::new(
+        map_protocol(config.api_protocol),
+        api_key.as_str(),
+    )
+    .with_timeout(timeout)
+    .with_allow_insecure_http(ctx.allow_insecure_http);
+    let base_url = config.api_base_url.trim();
+    if !base_url.is_empty() {
+        cfg = cfg.with_base_url(base_url);
+    }
+    if let Some(model) = model_override
+        .or(config.model.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cfg = cfg.with_model(model);
+    }
+    if let Some(limit) = max_tokens {
+        cfg = cfg.with_max_tokens(limit);
+    }
+    Ok(cfg)
+}
+
+fn sanitize_adk_error(err: &ruum_adk::AdkClientError, api_key: &str) -> String {
+    ruum_adk::sanitize_error_message(&err.to_string(), api_key)
+}
+
+struct ToolSlot {
+    result: Option<Result<serde_json::Value, String>>,
+    waker: Option<Waker>,
+}
+
+struct BlockingToolFuture {
+    slot: Arc<Mutex<ToolSlot>>,
+}
+
+impl Future for BlockingToolFuture {
+    type Output = Result<serde_json::Value, String>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Ok(mut guard) = self.slot.lock() else {
+            return Poll::Ready(Err(
+                "local MCP tool result mutex poisoned".to_owned()
+            ));
+        };
+        if let Some(res) = guard.result.take() {
+            return Poll::Ready(res);
+        }
+        guard.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+struct LocalMcpToolExecutor {
+    tool_name: String,
+    server: Arc<Mutex<McpServer>>,
+}
+
+impl ruum_adk::AdkToolExecutor for LocalMcpToolExecutor {
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
+        args: serde_json::Value,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<serde_json::Value, String>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let tool_name = self.tool_name.clone();
+        let server = Arc::clone(&self.server);
+        let slot = Arc::new(Mutex::new(ToolSlot {
+            result: None,
+            waker: None,
+        }));
+        let worker_slot = Arc::clone(&slot);
+        let spawn_res = std::thread::Builder::new()
+            .name("ruum-mcp-tool".to_owned())
+            .spawn(move || {
+                // Execute synchronous disk/git tools off the Tokio runtime so
+                // concurrent or timed-out tool calls never stall async workers.
+                let outcome = match server.lock() {
+                    Ok(mut guard) => {
+                        guard.dispatch_local_read_only_tool(&tool_name, &args)
+                    }
+                    Err(_) => Err("local MCP server mutex poisoned".to_owned()),
+                };
+                if let Ok(mut guard) = worker_slot.lock() {
+                    guard.result = Some(outcome);
+                    let waker = guard.waker.take();
+                    drop(guard);
+                    if let Some(w) = waker {
+                        w.wake();
+                    }
+                }
+            });
+        if let Err(err) = spawn_res
+            && let Ok(mut guard) = slot.lock()
+        {
+            guard.result =
+                Some(Err(format!("failed to spawn local MCP worker: {err}")));
+        }
+        Box::pin(BlockingToolFuture { slot })
+    }
+}
+
+fn build_local_mcp_adk_tools(
+    server: &Arc<Mutex<McpServer>>,
+) -> Vec<(ruum_adk::AdkToolDef, Arc<dyn ruum_adk::AdkToolExecutor>)> {
+    local_read_only_tool_definitions()
+        .into_iter()
+        .filter_map(|schema| {
+            let name = schema.get("name")?.as_str()?.to_owned();
+            let description = schema
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let parameters_schema = schema
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            let def = ruum_adk::AdkToolDef {
+                name: name.clone(),
+                description,
+                parameters_schema,
+            };
+            let exec: Arc<dyn ruum_adk::AdkToolExecutor> =
+                Arc::new(LocalMcpToolExecutor {
+                    tool_name: name,
+                    server: Arc::clone(server),
+                });
+            Some((def, exec))
+        })
+        .collect()
+}
+
+impl AiExecutionAdapter for DirectApiAiAdapter {
+    fn kind(&self) -> AiBackendKind {
+        AiBackendKind::DirectApi
+    }
+
+    fn test_connection(
+        &self,
+        config: &AiConfig,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<String, String> {
+        let adk_cfg = build_adk_model_config(
+            config,
+            ctx,
+            None,
+            Duration::from_secs(SHORT_COMMAND_TIMEOUT_SECS),
+            Some(16),
+        )?;
+        let key_ref = adk_cfg.api_key.as_str();
+        let client = ruum_adk::BlockingAdkClient::new()
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+        let probe = client
+            .test_connection(&adk_cfg)
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+        Ok(format!("{} ({})", probe.message, probe.endpoint))
+    }
+
+    fn discover_models(
+        &self,
+        config: &AiConfig,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+        let adk_cfg = build_adk_model_config(
+            config,
+            ctx,
+            None,
+            Duration::from_secs(SHORT_COMMAND_TIMEOUT_SECS),
+            None,
+        )?;
+        let key_ref = adk_cfg.api_key.as_str();
+        let client = ruum_adk::BlockingAdkClient::new()
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+        let models = client
+            .list_models(&adk_cfg)
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+        let proto_id = config.api_protocol.id().to_owned();
+        let mapped: Vec<DiscoveredModel> = models
+            .into_iter()
+            .map(|m| DiscoveredModel {
+                id: m.id,
+                label: m.label,
+                provider: Some(proto_id.clone()),
+            })
+            .collect();
+        let note = mapped.is_empty().then(|| {
+            "No models returned by /models; enter a model ID manually if needed."
+                .to_owned()
+        });
+        Ok((mapped, note))
+    }
+
+    fn benchmark_model(
+        &self,
+        config: &AiConfig,
+        model_override: Option<&str>,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> ModelSpeedResult {
+        let requested_model = model_override
+            .or(config.model.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(none)")
+            .to_owned();
+        let adk_cfg = match build_adk_model_config(
+            config,
+            ctx,
+            model_override,
+            Duration::from_secs(SHORT_COMMAND_TIMEOUT_SECS),
+            Some(16),
+        ) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: requested_model,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: err,
+                };
+            }
+        };
+        let key_ref = adk_cfg.api_key.as_str();
+        let client = match ruum_adk::BlockingAdkClient::new() {
+            Ok(c) => c,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: requested_model,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: sanitize_adk_error(&err, key_ref),
+                };
+            }
+        };
+        let mut req = ruum_adk::AdkAgentRequest::new(
+            "Reply concisely.",
+            "Reply with only OK.",
+        );
+        req.max_iterations = 1;
+        req.fallback_without_tools_on_unsupported = false;
+
+        let start = Instant::now();
+        let res = client.run_agent(&adk_cfg, req);
+        let elapsed_ms =
+            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match res {
+            Ok(resp) => {
+                let reply = first_line_snippet(&resp.text, 60);
+                ModelSpeedResult {
+                    model: resp.model,
+                    elapsed_ms,
+                    ok: true,
+                    detail: if reply.is_empty() {
+                        "OK".to_owned()
+                    } else {
+                        reply
+                    },
+                }
+            }
+            Err(err) => ModelSpeedResult {
+                model: requested_model,
+                elapsed_ms,
+                ok: false,
+                detail: sanitize_adk_error(&err, key_ref),
+            },
+        }
+    }
+
+    fn run_analysis_with_tree(
+        &self,
+        config: &AiConfig,
+        home_dir: &Path,
+        _current_exe: &Path,
+        now_secs: u64,
+        existing_tree: Option<&Node>,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String> {
+        let adk_cfg = build_adk_model_config(
+            config,
+            ctx,
+            None,
+            Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
+            None,
+        )?;
+        let key_ref = adk_cfg.api_key.as_str();
+        let client = ruum_adk::BlockingAdkClient::new()
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+
+        let candidates =
+            collect_reclaimable_candidates(home_dir, existing_tree, now_secs);
+        let (instruction, prompt) =
+            build_direct_api_analysis_prompt(home_dir, &candidates);
+
+        let mut mcp = McpServer::default().with_read_only(true);
+        if let Some(tree) = existing_tree {
+            mcp.seed_local_tree_cache(
+                home_dir,
+                tree.clone(),
+                Some(home_dir.to_path_buf()),
+            );
+        }
+        let shared_mcp = Arc::new(Mutex::new(mcp));
+
+        let mut req = ruum_adk::AdkAgentRequest::new(instruction, prompt);
+        req.tools = build_local_mcp_adk_tools(&shared_mcp);
+
+        let resp = client
+            .run_agent(&adk_cfg, req)
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+        parse_and_validate_proposal(&resp.text, home_dir, now_secs)
+    }
+
+    fn run_tree_analysis(
+        &self,
+        config: &AiConfig,
+        root_path: &Path,
+        home_path: Option<&Path>,
+        tree: &Node,
+        docker: &DockerProbeStatus,
+        target_os: TrashOs,
+        now_secs: u64,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String> {
+        let adk_cfg = build_adk_model_config(
+            config,
+            ctx,
+            None,
+            Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
+            None,
+        )?;
+        let key_ref = adk_cfg.api_key.as_str();
+        let client = ruum_adk::BlockingAdkClient::new()
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+
+        let candidates = collect_tree_candidates(root_path, tree, docker);
+        let prompt =
+            build_tree_analysis_prompt(root_path, target_os, &candidates);
+
+        // Remote / in-memory analysis runs single-turn inference with zero
+        // local disk or SSH tools mounted.
+        let mut req = ruum_adk::AdkAgentRequest::new(
+            "You are an automated disk cleanup advisor for Ruum. Analyze \
+             only the provided in-memory snapshot and output strictly valid \
+             JSON.",
+            prompt,
+        );
+        req.max_iterations = 1;
+        req.fallback_without_tools_on_unsupported = false;
+
+        let resp = client
+            .run_agent(&adk_cfg, req)
+            .map_err(|err| sanitize_adk_error(&err, key_ref))?;
+        validate_proposal_against_tree(
+            &resp.text, root_path, home_path, tree, docker, target_os, now_secs,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3189,6 +4101,7 @@ mod tests {
             extra_args: "--strict".to_owned(),
             model: Some("model-x".to_owned()),
             updated_at_secs: 1,
+            ..AiConfig::default()
         };
 
         let inv = build_invocation_for_config(&cfg, "check disk").unwrap();
@@ -3791,5 +4704,532 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].1[0].contains("/home/deploy/.cache"));
         drop(calls);
+    }
+
+    fn read_mock_http_request(
+        stream: &mut std::net::TcpStream,
+    ) -> (String, String) {
+        use std::io::Read as _;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "unexpected EOF reading HTTP headers");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let content_len: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        let total_len = header_end + 4 + content_len;
+        while buf.len() < total_len {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let body = String::from_utf8_lossy(&buf[header_end + 4..total_len])
+            .into_owned();
+        (headers, body)
+    }
+
+    fn write_mock_http_response(
+        stream: &mut std::net::TcpStream,
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) {
+        use std::io::Write as _;
+
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn write_mock_http_json(
+        stream: &mut std::net::TcpStream,
+        status: &str,
+        body: &str,
+    ) {
+        write_mock_http_response(stream, status, "application/json", body);
+    }
+
+    fn openai_sse_body(
+        content: Option<&str>,
+        tool_call: Option<(&str, &str, &str)>,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        if let Some(text) = content {
+            let chunk = serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": text },
+                    "finish_reason": null
+                }]
+            });
+            let _ = write!(out, "data: {chunk}\n\n");
+        }
+        if let Some((id, name, args_json)) = tool_call {
+            let chunk = serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args_json
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            });
+            let _ = write!(out, "data: {chunk}\n\n");
+        }
+        let finish = if tool_call.is_some() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        let done = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish
+            }]
+        });
+        let _ = write!(out, "data: {done}\n\ndata: [DONE]\n\n");
+        out
+    }
+
+    fn anthropic_sse_body(text: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-mock",
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            }
+        });
+        let bs = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        });
+        let bd = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": text }
+        });
+        let be =
+            serde_json::json!({ "type": "content_block_stop", "index": 0 });
+        let md = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+            "usage": { "output_tokens": 5 }
+        });
+        let _ = write!(
+            out,
+            "event: message_start\ndata: {start}\n\n\
+             event: content_block_start\ndata: {bs}\n\n\
+             event: content_block_delta\ndata: {bd}\n\n\
+             event: content_block_stop\ndata: {be}\n\n\
+             event: message_delta\ndata: {md}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        out
+    }
+
+    #[test]
+    fn ai_backend_factory_routes_cli_and_direct_api_with_zero_keychain_on_cli()
+    {
+        use crate::credentials::CREDENTIALS_FILE_NAME;
+        use crate::credentials::LazyCredentialStore;
+        use crate::credentials::test_helpers::MemoryRootSecretStore;
+        use std::sync::Arc;
+
+        for cli in [
+            AiCliProvider::Agy,
+            AiCliProvider::Pi,
+            AiCliProvider::Codex,
+            AiCliProvider::Custom,
+        ] {
+            assert_eq!(AiBackendFactory::kind_for(cli), AiBackendKind::Cli);
+            assert_eq!(
+                AiBackendFactory::create(cli).kind(),
+                AiBackendKind::Cli
+            );
+        }
+        assert_eq!(
+            AiBackendFactory::kind_for(AiCliProvider::Api),
+            AiBackendKind::DirectApi
+        );
+        assert_eq!(
+            AiBackendFactory::create(AiCliProvider::Api).kind(),
+            AiBackendKind::DirectApi
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join(CREDENTIALS_FILE_NAME);
+        let root_store = Arc::new(MemoryRootSecretStore::new([7_u8; 32]));
+        let cred_store =
+            LazyCredentialStore::new(file_path, root_store.clone());
+        let fake_cli = dir.path().join("fake-cli");
+        fs::write(&fake_cli, b"").unwrap();
+        let cfg = AiConfig {
+            provider: AiCliProvider::Custom,
+            custom_command: fake_cli.to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        };
+        let runner = MockCommandRunner::with_output(CommandOutput {
+            status_code: 0,
+            stdout: "1.0.0".to_owned(),
+            stderr: String::new(),
+        });
+        let ctx =
+            AiExecutionContext::default().with_credential_store(cred_store);
+        let msg = test_connection_for_config_with_context(&cfg, &runner, &ctx)
+            .expect("CLI test_connection");
+        assert!(msg.contains("1.0.0"));
+        assert_eq!(root_store.call_count(), 0);
+    }
+
+    #[test]
+    fn direct_api_probe_discover_benchmark_and_error_redaction() {
+        use crate::watchdog_config::ApiProtocol;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for idx in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, _body) = read_mock_http_request(&mut stream);
+                let headers_lc = headers.to_ascii_lowercase();
+                assert!(
+                    headers_lc.contains("authorization: bearer test-api-key"),
+                    "missing auth header in request #{idx}: {headers}"
+                );
+                match idx {
+                    0 | 1 => {
+                        write_mock_http_json(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"data":[{"id":"mimo-v2-flash"}]}"#,
+                        );
+                    }
+                    2 => {
+                        let sse = openai_sse_body(Some("OK"), None);
+                        write_mock_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "text/event-stream",
+                            &sse,
+                        );
+                    }
+                    _ => {
+                        write_mock_http_json(
+                            &mut stream,
+                            "401 Unauthorized",
+                            r#"{"error":"bad key test-api-key"}"#,
+                        );
+                    }
+                }
+            }
+        });
+
+        let cfg = AiConfig {
+            provider: AiCliProvider::Api,
+            api_protocol: ApiProtocol::OpenAi,
+            api_base_url: format!("http://{addr}/v1"),
+            model: Some("mimo-v2-flash".to_owned()),
+            ..AiConfig::default()
+        };
+        let ctx = AiExecutionContext::default().with_api_key("test-api-key");
+
+        let probe_msg = test_connection_for_config_with_context(
+            &cfg,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("probe succeeds");
+        assert!(probe_msg.contains("1 models"));
+
+        let (models, note) = discover_models_for_config_with_context(
+            &cfg,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("discover succeeds");
+        assert!(note.is_none());
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "mimo-v2-flash");
+
+        let speed = benchmark_model_for_config_with_context(
+            &cfg,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        );
+        assert!(speed.ok, "benchmark failed: {}", speed.detail);
+        assert_eq!(speed.detail, "OK");
+
+        let err = test_connection_for_config_with_context(
+            &cfg,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(!err.contains("test-api-key"), "key leaked in error: {err}");
+        assert!(err.contains("[REDACTED]"));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn direct_api_local_analysis_runs_read_only_mcp_and_reuses_seeded_tree() {
+        use crate::credentials::{
+            CREDENTIALS_FILE_NAME, LazyCredentialStore,
+            test_helpers::MemoryRootSecretStore,
+        };
+        use crate::watchdog_config::ApiProtocol;
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::removal::normalize(dir.path());
+        let cache_dir = home.join(".cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("blob.bin"), vec![7_u8; 4096]).unwrap();
+
+        let mut tree = make_tree_dir(
+            "home",
+            vec![make_tree_dir(
+                ".cache",
+                vec![Node::entry("blob.bin", NodeKind::File, 128 << 20)],
+            )],
+        );
+        crate::tree::aggregate(&mut tree, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut tree);
+
+        let cred_file = home.join(CREDENTIALS_FILE_NAME);
+        let root_store = Arc::new(MemoryRootSecretStore::new([11_u8; 32]));
+        let cred_store = LazyCredentialStore::new(cred_file, root_store);
+        cred_store.set_ai_api_key("test-api-key").unwrap();
+
+        let home_str = home.display().to_string();
+        let cache_str = cache_dir.display().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            // Turn 1: assert tool whitelist & prompt rules, then trigger tool call.
+            let (mut s1, _) = listener.accept().unwrap();
+            let (_h1, b1) = read_mock_http_request(&mut s1);
+            assert!(
+                !b1.contains("mcp --read-only"),
+                "direct API prompt must not mention `mcp --read-only`"
+            );
+            let req1: serde_json::Value = serde_json::from_str(&b1).unwrap();
+            let tools = req1["tools"].as_array().expect("tools array");
+            let mut tool_names: Vec<&str> = tools
+                .iter()
+                .filter_map(|t| t["function"]["name"].as_str())
+                .collect();
+            tool_names.sort_unstable();
+            assert_eq!(
+                tool_names,
+                vec![
+                    "check_git_safety",
+                    "find_reclaimable",
+                    "inspect_subtree",
+                    "list_volumes",
+                    "plan_removal",
+                    "scan_directory",
+                ]
+            );
+            for t in tools {
+                let props = &t["function"]["parameters"]["properties"];
+                assert!(props.get("profile").is_none());
+                assert!(props.get("ssh_host").is_none());
+            }
+
+            let call_args = serde_json::json!({ "root": home_str }).to_string();
+            let turn1 = openai_sse_body(
+                None,
+                Some(("call_1", "find_reclaimable", &call_args)),
+            );
+            write_mock_http_response(
+                &mut s1,
+                "200 OK",
+                "text/event-stream",
+                &turn1,
+            );
+
+            // Turn 2: assert tool output arrived from seeded cache, then reply.
+            let (mut s2, _) = listener.accept().unwrap();
+            let (_h2, b2) = read_mock_http_request(&mut s2);
+            assert!(
+                b2.contains("134217728"),
+                "seeded 128 MiB cache result must appear in turn 2: {b2}"
+            );
+            let final_json = serde_json::json!({
+                "summary": "Reclaim cached artifacts",
+                "items": [{
+                    "path": cache_str,
+                    "mode": "trash",
+                    "reason": "cache dir"
+                }]
+            })
+            .to_string();
+            let turn2 = openai_sse_body(Some(&final_json), None);
+            write_mock_http_response(
+                &mut s2,
+                "200 OK",
+                "text/event-stream",
+                &turn2,
+            );
+        });
+
+        let cfg = AiConfig {
+            provider: AiCliProvider::Api,
+            api_protocol: ApiProtocol::OpenAi,
+            api_base_url: format!("http://{addr}/v1"),
+            model: Some("gpt-mock".to_owned()),
+            ..AiConfig::default()
+        };
+        let ctx =
+            AiExecutionContext::default().with_credential_store(cred_store);
+        let proposal = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            &home,
+            Path::new("/bin/ruum"),
+            1_700_000_888,
+            Some(&tree),
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("direct API local analysis");
+
+        assert_eq!(proposal.items.len(), 1);
+        assert_eq!(proposal.items[0].path, cache_dir);
+        assert_eq!(proposal.items[0].bytes, 4096);
+        assert_eq!(proposal.items[0].mode, RemovalMode::Trash);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn direct_api_tree_analysis_runs_anthropic_in_memory_without_tools() {
+        use crate::watchdog_config::ApiProtocol;
+        use std::net::TcpListener;
+
+        let mut tree = make_tree_dir(
+            "deploy",
+            vec![make_tree_dir(
+                ".cache",
+                vec![Node::entry("blob.bin", NodeKind::File, 64 << 20)],
+            )],
+        );
+        crate::tree::aggregate(&mut tree, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut tree);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_mock_http_request(&mut stream);
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("x-api-key: test-api-key"),
+                "missing x-api-key header: {headers}"
+            );
+            let req: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                req.get("tools")
+                    .and_then(|t| t.as_array())
+                    .is_none_or(Vec::is_empty),
+                "remote tree analysis must not mount local/SSH tools: {body}"
+            );
+            let payload_text = r#"{"summary":"Remote cache + build cache","items":[{"path":"/home/deploy/.cache","mode":"permanent","reason":"pip cache"}],"docker_targets":[{"kind":"build_cache"}]}"#;
+            let sse = anthropic_sse_body(payload_text);
+            write_mock_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                &sse,
+            );
+        });
+
+        let cfg = AiConfig {
+            provider: AiCliProvider::Api,
+            api_protocol: ApiProtocol::Anthropic,
+            api_base_url: format!("http://{addr}/anthropic/v1"),
+            model: Some("claude-mock".to_owned()),
+            ..AiConfig::default()
+        };
+        let docker =
+            DockerProbeStatus::Available(build_sample_docker_summary());
+        let ctx = AiExecutionContext::default().with_api_key("test-api-key");
+
+        let prop = run_tree_analysis_for_config_with_context(
+            &cfg,
+            Path::new("/home/deploy"),
+            Some(Path::new("/home/deploy")),
+            &tree,
+            &docker,
+            TrashOs::Linux,
+            1_700_000_555,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("direct API remote tree analysis");
+
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.items[0].path, PathBuf::from("/home/deploy/.cache"));
+        assert_eq!(prop.items[0].bytes, 64 << 20);
+        assert_eq!(prop.docker_targets, vec![DockerCleanTarget::BuildCache]);
+
+        server.join().unwrap();
     }
 }

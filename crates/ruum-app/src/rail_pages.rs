@@ -30,7 +30,7 @@ use ruum_core::size::human_bytes;
 use ruum_core::storage::{AuthMode, UpdateChannel};
 use ruum_core::updater::{Manifest, UpdateCheckResult};
 use ruum_core::watchdog::ServiceStatus;
-use ruum_core::watchdog_config::AiCliProvider;
+use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
 
 use crate::palette;
 use crate::power::PowerEfficiency;
@@ -2432,12 +2432,23 @@ fn ai_settings_section(
         .watchdog_input_model
         .as_ref()
         .expect("inputs initialized");
+    let input_api_base_url = app
+        .watchdog_input_api_base_url
+        .as_ref()
+        .expect("inputs initialized");
+    let input_api_key = app
+        .watchdog_input_api_key
+        .as_ref()
+        .expect("inputs initialized");
 
     let is_auto_analyze = app.watchdog_draft.ai_auto_analyze;
     let current_provider = app.watchdog_draft.ai_provider;
+    let current_protocol = app.watchdog_draft.api_protocol;
+    let is_api = current_provider == AiCliProvider::Api;
     let entity_auto_analyze = cx.entity().downgrade();
 
-    let mut provider_buttons = div().flex().flex_row().gap(space::SM);
+    let mut provider_buttons =
+        div().flex().flex_row().flex_wrap().gap(space::SM);
     for provider in AiCliProvider::ALL {
         let is_selected = provider == current_provider;
         let id = match provider {
@@ -2445,21 +2456,26 @@ fn ai_settings_section(
             AiCliProvider::Pi => "provider-pi",
             AiCliProvider::Codex => "provider-codex",
             AiCliProvider::Custom => "provider-custom",
+            AiCliProvider::Api => "provider-api",
         };
         provider_buttons = provider_buttons.child(
-            button(
-                id,
-                provider.label_in(locale),
-                if is_selected {
-                    ButtonVariant::Primary
-                } else {
-                    ButtonVariant::Secondary
-                },
-                cx,
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_watchdog_provider(provider, cx);
-            })),
+            div().debug_selector(move || id.into()).child(
+                button(
+                    id,
+                    provider.label_in(locale),
+                    if is_selected {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    cx,
+                )
+                .on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.set_watchdog_provider(provider, cx);
+                    },
+                )),
+            ),
         );
     }
 
@@ -2499,9 +2515,10 @@ fn ai_settings_section(
         )
         .child(provider_buttons);
 
-    let show_custom_cmd = current_provider == AiCliProvider::Custom
-        || !app.ai_config.custom_command.is_empty()
-        || !input_custom_cmd.read(cx).value().trim().is_empty();
+    let show_custom_cmd = !is_api
+        && (current_provider == AiCliProvider::Custom
+            || !app.ai_config.custom_command.is_empty()
+            || !input_custom_cmd.read(cx).value().trim().is_empty());
     if show_custom_cmd {
         ai_section = ai_section.child(setting_input_field(
             "setting-custom-cmd-input",
@@ -2513,15 +2530,139 @@ fn ai_settings_section(
         ));
     }
 
-    ai_section = ai_section
-        .child(setting_input_field(
+    if is_api {
+        let mut protocol_buttons =
+            div().flex().flex_row().flex_wrap().gap(space::SM);
+        for protocol in ApiProtocol::ALL {
+            let is_selected = protocol == current_protocol;
+            let id = match protocol {
+                ApiProtocol::OpenAi => "setting-api-protocol-openai",
+                ApiProtocol::Anthropic => "setting-api-protocol-anthropic",
+            };
+            protocol_buttons = protocol_buttons.child(
+                div().debug_selector(move || id.into()).child(
+                    button(
+                        id,
+                        protocol.label_in(locale),
+                        if is_selected {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        },
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.set_watchdog_api_protocol(
+                                protocol, window, cx,
+                            );
+                        },
+                    )),
+                ),
+            );
+        }
+
+        let has_saved_hint = match app.api_key_session_known {
+            Some(known) => known,
+            None => app.cred_store.as_ref().is_some_and(
+                ruum_core::credentials::LazyCredentialStore::has_encrypted_file,
+            ) || ruum_core::ai_cli::env_api_key_present(),
+        };
+        let key_hint = if has_saved_hint {
+            crate::i18n::pages::api_key_keep_hint(locale)
+        } else {
+            crate::i18n::pages::api_key_empty_hint(locale)
+        };
+
+        ai_section = ai_section
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .child(
+                        div().text_color(theme.secondary).child(
+                            crate::i18n::pages::api_protocol_label(locale),
+                        ),
+                    )
+                    .child(protocol_buttons),
+            )
+            .child(setting_input_field(
+                "setting-api-base-url-input",
+                crate::i18n::pages::api_base_url_label(locale),
+                input_api_base_url,
+                theme.secondary,
+                window,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_end()
+                            .gap(space::SM)
+                            .child(div().flex_1().child(setting_input_field(
+                                "setting-api-key-input",
+                                crate::i18n::pages::api_key_label(locale),
+                                input_api_key,
+                                theme.secondary,
+                                window,
+                                cx,
+                            )))
+                            .child(
+                                div()
+                                    .debug_selector(|| {
+                                        "setting-clear-api-key".into()
+                                    })
+                                    .child(
+                                        button(
+                                            "setting-clear-api-key",
+                                            crate::i18n::pages::clear_api_key(
+                                                locale,
+                                            ),
+                                            ButtonVariant::Secondary,
+                                            cx,
+                                        )
+                                        .on_click(cx.listener(
+                                            |this, _, window, cx| {
+                                                this.clear_watchdog_api_key(
+                                                    window, cx,
+                                                );
+                                            },
+                                        )),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(key_hint),
+                    ),
+            );
+    } else {
+        ai_section = ai_section.child(setting_input_field(
             "setting-extra-args-input",
             crate::i18n::pages::custom_extra_args(locale),
             input_extra_args,
             theme.secondary,
             window,
             cx,
-        ))
+        ));
+    }
+
+    let test_btn_label = if is_api {
+        crate::i18n::pages::test_api_connection(locale)
+    } else {
+        crate::i18n::pages::test_cli_connection(locale)
+    };
+
+    ai_section = ai_section
         .child(setting_input_field(
             "setting-model-input",
             crate::i18n::pages::model_override(locale),
@@ -2542,7 +2683,7 @@ fn ai_settings_section(
                         action_button_with_spinner(
                             "setting-test-cli",
                             "setting-test-cli-spin",
-                            crate::i18n::pages::test_cli_connection(locale),
+                            test_btn_label,
                             app.watchdog_testing,
                             ButtonVariant::Secondary,
                             cx,

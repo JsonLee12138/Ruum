@@ -13,7 +13,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
-use ruum_core::ai_cli::{DefaultCommandRunner, run_analysis_for_config};
+use ruum_core::ai_cli::{
+    DefaultCommandRunner, env_api_key_present, run_analysis_for_config,
+};
 use ruum_core::credentials::{
     LazyCredentialStore, SshCredentialSecret,
     delete_ssh_profile_with_credentials,
@@ -46,8 +48,9 @@ use ruum_core::watchdog::{
     ServiceStatus, install_service, run_default_loop_with_db,
     run_default_once_with_db, service_status, uninstall_service,
 };
-use ruum_core::watchdog_config::AiCliProvider;
+use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
 use serde_json::json;
+use zeroize::Zeroizing;
 
 const HELP_TEXT: &str = "\
 ruum — headless disk usage explorer, configuration CLI, and MCP server
@@ -139,9 +142,13 @@ usage:
   ruum config webhook set [--enabled BOOL] [--url URL]
                           [--headers-json JSON] [--timeout-secs N] [--json]
   ruum config ai get [--json]
-  ruum config ai set [--auto-analyze BOOL] [--provider agy|pi|codex|custom]
+  ruum config ai set [--auto-analyze BOOL] [--provider agy|pi|codex|custom|api]
                      [--custom-command CMD] [--extra-args ARGS]
-                     [--model M | --clear-model] [--json]
+                     [--model M | --clear-model]
+                     [--api-protocol openai|anthropic]
+                     [--api-base-url URL | --clear-api-base-url]
+                     [--api-key KEY | --api-key-stdin | --clear-api-key]
+                     [--json]
   ruum config update get [--json]
   ruum config update set [--auto-check BOOL] [--channel stable|beta]
                          [--send-client-id BOOL] [--clear-skipped] [--json]";
@@ -1511,6 +1518,38 @@ fn cmd_config_webhook(args: &[OsString]) -> Result<()> {
     }
 }
 
+fn ai_api_key_configured(
+    provider: AiCliProvider,
+    check_store_if_non_api: bool,
+) -> Result<bool> {
+    if env_api_key_present() {
+        return Ok(true);
+    }
+    if provider != AiCliProvider::Api && !check_store_if_non_api {
+        return Ok(false);
+    }
+    LazyCredentialStore::open_default()
+        .and_then(|creds| creds.has_ai_api_key())
+        .map_err(anyhow::Error::msg)
+}
+
+fn ai_config_json(
+    cfg: &ruum_core::storage::AiConfig,
+    api_key_configured: bool,
+) -> serde_json::Value {
+    json!({
+        "auto_analyze_on_alert": cfg.auto_analyze_on_alert,
+        "provider": cfg.provider.id(),
+        "custom_command": cfg.custom_command,
+        "extra_args": cfg.extra_args,
+        "model": cfg.model,
+        "api_protocol": cfg.api_protocol.id(),
+        "api_base_url": cfg.api_base_url,
+        "api_key_configured": api_key_configured,
+        "updated_at_secs": cfg.updated_at_secs,
+    })
+}
+
 fn cmd_config_ai(args: &[OsString]) -> Result<()> {
     let Some(action) = args.first().map(|a| a.to_string_lossy()) else {
         bail!("usage: ruum config ai <get|set>");
@@ -1525,8 +1564,16 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
         "get" => {
             let json_out = check_json_only(rest, "ruum config ai get")?;
             let cfg = db.load_ai_config()?;
+            let api_key_configured =
+                ai_api_key_configured(cfg.provider, false)?;
             if json_out {
-                println!("{}", serde_json::to_string_pretty(&cfg)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ai_config_json(
+                        &cfg,
+                        api_key_configured,
+                    ))?
+                );
             } else {
                 println!(
                     "auto_analyze_on_alert = {}",
@@ -1536,12 +1583,18 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                 println!("custom_command = {}", cfg.custom_command);
                 println!("extra_args = {}", cfg.extra_args);
                 println!("model = {}", cfg.model.as_deref().unwrap_or(""));
+                println!("api_protocol = {}", cfg.api_protocol.id());
+                println!("api_base_url = {}", cfg.api_base_url);
+                println!("api_key_configured = {api_key_configured}");
             }
             Ok(())
         }
         "set" => {
             let mut cfg = db.load_ai_config()?;
             let mut json_out = false;
+            let mut api_key_arg: Option<Zeroizing<String>> = None;
+            let mut api_key_stdin = false;
+            let mut clear_api_key = false;
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {
                 match arg.to_str() {
@@ -1556,7 +1609,7 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                             .with_context(|| {
                                 format!(
                                     "unknown AI provider `{raw}`; expected \
-                                     agy, pi, codex, or custom"
+                                     agy, pi, codex, custom, or api"
                                 )
                             })?;
                     }
@@ -1571,6 +1624,31 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                         cfg.model = Some(next_str(&mut iter, "--model")?);
                     }
                     Some("--clear-model") => cfg.model = None,
+                    Some("--api-protocol") => {
+                        let raw = next_str(&mut iter, "--api-protocol")?;
+                        cfg.api_protocol = ApiProtocol::from_id(&raw)
+                            .with_context(|| {
+                                format!(
+                                    "unknown API protocol `{raw}`; expected \
+                                     openai or anthropic"
+                                )
+                            })?;
+                    }
+                    Some("--api-base-url") => {
+                        cfg.api_base_url =
+                            next_str(&mut iter, "--api-base-url")?;
+                    }
+                    Some("--clear-api-base-url") => {
+                        cfg.api_base_url.clear();
+                    }
+                    Some("--api-key") => {
+                        api_key_arg = Some(Zeroizing::new(next_str(
+                            &mut iter,
+                            "--api-key",
+                        )?));
+                    }
+                    Some("--api-key-stdin") => api_key_stdin = true,
+                    Some("--clear-api-key") => clear_api_key = true,
                     Some("--json") => json_out = true,
                     Some(other) => {
                         bail!("unknown option `{other}` for `config ai set`")
@@ -1578,11 +1656,44 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                     None => bail!("invalid UTF-8 option for `config ai set`"),
                 }
             }
+            let key_ops = usize::from(api_key_arg.is_some())
+                + usize::from(api_key_stdin)
+                + usize::from(clear_api_key);
+            anyhow::ensure!(
+                key_ops <= 1,
+                "--api-key, --api-key-stdin, and --clear-api-key are mutually \
+                 exclusive"
+            );
+            let next_api_key = if api_key_stdin {
+                Some(Zeroizing::new(read_stdin_trimmed("API key")?))
+            } else {
+                api_key_arg
+            };
+            if let Some(ref key) = next_api_key {
+                LazyCredentialStore::open_default()
+                    .and_then(|creds| creds.set_ai_api_key(key))
+                    .map_err(anyhow::Error::msg)?;
+            } else if clear_api_key {
+                LazyCredentialStore::open_default()
+                    .and_then(|creds| creds.delete_ai_api_key())
+                    .map_err(anyhow::Error::msg)?;
+            }
+
             cfg.updated_at_secs = now_unix_secs();
             db.save_ai_config(&cfg)?;
             let saved = db.load_ai_config()?;
             if json_out {
-                println!("{}", serde_json::to_string_pretty(&saved)?);
+                let api_key_configured = ai_api_key_configured(
+                    saved.provider,
+                    next_api_key.is_some() || clear_api_key,
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ai_config_json(
+                        &saved,
+                        api_key_configured,
+                    ))?
+                );
             } else {
                 println!("ai_config updated");
             }

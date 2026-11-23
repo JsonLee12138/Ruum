@@ -27,6 +27,7 @@ service = [
     "dep:rand_core",
     "dep:rsa",
     "dep:rusqlite",
+    "dep:ruum-adk",
     "dep:ruum-watchdog",
     "dep:semver",
     "dep:ssh-key",
@@ -51,6 +52,7 @@ rayon = { workspace = true }
 rsa = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 rusqlite = { workspace = true, optional = true }
+ruum-adk = { workspace = true, optional = true }
 ruum-watchdog = { workspace = true, optional = true }
 semver = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }

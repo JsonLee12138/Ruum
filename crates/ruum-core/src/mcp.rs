@@ -424,6 +424,59 @@ impl McpServer {
         self.cache.insert((ssh_host, root), entry);
     }
 
+    /// Seed the local scan cache from an existing in-memory treemap so
+    /// in-process read-only AI tool calls reuse it without rescanning disk.
+    pub(crate) fn seed_local_tree_cache(
+        &mut self,
+        root: &Path,
+        tree: Node,
+        home: Option<PathBuf>,
+    ) {
+        let root_norm = if root.is_absolute() {
+            normalize(root)
+        } else if let Ok(cwd) = std::env::current_dir() {
+            normalize(&cwd.join(root))
+        } else {
+            normalize(root)
+        };
+        let home_norm = home.map(|h| normalize(&h)).or_else(std::env::home_dir);
+        let entry = CachedScan {
+            tree,
+            space: space_info(&root_norm).ok(),
+            home: home_norm,
+            platform: std::env::consts::OS.to_owned(),
+            identity: crate::identity::HostIdentity::current(),
+            options: ScanOptions::default(),
+            scan_count: 1,
+        };
+        self.cache.insert((None, root_norm), entry);
+    }
+
+    /// Execute one of the 6 local read-only MCP tools in-process, rejecting
+    /// destructive tools, `list_ssh_profiles`, and any non-null `profile` or
+    /// `ssh_host` arguments.
+    pub(crate) fn dispatch_local_read_only_tool(
+        &mut self,
+        name: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if !is_local_read_only_tool(name) {
+            return Err(format!(
+                "Tool '{name}' is unavailable in local read-only mode"
+            ));
+        }
+        if matches!(args.get("profile"), Some(v) if !v.is_null())
+            || matches!(args.get("ssh_host"), Some(v) if !v.is_null())
+        {
+            return Err(
+                "Remote parameters 'profile' and 'ssh_host' are forbidden in \
+                 local read-only mode."
+                    .to_owned(),
+            );
+        }
+        self.dispatch_tool(name, args)
+    }
+
     /// Invalidate any cached entry for `ssh_host` whose root is an ancestor or
     /// descendant of `path` so subsequent calls never read stale sizes.
     pub fn invalidate_overlapping(
@@ -2173,6 +2226,43 @@ fn format_removal_failure(
         "space_after": space_after.map(format_space),
     }))
     .unwrap_or_else(|_| format!("{mode} removal encountered errors"))
+}
+
+fn is_local_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_volumes"
+            | "scan_directory"
+            | "inspect_subtree"
+            | "find_reclaimable"
+            | "check_git_safety"
+            | "plan_removal"
+    )
+}
+
+/// Tool definitions exposed to in-process direct AI API analysis: strictly
+/// the 6 local read-only tools with `profile` and `ssh_host` stripped from
+/// every schema.
+pub(crate) fn local_read_only_tool_definitions() -> Vec<Value> {
+    tool_definitions(true)
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_local_read_only_tool)
+        })
+        .map(|mut tool| {
+            if let Some(props) = tool
+                .get_mut("inputSchema")
+                .and_then(|s| s.get_mut("properties"))
+                .and_then(Value::as_object_mut)
+            {
+                props.remove("profile");
+                props.remove("ssh_host");
+            }
+            tool
+        })
+        .collect()
 }
 
 fn is_known_tool(name: &str) -> bool {
@@ -4269,6 +4359,99 @@ mod tests {
             exec_calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "expired and denied session must not run SSH transport"
+        );
+    }
+
+    #[test]
+    fn local_read_only_bridge_whitelist_and_seed_cache() {
+        let defs = local_read_only_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_volumes",
+                "scan_directory",
+                "inspect_subtree",
+                "find_reclaimable",
+                "check_git_safety",
+                "plan_removal",
+            ]
+        );
+        for def in &defs {
+            let props = &def["inputSchema"]["properties"];
+            assert!(props.get("profile").is_none());
+            assert!(props.get("ssh_host").is_none());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root_path = normalize(dir.path());
+        let cache_dir = root_path.join(".cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("blob.bin"), vec![1_u8; 4096]).unwrap();
+
+        let mut tree = Node::directory("root");
+        let mut cache_node = Node::directory(".cache");
+        cache_node.children.push(Node::entry(
+            "blob.bin",
+            NodeKind::File,
+            128 * 1024 * 1024,
+        ));
+        tree.children.push(cache_node);
+        aggregate(&mut tree, Metric::Bytes);
+        classify(&mut tree);
+
+        let mut server = McpServer::default().with_read_only(true);
+        server.seed_local_tree_cache(&root_path, tree, Some(root_path.clone()));
+
+        // Forbidden tools & any non-null profile/ssh_host are rejected.
+        for forbidden in
+            ["trash_paths", "delete_permanently", "list_ssh_profiles"]
+        {
+            assert!(
+                server
+                    .dispatch_local_read_only_tool(forbidden, &json!({}))
+                    .is_err(),
+                "{forbidden} must be rejected"
+            );
+        }
+        for bad_args in [
+            json!({ "profile": "prod" }),
+            json!({ "profile": "" }),
+            json!({ "ssh_host": "user@host" }),
+            json!({ "ssh_host": "" }),
+        ] {
+            assert!(
+                server
+                    .dispatch_local_read_only_tool("list_volumes", &bad_args)
+                    .is_err()
+            );
+        }
+
+        // Null profile/ssh_host is allowed and scan_directory reuses seeded cache.
+        let scan_res = server
+            .dispatch_local_read_only_tool(
+                "scan_directory",
+                &json!({
+                    "path": root_path.display().to_string(),
+                    "profile": null,
+                    "ssh_host": null
+                }),
+            )
+            .expect("scan_directory reuses seeded cache");
+        assert_eq!(scan_res["cached"], true);
+
+        let reclaim_res = server
+            .dispatch_local_read_only_tool(
+                "find_reclaimable",
+                &json!({ "root": root_path.display().to_string() }),
+            )
+            .expect("find_reclaimable");
+        assert_eq!(
+            reclaim_res["candidates"][0]["path"],
+            cache_dir.display().to_string()
         );
     }
 }

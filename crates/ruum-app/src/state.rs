@@ -68,7 +68,7 @@ use ruum_core::updater::{
     validate_update_url,
 };
 use ruum_core::watchdog::ServiceStatus;
-use ruum_core::watchdog_config::{AiCliProvider, CleanupProposal};
+use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol, CleanupProposal};
 use ruum_watchdog::{MIN_COOLDOWN_SECS, WatchdogConfig, WatchdogState};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
@@ -1294,6 +1294,7 @@ pub struct WatchdogSettingsDraft {
     pub background_service: bool,
     pub ai_auto_analyze: bool,
     pub ai_provider: AiCliProvider,
+    pub api_protocol: ApiProtocol,
     pub model: Option<String>,
 }
 
@@ -1326,6 +1327,7 @@ impl WatchdogSettingsDraft {
             background_service: wd.background_service,
             ai_auto_analyze: ai.auto_analyze_on_alert,
             ai_provider: ai.provider,
+            api_protocol: ai.api_protocol,
             model: ai.model.clone(),
         }
     }
@@ -1612,6 +1614,14 @@ pub struct Ruum {
     pub watchdog_input_extra_args: Option<Entity<InputState>>,
     /// Settings input: optional AI model override.
     pub watchdog_input_model: Option<Entity<InputState>>,
+    /// Settings input: direct AI API base URL.
+    pub watchdog_input_api_base_url: Option<Entity<InputState>>,
+    /// Settings input: masked direct AI API key (write-only draft).
+    pub watchdog_input_api_key: Option<Entity<InputState>>,
+    /// Session-local knowledge of whether a direct API key is saved
+    /// (`None` until a user action checks/writes/clears it, avoiding startup
+    /// keychain prompts).
+    pub api_key_session_known: Option<bool>,
     /// Monotonic generation counter for auto-dismissing toast notices.
     pub toast_epoch: u64,
     /// True while testing AI CLI connectivity.
@@ -2060,6 +2070,9 @@ impl Ruum {
             watchdog_input_custom_cmd: None,
             watchdog_input_extra_args: None,
             watchdog_input_model: None,
+            watchdog_input_api_base_url: None,
+            watchdog_input_api_key: None,
+            api_key_session_known: None,
             toast_epoch: 0,
             watchdog_testing: false,
             watchdog_test_epoch: 0,
@@ -2626,6 +2639,8 @@ impl Ruum {
             &self.watchdog_input_custom_cmd,
             &self.watchdog_input_extra_args,
             &self.watchdog_input_model,
+            &self.watchdog_input_api_base_url,
+            &self.watchdog_input_api_key,
         ];
         inputs
             .into_iter()
@@ -3363,6 +3378,8 @@ impl Ruum {
         let custom_cmd = self.ai_config.custom_command.clone();
         let extra_args = self.ai_config.extra_args.clone();
         let model = self.ai_config.model.clone().unwrap_or_default();
+        let api_base_url = self.ai_config.api_base_url.clone();
+        let api_placeholder = self.ai_config.api_protocol.default_base_url();
 
         let pairs = [
             (&self.setting_input_default_depth, default_depth),
@@ -3373,6 +3390,8 @@ impl Ruum {
             (&self.watchdog_input_custom_cmd, custom_cmd),
             (&self.watchdog_input_extra_args, extra_args),
             (&self.watchdog_input_model, model),
+            (&self.watchdog_input_api_base_url, api_base_url),
+            (&self.watchdog_input_api_key, String::new()),
         ];
         for (slot, val) in pairs {
             if let Some(input) = slot
@@ -3382,6 +3401,14 @@ impl Ruum {
                     inp.set_value(val, window, cx);
                 });
             }
+        }
+        if let Some(ref input) = self.watchdog_input_api_base_url
+            && input.read(cx).presentation().placeholder().as_str()
+                != api_placeholder
+        {
+            input.update(cx, |inp, cx| {
+                inp.set_placeholder(api_placeholder, window, cx);
+            });
         }
     }
 
@@ -3520,6 +3547,25 @@ impl Ruum {
             });
             self.watchdog_input_model = Some(input);
         }
+        if self.watchdog_input_api_base_url.is_none() {
+            let val = self.ai_config.api_base_url.clone();
+            let placeholder =
+                self.watchdog_draft.api_protocol.default_base_url();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(val)
+            });
+            self.watchdog_input_api_base_url = Some(input);
+        }
+        if self.watchdog_input_api_key.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).masked(true).placeholder(
+                    crate::i18n::messages::placeholder_api_key(locale),
+                )
+            });
+            self.watchdog_input_api_key = Some(input);
+        }
     }
 
     /// Read current AI settings including any unsaved draft/input values.
@@ -3527,6 +3573,7 @@ impl Ruum {
         let mut cfg = self.ai_config.clone();
         cfg.auto_analyze_on_alert = self.watchdog_draft.ai_auto_analyze;
         cfg.provider = self.watchdog_draft.ai_provider;
+        cfg.api_protocol = self.watchdog_draft.api_protocol;
         cfg.model.clone_from(&self.watchdog_draft.model);
 
         if let Some(ref input) = self.watchdog_input_custom_cmd {
@@ -3535,11 +3582,45 @@ impl Ruum {
         if let Some(ref input) = self.watchdog_input_extra_args {
             cfg.extra_args = input.read(cx).value().trim().to_string();
         }
+        if let Some(ref input) = self.watchdog_input_api_base_url {
+            cfg.api_base_url = input.read(cx).value().trim().to_string();
+        }
         if let Some(ref input) = self.watchdog_input_model {
             let text = input.read(cx).value().trim().to_string();
             cfg.model = (!text.is_empty()).then_some(text);
         }
         cfg.normalized()
+    }
+
+    /// Build an execution context carrying any unsaved draft API key or the
+    /// lazy credential store (without accessing the keychain on UI threads).
+    fn snapshot_ai_execution_context(
+        &self,
+        cx: &App,
+    ) -> ruum_core::ai_cli::AiExecutionContext {
+        let mut ctx = ruum_core::ai_cli::AiExecutionContext::default();
+        if self.watchdog_draft.ai_provider != AiCliProvider::Api {
+            return ctx;
+        }
+        if let Some(ref input) = self.watchdog_input_api_key {
+            let key = input.read(cx).value().trim().to_string();
+            if !key.is_empty() {
+                return ctx.with_api_key(key);
+            }
+        }
+        if let Some(ref store) = self.cred_store {
+            ctx = ctx.with_credential_store(store.clone());
+        } else if let Some(ref db_path) = self.db_path
+            && let Some(dir) = db_path.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            ctx = ctx.with_credential_store(LazyCredentialStore::platform(dir));
+        } else if cfg!(test) && !ruum_core::ai_cli::env_api_key_present() {
+            ctx = ctx.with_credential_store(LazyCredentialStore::unavailable(
+                "no credential store configured in test",
+            ));
+        }
+        ctx
     }
 
     /// Switch the active UI locale in tests.
@@ -3607,6 +3688,107 @@ impl Ruum {
             self.watchdog_speed_results.clear();
             cx.notify();
         }
+    }
+
+    /// Switch the direct API wire protocol and update uncustomized default URLs
+    /// and placeholders without overwriting user-entered custom URLs.
+    pub fn set_watchdog_api_protocol(
+        &mut self,
+        protocol: ApiProtocol,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = self.watchdog_draft.api_protocol != protocol;
+        if changed {
+            self.watchdog_draft.api_protocol = protocol;
+            self.watchdog_test_epoch += 1;
+            self.watchdog_fetch_epoch += 1;
+            self.watchdog_benchmark_epoch += 1;
+            self.watchdog_testing = false;
+            self.watchdog_fetching_models = false;
+            self.watchdog_benchmarking_models.clear();
+            self.watchdog_models.clear();
+            self.watchdog_speed_results.clear();
+        }
+        if let Some(ref input) = self.watchdog_input_api_base_url {
+            let other_default = match protocol {
+                ApiProtocol::OpenAi => {
+                    ApiProtocol::Anthropic.default_base_url()
+                }
+                ApiProtocol::Anthropic => {
+                    ApiProtocol::OpenAi.default_base_url()
+                }
+            };
+            input.update(cx, |inp, cx| {
+                inp.set_placeholder(protocol.default_base_url(), window, cx);
+                let cur = inp.value().trim().to_owned();
+                if cur.is_empty()
+                    || cur.trim_end_matches('/')
+                        == other_default.trim_end_matches('/')
+                {
+                    inp.set_value(
+                        protocol.default_base_url().to_owned(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Clear the draft API key input and delete any stored direct API key in
+    /// `LazyCredentialStore` (zero keychain calls when no encrypted file exists).
+    pub fn clear_watchdog_api_key(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(ref input) = self.watchdog_input_api_key
+            && !input.read(cx).value().is_empty()
+        {
+            input.update(cx, |inp, cx| {
+                inp.set_value(String::new(), window, cx);
+            });
+        }
+        if self.watchdog_draft.ai_provider == AiCliProvider::Api
+            && (self.cred_store.is_some() || self.db_path.is_some())
+        {
+            match self.ensure_cred_store() {
+                Ok(store) => {
+                    if let Err(err) = store.delete_ai_api_key() {
+                        self.push_toast(
+                            crate::i18n::messages::failed_save_settings(
+                                &err,
+                                self.locale,
+                            ),
+                            Status::Error,
+                            cx,
+                        );
+                        return;
+                    }
+                }
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::failed_save_settings(
+                            &err,
+                            self.locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+        self.api_key_session_known = Some(false);
+        self.push_toast(
+            crate::i18n::messages::api_key_cleared(self.locale),
+            Status::Success,
+            cx,
+        );
     }
 
     /// Populate the model override input from a discovered model choice.
@@ -3728,6 +3910,16 @@ impl Ruum {
             || self.ai_config.extra_args.clone(),
             |input| input.read(cx).value().trim().to_string(),
         );
+        let api_base_url =
+            self.watchdog_input_api_base_url.as_ref().map_or_else(
+                || self.ai_config.api_base_url.clone(),
+                |input| input.read(cx).value().trim().to_string(),
+            );
+        let api_key_draft = self
+            .watchdog_input_api_key
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .filter(|val| !val.is_empty());
         let model = self.watchdog_input_model.as_ref().map_or_else(
             || self.watchdog_draft.model.clone(),
             |input| {
@@ -3769,9 +3961,42 @@ impl Ruum {
             custom_command,
             extra_args,
             model,
+            api_protocol: self.watchdog_draft.api_protocol,
+            api_base_url,
             updated_at_secs: now_secs,
         }
         .normalized();
+
+        if next_ai.provider == AiCliProvider::Api
+            && let Some(ref new_key) = api_key_draft
+        {
+            let store = match self.ensure_cred_store() {
+                Ok(store) => store,
+                Err(err) => {
+                    self.push_toast(
+                        crate::i18n::messages::failed_save_settings(
+                            &err,
+                            self.locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                    return;
+                }
+            };
+            if let Err(err) = store.set_ai_api_key(new_key) {
+                self.push_toast(
+                    crate::i18n::messages::failed_save_settings(
+                        &err,
+                        self.locale,
+                    ),
+                    Status::Error,
+                    cx,
+                );
+                return;
+            }
+            self.api_key_session_known = Some(true);
+        }
 
         if self.db_path.is_some()
             && let Err(err) = (|| -> std::io::Result<()> {
@@ -4548,18 +4773,23 @@ impl Ruum {
             return;
         }
         let temp_cfg = self.snapshot_ai_config(cx);
+        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = temp_cfg.provider.label_in(self.locale);
         self.watchdog_testing = true;
         self.watchdog_test_epoch += 1;
         let epoch = self.watchdog_test_epoch;
-        self.push_toast(
+        let toast_msg = if temp_cfg.provider == AiCliProvider::Api {
+            crate::i18n::messages::testing_api_connection(
+                temp_cfg.api_protocol.label_in(self.locale),
+                self.locale,
+            )
+        } else {
             crate::i18n::messages::testing_cli_connection(
                 provider_label,
                 self.locale,
-            ),
-            Status::Neutral,
-            cx,
-        );
+            )
+        };
+        self.push_toast(toast_msg, Status::Neutral, cx);
 
         let task = cx.background_executor().spawn(async move {
             let runner = ruum_core::ai_cli::TimedCommandRunner::new(
@@ -4567,7 +4797,9 @@ impl Ruum {
                     ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                 ),
             );
-            ruum_core::ai_cli::test_connection_for_config(&temp_cfg, &runner)
+            ruum_core::ai_cli::test_connection_for_config_with_context(
+                &temp_cfg, &runner, &ai_ctx,
+            )
         });
 
         cx.spawn(async move |this, cx| {
@@ -4596,6 +4828,7 @@ impl Ruum {
             return;
         }
         let temp_cfg = self.snapshot_ai_config(cx);
+        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = temp_cfg.provider.label_in(self.locale);
         self.watchdog_fetching_models = true;
         self.watchdog_fetch_epoch += 1;
@@ -4612,7 +4845,9 @@ impl Ruum {
                     ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                 ),
             );
-            ruum_core::ai_cli::discover_models_for_config(&temp_cfg, &runner)
+            ruum_core::ai_cli::discover_models_for_config_with_context(
+                &temp_cfg, &runner, &ai_ctx,
+            )
         });
 
         cx.spawn(async move |this, cx| {
@@ -4687,6 +4922,7 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         let temp_cfg = self.snapshot_ai_config(cx);
+        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let target_key = model_override
             .as_deref()
             .map(str::trim)
@@ -4707,10 +4943,11 @@ impl Ruum {
                     ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                 ),
             );
-            ruum_core::ai_cli::benchmark_model_for_config(
+            ruum_core::ai_cli::benchmark_model_for_config_with_context(
                 &temp_cfg,
                 model_override.as_deref(),
                 &runner,
+                &ai_ctx,
             )
         });
 
@@ -4746,6 +4983,7 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         let temp_cfg = self.snapshot_ai_config(cx);
+        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let models_to_test: Vec<String> = self
             .watchdog_models
             .iter()
@@ -4778,6 +5016,7 @@ impl Ruum {
             let mut fail_count = 0usize;
             for model_id in models_to_test {
                 let cfg_clone = temp_cfg.clone();
+                let ctx_clone = ai_ctx.clone();
                 let id_for_task = model_id.clone();
                 let task = cx.background_executor().spawn(async move {
                     let runner = ruum_core::ai_cli::TimedCommandRunner::new(
@@ -4785,10 +5024,11 @@ impl Ruum {
                             ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
                         ),
                     );
-                    ruum_core::ai_cli::benchmark_model_for_config(
+                    ruum_core::ai_cli::benchmark_model_for_config_with_context(
                         &cfg_clone,
                         Some(&id_for_task),
                         &runner,
+                        &ctx_clone,
                     )
                 });
                 let result = task.await;
@@ -4931,6 +5171,7 @@ impl Ruum {
             return;
         };
         let ai_cfg = self.snapshot_ai_config(cx);
+        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = ai_cfg.provider.label_in(self.locale);
         let cli_exe = crate::resolve_cli_exe();
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
@@ -4964,14 +5205,16 @@ impl Ruum {
 
         let task = cx.background_executor().spawn(async move {
             let runner = ruum_core::ai_cli::DefaultCommandRunner;
-            let res = ruum_core::ai_cli::run_analysis_with_tree_for_config(
-                &ai_cfg,
-                &home,
-                &cli_exe,
-                now_secs,
-                existing_tree.as_deref(),
-                &runner,
-            );
+            let res =
+                ruum_core::ai_cli::run_analysis_with_tree_for_config_with_context(
+                    &ai_cfg,
+                    &home,
+                    &cli_exe,
+                    now_secs,
+                    existing_tree.as_deref(),
+                    &runner,
+                    &ai_ctx,
+                );
             (home, res)
         });
 
@@ -6214,6 +6457,7 @@ impl Ruum {
         let existing_session = self.find_live_ssh_session(id);
         let duration_minutes = self.app_settings.ssh_session_duration_minutes;
         let ai_cfg = self.snapshot_ai_config(cx);
+        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = ai_cfg.provider.label_in(self.locale);
         let options = self.options.clone();
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
@@ -6256,8 +6500,8 @@ impl Ruum {
             .map_err(|err| err.to_string())?;
             let snapshot = scan.wait().map_err(|err| err.to_string())?;
             let runner = ruum_core::ai_cli::DefaultCommandRunner;
-            let proposal = analyze_remote_snapshot_with_runner(
-                &ai_cfg, &snapshot, now_secs, &runner,
+            let proposal = analyze_remote_snapshot_with_context(
+                &ai_cfg, &snapshot, now_secs, &runner, &ai_ctx,
             )?;
             Ok::<_, String>((session, snapshot.header, proposal))
         });
@@ -10359,15 +10603,34 @@ fn apply_download_to_runtime(
 
 /// Run local AI analysis on an already-fetched remote [`Snapshot`] using pure
 /// in-memory tree + Docker whitelist validation.
+#[cfg(test)]
 pub fn analyze_remote_snapshot_with_runner(
     ai_cfg: &ruum_core::storage::AiConfig,
     snapshot: &ruum_core::remote::Snapshot,
     now_secs: u64,
     runner: &dyn ruum_core::ai_cli::CommandRunner,
 ) -> Result<CleanupProposal, String> {
+    analyze_remote_snapshot_with_context(
+        ai_cfg,
+        snapshot,
+        now_secs,
+        runner,
+        &ruum_core::ai_cli::AiExecutionContext::default(),
+    )
+}
+
+/// Run local AI analysis on an already-fetched remote [`Snapshot`] with an
+/// explicit [`ruum_core::ai_cli::AiExecutionContext`].
+pub fn analyze_remote_snapshot_with_context(
+    ai_cfg: &ruum_core::storage::AiConfig,
+    snapshot: &ruum_core::remote::Snapshot,
+    now_secs: u64,
+    runner: &dyn ruum_core::ai_cli::CommandRunner,
+    ctx: &ruum_core::ai_cli::AiExecutionContext,
+) -> Result<CleanupProposal, String> {
     let target_os =
         ruum_core::removal::trash_os_for_platform(&snapshot.header.platform);
-    ruum_core::ai_cli::run_tree_analysis_for_config(
+    ruum_core::ai_cli::run_tree_analysis_for_config_with_context(
         ai_cfg,
         &snapshot.header.root,
         snapshot.header.home.as_deref(),
@@ -10376,6 +10639,7 @@ pub fn analyze_remote_snapshot_with_runner(
         target_os,
         now_secs,
         runner,
+        ctx,
     )
 }
 

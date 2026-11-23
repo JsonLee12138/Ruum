@@ -4031,6 +4031,7 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
         model: Some("gpt-5-codex".into()),
         auto_analyze_on_alert: false,
         updated_at_secs: saved_ai.updated_at_secs,
+        ..AiConfig::default()
     };
     assert_eq!(saved_ai, expected_ai);
 
@@ -5127,6 +5128,7 @@ fn settings_general_watchdog_webhook_and_ai_round_trip_in_sqlite(
             model: Some("claude-sonnet-4-6".into()),
             auto_analyze_on_alert: false,
             updated_at_secs: saved_ai.updated_at_secs,
+            ..AiConfig::default()
         }
     );
 
@@ -8314,5 +8316,524 @@ fn update_modal_handles_none_manifest_and_friendly_errors_across_locales(
         assert!(cx.debug_bounds("setting-updates-section").is_some());
         assert!(cx.debug_bounds("setting-update-privacy-note").is_none());
         assert!(cx.debug_bounds("update-error-box").is_some());
+    }
+}
+
+fn read_test_http_request(
+    stream: &mut std::net::TcpStream,
+) -> (String, String) {
+    use std::io::Read as _;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).expect("read mock http");
+        assert!(n > 0, "unexpected EOF before headers");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let content_len = headers
+        .lines()
+        .find_map(|line| {
+            let (name, val) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                val.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let total_len = header_end + 4 + content_len;
+    while buf.len() < total_len {
+        let n = stream.read(&mut chunk).expect("read mock http body");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body =
+        String::from_utf8_lossy(&buf[header_end + 4..total_len]).into_owned();
+    (headers, body)
+}
+
+fn write_test_http_response(
+    stream: &mut std::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
+    use std::io::Write as _;
+
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).expect("write mock http");
+    stream.flush().expect("flush mock http");
+}
+
+#[gpui_kit::test]
+fn settings_api_provider_toggles_fields_links_default_urls_and_preserves_custom(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
+
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(cx);
+
+    // Initially Agy: CLI extra args visible, API controls hidden, API button present.
+    assert!(cx.debug_bounds("provider-api").is_some());
+    assert!(cx.debug_bounds("setting-extra-args-input").is_some());
+    assert!(cx.debug_bounds("setting-api-protocol-openai").is_none());
+    assert!(cx.debug_bounds("setting-api-base-url-input").is_none());
+    assert!(cx.debug_bounds("setting-api-key-input").is_none());
+
+    // Pre-populate custom command and extra args under Custom, then switch to Api.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.set_watchdog_provider(AiCliProvider::Custom, cx);
+            app.ai_config.custom_command = "/opt/bin/old-cli".into();
+            app.watchdog_input_custom_cmd.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value("/opt/bin/old-cli", window, cx);
+                },
+            );
+            app.watchdog_input_extra_args
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("--json", window, cx));
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("setting-custom-cmd-input").is_some());
+    assert!(cx.debug_bounds("setting-extra-args-input").is_some());
+
+    // Click the API provider button.
+    let api_btn = cx.debug_bounds("provider-api").expect("provider-api");
+    cx.simulate_click(api_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert_eq!(app.watchdog_draft.ai_provider, AiCliProvider::Api);
+        assert_eq!(app.watchdog_draft.api_protocol, ApiProtocol::OpenAi);
+    });
+    // CLI inputs MUST be hidden when Provider::Api is active.
+    assert!(cx.debug_bounds("setting-custom-cmd-input").is_none());
+    assert!(cx.debug_bounds("setting-extra-args-input").is_none());
+    // API inputs MUST be visible, and API key input MUST be masked.
+    assert!(cx.debug_bounds("setting-api-protocol-openai").is_some());
+    assert!(cx.debug_bounds("setting-api-protocol-anthropic").is_some());
+    assert!(cx.debug_bounds("setting-api-base-url-input").is_some());
+    assert!(cx.debug_bounds("setting-api-key-input").is_some());
+    assert!(cx.debug_bounds("setting-clear-api-key").is_some());
+    assert!(cx.debug_bounds("setting-model-input").is_some());
+    assert!(cx.debug_bounds("setting-test-cli").is_some());
+    assert!(cx.debug_bounds("setting-fetch-models").is_some());
+
+    let api_key_input =
+        read(&view, cx, |app| app.watchdog_input_api_key.clone())
+            .expect("api key input");
+    assert!(
+        cx.update(|_, cx| api_key_input.read(cx).presentation().is_masked())
+    );
+
+    let base_url_input =
+        read(&view, cx, |app| app.watchdog_input_api_base_url.clone())
+            .expect("base url input");
+    assert_eq!(
+        cx.update(|_, cx| {
+            base_url_input
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        }),
+        ApiProtocol::OpenAi.default_base_url()
+    );
+
+    // Switching OpenAI -> Claude when Base URL is empty updates placeholder & value.
+    let claude_btn = cx
+        .debug_bounds("setting-api-protocol-anthropic")
+        .expect("claude button");
+    cx.simulate_click(claude_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.watchdog_draft.api_protocol, ApiProtocol::Anthropic);
+    });
+    assert_eq!(
+        cx.update(|_, cx| base_url_input.read(cx).value().to_string()),
+        ApiProtocol::Anthropic.default_base_url()
+    );
+    assert_eq!(
+        cx.update(|_, cx| {
+            base_url_input
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        }),
+        ApiProtocol::Anthropic.default_base_url()
+    );
+
+    // Switching Claude -> OpenAI when Base URL equals Claude default updates to OpenAI default.
+    let openai_btn = cx
+        .debug_bounds("setting-api-protocol-openai")
+        .expect("openai button");
+    cx.simulate_click(openai_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.watchdog_draft.api_protocol, ApiProtocol::OpenAi);
+    });
+    assert_eq!(
+        cx.update(|_, cx| base_url_input.read(cx).value().to_string()),
+        ApiProtocol::OpenAi.default_base_url()
+    );
+    assert_eq!(
+        cx.update(|_, cx| {
+            base_url_input
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        }),
+        ApiProtocol::OpenAi.default_base_url()
+    );
+
+    // Entering a custom Base URL (e.g. MiMo) MUST NOT be overwritten when toggling protocol.
+    cx.update(|window, cx| {
+        base_url_input.update(cx, |i, cx| {
+            i.set_value("https://api.xiaomimimo.com/v1", window, cx);
+        });
+    });
+    let claude_btn = cx
+        .debug_bounds("setting-api-protocol-anthropic")
+        .expect("claude button");
+    cx.simulate_click(claude_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.watchdog_draft.api_protocol, ApiProtocol::Anthropic);
+    });
+    assert_eq!(
+        cx.update(|_, cx| base_url_input.read(cx).value().to_string()),
+        "https://api.xiaomimimo.com/v1"
+    );
+    assert_eq!(
+        cx.update(|_, cx| {
+            base_url_input
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        }),
+        ApiProtocol::Anthropic.default_base_url()
+    );
+}
+
+#[gpui_kit::test]
+fn settings_api_key_lazy_keychain_save_preserve_clear_and_draft_probe(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+    use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
+    use std::net::TcpListener;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("device-credentials.enc");
+
+    // Pre-seed an SSH profile + encrypted credential file so has_encrypted_file() == true.
+    let counter_seed = CountingRootSecret::new([0x33; 32]);
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.add_ssh_profile(&SshProfile {
+            id: "prof-ssh".into(),
+            alias: "prod".into(),
+            host: "10.0.0.9".into(),
+            port: 22,
+            username: "ops".into(),
+            auth_mode: AuthMode::PrivateKey,
+            default_path: None,
+            created_at_secs: 100,
+            updated_at_secs: 100,
+            last_total_bytes: None,
+            last_available_bytes: None,
+            last_scanned_secs: None,
+            pending_script_path: None,
+            pending_script_items: None,
+            pending_reclaim_bytes: None,
+            pending_created_secs: None,
+        })
+        .expect("seed ssh");
+        let seed_store = counter_seed.store_for(&enc_path);
+        seed_store
+            .set_ssh_secret(
+                "prof-ssh",
+                &ruum_core::credentials::SshCredentialSecret::Password {
+                    password: "pw".into(),
+                },
+            )
+            .expect("seed enc file");
+    }
+
+    // Fresh counter starting at 0 for the GUI lifecycle.
+    let counter = CountingRootSecret::new([0x33; 32]);
+    let store = counter.store_for(&enc_path);
+    assert!(store.has_encrypted_file());
+    assert_eq!(counter.load_count(), 0);
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
+
+    // 1. Navigate to Settings -> AI, switch to API, draw, and save with EMPTY key:
+    //    keychain MUST stay at 0 unlocks!
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.db_path = Some(db_path.clone());
+            app.cred_store = Some(store.clone());
+            app.reload_watchdog_config_and_prepare_settings();
+            app.navigate_rail(Screen::Settings, cx);
+            app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+            app.set_watchdog_provider(AiCliProvider::Api, cx);
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+    draw(cx);
+    assert_eq!(
+        counter.load_count(),
+        0,
+        "startup, Settings render, Provider::Api switch, and empty-key save must never unlock keychain"
+    );
+
+    // 2. Local TcpListener mock for OpenAI-compatible GET /models + POST /chat/completions.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock api");
+    let addr = listener.local_addr().expect("mock addr");
+    let server = std::thread::spawn(move || {
+        for idx in 0..4 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (headers, _body) = read_test_http_request(&mut stream);
+            let headers_lc = headers.to_ascii_lowercase();
+            assert!(
+                headers_lc.contains("authorization: bearer test-api-key"),
+                "request #{idx} missing draft/saved bearer key: {headers}"
+            );
+            match idx {
+                0 | 1 | 3 => {
+                    write_test_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        r#"{"data":[{"id":"mimo-v2-flash"}]}"#,
+                    );
+                }
+                _ => {
+                    let sse = concat!(
+                        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",",
+                        "\"model\":\"mimo-v2-flash\",\"choices\":[{\"index\":0,",
+                        "\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},",
+                        "\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",",
+                        "\"model\":\"mimo-v2-flash\",\"choices\":[{\"index\":0,",
+                        "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    write_test_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "text/event-stream",
+                        sse,
+                    );
+                }
+            }
+        }
+    });
+
+    // 3. Enter draft Base URL, Model, and API Key WITHOUT clicking Save yet,
+    //    then test connection, fetch models, and benchmark speed immediately.
+    let base_url = format!("http://{addr}/v1");
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.watchdog_input_api_base_url.as_ref().unwrap().update(
+                cx,
+                |i, cx| {
+                    i.set_value(base_url.clone(), window, cx);
+                },
+            );
+            app.watchdog_input_model
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| {
+                    i.set_value("mimo-v2-flash", window, cx);
+                });
+            app.watchdog_input_api_key
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| {
+                    i.set_value("test-api-key", window, cx);
+                });
+        });
+    });
+
+    let test_btn = cx.debug_bounds("setting-test-cli").expect("test btn");
+    cx.simulate_click(test_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert!(!app.watchdog_testing);
+        let (msg, status) = app.notice.as_ref().expect("test notice");
+        assert_eq!(*status, gpui_omarchy::Status::Success, "{msg}");
+    });
+
+    let fetch_btn = cx.debug_bounds("setting-fetch-models").expect("fetch btn");
+    cx.simulate_click(fetch_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert!(!app.watchdog_fetching_models);
+        assert_eq!(app.watchdog_models.len(), 1);
+        assert_eq!(app.watchdog_models[0].id, "mimo-v2-flash");
+    });
+
+    draw(cx);
+    let speed_btn = cx
+        .debug_bounds("setting-model-speed-0")
+        .expect("speed btn 0");
+    cx.simulate_click(speed_btn.center(), gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert!(app.watchdog_benchmarking_models.is_empty());
+        assert_eq!(app.watchdog_speed_results.len(), 1);
+        assert!(app.watchdog_speed_results[0].ok);
+        assert_eq!(app.watchdog_speed_results[0].model, "mimo-v2-flash");
+    });
+    // Draft operations used the draft key directly with 0 keychain unlocks!
+    assert_eq!(counter.load_count(), 0);
+
+    // 4. Save Settings: persists non-secret config to SQLite and API key to LazyCredentialStore.
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| {
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+    assert_eq!(counter.load_count(), 1);
+    let api_key_input = read(&view, cx, |app| {
+        assert_eq!(app.ai_config.provider, AiCliProvider::Api);
+        assert_eq!(app.ai_config.api_protocol, ApiProtocol::OpenAi);
+        assert_eq!(app.ai_config.api_base_url, base_url);
+        assert_eq!(app.ai_config.model.as_deref(), Some("mimo-v2-flash"));
+        assert_eq!(app.api_key_session_known, Some(true));
+        app.watchdog_input_api_key.clone().expect("api key input")
+    });
+    let key_val = cx.update(|_, cx| api_key_input.read(cx).value().to_string());
+    assert!(key_val.is_empty(), "key input should clear after saving");
+    let db = StorageDb::open(&db_path).expect("reopen db");
+    let saved_ai = db.load_ai_config().expect("load saved ai");
+    assert_eq!(saved_ai.provider, AiCliProvider::Api);
+    assert_eq!(saved_ai.api_protocol, ApiProtocol::OpenAi);
+    assert_eq!(saved_ai.api_base_url, base_url);
+
+    // 5. Fresh Ruum instance with a fresh 0-count store: rendering Settings does
+    //    NOT unlock keychain, saving empty key preserves existing key, and
+    //    testing connection with empty input lazily reads the saved key.
+    let fresh_counter = CountingRootSecret::new([0x33; 32]);
+    let fresh_store = fresh_counter.store_for(&enc_path);
+    let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
+    fresh_cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
+
+    fresh_cx.update(|window, cx| {
+        fresh_view.update(cx, |app, cx| {
+            app.db_path = Some(db_path.clone());
+            app.cred_store = Some(fresh_store.clone());
+            app.reload_watchdog_config_and_prepare_settings();
+            app.navigate_rail(Screen::Settings, cx);
+            app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+            app.ensure_watchdog_inputs(window, cx);
+            app.watchdog_input_model
+                .as_ref()
+                .unwrap()
+                .update(cx, |i, cx| {
+                    i.set_value("deepseek-chat", window, cx);
+                });
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+    draw(fresh_cx);
+    assert_eq!(
+        fresh_counter.load_count(),
+        0,
+        "saving with empty API key must preserve existing key without unlocking keychain"
+    );
+
+    let test_btn = fresh_cx
+        .debug_bounds("setting-test-cli")
+        .expect("fresh test btn");
+    fresh_cx.simulate_click(test_btn.center(), gpui_kit::Modifiers::none());
+    fresh_cx.run_until_parked();
+    assert_eq!(fresh_counter.load_count(), 1);
+    read(&fresh_view, fresh_cx, |app| {
+        let (msg, status) = app.notice.as_ref().expect("fresh test notice");
+        assert_eq!(*status, gpui_omarchy::Status::Success, "{msg}");
+    });
+    server.join().expect("mock api server join");
+
+    // 6. Clicking Clear Key removes the stored API key cleanly.
+    let clear_btn = fresh_cx
+        .debug_bounds("setting-clear-api-key")
+        .expect("clear api key btn");
+    fresh_cx.simulate_click(clear_btn.center(), gpui_kit::Modifiers::none());
+    draw(fresh_cx);
+    read(&fresh_view, fresh_cx, |app| {
+        assert_eq!(app.api_key_session_known, Some(false));
+    });
+    assert_eq!(
+        fresh_store.get_ai_api_key().expect("read after clear"),
+        None
+    );
+}
+
+#[gpui_kit::test]
+fn settings_api_renders_cleanly_across_all_four_locales(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::ALL_LOCALES;
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
+
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.set_watchdog_provider(AiCliProvider::Api, cx);
+    });
+
+    for locale in ALL_LOCALES {
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("provider-api").is_some());
+        assert!(cx.debug_bounds("setting-api-protocol-openai").is_some());
+        assert!(cx.debug_bounds("setting-api-protocol-anthropic").is_some());
+        assert!(cx.debug_bounds("setting-api-base-url-input").is_some());
+        assert!(cx.debug_bounds("setting-api-key-input").is_some());
+        assert!(cx.debug_bounds("setting-clear-api-key").is_some());
+        assert!(cx.debug_bounds("setting-custom-cmd-input").is_none());
+        assert!(cx.debug_bounds("setting-extra-args-input").is_none());
     }
 }

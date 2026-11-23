@@ -24,7 +24,7 @@ use ruum_watchdog::WatchdogConfigService;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::watchdog_config::{AiCliProvider, CleanupProposal};
+use crate::watchdog_config::{AiCliProvider, ApiProtocol, CleanupProposal};
 
 /// Default scan power preset.
 pub const DEFAULT_POWER_PRESET: &str = "balanced";
@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS ai_config (
     custom_command TEXT NOT NULL DEFAULT '',
     extra_args TEXT NOT NULL DEFAULT '',
     model TEXT,
+    api_protocol TEXT NOT NULL DEFAULT 'openai',
+    api_base_url TEXT NOT NULL DEFAULT '',
     updated_at_secs INTEGER NOT NULL DEFAULT 0
 );
 
@@ -497,6 +499,8 @@ pub struct AiConfig {
     pub custom_command: String,
     pub extra_args: String,
     pub model: Option<String>,
+    pub api_protocol: ApiProtocol,
+    pub api_base_url: String,
     pub updated_at_secs: u64,
 }
 
@@ -508,6 +512,8 @@ impl Default for AiConfig {
             custom_command: String::new(),
             extra_args: String::new(),
             model: None,
+            api_protocol: ApiProtocol::OpenAi,
+            api_base_url: String::new(),
             updated_at_secs: 0,
         }
     }
@@ -529,6 +535,8 @@ impl AiConfig {
             custom_command: self.custom_command.trim().to_owned(),
             extra_args: self.extra_args.trim().to_owned(),
             model,
+            api_protocol: self.api_protocol,
+            api_base_url: self.api_base_url.trim().to_owned(),
             updated_at_secs: self.updated_at_secs,
         }
     }
@@ -954,6 +962,32 @@ fn migrate_ssh_profiles_pending_columns(
     Ok(())
 }
 
+fn migrate_ai_config_api_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(ai_config)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            existing.insert(name);
+        }
+    }
+    for (col_name, col_def) in [
+        ("api_protocol", "TEXT NOT NULL DEFAULT 'openai'"),
+        ("api_base_url", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !existing.contains(col_name) {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE ai_config ADD COLUMN {col_name} {col_def}"
+                ),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate_legacy_webhook_config(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO webhook_endpoints (
@@ -1074,6 +1108,7 @@ impl StorageDb {
             )?;
             conn.execute_batch(SCHEMA_SQL)?;
             migrate_ssh_profiles_pending_columns(&conn)?;
+            migrate_ai_config_api_columns(&conn)?;
             migrate_legacy_webhook_config(&conn)
         })?;
         Ok(Self {
@@ -1846,7 +1881,8 @@ impl StorageDb {
         let row = self.with_conn_retry(|conn| {
             conn.query_row(
                 "SELECT auto_analyze_on_alert, provider, custom_command, \
-                 extra_args, model, updated_at_secs \
+                 extra_args, model, api_protocol, api_base_url, \
+                 updated_at_secs \
                  FROM ai_config WHERE id = 1",
                 [],
                 |row| {
@@ -1855,7 +1891,9 @@ impl StorageDb {
                     let custom_command: String = row.get(2)?;
                     let extra_args: String = row.get(3)?;
                     let model: Option<String> = row.get(4)?;
-                    let updated_at_secs: i64 = row.get(5)?;
+                    let protocol_raw: String = row.get(5)?;
+                    let api_base_url: String = row.get(6)?;
+                    let updated_at_secs: i64 = row.get(7)?;
                     let provider = AiCliProvider::from_id(&provider_raw)
                         .ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
@@ -1869,12 +1907,27 @@ impl StorageDb {
                                 )),
                             )
                         })?;
+                    let api_protocol = ApiProtocol::from_id(&protocol_raw)
+                        .ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "unknown api protocol: `{protocol_raw}`"
+                                    ),
+                                )),
+                            )
+                        })?;
                     Ok(AiConfig {
                         auto_analyze_on_alert: auto_analyze != 0,
                         provider,
                         custom_command,
                         extra_args,
                         model,
+                        api_protocol,
+                        api_base_url,
                         updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
                     })
                 },
@@ -1891,14 +1944,17 @@ impl StorageDb {
             conn.execute(
                 "INSERT INTO ai_config (
                     id, auto_analyze_on_alert, provider, custom_command,
-                    extra_args, model, updated_at_secs
-                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                    extra_args, model, api_protocol, api_base_url,
+                    updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                     auto_analyze_on_alert = excluded.auto_analyze_on_alert,
                     provider = excluded.provider,
                     custom_command = excluded.custom_command,
                     extra_args = excluded.extra_args,
                     model = excluded.model,
+                    api_protocol = excluded.api_protocol,
+                    api_base_url = excluded.api_base_url,
                     updated_at_secs = excluded.updated_at_secs",
                 params![
                     i64::from(norm.auto_analyze_on_alert),
@@ -1906,6 +1962,8 @@ impl StorageDb {
                     norm.custom_command,
                     norm.extra_args,
                     norm.model,
+                    norm.api_protocol.id(),
+                    norm.api_base_url,
                     u64_to_sqlite_i64(norm.updated_at_secs),
                 ],
             )
@@ -2481,7 +2539,7 @@ mod tests {
                 custom_command: "my-ai".to_owned(),
                 extra_args: "--json".to_owned(),
                 model: Some("gpt-5".to_owned()),
-                updated_at_secs: 1_700_000_300,
+                ..AiConfig::default()
             };
             db.save_ai_config(&cfg).unwrap();
             assert_eq!(db.load_ai_config().unwrap(), cfg);
@@ -2524,6 +2582,47 @@ mod tests {
             db.save_ai_state(&invalid_state).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+
+        // Migration adds api_protocol and api_base_url to legacy ai_config tables.
+        let legacy_path = temp.path().join("legacy-ai.db");
+        {
+            let conn = Connection::open(&legacy_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ai_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    auto_analyze_on_alert INTEGER NOT NULL DEFAULT 1,
+                    provider TEXT NOT NULL DEFAULT 'agy',
+                    custom_command TEXT NOT NULL DEFAULT '',
+                    extra_args TEXT NOT NULL DEFAULT '',
+                    model TEXT,
+                    updated_at_secs INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO ai_config (
+                    id, auto_analyze_on_alert, provider, custom_command,
+                    extra_args, model, updated_at_secs
+                ) VALUES (1, 1, 'agy', '', '', 'gpt-5', 42);",
+            )
+            .unwrap();
+        }
+        let migrated_db = StorageDb::open(&legacy_path).unwrap();
+        let migrated = migrated_db.load_ai_config().unwrap();
+        assert_eq!(migrated.provider, AiCliProvider::Agy);
+        assert_eq!(migrated.model.as_deref(), Some("gpt-5"));
+        assert_eq!(migrated.api_protocol, ApiProtocol::OpenAi);
+        assert_eq!(migrated.api_base_url, "");
+
+        let api_cfg = AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Api,
+            custom_command: String::new(),
+            extra_args: String::new(),
+            model: Some("claude-sonnet-4-6".to_owned()),
+            api_protocol: ApiProtocol::Anthropic,
+            api_base_url: "https://api.xiaomimimo.com/anthropic".to_owned(),
+            updated_at_secs: 1_700_000_999,
+        };
+        migrated_db.save_ai_config(&api_cfg).unwrap();
+        assert_eq!(migrated_db.load_ai_config().unwrap(), api_cfg);
     }
 
     #[test]
@@ -2632,6 +2731,7 @@ mod tests {
                         extra_args: String::new(),
                         model: None,
                         updated_at_secs: ts,
+                        ..AiConfig::default()
                     })
                     .unwrap();
 

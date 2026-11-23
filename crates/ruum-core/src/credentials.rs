@@ -46,6 +46,12 @@ pub const APP_DATA_DIR_NAME: &str = "ruum";
 /// Credential namespace used for saved SSH profile secrets.
 pub const SSH_CREDENTIAL_SERVICE: &str = "ruum.ssh";
 
+/// Credential namespace used for direct AI API secrets.
+pub const AI_CREDENTIAL_SERVICE: &str = "ruum.ai";
+
+/// Account identifier for the stored direct AI API key.
+pub const AI_DIRECT_API_KEY_ACCOUNT: &str = "direct-api-key";
+
 const MAGIC: &[u8; 4] = b"RMDC";
 const VERSION_EMPTY_AAD: u8 = 1;
 const VERSION_BOUND_AAD: u8 = 2;
@@ -957,6 +963,48 @@ impl LazyCredentialStore {
     pub fn delete_ssh_secret(&self, profile_id: &str) -> Result<(), String> {
         self.delete(SSH_CREDENTIAL_SERVICE, profile_id.trim())
     }
+
+    /// Store or overwrite the direct AI API key in `ruum.ai`.
+    pub fn set_ai_api_key(&self, api_key: &str) -> Result<(), String> {
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
+            return Err("AI API key cannot be empty".to_owned());
+        }
+        let secret = Zeroizing::new(trimmed.as_bytes().to_vec());
+        self.set(
+            AI_CREDENTIAL_SERVICE,
+            AI_DIRECT_API_KEY_ACCOUNT,
+            secret.as_slice(),
+        )
+    }
+
+    /// Load the direct AI API key on demand (zero keychain calls if absent).
+    pub fn get_ai_api_key(&self) -> Result<Option<Zeroizing<String>>, String> {
+        let Some(raw) =
+            self.get(AI_CREDENTIAL_SERVICE, AI_DIRECT_API_KEY_ACCOUNT)?
+        else {
+            return Ok(None);
+        };
+        let text = Zeroizing::new(
+            String::from_utf8(raw.to_vec())
+                .map_err(|e| format!("解码 AI API 密钥失败: {e}"))?,
+        );
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Zeroizing::new(trimmed.to_owned())))
+    }
+
+    /// Remove the stored direct AI API key if present.
+    pub fn delete_ai_api_key(&self) -> Result<(), String> {
+        self.delete(AI_CREDENTIAL_SERVICE, AI_DIRECT_API_KEY_ACCOUNT)
+    }
+
+    /// Return whether a non-empty direct AI API key is stored.
+    pub fn has_ai_api_key(&self) -> Result<bool, String> {
+        Ok(self.get_ai_api_key()?.is_some())
+    }
 }
 
 /// Namespaced view into a [`LazyCredentialStore`].
@@ -1592,5 +1640,43 @@ mod tests {
             store.get("ruum.ssh", "prof-b").unwrap().unwrap().as_slice(),
             b"beta"
         );
+    }
+
+    #[test]
+    fn ai_api_key_crud_and_lazy_keychain_short_circuit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join(CREDENTIALS_FILE_NAME);
+        let root_store = Arc::new(MemoryRootSecretStore::new([99_u8; 32]));
+        let store = LazyCredentialStore::new(file_path, root_store.clone());
+
+        assert_eq!(AI_CREDENTIAL_SERVICE, "ruum.ai");
+        assert_eq!(AI_DIRECT_API_KEY_ACCOUNT, "direct-api-key");
+
+        // Missing file short-circuits with zero keychain calls.
+        assert!(!store.has_ai_api_key().unwrap());
+        assert!(store.get_ai_api_key().unwrap().is_none());
+        store.delete_ai_api_key().unwrap();
+        assert_eq!(root_store.call_count(), 0);
+
+        // Empty/whitespace API keys are rejected.
+        assert!(store.set_ai_api_key("   ").is_err());
+        assert_eq!(root_store.call_count(), 0);
+
+        // Save, read, overwrite, delete.
+        store.set_ai_api_key("  test-api-key  ").unwrap();
+        assert_eq!(root_store.call_count(), 1);
+        assert!(store.has_ai_api_key().unwrap());
+        assert_eq!(
+            store
+                .get_ai_api_key()
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("test-api-key")
+        );
+
+        store.delete_ai_api_key().unwrap();
+        assert!(!store.has_ai_api_key().unwrap());
+        assert!(store.get_ai_api_key().unwrap().is_none());
     }
 }

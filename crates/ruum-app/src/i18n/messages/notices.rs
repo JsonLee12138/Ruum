@@ -147,6 +147,25 @@ pub fn testing_cli_connection(provider: &str, locale: Locale) -> String {
     }
 }
 
+pub fn testing_api_connection(protocol: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Testing {protocol} API connection\u{2026}"),
+        Locale::Zh => format!("正在测试 {protocol} API 连接\u{2026}"),
+        Locale::Ja => format!("{protocol} API 接続をテスト中\u{2026}"),
+        Locale::Ko => format!("{protocol} API 연결 테스트 중\u{2026}"),
+    }
+}
+
+pub const fn api_key_cleared(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Cleared saved API key.",
+        "已清除保存的 API 密钥。",
+        "保存済みの API キーを削除しました。",
+        "저장된 API 키를 지웠습니다.",
+    )
+}
+
 pub fn fetching_models(provider: &str, locale: Locale) -> String {
     match locale {
         Locale::En => format!("Fetching {provider} models\u{2026}"),

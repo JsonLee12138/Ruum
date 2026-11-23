@@ -2,6 +2,17 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.4-beta.1] - 2026-11-23
+
+### Features
+
+- **adk,core:** Add reusable `ruum-adk` direct AI API crate (`OpenAI` & `Anthropic`/Claude protocols with pure `rustls`, custom `base_url` normalization, `/models` discovery, multi-turn `LlmAgent` tool loop, and sync `BlockingAdkClient`) alongside `AiBackendFactory` / `DirectApiAiAdapter` and an in-process 6-tool read-only local MCP bridge (`list_volumes`, `scan_directory`, `inspect_subtree`, `find_reclaimable`, `check_git_safety`, `plan_removal`).
+- **app,cli,core:** Add `API` provider support in **Settings › AI** (`OpenAI` / `Claude` protocol selector, `Base URL`, masked `API Key` stored lazily in `ruum.ai` keychain, draft connection test / model listing / latency benchmark across `en`/`zh`/`ja`/`ko`) and extend `ruum config ai get/set` with `--provider api`, `--api-protocol`, `--api-base-url`, `--api-key`, `--api-key-stdin`, and redacted output.
+
+### Fixes
+
+- **xtask:** Extend macOS `hdiutil` retry backoff up to 31s to prevent transient `.dmg` creation locks during releases.
+
 ## [0.2.3] - 2026-11-20
 
 ### Features

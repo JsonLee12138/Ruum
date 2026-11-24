@@ -358,6 +358,7 @@ export function classifyChanges({
       run_worker: true,
       run_ci_scripts: true,
       run_macos_intel: Boolean(includeMacosIntel),
+      run_windows_release_check: true,
       reason: "workflow_dispatch",
     };
   }
@@ -373,6 +374,7 @@ export function classifyChanges({
       run_worker: true,
       run_ci_scripts: true,
       run_macos_intel: false,
+      run_windows_release_check: true,
       reason: "fallback: unable to narrow diff range",
     };
   }
@@ -382,9 +384,9 @@ export function classifyChanges({
   let run_worker = false;
   let run_ci_scripts = false;
   const run_macos_intel = Boolean(includeMacosIntel);
+  let run_windows_release_check = false;
 
   for (const p of files) {
-
     if (isDocOrMetadataPath(p)) {
       continue;
     }
@@ -403,6 +405,7 @@ export function classifyChanges({
       if (!cargoTomlVersionOnly) {
         run_rust = true;
         run_macos_bundle = true;
+        run_windows_release_check = true;
       }
       continue;
     }
@@ -410,6 +413,7 @@ export function classifyChanges({
       if (!cargoLockWorkspaceVersionOnly) {
         run_rust = true;
         run_macos_bundle = true;
+        run_windows_release_check = true;
       }
       continue;
     }
@@ -419,14 +423,19 @@ export function classifyChanges({
       run_macos_bundle = true;
       run_worker = true;
       run_ci_scripts = true;
+      run_windows_release_check = true;
     } else if (
       p.startsWith("packaging/") ||
       p.startsWith("assets/") ||
       p.startsWith("xtask/") ||
-      p.startsWith("crates/ruum-scan/") ||
       p === "rustfmt.toml"
     ) {
       run_macos_bundle = true;
+      run_windows_release_check = true;
+    } else if (p.startsWith("crates/ruum-scan/")) {
+      run_macos_bundle = true;
+    } else if (p === "crates/ruum-app/build.rs") {
+      run_windows_release_check = true;
     }
   }
 
@@ -436,6 +445,7 @@ export function classifyChanges({
   if (run_worker) active.push("worker");
   if (run_ci_scripts) active.push("ci-scripts");
   if (run_macos_intel) active.push("macos-intel");
+  if (run_windows_release_check) active.push("windows-release-check");
 
   const reason =
     active.length > 0
@@ -448,6 +458,7 @@ export function classifyChanges({
     run_worker,
     run_ci_scripts,
     run_macos_intel,
+    run_windows_release_check,
     reason,
   };
 }
@@ -560,6 +571,7 @@ export function runCli(env = process.env, cwd = process.cwd()) {
     `run_worker=${result.run_worker}`,
     `run_ci_scripts=${result.run_ci_scripts}`,
     `run_macos_intel=${result.run_macos_intel}`,
+    `run_windows_release_check=${result.run_windows_release_check}`,
   ].join("\n");
 
   if (env.GITHUB_OUTPUT) {
@@ -582,6 +594,7 @@ export function runCli(env = process.env, cwd = process.cwd()) {
       `| \`run_worker\` | \`${result.run_worker}\` |`,
       `| \`run_ci_scripts\` | \`${result.run_ci_scripts}\` |`,
       `| \`run_macos_intel\` | \`${result.run_macos_intel}\` |`,
+      `| \`run_windows_release_check\` | \`${result.run_windows_release_check}\` |`,
       "",
     ].join("\n");
     fs.appendFileSync(env.GITHUB_STEP_SUMMARY, summary, "utf8");

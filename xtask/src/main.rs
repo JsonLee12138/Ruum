@@ -31,6 +31,7 @@ tasks:
   scanner-pack [--out <path>] [--strict]
             cross-compile static Linux scanners into ruum-scan-linux.pack
   bundle    macOS: target/bundle/ruum.app and its zip
+              --target <triple>          cross-compile (aarch64-apple-darwin | x86_64-apple-darwin)
               --scanner-pack <path>      embed prebuilt ruum-scan-linux.pack
               --require-scanner-pack     fail if Linux musl targets are missing
               --sign IDENTITY            sign app with Developer ID (default: ad hoc)

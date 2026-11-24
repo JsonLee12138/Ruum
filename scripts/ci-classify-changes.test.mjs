@@ -96,6 +96,7 @@ test("1. pure Cargo.toml [workspace.package] version bump skips rust and bundle"
       run_worker: result.run_worker,
       run_ci_scripts: result.run_ci_scripts,
       run_macos_intel: result.run_macos_intel,
+      run_windows_release_check: result.run_windows_release_check,
     },
     {
       run_rust: false,
@@ -103,6 +104,7 @@ test("1. pure Cargo.toml [workspace.package] version bump skips rust and bundle"
       run_worker: false,
       run_ci_scripts: false,
       run_macos_intel: false,
+      run_windows_release_check: false,
     },
   );
 });
@@ -168,12 +170,14 @@ test("2. release bump (Cargo.toml + Cargo.lock workspace versions + CHANGELOG.md
       run_macos_bundle: result.run_macos_bundle,
       run_worker: result.run_worker,
       run_ci_scripts: result.run_ci_scripts,
+      run_windows_release_check: result.run_windows_release_check,
     },
     {
       run_rust: false,
       run_macos_bundle: false,
       run_worker: false,
       run_ci_scripts: false,
+      run_windows_release_check: false,
     },
   );
 });
@@ -215,6 +219,7 @@ test("3. Cargo.toml dependency change alone or alongside version bump triggers r
     });
     assert.equal(result.run_rust, true);
     assert.equal(result.run_macos_bundle, true);
+    assert.equal(result.run_windows_release_check, true);
   }
 });
 
@@ -239,6 +244,7 @@ test("4. Cargo.toml invalid SemVer fails closed to run rust and macOS bundle", (
   });
   assert.equal(result.run_rust, true);
   assert.equal(result.run_macos_bundle, true);
+  assert.equal(result.run_windows_release_check, true);
 });
 
 test("5. Cargo.lock external dependency change triggers rust and macOS bundle", () => {
@@ -280,6 +286,7 @@ test("5. Cargo.lock external dependency change triggers rust and macOS bundle", 
   });
   assert.equal(result.run_rust, true);
   assert.equal(result.run_macos_bundle, true);
+  assert.equal(result.run_windows_release_check, true);
 });
 
 test("6. Cargo.lock line added or removed triggers rust and macOS bundle", () => {
@@ -305,6 +312,7 @@ version = "0.1.0"
   });
   assert.equal(result.run_rust, true);
   assert.equal(result.run_macos_bundle, true);
+  assert.equal(result.run_windows_release_check, true);
 });
 
 test("7. Rust source edit runs rust without macOS bundle", () => {
@@ -324,6 +332,7 @@ test("7. Rust source edit runs rust without macOS bundle", () => {
       run_worker: result.run_worker,
       run_ci_scripts: result.run_ci_scripts,
       run_macos_intel: result.run_macos_intel,
+      run_windows_release_check: result.run_windows_release_check,
     },
     {
       run_rust: true,
@@ -331,6 +340,7 @@ test("7. Rust source edit runs rust without macOS bundle", () => {
       run_worker: false,
       run_ci_scripts: false,
       run_macos_intel: false,
+      run_windows_release_check: false,
     },
   );
 });
@@ -357,6 +367,11 @@ test("8. bundle-impacting edits trigger both rust and macOS bundle", () => {
       true,
       `${file} should trigger run_macos_bundle`,
     );
+    assert.equal(
+      result.run_windows_release_check,
+      file !== "crates/ruum-scan/src/main.rs",
+      `${file} run_windows_release_check`,
+    );
     assert.equal(result.run_worker, false);
     assert.equal(result.run_ci_scripts, false);
   }
@@ -378,12 +393,14 @@ test("9. worker-only edit runs worker tests only", () => {
       run_macos_bundle: result.run_macos_bundle,
       run_worker: result.run_worker,
       run_ci_scripts: result.run_ci_scripts,
+      run_windows_release_check: result.run_windows_release_check,
     },
     {
       run_rust: false,
       run_macos_bundle: false,
       run_worker: true,
       run_ci_scripts: false,
+      run_windows_release_check: false,
     },
   );
 
@@ -419,12 +436,14 @@ test("10. classifier-only edit runs ci-scripts tests only", () => {
         run_macos_bundle: result.run_macos_bundle,
         run_worker: result.run_worker,
         run_ci_scripts: result.run_ci_scripts,
+        run_windows_release_check: result.run_windows_release_check,
       },
       {
         run_rust: false,
         run_macos_bundle: false,
         run_worker: false,
         run_ci_scripts: true,
+        run_windows_release_check: false,
       },
     );
   }
@@ -447,6 +466,7 @@ test("11. workflow edit triggers all standard suites", () => {
       run_worker: result.run_worker,
       run_ci_scripts: result.run_ci_scripts,
       run_macos_intel: result.run_macos_intel,
+      run_windows_release_check: result.run_windows_release_check,
     },
     {
       run_rust: true,
@@ -454,6 +474,7 @@ test("11. workflow edit triggers all standard suites", () => {
       run_worker: true,
       run_ci_scripts: true,
       run_macos_intel: false,
+      run_windows_release_check: true,
     },
   );
 });
@@ -475,6 +496,7 @@ test("12. workflow_dispatch respects includeMacosIntel true and false", () => {
         run_worker: result.run_worker,
         run_ci_scripts: result.run_ci_scripts,
         run_macos_intel: result.run_macos_intel,
+        run_windows_release_check: result.run_windows_release_check,
         reason: result.reason,
       },
       {
@@ -483,6 +505,7 @@ test("12. workflow_dispatch respects includeMacosIntel true and false", () => {
         run_worker: true,
         run_ci_scripts: true,
         run_macos_intel: includeMacosIntel,
+        run_windows_release_check: true,
         reason: "workflow_dispatch",
       },
     );
@@ -516,6 +539,7 @@ test("13. missing or zero EVENT_BEFORE and empty changedFiles fail open", () => 
         run_worker: result.run_worker,
         run_ci_scripts: result.run_ci_scripts,
         run_macos_intel: result.run_macos_intel,
+        run_windows_release_check: result.run_windows_release_check,
       },
       {
         run_rust: true,
@@ -523,6 +547,7 @@ test("13. missing or zero EVENT_BEFORE and empty changedFiles fail open", () => 
         run_worker: true,
         run_ci_scripts: true,
         run_macos_intel: false,
+        run_windows_release_check: true,
       },
     );
   }
@@ -560,6 +585,7 @@ test("13. missing or zero EVENT_BEFORE and empty changedFiles fail open", () => 
     assert.match(zeroText, /^run_worker=true$/m);
     assert.match(zeroText, /^run_ci_scripts=true$/m);
     assert.match(zeroText, /^run_macos_intel=false$/m);
+    assert.match(zeroText, /^run_windows_release_check=true$/m);
 
     const outMissing = path.join(tmpDir, "missing.out");
     runCli(
@@ -569,7 +595,9 @@ test("13. missing or zero EVENT_BEFORE and empty changedFiles fail open", () => 
       },
       tmpDir,
     );
-    assert.match(fs.readFileSync(outMissing, "utf8"), /^run_rust=true$/m);
+    const missingText = fs.readFileSync(outMissing, "utf8");
+    assert.match(missingText, /^run_rust=true$/m);
+    assert.match(missingText, /^run_windows_release_check=true$/m);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -684,11 +712,13 @@ version = "0.2.3"
         "run_worker=false",
         "run_ci_scripts=false",
         "run_macos_intel=false",
+        "run_windows_release_check=false",
         "",
       ].join("\n"),
     );
     const summaryText = fs.readFileSync(bumpSummaryPath, "utf8");
     assert.match(summaryText, /run_rust/);
+    assert.match(summaryText, /run_windows_release_check/);
 
     // Commit 2: Rust source file edit
     fs.writeFileSync(
@@ -699,7 +729,7 @@ version = "0.2.3"
     git(["commit", "-m", "fix(updater): return bool"]);
 
     const rustOutputPath = path.join(tmpDir, "rust.output");
-    execFileSync(process.execPath, [CLASSIFIER_PATH], {
+    const rustStdout = execFileSync(process.execPath, [CLASSIFIER_PATH], {
       cwd: tmpDir,
       env: {
         ...process.env,
@@ -708,6 +738,7 @@ version = "0.2.3"
         INCLUDE_MACOS_INTEL: "false",
         GITHUB_OUTPUT: rustOutputPath,
       },
+      encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -720,10 +751,87 @@ version = "0.2.3"
         "run_worker=false",
         "run_ci_scripts=false",
         "run_macos_intel=false",
+        "run_windows_release_check=false",
         "",
       ].join("\n"),
     );
+    assert.match(rustStdout, /^run_windows_release_check=false$/m);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("15. run_windows_release_check triggers for build.rs and assets without breaking existing outputs", () => {
+  const buildRsResult = classifyChanges({
+    eventName: "pull_request",
+    changedFiles: ["crates/ruum-app/build.rs"],
+    includeMacosIntel: false,
+    cargoTomlVersionOnly: false,
+    cargoLockWorkspaceVersionOnly: false,
+    fallback: false,
+  });
+  assert.deepEqual(
+    {
+      run_rust: buildRsResult.run_rust,
+      run_macos_bundle: buildRsResult.run_macos_bundle,
+      run_worker: buildRsResult.run_worker,
+      run_ci_scripts: buildRsResult.run_ci_scripts,
+      run_macos_intel: buildRsResult.run_macos_intel,
+      run_windows_release_check: buildRsResult.run_windows_release_check,
+    },
+    {
+      run_rust: true,
+      run_macos_bundle: false,
+      run_worker: false,
+      run_ci_scripts: false,
+      run_macos_intel: false,
+      run_windows_release_check: true,
+    },
+  );
+
+  for (const file of [
+    "assets/ruum.ico",
+    "packaging/windows/installer.iss",
+    "xtask/src/package.rs",
+    ".github/workflows/release.yml",
+    "rustfmt.toml",
+  ]) {
+    const result = classifyChanges({
+      eventName: "pull_request",
+      changedFiles: [file],
+      includeMacosIntel: false,
+      cargoTomlVersionOnly: false,
+      cargoLockWorkspaceVersionOnly: false,
+      fallback: false,
+    });
+    assert.equal(
+      result.run_windows_release_check,
+      true,
+      `${file} should trigger run_windows_release_check`,
+    );
+  }
+
+  for (const file of [
+    "README.md",
+    "docs/guide.md",
+    "crates/ruum-app/src/main.rs",
+    "crates/ruum-core/src/lib.rs",
+    "crates/ruum-scan/src/main.rs",
+    "infra/update-worker/src/index.mjs",
+    "scripts/ci-classify-changes.mjs",
+  ]) {
+    const result = classifyChanges({
+      eventName: "pull_request",
+      changedFiles: [file],
+      includeMacosIntel: false,
+      cargoTomlVersionOnly: false,
+      cargoLockWorkspaceVersionOnly: false,
+      fallback: false,
+    });
+    assert.equal(
+      result.run_windows_release_check,
+      false,
+      `${file} should not trigger run_windows_release_check`,
+    );
   }
 });

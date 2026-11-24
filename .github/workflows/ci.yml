@@ -24,6 +24,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   changes:
@@ -33,6 +34,7 @@ jobs:
     outputs:
       run_rust: ${{ steps.classify.outputs.run_rust }}
       run_macos_bundle: ${{ steps.classify.outputs.run_macos_bundle }}
+      run_windows_release_check: ${{ steps.classify.outputs.run_windows_release_check }}
       run_worker: ${{ steps.classify.outputs.run_worker }}
       run_ci_scripts: ${{ steps.classify.outputs.run_ci_scripts }}
       run_macos_intel: ${{ steps.classify.outputs.run_macos_intel }}
@@ -94,6 +96,9 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo xtask lint
@@ -119,6 +124,9 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo xtask lint
@@ -131,7 +139,9 @@ jobs:
       # release does.
       - name: Bundle
         if: needs.changes.outputs.run_macos_bundle == 'true'
-        run: cargo xtask bundle --all
+        run: |
+          cargo xtask bundle --all
+          rm -rf target/release target/bundle
 
   windows:
     name: Lint and test (Windows)
@@ -153,6 +163,9 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo xtask lint
@@ -160,10 +173,12 @@ jobs:
       - name: Test
         run: cargo xtask test
 
-      - name: Check embedded executable icon
+      - name: Check embedded executable icon (debug)
         shell: pwsh
         run: |
-          cargo build --release --locked -p ruum-app -p ruum-core --bin ruum-gui --bin ruum
+          $ErrorActionPreference = "Stop"
+          cargo build --locked -p ruum-app -p ruum-core --bin ruum-gui --bin ruum
+          if ($LASTEXITCODE -ne 0) { throw "cargo build (debug) failed" }
           Add-Type @'
           using System;
           using System.Runtime.InteropServices;
@@ -173,12 +188,42 @@ jobs:
                   string file, int index, IntPtr[] large, IntPtr[] small, uint count);
           }
           '@
-          $guiExe = (Resolve-Path target/release/ruum-gui.exe).Path
+          $guiExe = (Resolve-Path target/debug/ruum-gui.exe).Path
           if ([ExecutableIcons]::ExtractIconEx($guiExe, -1, $null, $null, 0) -lt 1) {
-            throw "ruum-gui.exe has no embedded icon"
+            throw "ruum-gui.exe (debug) has no embedded icon"
           }
-          if (-not (Test-Path -LiteralPath target/release/ruum.exe -PathType Leaf)) {
-            throw "ruum.exe missing from release output"
+          if (-not (Test-Path -LiteralPath target/debug/ruum.exe -PathType Leaf)) {
+            throw "ruum.exe missing from debug output"
+          }
+
+      - name: Check embedded executable icon (release)
+        if: needs.changes.outputs.run_windows_release_check == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+            cargo build --release --locked -p ruum-app -p ruum-core --bin ruum-gui --bin ruum
+            if ($LASTEXITCODE -ne 0) { throw "cargo build (release) failed" }
+            Add-Type @'
+            using System;
+            using System.Runtime.InteropServices;
+            public static class ExecutableIcons {
+                [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+                public static extern uint ExtractIconEx(
+                    string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+            }
+          '@
+            $guiExe = (Resolve-Path target/release/ruum-gui.exe).Path
+            if ([ExecutableIcons]::ExtractIconEx($guiExe, -1, $null, $null, 0) -lt 1) {
+              throw "ruum-gui.exe (release) has no embedded icon"
+            }
+            if (-not (Test-Path -LiteralPath target/release/ruum.exe -PathType Leaf)) {
+              throw "ruum.exe missing from release output"
+            }
+          } finally {
+            if (Test-Path -LiteralPath target/release) {
+              Remove-Item -Recurse -Force -LiteralPath target/release
+            }
           }
 
   # The other half of each release: the same tests on the architectures
@@ -215,6 +260,9 @@ jobs:
           toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo xtask test
@@ -233,6 +281,9 @@ jobs:
           toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo xtask test

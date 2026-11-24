@@ -48,6 +48,7 @@ const ICON_SIZES: [(&str, u32); 10] = [
 /// What `bundle` was asked to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
+    target: Option<String>,
     /// A `Developer ID Application: …` identity from the keychain; ad hoc
     /// when absent.
     identity: Option<String>,
@@ -67,6 +68,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--target" => {
+                let target = args
+                    .next()
+                    .ok_or("--target needs a macOS target triple")?;
+                if target.trim().is_empty() {
+                    return Err("--target got an empty target triple".into());
+                }
+                macos_arch_for_target(target)?;
+                options.target = Some(target.clone());
+            }
             "--sign" => {
                 let identity = args.next().ok_or(
                     "--sign needs an identity, e.g. \
@@ -136,7 +147,10 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     let options = parse(args)?;
     let root = workspace_root();
     let version = env!("CARGO_PKG_VERSION");
-    let arch = std::env::consts::ARCH;
+    let arch = match options.target.as_deref() {
+        Some(triple) => macos_arch_for_target(triple)?,
+        None => std::env::consts::ARCH,
+    };
     let out = root.join("target/bundle");
     let app = out.join(APP);
 
@@ -145,26 +159,32 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     // binary there and leave a stale one here to be bundled.
     let target = root.join("target");
     let cargo = option_env!("CARGO").unwrap_or("cargo");
-    tool(
-        Command::new(cargo)
-            .current_dir(&root)
-            .args([
-                "build",
-                "--release",
-                "--locked",
-                "-p",
-                "ruum-app",
-                "-p",
-                "ruum-core",
-                "--bin",
-                GUI_EXECUTABLE,
-                "--bin",
-                CLI_EXECUTABLE,
-            ])
-            .arg("--target-dir")
-            .arg(&target)
-            .env("MACOSX_DEPLOYMENT_TARGET", DEPLOYMENT_TARGET),
-    )?;
+    let mut build = Command::new(cargo);
+    build
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "ruum-app",
+            "-p",
+            "ruum-core",
+            "--bin",
+            GUI_EXECUTABLE,
+            "--bin",
+            CLI_EXECUTABLE,
+        ])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("MACOSX_DEPLOYMENT_TARGET", DEPLOYMENT_TARGET);
+    if let Some(triple) = options.target.as_deref() {
+        build.arg("--target").arg(triple).env(
+            "CMAKE_OSX_ARCHITECTURES",
+            cmake_osx_arch_for_target(triple)?,
+        );
+    }
+    tool(&mut build)?;
 
     // Only ever the bundle this task made, never anything else in target/.
     if app.exists() {
@@ -179,9 +199,10 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
             .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
     }
 
+    let bin_dir = release_bin_dir(&target, options.target.as_deref());
     for exe in [GUI_EXECUTABLE, CLI_EXECUTABLE] {
         let binary = macos.join(exe);
-        copy(&target.join("release").join(exe), &binary)?;
+        copy(&bin_dir.join(exe), &binary)?;
         // Local symbols only: the backtrace of a panic still names functions.
         tool(Command::new("strip").arg("-x").arg(&binary))?;
     }
@@ -512,6 +533,34 @@ fn build_pkg(
         let _ = fs::remove_file(file);
     }
     Ok(())
+}
+
+fn macos_target_arches(
+    target: &str,
+) -> Result<(&'static str, &'static str), String> {
+    match target {
+        "aarch64-apple-darwin" => Ok(("aarch64", "arm64")),
+        "x86_64-apple-darwin" => Ok(("x86_64", "x86_64")),
+        _ => Err(format!(
+            "unsupported macOS target {target}; expected \
+             aarch64-apple-darwin or x86_64-apple-darwin"
+        )),
+    }
+}
+
+fn macos_arch_for_target(target: &str) -> Result<&'static str, String> {
+    macos_target_arches(target).map(|(arch, _)| arch)
+}
+
+fn cmake_osx_arch_for_target(target: &str) -> Result<&'static str, String> {
+    macos_target_arches(target).map(|(_, cmake_arch)| cmake_arch)
+}
+
+fn release_bin_dir(target_dir: &Path, target: Option<&str>) -> PathBuf {
+    match target {
+        Some(triple) => target_dir.join(triple).join("release"),
+        None => target_dir.join("release"),
+    }
 }
 
 const fn macos_host_arch(arch: &str) -> &'static str {
@@ -846,5 +895,78 @@ mod tests {
         );
         assert_eq!(attempts, HDIUTIL_BACKOFFS_MS.len() + 1);
         assert_eq!(sleeps, HDIUTIL_BACKOFFS_MS);
+    }
+
+    #[test]
+    fn parses_valid_target_and_rejects_invalid_targets() {
+        let default_opts = parse(&[]).expect("default options");
+        assert_eq!(default_opts.target, None);
+
+        let arm64 = parse(&args(&["--target", "aarch64-apple-darwin"]))
+            .expect("aarch64-apple-darwin");
+        assert_eq!(arm64.target.as_deref(), Some("aarch64-apple-darwin"));
+
+        let x64 = parse(&args(&["--target", "x86_64-apple-darwin"]))
+            .expect("x86_64-apple-darwin");
+        assert_eq!(x64.target.as_deref(), Some("x86_64-apple-darwin"));
+
+        let missing = parse(&args(&["--target"]))
+            .expect_err("missing target value must fail");
+        assert!(missing.contains("--target"), "{missing}");
+
+        let empty = parse(&args(&["--target", ""]))
+            .expect_err("empty target value must fail");
+        assert!(empty.contains("--target"), "{empty}");
+
+        let whitespace = parse(&args(&["--target", "   "]))
+            .expect_err("whitespace target value must fail");
+        assert!(whitespace.contains("--target"), "{whitespace}");
+
+        let unsupported =
+            parse(&args(&["--target", "x86_64-unknown-linux-gnu"]))
+                .expect_err("unsupported target must fail");
+        assert!(
+            unsupported.contains("x86_64-unknown-linux-gnu"),
+            "{unsupported}"
+        );
+    }
+
+    #[test]
+    fn maps_macos_target_to_arch_and_cmake_arch() {
+        assert_eq!(
+            macos_arch_for_target("aarch64-apple-darwin")
+                .expect("aarch64 arch"),
+            "aarch64"
+        );
+        assert_eq!(
+            macos_arch_for_target("x86_64-apple-darwin").expect("x86_64 arch"),
+            "x86_64"
+        );
+        assert!(macos_arch_for_target("aarch64-unknown-linux-gnu").is_err());
+
+        assert_eq!(
+            cmake_osx_arch_for_target("aarch64-apple-darwin")
+                .expect("arm64 cmake arch"),
+            "arm64"
+        );
+        assert_eq!(
+            cmake_osx_arch_for_target("x86_64-apple-darwin")
+                .expect("x86_64 cmake arch"),
+            "x86_64"
+        );
+        assert!(cmake_osx_arch_for_target("x86_64-pc-windows-msvc").is_err());
+    }
+
+    #[test]
+    fn resolves_release_bin_dir_for_host_and_target() {
+        let target_dir = Path::new("/tmp/ruum/target");
+        assert_eq!(
+            release_bin_dir(target_dir, None),
+            PathBuf::from("/tmp/ruum/target/release")
+        );
+        assert_eq!(
+            release_bin_dir(target_dir, Some("x86_64-apple-darwin")),
+            PathBuf::from("/tmp/ruum/target/x86_64-apple-darwin/release")
+        );
     }
 }

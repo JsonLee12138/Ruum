@@ -20,6 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   validate:
@@ -89,6 +90,9 @@ jobs:
           toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          save-if: false
 
       - name: Test
         run: cargo xtask test
@@ -263,10 +267,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `xtask bundle` names artifacts after the machine it runs on, so
-          # each architecture builds on its own.
-          - { runner: macos-15, arch: aarch64 }
-          - { runner: macos-15-intel, arch: x86_64 }
+          # Cross-compile x86_64 on macos-15 and test under Rosetta 2.
+          - { runner: macos-15, arch: aarch64, target: aarch64-apple-darwin }
+          - { runner: macos-15, arch: x86_64, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     env:
@@ -296,9 +299,30 @@ jobs:
           toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: false
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Ensure Rosetta 2
+        if: matrix.arch == 'x86_64'
+        run: |
+          if ! /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/uname -m | grep -qx x86_64
 
       - name: Test
-        run: cargo xtask test
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$ARCH" = "x86_64" ]; then
+            export CMAKE_OSX_ARCHITECTURES=x86_64
+          fi
+          cargo test --workspace --locked --target "$TARGET"
 
       # A keychain of its own for the certificate, deleted with the runner.
       - name: Signing certificate
@@ -326,11 +350,13 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
           RUUM_UPDATE_BASE_URL: ${{ vars.RUUM_UPDATE_BASE_URL }}
           RUUM_UPDATE_PUBLIC_KEY: ${{ vars.RUUM_UPDATE_PUBLIC_KEY }}
         run: |
           trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
           args=(--all --require-scanner-pack)
+          args+=(--target "$TARGET")
           signed=false
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_SIGN_IDENTITY" ]; then
             args+=(--sign "$MACOS_SIGN_IDENTITY")
@@ -350,6 +376,21 @@ jobs:
           args+=(--scanner-pack target/scanner/ruum-scan-linux.pack)
           cargo xtask bundle "${args[@]}"
           rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+          expected_lipo="arm64"
+          if [ "$ARCH" = "x86_64" ]; then
+            expected_lipo="x86_64"
+          fi
+          for bin in \
+            target/bundle/ruum.app/Contents/MacOS/ruum-gui \
+            target/bundle/ruum.app/Contents/MacOS/ruum
+          do
+            actual_lipo=$(lipo -archs "$bin")
+            if [ "$actual_lipo" != "$expected_lipo" ]; then
+              echo "expected $bin arch $expected_lipo, got $actual_lipo" >&2
+              exit 1
+            fi
+          done
 
           mkdir -p dist
           for ext in zip dmg pkg; do
@@ -410,9 +451,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
-      # The C runtime linked in, so ruum.exe also runs where the Visual
-      # C++ runtime was never installed. For the tests too, so both steps
-      # share one build.
+      # Link the C runtime statically so ruum.exe runs without the Visual C++
+      # redistributable, and keep RUSTFLAGS uniform so Test/Build isolate
+      # target artifacts from non-static CI builds while sharing cargo cache.
       RUSTFLAGS: -C target-feature=+crt-static
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
@@ -431,6 +472,9 @@ jobs:
           toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ruum-${{ runner.os }}-${{ runner.arch }}"
+          save-if: false
 
       - name: Test
         run: cargo xtask test
@@ -782,7 +826,7 @@ jobs:
           Copy-Item "target\release\ruum.exe", "target\release\ruum-gui.exe", $scannerPackAbs, README.md, LICENSE, THIRD_PARTY_NOTICES.md $zipStage
           Compress-Archive -Path $zipStage -DestinationPath "dist\$name.zip"
 
-          & $env:WIX_PATH build (Join-Path $stageDir "ruum.wxs") -arch $wixArch -o "dist\$name.msi"
+          & $env:WIX_PATH build (Join-Path $stageDir "ruum.wxs") -arch $wixArch -pdbtype none -o "dist\$name.msi"
           if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 
           & $env:ISCC_PATH (Join-Path $stageDir "ruum.iss")
@@ -836,6 +880,9 @@ jobs:
           toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          save-if: false
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -968,25 +1015,30 @@ jobs:
             esac
           }
 
-          for file in dist/*; do
-            [ -f "$file" ] || continue
+          npm install --prefix "$RUNNER_TEMP/wrangler" --no-save --no-audit --no-fund wrangler
+          export PATH="$RUNNER_TEMP/wrangler/node_modules/.bin:$PATH"
+          export TAG
+          export -f content_type_for
+
+          find dist -maxdepth 1 -type f -print0 | xargs -0 -P 4 -I {} bash -ec '
+            file="$1"
             name=$(basename "$file")
             ct=$(content_type_for "$name")
-            npx --yes wrangler r2 object put \
+            wrangler r2 object put \
               "ruum-releases/releases/$TAG/$name" \
               --file "$file" \
               --content-type "$ct" \
               --remote
-          done
+          ' _ {}
 
-          npx --yes wrangler r2 object put \
+          wrangler r2 object put \
             "ruum-releases/channels/$CHANNEL/manifest.json" \
             --file "dist/manifest.json" \
             --content-type "application/json; charset=utf-8" \
             --remote
 
           if [ -f "dist/manifest.json.sig" ]; then
-            npx --yes wrangler r2 object put \
+            wrangler r2 object put \
               "ruum-releases/channels/$CHANNEL/manifest.json.sig" \
               --file "dist/manifest.json.sig" \
               --content-type "text/plain; charset=utf-8" \

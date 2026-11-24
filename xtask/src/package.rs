@@ -1591,6 +1591,10 @@ mod tests {
         );
         assert!(workflow.contains("WIX_PATH="));
         assert!(workflow.contains("& $env:WIX_PATH build"));
+        assert!(workflow.lines().any(|line| {
+            line.contains("& $env:WIX_PATH build")
+                && line.contains("-pdbtype none")
+        }));
         assert!(!workflow.contains("dotnet tool install --global wix"));
         assert!(workflow.contains("cargo xtask scanner-pack --strict"));
         assert!(workflow.contains("ruum-scan-linux.pack"));
@@ -1893,9 +1897,26 @@ mod tests {
         assert!(workflow.contains("cargo xtask release-notes"));
         assert!(workflow.contains("cargo xtask package manifest"));
         assert!(workflow.contains("RUUM_UPDATE_SIGNING_KEY"));
-        assert!(workflow.contains("wrangler r2 object put"));
-        assert!(workflow.contains("--remote"));
-        assert!(workflow.contains("channels/$CHANNEL/manifest.json"));
+
+        let publish = workflow_job_section(workflow, "publish", None);
+        assert!(publish.contains(
+            "npm install --prefix \"$RUNNER_TEMP/wrangler\" \
+             --no-save --no-audit --no-fund wrangler"
+        ));
+        assert!(!publish.contains("npx --yes wrangler"));
+        assert!(publish.contains("wrangler r2 object put"));
+        assert!(publish.contains("--remote"));
+        assert!(publish.contains("xargs -0 -P 4"));
+        let releases_upload = publish
+            .find("ruum-releases/releases/$TAG/")
+            .expect("publish must upload release assets to R2");
+        let manifest_upload = publish
+            .find("channels/$CHANNEL/manifest.json")
+            .expect("publish must upload channel manifest to R2");
+        assert!(
+            releases_upload < manifest_upload,
+            "release objects must finish uploading before manifest pointer"
+        );
     }
 
     fn workflow_job_section<'a>(
@@ -1931,6 +1952,7 @@ mod tests {
         assert!(ci.contains(
             "group: ci-${{ github.event.pull_request.number || github.ref }}"
         ));
+        assert!(ci.contains("CARGO_PROFILE_DEV_DEBUG: line-tables-only"));
         assert!(ci.contains(
             "cancel-in-progress: ${{ github.event_name == 'pull_request' }}"
         ));
@@ -1942,6 +1964,7 @@ mod tests {
         for out in [
             "run_rust",
             "run_macos_bundle",
+            "run_windows_release_check",
             "run_worker",
             "run_ci_scripts",
             "run_macos_intel",
@@ -1986,6 +2009,7 @@ mod tests {
             )
         );
         assert!(macos.contains("cargo xtask bundle --all"));
+        assert!(macos.contains("rm -rf target/release target/bundle"));
 
         let windows =
             workflow_job_section(ci, "windows", Some("other-architectures"));
@@ -1994,6 +2018,17 @@ mod tests {
             windows.contains("if: needs.changes.outputs.run_rust == 'true'")
         );
         assert!(windows.contains("timeout-minutes: 45"));
+        assert!(windows.contains("Check embedded executable icon (debug)"));
+        assert!(windows.contains("target/debug/ruum-gui.exe"));
+        assert!(windows.contains("target/debug/ruum.exe"));
+        assert!(windows.contains("Check embedded executable icon (release)"));
+        assert!(windows.contains(
+            "if: needs.changes.outputs.run_windows_release_check == 'true'"
+        ));
+        assert!(windows.contains("target/release/ruum-gui.exe"));
+        assert!(windows.contains("target/release/ruum.exe"));
+        assert!(windows.contains("finally {"));
+        assert!(windows.contains("Remove-Item -Recurse -Force -LiteralPath"));
 
         let other = workflow_job_section(
             ci,
@@ -2017,7 +2052,33 @@ mod tests {
         assert!(intel.contains("timeout-minutes: 60"));
         assert!(intel.contains("cargo xtask test"));
 
+        for (job_name, section) in [
+            ("check", check),
+            ("check-macos", macos),
+            ("windows", windows),
+            ("other-architectures", other),
+            ("test-macos-intel", intel),
+        ] {
+            assert!(
+                section.contains("uses: Swatinem/rust-cache@v2"),
+                "ci job `{job_name}` missing rust-cache"
+            );
+            assert!(
+                section.contains(
+                    "shared-key: \"ruum-${{ runner.os }}-${{ runner.arch }}\""
+                ),
+                "ci job `{job_name}` missing shared-key"
+            );
+            assert!(
+                section.contains(
+                    "save-if: ${{ github.ref == 'refs/heads/main' }}"
+                ),
+                "ci job `{job_name}` missing main-only save-if"
+            );
+        }
+
         let release = include_str!("../../.github/workflows/release.yml");
+        assert!(release.contains("CARGO_PROFILE_DEV_DEBUG: line-tables-only"));
         assert!(
             release.contains(
                 "group: release-${{ inputs.tag || github.ref_name }}"
@@ -2038,5 +2099,58 @@ mod tests {
                 "release job `{job}` missing `{timeout}`"
             );
         }
+
+        let rel_linux = workflow_job_section(release, "linux", Some("macos"));
+        let rel_macos = workflow_job_section(release, "macos", Some("windows"));
+        let rel_windows =
+            workflow_job_section(release, "windows", Some("publish"));
+        let rel_publish = workflow_job_section(release, "publish", None);
+
+        for (job_name, section) in [
+            ("linux", rel_linux),
+            ("macos", rel_macos),
+            ("windows", rel_windows),
+            ("publish", rel_publish),
+        ] {
+            assert!(
+                section.contains("uses: Swatinem/rust-cache@v2"),
+                "release job `{job_name}` missing rust-cache"
+            );
+            assert!(
+                section.contains("save-if: false"),
+                "release job `{job_name}` must disable cache writes"
+            );
+        }
+        assert!(rel_linux.contains("cache-targets: false"));
+        assert!(rel_publish.contains("cache-targets: false"));
+        assert!(rel_macos.contains(
+            "shared-key: \"ruum-${{ runner.os }}-${{ runner.arch }}\""
+        ));
+        assert!(rel_windows.contains(
+            "shared-key: \"ruum-${{ runner.os }}-${{ runner.arch }}\""
+        ));
+
+        assert!(!rel_macos.contains("macos-15-intel"));
+        assert!(rel_macos.contains("target: aarch64-apple-darwin"));
+        assert!(rel_macos.contains("target: x86_64-apple-darwin"));
+        assert!(rel_macos.contains("rustup target add ${{ matrix.target }}"));
+        assert!(rel_macos.contains("if: matrix.arch == 'x86_64'"));
+        assert!(rel_macos.contains("Ensure Rosetta 2"));
+        assert!(rel_macos.contains("/usr/bin/arch -x86_64 /usr/bin/uname -m"));
+        assert!(rel_macos.contains("CMAKE_OSX_ARCHITECTURES=x86_64"));
+        assert!(
+            rel_macos.contains(
+                "cargo test --workspace --locked --target \"$TARGET\""
+            )
+        );
+        assert!(rel_macos.contains("args+=(--target \"$TARGET\")"));
+        assert!(rel_macos.contains("lipo -archs"));
+        assert!(
+            rel_macos
+                .contains("target/bundle/ruum.app/Contents/MacOS/ruum-gui")
+        );
+        assert!(
+            rel_macos.contains("target/bundle/ruum.app/Contents/MacOS/ruum")
+        );
     }
 }

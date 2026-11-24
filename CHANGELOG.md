@@ -2,17 +2,40 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.4] - 2026-11-24
+
+### Features
+
+- **adk,core,app,cli:** Add reusable `ruum-adk` direct AI API crate (`OpenAI` & `Anthropic`/Claude protocols with pure `rustls`, custom `base_url` normalization, `/models` discovery, multi-turn `LlmAgent` tool loop, and sync `BlockingAdkClient`) alongside `AiBackendFactory` / `DirectApiAiAdapter` and an in-process 6-tool read-only local MCP bridge (`list_volumes`, `scan_directory`, `inspect_subtree`, `find_reclaimable`, `check_git_safety`, `plan_removal`).
+- **app,cli,core:** Add `API` provider support in **Settings › AI** (`OpenAI` / `Claude` protocol selector, `Base URL`, masked `API Key` stored lazily in `ruum.ai` keychain, draft connection test / model listing / latency benchmark across `en`/`zh`/`ja`/`ko`) and extend `ruum config ai get/set` with `--provider api`, `--api-protocol`, `--api-base-url`, `--api-key`, `--api-key-stdin`, and redacted output.
+- **app,core,watchdog:** Add native background mode (`ruum-gui --background`) and tri-platform login autostart (`SMAppService` / `LaunchAgents` on macOS, XDG `.desktop` on Linux, `HKCU\...\Run` on Windows), allowing the app to hide Dock/taskbar entries when windows close while keeping the system tray active.
+- **app:** Add tri-platform system tray / menu-bar disk-space gauge (`TrayGaugeAdapter` with Retina capsule + menu-bar title on macOS, taskbar theme-adaptive icon on Windows, and dual-contrast badge + panel title on Linux).
+- **app,core,watchdog:** Add AI failure desktop notifications, an in-app cleanup progress modal, expanded Docker cleanup adapters, and a redesigned Home layout.
+
+### Fixes & Performance
+
+- **xtask:** Extend macOS `hdiutil` retry backoff up to 31s to prevent transient `.dmg` creation locks during releases.
+- **ci,release,xtask:** Slim `xtask` dependencies (`service` feature disabled), optimize dev/CI caching and glibc isolation for Linux portable builds, migrate macOS `x86_64` releases to `macos-15` cross-compilation with Rosetta 2 verification, omit `.wixpdb`, and parallelize R2 release uploads.
+
+### Docs
+
+- **readme:** Add sponsor links and GitHub `FUNDING.yml` across `en`/`zh`/`ja`/`ko` READMEs.
+
 ## [0.2.4-beta.3] - 2026-11-24
 
-### Changes
+### Performance & CI
 
-- Prepare release `0.2.4-beta.3`.
+- **ci,release,xtask:** Slim `xtask`, fix CI cache eviction, add Windows release icon checks, migrate macOS `x86_64` releases to `macos-15` cross-compilation (`--target` in `cargo xtask bundle`), omit `.wixpdb`, and parallelize R2 uploads.
+
+### Docs
+
+- **readme:** Add sponsor links and GitHub `FUNDING.yml` across `en`/`zh`/`ja`/`ko` READMEs.
 
 ## [0.2.4-beta.2] - 2026-11-24
 
-### Changes
+### Features
 
-- Prepare release `0.2.4-beta.2`.
+- **app,core,watchdog:** Add AI failure notifications, cleanup progress modal, native background mode (`--background`) with tri-platform login autostart, system tray / menu-bar disk-space gauge, Docker cleanup improvements, and Home layout overhaul.
 
 ## [0.2.4-beta.1] - 2026-11-23
 

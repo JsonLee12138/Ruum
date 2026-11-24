@@ -7323,7 +7323,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-adk"
-version = "0.2.4-beta.3"
+version = "0.2.4"
 dependencies = [
  "adk-agent",
  "adk-core",
@@ -7344,7 +7344,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-app"
-version = "0.2.4-beta.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "dunce",
@@ -7366,7 +7366,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-core"
-version = "0.2.4-beta.3"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -7404,7 +7404,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-scan"
-version = "0.2.4-beta.3"
+version = "0.2.4"
 dependencies = [
  "rustix",
  "ruum-core",
@@ -7414,7 +7414,7 @@ dependencies = [
 
 [[package]]
 name = "ruum-watchdog"
-version = "0.2.4-beta.3"
+version = "0.2.4"
 dependencies = [
  "rusqlite",
  "serde",
@@ -10550,7 +10550,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.2.4-beta.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

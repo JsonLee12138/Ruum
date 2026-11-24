@@ -107,6 +107,46 @@ pub const fn remote_docker_tooltip(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn ai_analyze_local_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run local AI cleanup analysis",
+        "运行本机 AI 清理分析",
+        "ローカル AI クリーンアップ分析を実行",
+        "로컬 AI 정리 분석 실행",
+    )
+}
+
+pub const fn ai_analyze_remote_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run remote AI cleanup analysis",
+        "运行远程 AI 清理分析",
+        "リモート AI クリーンアップ分析を実行",
+        "원격 AI 정리 분석 실행",
+    )
+}
+
+pub const fn ai_analyze_running_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "AI cleanup analysis is running\u{2026}",
+        "正在运行 AI 清理分析\u{2026}",
+        "AI クリーンアップ分析を実行中\u{2026}",
+        "AI 정리 분석 실행 중\u{2026}",
+    )
+}
+
+pub const fn ai_analyze_disconnected_tooltip(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "SSH session disconnected \u{2014} reconnect on Remote page",
+        "SSH 会话已断开 \u{2014} 请在远程页重新连接",
+        "SSH セッションが切断されています \u{2014} リモートページで再接続してください",
+        "SSH 세션이 연결 해제되었습니다 \u{2014} 원격 페이지에서 다시 연결하세요",
+    )
+}
+
 pub fn siblings_in(parent_name: &str, locale: Locale) -> String {
     match locale {
         Locale::En => format!("Siblings in {parent_name}"),

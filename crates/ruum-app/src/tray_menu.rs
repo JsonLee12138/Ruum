@@ -4,19 +4,24 @@
 //! items on macOS and Windows) with zero `unsafe` code and zero external icon
 //! assets at runtime.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 
 use crate::i18n::{Locale, common};
+use crate::tray_gauge::{
+    ICON_SIZE_PX, TrayGaugeAdapter, TrayGaugeFactory, TrayVisualRender,
+    TrayVisualSignature, calc_used_percent,
+};
 use anyhow::Context as _;
+use ruum_core::size::human_bytes;
+use ruum_core::space::SpaceInfo;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 #[cfg(target_os = "linux")]
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
-
-const ICON_SIZE_PX: u32 = 32;
 
 const ID_STATUS: &str = "ruum.tray.status";
 const ID_OPEN_RUUM: &str = "ruum.tray.open_ruum";
@@ -24,9 +29,10 @@ const ID_OPEN_REMOTE: &str = "ruum.tray.open_remote";
 const ID_OPEN_WATCHDOG: &str = "ruum.tray.open_watchdog";
 const ID_OPEN_SETTINGS: &str = "ruum.tray.open_settings";
 const ID_CHECK_UPDATES: &str = "ruum.tray.check_updates";
-const ID_CHECK_DISK: &str = "ruum.tray.check_disk";
+const ID_TOGGLE_WATCHDOG: &str = "ruum.tray.toggle_watchdog";
 const ID_RUN_AI: &str = "ruum.tray.run_ai";
 const ID_REVIEW_PROPOSAL: &str = "ruum.tray.review_proposal";
+const ID_CLEANUP_PROGRESS: &str = "ruum.tray.cleanup_progress";
 const ID_QUIT: &str = "ruum.tray.quit";
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -56,14 +62,24 @@ pub enum TrayAction {
     OpenSettings,
     /// Open update modal or check for updates in `Settings::Updates`.
     CheckForUpdates,
-    /// Run an immediate O(1) disk space check.
-    CheckDiskSpaceNow,
+    /// Toggle Watchdog monitoring on/off directly from the system tray.
+    ToggleWatchdog,
     /// Trigger an immediate AI cleanup analysis.
     RunAiAnalysisNow,
     /// Open the independent confirmation window for the latest proposal.
     ReviewLatestProposal,
+    /// Open or focus the background cleanup progress window.
+    ShowCleanupProgress,
     /// Explicitly quit the application.
     Quit,
+}
+
+/// Live background cleanup counters displayed in the tray menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayCleanupStatus {
+    pub completed: usize,
+    pub total: usize,
+    pub cancelling: bool,
 }
 
 /// Active OS tray icon and menu handles.
@@ -71,9 +87,13 @@ pub struct TrayMenu {
     instance_id: u64,
     locale: Locale,
     tray: TrayIcon,
+    gauge_adapter: Box<dyn TrayGaugeAdapter>,
     status_item: MenuItem,
     check_updates_item: MenuItem,
+    toggle_watchdog_item: MenuItem,
     review_proposal_item: MenuItem,
+    cleanup_progress_item: MenuItem,
+    last_visual: RefCell<TrayVisualSignature>,
     rx: Receiver<TrayAction>,
 }
 
@@ -133,9 +153,9 @@ impl TrayMenu {
             true,
             None,
         );
-        let check_disk_item = MenuItem::with_id(
-            ID_CHECK_DISK,
-            common::tray_check_disk_space(locale),
+        let toggle_watchdog_item = MenuItem::with_id(
+            ID_TOGGLE_WATCHDOG,
+            format_toggle_watchdog_label(false, locale),
             true,
             None,
         );
@@ -148,6 +168,12 @@ impl TrayMenu {
         let review_proposal_item = MenuItem::with_id(
             ID_REVIEW_PROPOSAL,
             common::tray_review_latest_proposal(locale),
+            false,
+            None,
+        );
+        let cleanup_progress_item = MenuItem::with_id(
+            ID_CLEANUP_PROGRESS,
+            format_cleanup_progress_label(None, locale),
             false,
             None,
         );
@@ -171,23 +197,45 @@ impl TrayMenu {
             &settings_item,
             &check_updates_item,
             &sep2,
-            &check_disk_item,
+            &toggle_watchdog_item,
             &run_ai_item,
             &review_proposal_item,
+            &cleanup_progress_item,
             &sep3,
             &quit_item,
         ])
         .context("build tray context menu")?;
 
-        let icon = build_treemap_icon(ICON_SIZE_PX)?;
+        let gauge_adapter = TrayGaugeFactory::create();
+        let initial_env = gauge_adapter.initial_env();
+        let (icon, icon_is_template) = match gauge_adapter
+            .render_monochrome_c1(ICON_SIZE_PX, initial_env)
+        {
+            TrayVisualRender::MonochromeC1 {
+                size,
+                rgba,
+                icon_is_template,
+            } => (
+                Icon::from_rgba(rgba, size, size)
+                    .context("construct tray icon from RGBA")?,
+                icon_is_template,
+            ),
+            TrayVisualRender::DiskGauge(gauge) => (
+                Icon::from_rgba(gauge.rgba, gauge.width, gauge.height)
+                    .context("construct tray icon from RGBA")?,
+                gauge.icon_is_template,
+            ),
+        };
         let mut builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon)
             .with_tooltip("ruum");
-        if cfg!(target_os = "macos") {
+        if icon_is_template {
             builder = builder.with_icon_as_template(true);
         }
         let tray = builder.build().context("create system tray icon")?;
+        let initial_sig =
+            gauge_adapter.visual_signature(None, false, initial_env);
 
         let (tx, rx) = mpsc::channel();
         let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
@@ -198,27 +246,86 @@ impl TrayMenu {
             instance_id,
             locale,
             tray,
+            gauge_adapter,
             status_item,
             check_updates_item,
+            toggle_watchdog_item,
             review_proposal_item,
+            cleanup_progress_item,
+            last_visual: RefCell::new(initial_sig),
             rx,
         })
     }
 
-    /// Refresh the disabled status line, tooltip, and proposal availability.
+    /// Refresh the disabled status line, watchdog toggle label, tooltip,
+    /// proposal availability, and (when enabled) the menu-bar/tray disk gauge.
     pub fn update_status(
         &self,
-        free_bytes: Option<u64>,
+        space: Option<SpaceInfo>,
         watchdog_enabled: bool,
         has_proposal: bool,
+        show_disk_space: bool,
     ) {
+        let free_bytes = space.map(|s| s.available);
         let label =
             format_status_label(free_bytes, watchdog_enabled, self.locale);
         self.status_item.set_text(&label);
+        self.toggle_watchdog_item
+            .set_text(format_toggle_watchdog_label(
+                watchdog_enabled,
+                self.locale,
+            ));
         self.review_proposal_item.set_enabled(has_proposal);
-        let _ = self
-            .tray
-            .set_tooltip(Some(format!("ruum \u{2014} {label}")));
+        let tooltip = format_tray_tooltip(
+            space,
+            watchdog_enabled,
+            show_disk_space,
+            self.locale,
+        );
+        let _ = self.tray.set_tooltip(Some(tooltip));
+
+        let env = self.gauge_adapter.probe_env(&self.tray);
+        let next_sig =
+            self.gauge_adapter
+                .visual_signature(space, show_disk_space, env);
+        let changed = *self.last_visual.borrow() != next_sig;
+        if changed {
+            let (visual_applied, next_title) = match self
+                .gauge_adapter
+                .build_visual(space, show_disk_space, env)
+            {
+                TrayVisualRender::MonochromeC1 {
+                    size,
+                    rgba,
+                    icon_is_template,
+                } => (
+                    apply_tray_icon(
+                        self.gauge_adapter.as_ref(),
+                        &self.tray,
+                        rgba,
+                        size,
+                        size,
+                        icon_is_template,
+                    ),
+                    None,
+                ),
+                TrayVisualRender::DiskGauge(gauge) => (
+                    apply_tray_icon(
+                        self.gauge_adapter.as_ref(),
+                        &self.tray,
+                        gauge.rgba,
+                        gauge.width,
+                        gauge.height,
+                        gauge.icon_is_template,
+                    ),
+                    gauge.title,
+                ),
+            };
+            if visual_applied {
+                self.tray.set_title(next_title.as_deref());
+                *self.last_visual.borrow_mut() = next_sig;
+            }
+        }
     }
 
     /// Update the tray check-for-updates menu item label for an available
@@ -226,6 +333,13 @@ impl TrayMenu {
     pub fn set_update_available(&self, version: Option<&str>) {
         let label = format_check_updates_label(version, self.locale);
         self.check_updates_item.set_text(&label);
+    }
+
+    /// Update the tray cleanup-progress menu item label and enabled state.
+    pub fn set_cleanup_progress(&self, cleanup: Option<TrayCleanupStatus>) {
+        let label = format_cleanup_progress_label(cleanup, self.locale);
+        self.cleanup_progress_item.set_text(&label);
+        self.cleanup_progress_item.set_enabled(cleanup.is_some());
     }
 
     /// Pop the next queued [`TrayAction`], if any.
@@ -310,9 +424,10 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
         ID_OPEN_WATCHDOG => Some(TrayAction::OpenWatchdog),
         ID_OPEN_SETTINGS => Some(TrayAction::OpenSettings),
         ID_CHECK_UPDATES => Some(TrayAction::CheckForUpdates),
-        ID_CHECK_DISK => Some(TrayAction::CheckDiskSpaceNow),
+        ID_TOGGLE_WATCHDOG => Some(TrayAction::ToggleWatchdog),
         ID_RUN_AI => Some(TrayAction::RunAiAnalysisNow),
         ID_REVIEW_PROPOSAL => Some(TrayAction::ReviewLatestProposal),
+        ID_CLEANUP_PROGRESS => Some(TrayAction::ShowCleanupProgress),
         ID_QUIT => Some(TrayAction::Quit),
         _ => None,
     }
@@ -328,6 +443,32 @@ pub fn format_status_label(
     common::tray_status_label(free_bytes, watchdog_enabled, locale)
 }
 
+/// Format the localized tray menu item label for toggling the Watchdog.
+#[must_use]
+pub const fn format_toggle_watchdog_label(
+    watchdog_enabled: bool,
+    locale: Locale,
+) -> &'static str {
+    common::tray_toggle_watchdog(watchdog_enabled, locale)
+}
+
+/// Format the localized tray menu item label for active or idle cleanup.
+#[must_use]
+pub fn format_cleanup_progress_label(
+    cleanup: Option<TrayCleanupStatus>,
+    locale: Locale,
+) -> String {
+    match cleanup {
+        Some(status) => common::tray_cleanup_progress_active(
+            status.completed,
+            status.total,
+            status.cancelling,
+            locale,
+        ),
+        None => common::tray_cleanup_progress_idle(locale).to_owned(),
+    }
+}
+
 /// Format the localized tray menu item label for software updates.
 #[must_use]
 pub fn format_check_updates_label(
@@ -340,205 +481,81 @@ pub fn format_check_updates_label(
     }
 }
 
-fn build_treemap_icon(size: u32) -> anyhow::Result<Icon> {
-    let rgba = build_treemap_icon_rgba(size);
-    Icon::from_rgba(rgba, size, size).context("construct tray icon from RGBA")
-}
-
-/// Generate a crisp monochrome RGBA `C1 (Machined Monolith)` icon in memory.
-///
-/// On macOS the icon uses black pixels with alpha so `AppKit`'s template mode
-/// adapts automatically to Light and Dark menu bars.
+/// Format the tray tooltip, embedding full free/total capacity when the disk
+/// gauge is active (bounded under Windows' 128-UTF-16 tooltip limit).
 #[must_use]
-pub fn build_treemap_icon_rgba(size: u32) -> Vec<u8> {
-    build_treemap_icon_rgba_with_rgb(
-        size,
-        monochrome_rgb(cfg!(target_os = "macos")),
-    )
-}
-
-const fn monochrome_rgb(is_macos: bool) -> [u8; 3] {
-    if is_macos { [0, 0, 0] } else { [238, 238, 242] }
-}
-
-fn build_treemap_icon_rgba_with_rgb(size: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let pixel_count = (size as usize) * (size as usize);
-    let mut rgba = vec![0u8; pixel_count * 4];
-    if size < 8 {
-        return rgba;
-    }
-
-    let geometry = C1Geometry::for_size(size);
-    for y in 0..size {
-        for x in 0..size {
-            let alpha = geometry.alpha_at(x, y);
-            if alpha > 0 {
-                let idx = ((y * size + x) as usize) * 4;
-                rgba[idx] = rgb[0];
-                rgba[idx + 1] = rgb[1];
-                rgba[idx + 2] = rgb[2];
-                rgba[idx + 3] = alpha;
-            }
-        }
-    }
-
-    rgba
-}
-
-struct C1Geometry {
-    pad: u32,
-    frame_end: u32,
-    frame_inner_start: u32,
-    frame_inner_end: u32,
-    content_start: u32,
-    content_end: u32,
-    left_end: u32,
-    right_start: u32,
-    top_end: u32,
-    bottom_start: u32,
-    wall_inner_x: u32,
-    wall_inner_y: u32,
-    wall_inner_end: u32,
-    core_start_x: u32,
-    core_start_y: u32,
-    core_end: u32,
-}
-
-impl C1Geometry {
-    fn for_size(size: u32) -> Self {
-        // Above 28 px the 32 px C1 layout scales with 2 px strokes and moats;
-        // smaller sizes lock strokes and moats to 1 px so the double-square
-        // core keeps an open moat.
-        let (pad, frame_t, frame_moat, gap, wall_t, core_moat) = if size >= 28 {
-            (
-                (3 * size + 16) / 32,
-                (2 * size + 16) / 32,
-                (2 * size + 16) / 32,
-                (2 * size + 16) / 32,
-                (2 * size + 16) / 32,
-                (size + 16) / 32,
-            )
-        } else {
-            let pad = if size >= 14 { (size / 12).max(1) } else { 0 };
-            let frame_moat = u32::from(size >= 10);
-            (pad, 1, frame_moat, 1, 1, 1)
+pub fn format_tray_tooltip(
+    space: Option<SpaceInfo>,
+    watchdog_enabled: bool,
+    show_disk_space: bool,
+    locale: Locale,
+) -> String {
+    if show_disk_space && let Some(sp) = space {
+        let avail = human_bytes(sp.available);
+        let total = human_bytes(sp.total);
+        let used_pct = calc_used_percent(sp);
+        let watchdog = watchdog_short_label(watchdog_enabled, locale);
+        return match locale {
+            Locale::En => format!(
+                "ruum \u{2014} Free: {avail} / {total} ({used_pct}% used) \u{00b7} {watchdog}"
+            ),
+            Locale::Zh => format!(
+                "ruum \u{2014} \u{53ef}\u{7528}\u{ff1a}{avail} / {total}\u{ff08}\u{5df2}\u{7528} {used_pct}%\u{ff09}\u{00b7} {watchdog}"
+            ),
+            Locale::Ja => format!(
+                "ruum \u{2014} \u{7a7a}\u{304d}: {avail} / {total}\u{ff08}\u{4f7f}\u{7528} {used_pct}%\u{ff09}\u{00b7} {watchdog}"
+            ),
+            Locale::Ko => format!(
+                "ruum \u{2014} \u{c5ec}\u{c720}: {avail} / {total} ({used_pct}% \u{c0ac}\u{c6a9}) \u{00b7} {watchdog}"
+            ),
         };
-
-        let frame_end = size.saturating_sub(pad);
-        let frame_inner_start = pad + frame_t;
-        let frame_inner_end = frame_end.saturating_sub(frame_t);
-        let content_start = frame_inner_start + frame_moat;
-        let content_end = frame_inner_end.saturating_sub(frame_moat);
-        let content_span = content_end.saturating_sub(content_start);
-        let avail = content_span.saturating_sub(gap);
-
-        let right_size = if size >= 28 {
-            (avail * 9 + 8) / 16
-        } else {
-            (avail * 5 + 4) / 9
-        };
-        let left_w = avail.saturating_sub(right_size);
-
-        let left_end = content_start + left_w;
-        let right_start = left_end + gap;
-        let bottom_start = content_end.saturating_sub(right_size);
-        let top_end = bottom_start.saturating_sub(gap);
-
-        let wall_inner_x = right_start + wall_t;
-        let wall_inner_y = bottom_start + wall_t;
-        let wall_inner_end = content_end.saturating_sub(wall_t);
-        let core_start_x = wall_inner_x + core_moat;
-        let core_start_y = wall_inner_y + core_moat;
-        let core_end = wall_inner_end.saturating_sub(core_moat);
-
-        Self {
-            pad,
-            frame_end,
-            frame_inner_start,
-            frame_inner_end,
-            content_start,
-            content_end,
-            left_end,
-            right_start,
-            top_end,
-            bottom_start,
-            wall_inner_x,
-            wall_inner_y,
-            wall_inner_end,
-            core_start_x,
-            core_start_y,
-            core_end,
-        }
     }
+    let label = format_status_label(
+        space.map(|s| s.available),
+        watchdog_enabled,
+        locale,
+    );
+    format!("ruum \u{2014} {label}")
+}
 
-    const fn alpha_at(&self, x: u32, y: u32) -> u8 {
-        let in_frame =
-            in_rect(x, y, self.pad, self.pad, self.frame_end, self.frame_end)
-                && !in_rect(
-                    x,
-                    y,
-                    self.frame_inner_start,
-                    self.frame_inner_start,
-                    self.frame_inner_end,
-                    self.frame_inner_end,
-                );
-        if in_frame {
-            return 160;
+const fn watchdog_short_label(enabled: bool, locale: Locale) -> &'static str {
+    if enabled {
+        match locale {
+            Locale::En => "Watchdog On",
+            Locale::Zh => "\u{5b88}\u{62a4}\u{5df2}\u{5f00}\u{542f}",
+            Locale::Ja => "\u{76e3}\u{8996}\u{30aa}\u{30f3}",
+            Locale::Ko => "\u{c6cc}\u{ce58}\u{b3c5} \u{cf1c}\u{c9d0}",
         }
-
-        let in_monolith = in_rect(
-            x,
-            y,
-            self.content_start,
-            self.content_start,
-            self.left_end,
-            self.content_end,
-        );
-        let in_vault_wall = in_rect(
-            x,
-            y,
-            self.right_start,
-            self.bottom_start,
-            self.content_end,
-            self.content_end,
-        ) && !in_rect(
-            x,
-            y,
-            self.wall_inner_x,
-            self.wall_inner_y,
-            self.wall_inner_end,
-            self.wall_inner_end,
-        );
-        let in_vault_core = in_rect(
-            x,
-            y,
-            self.core_start_x,
-            self.core_start_y,
-            self.core_end,
-            self.core_end,
-        );
-        if in_monolith || in_vault_wall || in_vault_core {
-            return 255;
+    } else {
+        match locale {
+            Locale::En => "Watchdog Off",
+            Locale::Zh => "\u{5b88}\u{62a4}\u{5df2}\u{5173}\u{95ed}",
+            Locale::Ja => "\u{76e3}\u{8996}\u{30aa}\u{30d5}",
+            Locale::Ko => "\u{c6cc}\u{ce58}\u{b3c5} \u{aec4}\u{c9d0}",
         }
-
-        let in_slab = in_rect(
-            x,
-            y,
-            self.right_start,
-            self.content_start,
-            self.content_end,
-            self.top_end,
-        );
-        if in_slab {
-            return 195;
-        }
-
-        0
     }
 }
 
-const fn in_rect(x: u32, y: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
-    x >= x0 && x < x1 && y >= y0 && y < y1
+fn apply_tray_icon(
+    adapter: &dyn TrayGaugeAdapter,
+    tray: &TrayIcon,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    is_template: bool,
+) -> bool {
+    let icon = match Icon::from_rgba(rgba, width, height) {
+        Ok(icon) => icon,
+        Err(err) => {
+            eprintln!("ruum: failed to build tray icon: {err}");
+            return false;
+        }
+    };
+    if let Err(err) = adapter.apply_icon(tray, icon, is_template) {
+        eprintln!("ruum: failed to set tray icon: {err}");
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -567,123 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn icon_rgba_renders_c1_machined_monolith_silhouette() {
-        assert_eq!(monochrome_rgb(true), [0, 0, 0]);
-        assert_eq!(monochrome_rgb(false), [238, 238, 242]);
-
-        let expected_rgb = monochrome_rgb(cfg!(target_os = "macos"));
-        let expected_16 = |x, y| {
-            let in_frame =
-                in_rect(x, y, 1, 1, 15, 15) && !in_rect(x, y, 2, 2, 14, 14);
-            let in_monolith = in_rect(x, y, 3, 3, 7, 13);
-            let in_slab = in_rect(x, y, 8, 3, 13, 7);
-            let in_vault_wall =
-                in_rect(x, y, 8, 8, 13, 13) && !in_rect(x, y, 9, 9, 12, 12);
-            let in_vault_core = in_rect(x, y, 10, 10, 11, 11);
-
-            if in_monolith || in_vault_wall || in_vault_core {
-                255
-            } else if in_slab {
-                195
-            } else if in_frame {
-                160
-            } else {
-                0
-            }
-        };
-        let expected_32 = |x, y| {
-            let in_frame =
-                in_rect(x, y, 3, 3, 29, 29) && !in_rect(x, y, 5, 5, 27, 27);
-            let in_monolith = in_rect(x, y, 7, 7, 14, 25);
-            let in_slab = in_rect(x, y, 16, 7, 25, 14);
-            let in_vault_wall =
-                in_rect(x, y, 16, 16, 25, 25) && !in_rect(x, y, 18, 18, 23, 23);
-            let in_vault_core = in_rect(x, y, 19, 19, 22, 22);
-
-            if in_monolith || in_vault_wall || in_vault_core {
-                255
-            } else if in_slab {
-                195
-            } else if in_frame {
-                160
-            } else {
-                0
-            }
-        };
-
-        assert_c1_grid(
-            &build_treemap_icon_rgba(16),
-            16,
-            expected_rgb,
-            expected_16,
-        );
-        assert_c1_grid(
-            &build_treemap_icon_rgba(32),
-            32,
-            expected_rgb,
-            expected_32,
-        );
-        assert_c1_grid(
-            &build_treemap_icon_rgba_with_rgb(16, [0, 0, 0]),
-            16,
-            [0, 0, 0],
-            expected_16,
-        );
-        assert_c1_grid(
-            &build_treemap_icon_rgba_with_rgb(32, [238, 238, 242]),
-            32,
-            [238, 238, 242],
-            expected_32,
-        );
-
-        for size in [8u32, 24u32, 48u32] {
-            let rgba = build_treemap_icon_rgba(size);
-            assert_eq!(rgba.len(), (size as usize) * (size as usize) * 4);
-            assert!(rgba.chunks_exact(4).any(|px| px[3] == 160));
-            assert!(rgba.chunks_exact(4).any(|px| px[3] == 195));
-            assert!(rgba.chunks_exact(4).any(|px| px[3] == 255));
-            assert!(rgba.chunks_exact(4).any(|px| px[3] == 0));
-            assert!(Icon::from_rgba(rgba, size, size).is_ok());
-        }
-
-        let tiny = build_treemap_icon_rgba(7);
-        assert!(tiny.iter().all(|&b| b == 0));
-    }
-
-    fn assert_c1_grid(
-        rgba: &[u8],
-        size: u32,
-        expected_rgb: [u8; 3],
-        expected_alpha_at: impl Fn(u32, u32) -> u8,
-    ) {
-        assert_eq!(rgba.len(), (size as usize) * (size as usize) * 4);
-
-        for y in 0..size {
-            for x in 0..size {
-                let idx = ((y * size + x) as usize) * 4;
-                let expected_alpha = expected_alpha_at(x, y);
-                let expected_px = if expected_alpha == 0 {
-                    [0, 0, 0, 0]
-                } else {
-                    [
-                        expected_rgb[0],
-                        expected_rgb[1],
-                        expected_rgb[2],
-                        expected_alpha,
-                    ]
-                };
-                assert_eq!(
-                    &rgba[idx..idx + 4],
-                    &expected_px,
-                    "pixel mismatch at ({x}, {y}) for size {size}"
-                );
-            }
-        }
-
-        assert!(Icon::from_rgba(rgba.to_vec(), size, size).is_ok());
-    }
-
-    #[test]
     fn menu_id_mapping_covers_all_interactive_items() {
         assert_eq!(
             action_for_menu_id(ID_OPEN_RUUM),
@@ -701,10 +601,7 @@ mod tests {
             action_for_menu_id(ID_OPEN_SETTINGS),
             Some(TrayAction::OpenSettings)
         );
-        assert_eq!(
-            action_for_menu_id(ID_CHECK_DISK),
-            Some(TrayAction::CheckDiskSpaceNow)
-        );
+        assert_eq!(action_for_menu_id("ruum.tray.check_disk"), None);
         assert_eq!(
             action_for_menu_id(ID_RUN_AI),
             Some(TrayAction::RunAiAnalysisNow)
@@ -714,8 +611,16 @@ mod tests {
             Some(TrayAction::ReviewLatestProposal)
         );
         assert_eq!(
+            action_for_menu_id(ID_CLEANUP_PROGRESS),
+            Some(TrayAction::ShowCleanupProgress)
+        );
+        assert_eq!(
             action_for_menu_id(ID_CHECK_UPDATES),
             Some(TrayAction::CheckForUpdates)
+        );
+        assert_eq!(
+            action_for_menu_id(ID_TOGGLE_WATCHDOG),
+            Some(TrayAction::ToggleWatchdog)
         );
         assert_eq!(action_for_menu_id(ID_QUIT), Some(TrayAction::Quit));
         assert_eq!(action_for_menu_id(ID_STATUS), None);
@@ -750,6 +655,63 @@ mod tests {
     }
 
     #[test]
+    fn toggle_watchdog_label_formats_both_states_across_locales() {
+        assert_eq!(
+            format_toggle_watchdog_label(false, Locale::En),
+            "Enable Watchdog"
+        );
+        assert_eq!(
+            format_toggle_watchdog_label(true, Locale::En),
+            "Pause Watchdog"
+        );
+        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            let enable = format_toggle_watchdog_label(false, locale);
+            let pause = format_toggle_watchdog_label(true, locale);
+            assert!(!enable.is_empty());
+            assert!(!pause.is_empty());
+            assert_ne!(enable, pause);
+            assert_ne!(enable, format_toggle_watchdog_label(false, Locale::En));
+        }
+    }
+
+    #[test]
+    fn cleanup_progress_label_reflects_idle_active_and_cancelling_across_locales()
+     {
+        let active = TrayCleanupStatus {
+            completed: 3,
+            total: 12,
+            cancelling: false,
+        };
+        let cancelling = TrayCleanupStatus {
+            completed: 3,
+            total: 12,
+            cancelling: true,
+        };
+        for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+            let idle_label = format_cleanup_progress_label(None, locale);
+            let active_label =
+                format_cleanup_progress_label(Some(active), locale);
+            let stop_label =
+                format_cleanup_progress_label(Some(cancelling), locale);
+            assert!(!idle_label.is_empty());
+            assert!(active_label.contains("(3/12)"));
+            assert!(stop_label.contains("(3/12)"));
+            assert_ne!(active_label, stop_label);
+            assert_ne!(idle_label, active_label);
+            if locale != Locale::En {
+                assert_ne!(
+                    idle_label,
+                    format_cleanup_progress_label(None, Locale::En)
+                );
+                assert_ne!(
+                    active_label,
+                    format_cleanup_progress_label(Some(active), Locale::En)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn event_sink_queues_action_and_invokes_waker() {
         use std::sync::atomic::AtomicBool;
 
@@ -777,6 +739,32 @@ mod tests {
                 .is_some_and(|sink| sink.instance_id == instance_id)
         {
             *guard = None;
+        }
+    }
+
+    #[test]
+    fn tray_tooltip_includes_full_capacity_when_gauge_enabled_within_win32_limit()
+     {
+        use ruum_core::space::SpaceInfo;
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let space = SpaceInfo {
+            total: 500 * GIB,
+            free: 42 * GIB,
+            available: 42 * GIB,
+        };
+
+        for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+            let tip_on = format_tray_tooltip(Some(space), true, true, locale);
+            assert!(tip_on.contains("42 GiB"));
+            assert!(tip_on.contains("500 GiB"));
+            assert!(tip_on.contains("92%"));
+            assert!(tip_on.encode_utf16().count() < 128);
+
+            let tip_off =
+                format_tray_tooltip(Some(space), false, false, locale);
+            assert!(tip_off.contains("42 GiB"));
+            assert!(tip_off.starts_with("ruum \u{2014} "));
         }
     }
 }

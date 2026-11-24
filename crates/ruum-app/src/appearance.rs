@@ -52,7 +52,10 @@ pub fn apply(appearance: WindowAppearance, cx: &mut App) {
 /// Follow `window`'s appearance from now on.
 pub fn follow(window: &Window) {
     window
-        .observe_window_appearance(|window, cx| apply(window.appearance(), cx))
+        .observe_window_appearance(|window, cx| {
+            apply(window.appearance(), cx);
+            crate::refresh_tray_status(cx);
+        })
         .detach();
 }
 

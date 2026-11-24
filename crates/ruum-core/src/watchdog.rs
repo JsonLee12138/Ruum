@@ -25,6 +25,9 @@ use crate::confirm::{
     CleanupConfirmRequest, GuiCleanupConfirm,
 };
 use crate::i18n::{self, Locale};
+pub use crate::i18n::{
+    AiFailureKind, classify_ai_failure, format_ai_failure_summary,
+};
 use crate::notify::resolve_ipc_target_and_token;
 pub use crate::notify::{
     NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_CLEANUP_STARTED,
@@ -236,6 +239,19 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
                 }
                 Err(err) => {
                     eprintln!("ruum watchdog: AI analysis error: {err}");
+                    let summary = notify_watchdog_ai_failure(
+                        self.notifier,
+                        &err,
+                        self.locale,
+                    );
+                    if let Err(db_err) =
+                        self.db.record_ai_error(&summary, *timestamp_secs)
+                    {
+                        eprintln!(
+                            "ruum watchdog: failed to record ai_state error: \
+                             {db_err}"
+                        );
+                    }
                     self.send_ipc_watchdog_update();
                     None
                 }
@@ -309,6 +325,23 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
 
         Ok(())
     }
+}
+
+fn notify_watchdog_ai_failure(
+    notifier: &dyn NotificationAdapter,
+    err: &str,
+    locale: Locale,
+) -> String {
+    let kind = classify_ai_failure(err);
+    let summary = format_ai_failure_summary(err, locale);
+    if let Err(notif_err) = notifier.notify_tagged(
+        NOTIF_TAG_AI_ANALYSIS,
+        i18n::ai_analysis_failure_title(kind, locale),
+        &summary,
+    ) {
+        eprintln!("ruum watchdog: AI failure notification error: {notif_err}");
+    }
+    summary
 }
 
 /// Run a single `SQLite`-backed watchdog evaluation tick via `ruum-watchdog`
@@ -478,9 +511,10 @@ pub fn evaluate_tick(
 }
 
 pub use crate::watchdog_service::{
-    ServiceStatus, install_service, linux_systemd_service_path,
-    linux_systemd_unit_content, macos_launchd_plist_content,
-    macos_launchd_plist_path, service_status, uninstall_service,
+    ServiceStatus, has_legacy_service_residue, install_service,
+    linux_systemd_service_path, linux_systemd_unit_content,
+    macos_launchd_plist_content, macos_launchd_plist_path, service_status,
+    uninstall_legacy_service_if_present, uninstall_service,
 };
 
 /// Summary outcome of a single watchdog check execution.
@@ -514,15 +548,92 @@ pub fn execute_confirmed_cleanup_tracked(
     })
 }
 
+/// Progress events emitted by [`execute_confirmed_cleanup_cancellable`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanupProgressEvent {
+    Start {
+        total_items: usize,
+        total_bytes: u64,
+    },
+    ItemDone {
+        path: PathBuf,
+        bytes: u64,
+        outcome: Result<(), String>,
+    },
+    Finished {
+        removed_count: usize,
+        reclaimed_bytes: u64,
+        cleaned_paths: Vec<PathBuf>,
+        cancelled: bool,
+    },
+}
+
+/// Execute confirmed cleanup across `Trash` and `Permanent` modes while
+/// streaming [`CleanupProgressEvent`] updates and honoring `cancel`.
+#[must_use]
+pub fn execute_confirmed_cleanup_cancellable(
+    items: &[ProposalItem],
+    home_dir: &Path,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(CleanupProgressEvent),
+) -> (u64, usize, Vec<PathBuf>, bool) {
+    execute_confirmed_cleanup_core(
+        items,
+        home_dir,
+        Some(cancel),
+        &mut |_, _| {},
+        on_event,
+    )
+}
+
 fn execute_confirmed_cleanup_with(
     items: &[ProposalItem],
     home_dir: &Path,
     log_error: &mut dyn FnMut(&Path, &str),
 ) -> (u64, usize, Vec<PathBuf>) {
-    let mut total_bytes = 0_u64;
-    let mut total_count = 0_usize;
-    let mut cleaned_paths = Vec::new();
+    let (bytes, count, cleaned_paths, _) = execute_confirmed_cleanup_core(
+        items,
+        home_dir,
+        None,
+        log_error,
+        &mut |_| {},
+    );
+    (bytes, count, cleaned_paths)
+}
 
+struct CleanupRunnerHooks<'a> {
+    log_error: &'a mut dyn FnMut(&Path, &str),
+    on_event: &'a mut dyn FnMut(CleanupProgressEvent),
+    spawn_plan: &'a mut dyn FnMut(
+        crate::removal::Plan,
+        RemovalMode,
+    ) -> crate::removal::RemovalHandle,
+    on_worker_cancelled: &'a mut dyn FnMut(),
+}
+
+fn execute_confirmed_cleanup_core(
+    items: &[ProposalItem],
+    home_dir: &Path,
+    cancel: Option<&AtomicBool>,
+    log_error: &mut dyn FnMut(&Path, &str),
+    on_event: &mut dyn FnMut(CleanupProgressEvent),
+) -> (u64, usize, Vec<PathBuf>, bool) {
+    let mut hooks = CleanupRunnerHooks {
+        log_error,
+        on_event,
+        spawn_plan: &mut crate::removal::spawn,
+        on_worker_cancelled: &mut || {},
+    };
+    execute_confirmed_cleanup_with_hooks(items, home_dir, cancel, &mut hooks)
+}
+
+fn execute_confirmed_cleanup_with_hooks(
+    items: &[ProposalItem],
+    home_dir: &Path,
+    cancel: Option<&AtomicBool>,
+    hooks: &mut CleanupRunnerHooks<'_>,
+) -> (u64, usize, Vec<PathBuf>, bool) {
+    let mut plans = Vec::new();
     for mode in [RemovalMode::Trash, RemovalMode::Permanent] {
         let mode_items: Vec<&ProposalItem> =
             items.iter().filter(|i| i.mode == mode).collect();
@@ -549,13 +660,46 @@ fn execute_confirmed_cleanup_with(
             .collect();
 
         let plan = crate::removal::plan_for_mode(&targets, home_dir, mode);
-        if plan.targets.is_empty() {
-            continue;
+        if !plan.targets.is_empty() {
+            plans.push((mode, plan));
+        }
+    }
+
+    let planned_items: usize = plans.iter().map(|(_, p)| p.targets.len()).sum();
+    let planned_bytes: u64 = plans
+        .iter()
+        .flat_map(|(_, p)| p.targets.iter())
+        .map(|t| t.bytes)
+        .sum();
+    (hooks.on_event)(CleanupProgressEvent::Start {
+        total_items: planned_items,
+        total_bytes: planned_bytes,
+    });
+
+    let mut total_bytes = 0_u64;
+    let mut total_count = 0_usize;
+    let mut cleaned_paths = Vec::new();
+    let mut cancelled = cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
+
+    for (mode, plan) in plans {
+        if cancelled || cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            cancelled = true;
+            break;
         }
 
-        let handle = crate::removal::spawn(plan, mode);
+        let handle = (hooks.spawn_plan)(plan, mode);
+        let mut handle_cancelled = false;
         let mut done = false;
         while !done {
+            if !handle_cancelled
+                && cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                handle.cancel();
+                (hooks.on_worker_cancelled)();
+                handle_cancelled = true;
+                cancelled = true;
+            }
             let mut progressed = false;
             while let Some(event) = handle.poll() {
                 progressed = true;
@@ -568,24 +712,47 @@ fn execute_confirmed_cleanup_with(
                     }
                     RemovalEvent::Item {
                         path,
-                        outcome: Err(err),
-                        ..
-                    } => log_error(&path, &err),
-                    RemovalEvent::Item {
-                        path,
-                        outcome: Ok(()),
-                        ..
-                    } => cleaned_paths.push(path),
+                        bytes,
+                        outcome,
+                    } => {
+                        if let Err(ref err) = outcome {
+                            (hooks.log_error)(&path, err);
+                        } else {
+                            cleaned_paths.push(path.clone());
+                        }
+                        (hooks.on_event)(CleanupProgressEvent::ItemDone {
+                            path,
+                            bytes,
+                            outcome,
+                        });
+                        if !handle_cancelled
+                            && cancel.is_some_and(|flag| {
+                                flag.load(Ordering::Acquire)
+                            })
+                        {
+                            handle.cancel();
+                            (hooks.on_worker_cancelled)();
+                            handle_cancelled = true;
+                            cancelled = true;
+                        }
+                    }
                     RemovalEvent::Start { .. } => {}
                 }
             }
             if !progressed && !done {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }
 
-    (total_bytes, total_count, cleaned_paths)
+    (hooks.on_event)(CleanupProgressEvent::Finished {
+        removed_count: total_count,
+        reclaimed_bytes: total_bytes,
+        cleaned_paths: cleaned_paths.clone(),
+        cancelled,
+    });
+
+    (total_bytes, total_count, cleaned_paths, cancelled)
 }
 
 /// Run a single watchdog evaluation, AI analysis, confirmation and cleanup.
@@ -684,6 +851,7 @@ fn run_once_in(
             }
             Err(err) => {
                 eprintln!("ruum watchdog: AI analysis error: {err}");
+                let _ = notify_watchdog_ai_failure(notifier, &err, locale);
             }
         }
     }
@@ -1775,6 +1943,343 @@ mod tests {
     }
 
     #[test]
+    fn execute_confirmed_cleanup_cancellable_emits_single_start_and_finished_across_modes()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let dir = home.join("junk");
+        fs::create_dir_all(&dir).unwrap();
+        // A non-existent path in Trash mode still passes `plan_for_mode` and
+        // enters the worker Trash phase (failing cleanly without moving real
+        // test fixtures into the host OS Trash), while Permanent deletes real
+        // files in phase 2. Both phases must produce one Start and one Finished.
+        let trash_missing = dir.join("missing-trash.bin");
+        let f1 = dir.join("a.bin");
+        let f2 = dir.join("b.bin");
+        fs::write(&f1, vec![b'a'; 64]).unwrap();
+        fs::write(&f2, vec![b'b'; 128]).unwrap();
+
+        let items = vec![
+            ProposalItem::new(
+                trash_missing.clone(),
+                32,
+                RemovalMode::Trash,
+                None,
+                None,
+            ),
+            ProposalItem::new(
+                f1.clone(),
+                64,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+            ProposalItem::new(
+                f2.clone(),
+                128,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+        ];
+        let cancel = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let (bytes, count, cleaned, cancelled) =
+            execute_confirmed_cleanup_cancellable(
+                &items,
+                home,
+                &cancel,
+                &mut |ev| events.push(ev),
+            );
+
+        assert!(!cancelled);
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 192);
+        assert_eq!(cleaned, vec![f1.clone(), f2.clone()]);
+        assert!(!f1.exists());
+        assert!(!f2.exists());
+
+        assert_eq!(
+            events.first(),
+            Some(&CleanupProgressEvent::Start {
+                total_items: 3,
+                total_bytes: 224,
+            })
+        );
+        let start_count = events
+            .iter()
+            .filter(|e| matches!(e, CleanupProgressEvent::Start { .. }))
+            .count();
+        let done_count = events
+            .iter()
+            .filter(|e| matches!(e, CleanupProgressEvent::ItemDone { .. }))
+            .count();
+        let finish_count = events
+            .iter()
+            .filter(|e| matches!(e, CleanupProgressEvent::Finished { .. }))
+            .count();
+        assert_eq!(start_count, 1);
+        assert_eq!(done_count, 3);
+        assert_eq!(finish_count, 1);
+        assert!(matches!(
+            &events[1],
+            CleanupProgressEvent::ItemDone {
+                path,
+                outcome: Err(_),
+                ..
+            } if path == &trash_missing
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&CleanupProgressEvent::Finished {
+                removed_count: 2,
+                reclaimed_bytes: 192,
+                cleaned_paths: cleaned,
+                cancelled: false,
+            })
+        );
+    }
+
+    #[test]
+    fn execute_confirmed_cleanup_cancellable_stops_on_cancel_and_preserves_done_items()
+     {
+        #[derive(Debug)]
+        struct GatedSecondItemTrashAdapter {
+            gate_name: std::ffi::OsString,
+            gate: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+            inner: Box<dyn crate::trash_adapter::TrashAdapter>,
+        }
+
+        impl crate::trash_adapter::TrashAdapter for GatedSecondItemTrashAdapter {
+            fn os_kind(&self) -> crate::trash_adapter::TrashOs {
+                self.inner.os_kind()
+            }
+
+            fn classify(
+                &self,
+                path: &Path,
+                env: &crate::trash_adapter::TrashEnv,
+                mounts: &[PathBuf],
+            ) -> crate::trash_adapter::TrashDisposition {
+                self.inner.classify(path, env, mounts)
+            }
+
+            fn remove_permanent(
+                &self,
+                path: &Path,
+                root: &Path,
+                disposition: &crate::trash_adapter::TrashDisposition,
+            ) -> io::Result<()> {
+                if path.file_name() == Some(self.gate_name.as_os_str()) {
+                    let (lock, cvar) = &*self.gate;
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(5);
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        let remaining = deadline.saturating_duration_since(
+                            std::time::Instant::now(),
+                        );
+                        assert!(
+                            !remaining.is_zero(),
+                            "timed out waiting for handle.cancel()"
+                        );
+                        let (next, _) =
+                            cvar.wait_timeout(released, remaining).unwrap();
+                        released = next;
+                    }
+                    drop(released);
+                }
+                self.inner.remove_permanent(path, root, disposition)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let dir = home.join("junk");
+        fs::create_dir_all(&dir).unwrap();
+        let trash_missing = dir.join("missing-trash.bin");
+        let f1 = dir.join("first.bin");
+        let f2 = dir.join("second.bin");
+        let f3 = dir.join("third.bin");
+        fs::write(&f1, vec![b'1'; 100]).unwrap();
+        fs::write(&f2, vec![b'2'; 200]).unwrap();
+        fs::write(&f3, vec![b'3'; 300]).unwrap();
+
+        // 1) Pre-cancelled skips both Trash and Permanent phases immediately.
+        let pre_cancel = AtomicBool::new(true);
+        let pre_items = vec![
+            ProposalItem::new(f1.clone(), 100, RemovalMode::Trash, None, None),
+            ProposalItem::new(
+                f2.clone(),
+                200,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+        ];
+        let mut pre_events = Vec::new();
+        let (pre_bytes, pre_count, pre_cleaned, was_pre_cancelled) =
+            execute_confirmed_cleanup_cancellable(
+                &pre_items,
+                home,
+                &pre_cancel,
+                &mut |ev| pre_events.push(ev),
+            );
+        assert!(was_pre_cancelled);
+        assert_eq!((pre_bytes, pre_count), (0, 0));
+        assert!(pre_cleaned.is_empty());
+        assert!(f1.exists());
+        assert!(f2.exists());
+        assert_eq!(
+            pre_events,
+            vec![
+                CleanupProgressEvent::Start {
+                    total_items: 2,
+                    total_bytes: 300,
+                },
+                CleanupProgressEvent::Finished {
+                    removed_count: 0,
+                    reclaimed_bytes: 0,
+                    cleaned_paths: Vec::new(),
+                    cancelled: true,
+                },
+            ]
+        );
+
+        // 2) Cancel during Trash phase skips phase 2 (Permanent) completely.
+        let cross_cancel = AtomicBool::new(false);
+        let cross_items = vec![
+            ProposalItem::new(
+                trash_missing,
+                32,
+                RemovalMode::Trash,
+                None,
+                None,
+            ),
+            ProposalItem::new(
+                f1.clone(),
+                100,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+        ];
+        let mut cross_events = Vec::new();
+        let (cross_bytes, cross_count, cross_cleaned, cross_was_cancelled) =
+            execute_confirmed_cleanup_cancellable(
+                &cross_items,
+                home,
+                &cross_cancel,
+                &mut |ev| {
+                    if matches!(ev, CleanupProgressEvent::ItemDone { .. }) {
+                        cross_cancel.store(true, Ordering::Release);
+                    }
+                    cross_events.push(ev);
+                },
+            );
+        assert!(cross_was_cancelled);
+        assert_eq!((cross_bytes, cross_count), (0, 0));
+        assert!(cross_cleaned.is_empty());
+        assert!(f1.exists(), "Permanent phase must be skipped on cancel");
+        assert_eq!(
+            cross_events
+                .iter()
+                .filter(|e| matches!(e, CleanupProgressEvent::Finished { .. }))
+                .count(),
+            1
+        );
+
+        // 3) Deterministically cancel mid-flight after ItemDone(f1) while f2
+        //    is gated on worker cancellation, ensuring f1 and f2 complete and
+        //    f3 stays untouched on disk.
+        let cancel = AtomicBool::new(false);
+        let items = vec![
+            ProposalItem::new(
+                f1.clone(),
+                100,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+            ProposalItem::new(
+                f2.clone(),
+                200,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+            ProposalItem::new(
+                f3.clone(),
+                300,
+                RemovalMode::Permanent,
+                None,
+                None,
+            ),
+        ];
+        let gate =
+            std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_adapter = std::sync::Arc::clone(&gate);
+        let gate_name = f2.file_name().unwrap().to_os_string();
+        let mut spawn_gated = move |plan, mode| {
+            let adapter = GatedSecondItemTrashAdapter {
+                gate_name: gate_name.clone(),
+                gate: std::sync::Arc::clone(&gate_adapter),
+                inner: crate::trash_adapter::TrashAdapterFactory::create(),
+            };
+            crate::removal::spawn_with_trash_adapter(
+                plan,
+                mode,
+                Box::new(adapter),
+                crate::trash_adapter::TrashEnv::current(),
+            )
+        };
+        let mut events = Vec::new();
+        let mut hooks = CleanupRunnerHooks {
+            log_error: &mut |_, _| {},
+            on_event: &mut |ev| {
+                if matches!(ev, CleanupProgressEvent::ItemDone { .. }) {
+                    cancel.store(true, Ordering::Release);
+                }
+                events.push(ev);
+            },
+            spawn_plan: &mut spawn_gated,
+            on_worker_cancelled: &mut || {
+                let (lock, cvar) = &*gate;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            },
+        };
+        let (bytes, count, cleaned, cancelled) =
+            execute_confirmed_cleanup_with_hooks(
+                &items,
+                home,
+                Some(&cancel),
+                &mut hooks,
+            );
+        assert!(cancelled);
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 300);
+        assert!(!f1.exists());
+        assert!(!f2.exists());
+        assert!(f3.exists());
+        assert_eq!(cleaned.len(), count);
+        assert_eq!(
+            events.first(),
+            Some(&CleanupProgressEvent::Start {
+                total_items: 3,
+                total_bytes: 600,
+            })
+        );
+        assert!(matches!(
+            events.last(),
+            Some(CleanupProgressEvent::Finished {
+                cancelled: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn core_space_probe_reads_live_volume_metrics() {
         let temp = tempfile::tempdir().unwrap();
         let sample = CoreSpaceProbe.probe(temp.path()).unwrap();
@@ -2285,5 +2790,200 @@ mod tests {
         drop(tagged);
         assert!(!target_file.exists());
         assert_eq!(db.load_ai_state().unwrap().last_proposal_json, None);
+    }
+
+    #[test]
+    fn core_event_handler_notifies_and_persists_ai_error_preserving_proposal() {
+        use crate::storage::AiConfig;
+        use crate::watchdog_config::AiCliProvider;
+
+        struct ErrorMockRunner(String);
+        impl CommandRunner for ErrorMockRunner {
+            fn run(
+                &self,
+                _program: &Path,
+                _args: &[&str],
+                _envs: &[(&str, &str)],
+            ) -> io::Result<ai_cli::CommandOutput> {
+                Ok(ai_cli::CommandOutput {
+                    status_code: 1,
+                    stdout: String::new(),
+                    stderr: self.0.clone(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+
+        let keep_file = home.join("keep.dat");
+        fs::write(&keep_file, b"keep-me").unwrap();
+        let fake_ai = home.join("fake-ai");
+        fs::write(&fake_ai, b"").unwrap();
+
+        let prior_proposal = CleanupProposal {
+            timestamp_secs: 1_699_999_000,
+            summary: "Prior valid proposal".to_owned(),
+            items: vec![ProposalItem::new(
+                keep_file.clone(),
+                7,
+                RemovalMode::Trash,
+                Some("old".to_owned()),
+                None,
+            )],
+            docker_targets: Vec::new(),
+        };
+        let prior_state =
+            AiState::from_proposal(&prior_proposal, 1_699_999_000).unwrap();
+        db.save_ai_state(&prior_state).unwrap();
+
+        db.save_ai_config(&AiConfig {
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: fake_ai.to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        // 1. Timeout failure sends NOTIF_TAG_AI_ANALYSIS and persists error
+        //    without dropping the existing proposal.
+        let timeout_runner = ErrorMockRunner(
+            "command `fake-ai` timed out after 180s\nstack line".to_owned(),
+        );
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db,
+            fake_ai.clone(),
+            &timeout_runner,
+            &confirm,
+            &notifier,
+        )
+        .with_locale(Locale::Zh)
+        .with_ipc_target(None);
+
+        let event = WatchdogEvent::LowDiskSpace {
+            timestamp_secs: 1_700_000_111,
+            mount_path: home.to_path_buf(),
+            available_bytes: 512,
+            total_bytes: 1024,
+            threshold_bytes: 1024 * 1024 * 1024,
+        };
+        handler.on_event(&event).unwrap();
+
+        let tagged = notifier.tagged.lock().unwrap().clone();
+        assert_eq!(tagged.len(), 2);
+        assert_eq!(tagged[0].0, NOTIF_TAG_LOW_SPACE);
+        assert_eq!(tagged[1].0, NOTIF_TAG_AI_ANALYSIS);
+        assert_eq!(tagged[1].1, i18n::ai_analysis_timed_out_title(Locale::Zh));
+        assert!(tagged[1].2.chars().count() <= 160);
+        assert!(!tagged[1].2.contains('\n'));
+
+        let saved_state = db.load_ai_state().unwrap();
+        assert_eq!(
+            saved_state.last_proposal_json,
+            prior_state.last_proposal_json
+        );
+        assert_eq!(
+            saved_state.last_error.as_deref(),
+            Some(tagged[1].2.as_str())
+        );
+        assert_eq!(saved_state.last_error_at_secs, Some(1_700_000_111));
+
+        // 2. Subsequent successful analysis clears last_error.
+        let ok_json = serde_json::json!({
+            "summary": "Recovered proposal",
+            "items": [{
+                "path": keep_file.to_string_lossy(),
+                "mode": "trash",
+                "reason": "recovered",
+            }],
+        })
+        .to_string();
+        let ok_runner = AiMock(ok_json);
+        let ok_notifier = MockNotification::default();
+        let ok_handler = CoreWatchdogEventHandler::new(
+            &db,
+            fake_ai,
+            &ok_runner,
+            &confirm,
+            &ok_notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None);
+        ok_handler.on_event(&event).unwrap();
+
+        let recovered_state = db.load_ai_state().unwrap();
+        assert_eq!(recovered_state.last_error, None);
+        assert_eq!(recovered_state.last_error_at_secs, None);
+        assert_eq!(
+            recovered_state.parse_proposal().unwrap().unwrap().summary,
+            "Recovered proposal"
+        );
+    }
+
+    #[test]
+    fn run_once_in_sends_ai_failure_notification_without_db() {
+        struct TimeoutIoRunner;
+        impl CommandRunner for TimeoutIoRunner {
+            fn run(
+                &self,
+                _program: &Path,
+                _args: &[&str],
+                _envs: &[(&str, &str)],
+            ) -> io::Result<ai_cli::CommandOutput> {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "command `fake-ai` timed out after 180s",
+                ))
+            }
+        }
+
+        for locale in [Locale::En, Locale::Ja] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let cfg_path = home.join("watchdog.json");
+            let state_path = home.join("watchdog-state.json");
+            let fake_exe = home.join("fake-ai");
+            fs::write(&fake_exe, b"").unwrap();
+
+            let cfg = WatchdogConfig {
+                enabled: true,
+                min_free_gb: 1_000_000,
+                ai_auto_analyze: true,
+                ai_provider: crate::watchdog_config::AiCliProvider::Custom,
+                custom_command: fake_exe.to_string_lossy().to_string(),
+                ..WatchdogConfig::default()
+            };
+            crate::watchdog_config::save_config(&cfg_path, &cfg).unwrap();
+
+            let notifier = MockNotification::default();
+            let confirm = MockConfirm {
+                decision: CleanupConfirmDecision::Cancelled,
+            };
+            run_once_in(
+                &cfg_path,
+                &state_path,
+                home,
+                &fake_exe,
+                1_700_000_222,
+                &TimeoutIoRunner,
+                &confirm,
+                &notifier,
+                locale,
+            )
+            .unwrap();
+
+            let tagged = notifier.tagged.lock().unwrap().clone();
+            assert_eq!(tagged.len(), 2);
+            assert_eq!(tagged[0].0, NOTIF_TAG_LOW_SPACE);
+            assert_eq!(tagged[1].0, NOTIF_TAG_AI_ANALYSIS);
+            assert_eq!(tagged[1].1, i18n::ai_analysis_timed_out_title(locale));
+            assert!(tagged[1].2.chars().count() <= 160);
+            assert!(!tagged[1].2.contains('\n'));
+        }
     }
 }

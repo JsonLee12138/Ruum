@@ -183,16 +183,6 @@ pub fn tray_update_available(version: &str, locale: Locale) -> String {
     }
 }
 
-pub const fn tray_check_disk_space(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Check Disk Space Now",
-        "立即检查磁盘空间",
-        "今すぐディスク空き容量を確認",
-        "지금 디스크 공간 확인",
-    )
-}
-
 pub const fn tray_run_ai_analysis(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -213,8 +203,80 @@ pub const fn tray_review_latest_proposal(locale: Locale) -> &'static str {
     )
 }
 
+pub fn tray_cleanup_progress_active(
+    completed: usize,
+    total: usize,
+    cancelling: bool,
+    locale: Locale,
+) -> String {
+    if cancelling {
+        match locale {
+            Locale::En => format!(
+                "Stopping Cleanup ({completed}/{total})\u{2026} \u{00b7} View Progress"
+            ),
+            Locale::Zh => format!(
+                "正在停止清理 ({completed}/{total})\u{2026} \u{00b7} 查看进度"
+            ),
+            Locale::Ja => format!(
+                "クリーンアップを停止中 ({completed}/{total})\u{2026} \u{00b7} 進捗を表示"
+            ),
+            Locale::Ko => format!(
+                "정리 중지 중 ({completed}/{total})\u{2026} \u{00b7} 진행 상태 보기"
+            ),
+        }
+    } else {
+        match locale {
+            Locale::En => format!(
+                "Cleaning ({completed}/{total})\u{2026} \u{00b7} View Progress"
+            ),
+            Locale::Zh => format!(
+                "正在清理 ({completed}/{total})\u{2026} \u{00b7} 查看进度"
+            ),
+            Locale::Ja => format!(
+                "クリーンアップ中 ({completed}/{total})\u{2026} \u{00b7} 進捗を表示"
+            ),
+            Locale::Ko => format!(
+                "정리 중 ({completed}/{total})\u{2026} \u{00b7} 진행 상태 보기"
+            ),
+        }
+    }
+}
+
+pub const fn tray_cleanup_progress_idle(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "No Active Cleanup",
+        "暂无进行中的清理",
+        "実行中のクリーンアップはありません",
+        "진행 중인 정리 작업 없음",
+    )
+}
+
 pub const fn tray_quit_ruum(locale: Locale) -> &'static str {
     pick(locale, "Quit Ruum", "退出 Ruum", "Ruum を終了", "Ruum 종료")
+}
+
+pub const fn tray_toggle_watchdog(
+    enabled: bool,
+    locale: Locale,
+) -> &'static str {
+    if enabled {
+        pick(
+            locale,
+            "Pause Watchdog",
+            "暂停看门狗",
+            "ウォッチドッグを一時停止",
+            "워치독 일시 중지",
+        )
+    } else {
+        pick(
+            locale,
+            "Enable Watchdog",
+            "开启看门狗",
+            "ウォッチドッグを有効にする",
+            "워치독 켜기",
+        )
+    }
 }
 
 pub fn tray_status_label(

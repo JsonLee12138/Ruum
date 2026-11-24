@@ -5,6 +5,7 @@ mod notices;
 
 pub use notices::*;
 use ruum_core::size::human_bytes;
+use ruum_core::watchdog::AiFailureKind;
 
 use crate::i18n::{Locale, item_count, pick};
 
@@ -63,6 +64,18 @@ pub const fn title_confirm_cleanup(locale: Locale) -> &'static str {
         "ruum \u{00b7} \u{786e}\u{8ba4}\u{6e05}\u{7406}",
         "ruum \u{00b7} \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{306e}\u{78ba}\u{8a8d}",
         "ruum \u{00b7} \u{c815}\u{b9ac} \u{d655}\u{c778}",
+    )
+}
+
+/// Title for the standalone cancellable cleanup progress window.
+#[must_use]
+pub const fn title_cleanup_progress(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "ruum \u{00b7} Cleaning Up",
+        "ruum \u{00b7} \u{6b63}\u{5728}\u{6e05}\u{7406}",
+        "ruum \u{00b7} \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{4e2d}",
+        "ruum \u{00b7} \u{c815}\u{b9ac} \u{c911}",
     )
 }
 
@@ -286,21 +299,80 @@ pub const fn cleanup_complete_notif_title(locale: Locale) -> &'static str {
     )
 }
 
-/// Toast shown after triggering a tray disk-space check.
+/// OS notification title when background cleanup stops due to cancellation.
 #[must_use]
-pub fn disk_check_available(avail: u64, locale: Locale) -> String {
-    let bytes = human_bytes(avail);
+pub const fn cleanup_cancelled_notif_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "ruum Cleanup Cancelled",
+        "ruum \u{6e05}\u{7406}\u{5df2}\u{53d6}\u{6d88}",
+        "ruum \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{3092}\u{4e2d}\u{6b62}\u{3057}\u{307e}\u{3057}\u{305f}",
+        "ruum \u{c815}\u{b9ac}\u{ac00} \u{cde8}\u{c18c}\u{b428}",
+    )
+}
+
+/// Summary notification/toast body when cleanup stops after user cancellation.
+#[must_use]
+pub fn cleanup_cancelled_summary(
+    count: usize,
+    bytes: u64,
+    locale: Locale,
+) -> String {
+    let items = item_count(count, locale);
+    let freed = human_bytes(bytes);
     match locale {
-        Locale::En => format!("Disk check: {bytes} available"),
+        Locale::En => {
+            format!(
+                "Cleanup cancelled \u{00b7} cleaned {items}, freeing {freed}"
+            )
+        }
         Locale::Zh => format!(
-            "\u{78c1}\u{76d8}\u{68c0}\u{67e5}\u{ff1a}\u{53ef}\u{7528} {bytes}"
+            "\u{6e05}\u{7406}\u{5df2}\u{53d6}\u{6d88} \u{00b7} \u{5df2}\u{6e05}\u{7406} {items}\u{ff0c}\u{91ca}\u{653e} {freed}"
         ),
         Locale::Ja => format!(
-            "\u{30c7}\u{30a3}\u{30b9}\u{30af}\u{78ba}\u{8a8d}: {bytes} \u{5229}\u{7528}\u{53ef}\u{80fd}"
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{3092}\u{4e2d}\u{6b62} \u{00b7} {items} \u{3092}\u{524a}\u{9664}\u{3001}{freed} \u{3092}\u{89e3}\u{653e}"
         ),
         Locale::Ko => format!(
-            "\u{b514}\u{c2a4}\u{d06c} \u{d655}\u{c778}: {bytes} \u{c0ac}\u{c6a9} \u{ac00}\u{b2a5}"
+            "\u{c815}\u{b9ac} \u{cde8}\u{c18c}\u{b428} \u{00b7} {items} \u{c815}\u{b9ac}, {freed} \u{d655}\u{bcf4}"
         ),
+    }
+}
+
+/// Localized label for an active Docker cleanup phase inside the progress UI.
+#[must_use]
+pub const fn cleanup_docker_stage(stage: &str, locale: Locale) -> &'static str {
+    if matches!(stage.as_bytes(), b"containers") {
+        pick(
+            locale,
+            "Docker: containers",
+            "Docker\u{ff1a}\u{5bb9}\u{5668}",
+            "Docker: \u{30b3}\u{30f3}\u{30c6}\u{30ca}",
+            "Docker: \u{cee8}\u{d14c}\u{c774}\u{b108}",
+        )
+    } else if matches!(stage.as_bytes(), b"images") {
+        pick(
+            locale,
+            "Docker: images",
+            "Docker\u{ff1a}\u{955c}\u{50cf}",
+            "Docker: \u{30a4}\u{30e1}\u{30fc}\u{30b8}",
+            "Docker: \u{c774}\u{bbf8}\u{c9c0}",
+        )
+    } else if matches!(stage.as_bytes(), b"build_cache") {
+        pick(
+            locale,
+            "Docker: build cache",
+            "Docker\u{ff1a}\u{6784}\u{5efa}\u{7f13}\u{5b58}",
+            "Docker: \u{30d3}\u{30eb}\u{30c9}\u{30ad}\u{30e3}\u{30c3}\u{30b7}\u{30e5}",
+            "Docker: \u{be4c}\u{b4dc} \u{ce90}\u{c2dc}",
+        )
+    } else {
+        pick(
+            locale,
+            "Docker: cleanup",
+            "Docker\u{ff1a}\u{6e05}\u{7406}",
+            "Docker: \u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}",
+            "Docker: \u{c815}\u{b9ac}",
+        )
     }
 }
 
@@ -338,4 +410,28 @@ pub const fn ai_analysis_failed_notif_title(locale: Locale) -> &'static str {
         "ruum AI \u{5206}\u{6790}\u{5931}\u{6557}",
         "ruum AI \u{bd84}\u{c11d} \u{c2e4}\u{d328}",
     )
+}
+
+/// OS notification title when AI analysis times out.
+#[must_use]
+pub const fn ai_analysis_timed_out_notif_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "ruum AI Analysis Timed Out",
+        "ruum AI \u{5206}\u{6790}\u{8d85}\u{65f6}",
+        "ruum AI \u{5206}\u{6790}\u{30bf}\u{30a4}\u{30e0}\u{30a2}\u{30a6}\u{30c8}",
+        "ruum AI \u{bd84}\u{c11d} \u{c2dc}\u{ac04} \u{cd08}\u{acfc}",
+    )
+}
+
+/// Select the localized AI analysis failure notification title for `kind`.
+#[must_use]
+pub const fn ai_analysis_failure_notif_title(
+    kind: AiFailureKind,
+    locale: Locale,
+) -> &'static str {
+    match kind {
+        AiFailureKind::TimedOut => ai_analysis_timed_out_notif_title(locale),
+        AiFailureKind::Failed => ai_analysis_failed_notif_title(locale),
+    }
 }

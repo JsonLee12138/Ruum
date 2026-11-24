@@ -473,7 +473,9 @@ pub(crate) fn map_adk_error(err: &AdkError, api_key: &str) -> AdkClientError {
         };
     }
 
-    if err.category == ErrorCategory::Timeout || status == Some(408) {
+    if err.category == ErrorCategory::Timeout
+        || matches!(status, Some(408 | 504))
+    {
         return AdkClientError::Model(format!("request timed out: {msg}"));
     }
 
@@ -661,4 +663,58 @@ async fn probe_minimal_completion(
         model_count: None,
         message: format!("Connected via minimal completion ({model})"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adk_core::{ErrorComponent, ErrorDetails};
+
+    #[test]
+    fn map_adk_error_treats_http_408_and_504_as_timeouts() {
+        for status in [408_u16, 504_u16] {
+            let err = AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                "E_HTTP",
+                "gateway error",
+            )
+            .with_details(ErrorDetails {
+                upstream_status_code: Some(status),
+                ..ErrorDetails::default()
+            });
+            let mapped = map_adk_error(&err, "secret-key");
+            match mapped {
+                AdkClientError::Model(msg) => {
+                    assert!(
+                        msg.starts_with("request timed out:"),
+                        "status {status} mapped to unexpected message: {msg}"
+                    );
+                }
+                other => {
+                    panic!(
+                        "status {status} mapped to unexpected error: {other}"
+                    )
+                }
+            }
+        }
+
+        let err_500 = AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Internal,
+            "E_HTTP",
+            "internal error",
+        )
+        .with_details(ErrorDetails {
+            upstream_status_code: Some(500),
+            ..ErrorDetails::default()
+        });
+        assert!(matches!(
+            map_adk_error(&err_500, ""),
+            AdkClientError::Http {
+                status: Some(500),
+                ..
+            }
+        ));
+    }
 }

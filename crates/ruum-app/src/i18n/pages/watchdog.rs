@@ -231,36 +231,6 @@ pub const fn last_checked_label(locale: Locale) -> &'static str {
     )
 }
 
-pub const fn actions_title(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Actions",
-        "\u{64cd}\u{4f5c}",
-        "\u{30a2}\u{30af}\u{30b7}\u{30e7}\u{30f3}",
-        "\u{c791}\u{c5c5}",
-    )
-}
-
-pub const fn check_disk_space_now(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Check Local Disk Space",
-        "\u{68c0}\u{67e5}\u{672c}\u{673a}\u{78c1}\u{76d8}\u{7a7a}\u{95f4}",
-        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{3092}\u{78ba}\u{8a8d}",
-        "\u{b85c}\u{ceec} \u{b514}\u{c2a4}\u{d06c} \u{acf5}\u{ac04} \u{d655}\u{c778}",
-    )
-}
-
-pub const fn run_ai_analysis_now(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Run Local AI Analysis",
-        "\u{8fd0}\u{884c}\u{672c}\u{673a} AI \u{5206}\u{6790}",
-        "\u{30ed}\u{30fc}\u{30ab}\u{30eb} AI \u{5206}\u{6790}\u{3092}\u{5b9f}\u{884c}",
-        "\u{b85c}\u{ceec} AI \u{bd84}\u{c11d} \u{c2e4}\u{d589}",
-    )
-}
-
 pub const fn latest_proposal_title(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -308,5 +278,184 @@ pub const fn no_proposals_yet(locale: Locale) -> &'static str {
         "\u{6682}\u{65e0}\u{6e05}\u{7406}\u{5efa}\u{8bae}\u{8bb0}\u{5f55}\u{3002}\u{53ef}\u{624b}\u{52a8}\u{8fd0}\u{884c} AI \u{5206}\u{6790}\u{6216}\u{7b49}\u{5f85}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{89e6}\u{53d1}\u{3002}",
         "\u{63d0}\u{6848}\u{306f}\u{307e}\u{3060}\u{3042}\u{308a}\u{307e}\u{305b}\u{3093}\u{3002}AI \u{5206}\u{6790}\u{3092}\u{5b9f}\u{884c}\u{3059}\u{308b}\u{304b}\u{3001}\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}\u{306e}\u{767a}\u{52d5}\u{3092}\u{304a}\u{5f85}\u{3061}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
         "\u{c544}\u{c9c1} \u{ae30}\u{b85d}\u{b41c} \u{c81c}\u{c548}\u{c774} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. AI \u{bd84}\u{c11d}\u{c744} \u{c2e4}\u{d589}\u{d558}\u{ac70}\u{b098} \u{c6cc}\u{ce58}\u{b3c5} \u{d2b8}\u{b9ac}\u{ac70}\u{b97c} \u{ae30}\u{b2e4}\u{b9ac}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn latest_ai_error_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Latest AI Analysis Failure",
+        "\u{6700}\u{8fd1}\u{4e00}\u{6b21} AI \u{5206}\u{6790}\u{5931}\u{8d25}",
+        "\u{6700}\u{65b0}\u{306e} AI \u{5206}\u{6790}\u{30a8}\u{30e9}\u{30fc}",
+        "\u{cd5c}\u{adfc} AI \u{bd84}\u{c11d} \u{c2e4}\u{d328}",
+    )
+}
+
+pub const fn cleanup_progress_heading(
+    cancelling: bool,
+    locale: Locale,
+) -> &'static str {
+    if cancelling {
+        pick(
+            locale,
+            "Stopping Cleanup\u{2026}",
+            "\u{6b63}\u{5728}\u{505c}\u{6b62}\u{6e05}\u{7406}\u{2026}",
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{3092}\u{505c}\u{6b62}\u{4e2d}\u{2026}",
+            "\u{c815}\u{b9ac} \u{c911}\u{c9c0} \u{c911}\u{2026}",
+        )
+    } else {
+        pick(
+            locale,
+            "Cleaning Selected Items\u{2026}",
+            "\u{6b63}\u{5728}\u{6e05}\u{7406}\u{9009}\u{5b9a}\u{9879}\u{76ee}\u{2026}",
+            "\u{9078}\u{629e}\u{3057}\u{305f}\u{9805}\u{76ee}\u{3092}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{4e2d}\u{2026}",
+            "\u{c120}\u{d0dd}\u{d55c} \u{d56d}\u{baa9} \u{c815}\u{b9ac} \u{c911}\u{2026}",
+        )
+    }
+}
+
+pub const fn cleanup_progress_subtitle(
+    cancelling: bool,
+    locale: Locale,
+) -> &'static str {
+    if cancelling {
+        pick(
+            locale,
+            "Stopping, waiting for current item to finish safely\u{2026}",
+            "\u{6b63}\u{5728}\u{505c}\u{6b62}\u{ff0c}\u{7b49}\u{5f85}\u{5f53}\u{524d}\u{9879}\u{5b89}\u{5168}\u{5b8c}\u{6210}\u{2026}",
+            "\u{505c}\u{6b62}\u{4e2d}\u{3067}\u{3059}\u{3002}\u{73fe}\u{5728}\u{306e}\u{9805}\u{76ee}\u{304c}\u{5b89}\u{5168}\u{306b}\u{5b8c}\u{4e86}\u{3059}\u{308b}\u{306e}\u{3092}\u{5f85}\u{3063}\u{3066}\u{3044}\u{307e}\u{3059}\u{2026}",
+            "\u{c911}\u{c9c0} \u{c911}\u{c785}\u{b2c8}\u{b2e4}. \u{d604}\u{c7ac} \u{d56d}\u{baa9}\u{c774} \u{c548}\u{c804}\u{d558}\u{ac8c} \u{c644}\u{b8cc}\u{b420} \u{b54c}\u{ae4c}\u{c9c0} \u{ae30}\u{b2e4}\u{b9ac}\u{b294} \u{c911}\u{2026}",
+        )
+    } else {
+        pick(
+            locale,
+            "Removing confirmed items safely. Closing this window continues cleanup in the background.",
+            "\u{6b63}\u{5728}\u{5b89}\u{5168}\u{6e05}\u{7406}\u{5df2}\u{786e}\u{8ba4}\u{9879}\u{76ee}\u{3002}\u{5173}\u{95ed}\u{6b64}\u{7a97}\u{53e3}\u{540e}\u{5c06}\u{5728}\u{540e}\u{53f0}\u{7ee7}\u{7eed}\u{6e05}\u{7406}\u{3002}",
+            "\u{78ba}\u{8a8d}\u{6e08}\u{307f}\u{306e}\u{9805}\u{76ee}\u{3092}\u{5b89}\u{5168}\u{306b}\u{524a}\u{9664}\u{3057}\u{3066}\u{3044}\u{307e}\u{3059}\u{3002}\u{3053}\u{306e}\u{30a6}\u{30a3}\u{30f3}\u{30c9}\u{30a6}\u{3092}\u{9589}\u{3058}\u{3066}\u{3082}\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{3067}\u{7d9a}\u{884c}\u{3055}\u{308c}\u{307e}\u{3059}\u{3002}",
+            "\u{d655}\u{c778}\u{b41c} \u{d56d}\u{baa9}\u{c744} \u{c548}\u{c804}\u{d558}\u{ac8c} \u{c815}\u{b9ac}\u{d558}\u{ace0} \u{c788}\u{c2b5}\u{b2c8}\u{b2e4}. \u{c774} \u{cc3d}\u{c744} \u{b2eb}\u{c544}\u{b3c4} \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc}\u{c5d0}\u{c11c} \u{acc4}\u{c18d} \u{c9c4}\u{d589}\u{b429}\u{b2c8}\u{b2e4}.",
+        )
+    }
+}
+
+pub const fn cleanup_progress_preparing(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Preparing cleanup\u{2026}",
+        "\u{6b63}\u{5728}\u{51c6}\u{5907}\u{6e05}\u{7406}\u{2026}",
+        "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{3092}\u{6e96}\u{5099}\u{4e2d}\u{2026}",
+        "\u{c815}\u{b9ac} \u{c900}\u{be44} \u{c911}\u{2026}",
+    )
+}
+
+pub fn cleanup_reclaimed_so_far(
+    reclaimed: &str,
+    total: Option<&str>,
+    locale: Locale,
+) -> String {
+    match total {
+        Some(tot) => match locale {
+            Locale::En => format!("Freed {reclaimed} / {tot}"),
+            Locale::Zh => {
+                format!("\u{5df2}\u{91ca}\u{653e} {reclaimed} / {tot}")
+            }
+            Locale::Ja => format!("{reclaimed} / {tot} \u{89e3}\u{653e}"),
+            Locale::Ko => format!("{reclaimed} / {tot} \u{d655}\u{bcf4}"),
+        },
+        None => match locale {
+            Locale::En => format!("Freed {reclaimed}"),
+            Locale::Zh => format!("\u{5df2}\u{91ca}\u{653e} {reclaimed}"),
+            Locale::Ja => format!("{reclaimed} \u{89e3}\u{653e}"),
+            Locale::Ko => format!("{reclaimed} \u{d655}\u{bcf4}"),
+        },
+    }
+}
+
+pub const fn cleanup_continue_in_background(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Continue in Background",
+        "\u{540e}\u{53f0}\u{7ee7}\u{7eed}",
+        "\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{3067}\u{7d9a}\u{884c}",
+        "\u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc}\u{c5d0}\u{c11c} \u{acc4}\u{c18d}",
+    )
+}
+
+pub const fn cleanup_cancel_button(
+    cancelling: bool,
+    locale: Locale,
+) -> &'static str {
+    if cancelling {
+        pick(
+            locale,
+            "Stopping\u{2026}",
+            "\u{6b63}\u{5728}\u{505c}\u{6b62}\u{2026}",
+            "\u{505c}\u{6b62}\u{4e2d}\u{2026}",
+            "\u{c911}\u{c9c0} \u{c911}\u{2026}",
+        )
+    } else {
+        pick(
+            locale,
+            "Cancel Cleanup",
+            "\u{53d6}\u{6d88}\u{6e05}\u{7406}",
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{3092}\u{4e2d}\u{6b62}",
+            "\u{c815}\u{b9ac} \u{cde8}\u{c18c}",
+        )
+    }
+}
+
+pub const fn cleanup_progress_done_heading(
+    cancelled: bool,
+    failed: bool,
+    locale: Locale,
+) -> &'static str {
+    if cancelled {
+        pick(
+            locale,
+            "Cleanup Cancelled",
+            "\u{6e05}\u{7406}\u{5df2}\u{53d6}\u{6d88}",
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{3092}\u{4e2d}\u{6b62}\u{3057}\u{307e}\u{3057}\u{305f}",
+            "\u{c815}\u{b9ac}\u{ac00} \u{cde8}\u{c18c}\u{b428}",
+        )
+    } else if failed {
+        pick(
+            locale,
+            "Cleanup Failed",
+            "\u{6e05}\u{7406}\u{5931}\u{8d25}",
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}",
+            "\u{c815}\u{b9ac} \u{c2e4}\u{d328}",
+        )
+    } else {
+        pick(
+            locale,
+            "Cleanup Complete",
+            "\u{6e05}\u{7406}\u{5b8c}\u{6210}",
+            "\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30a2}\u{30c3}\u{30d7}\u{5b8c}\u{4e86}",
+            "\u{c815}\u{b9ac} \u{c644}\u{b8cc}",
+        )
+    }
+}
+
+pub fn cleanup_progress_auto_closing(seconds: u64, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Closing automatically in {seconds}s\u{2026}"),
+        Locale::Zh => format!(
+            "\u{6b64}\u{7a97}\u{53e3}\u{5c06}\u{5728} {seconds} \u{79d2}\u{540e}\u{81ea}\u{52a8}\u{5173}\u{95ed}\u{2026}"
+        ),
+        Locale::Ja => format!(
+            "\u{3053}\u{306e}\u{30a6}\u{30a3}\u{30f3}\u{30c9}\u{30a6}\u{306f} {seconds} \u{79d2}\u{5f8c}\u{306b}\u{81ea}\u{52d5}\u{3067}\u{9589}\u{3058}\u{307e}\u{3059}\u{2026}"
+        ),
+        Locale::Ko => format!(
+            "\u{c774} \u{cc3d}\u{c740} {seconds}\u{cd08} \u{d6c4} \u{c790}\u{b3d9}\u{c73c}\u{b85c} \u{b2eb}\u{d799}\u{b2c8}\u{b2e4}\u{2026}"
+        ),
+    }
+}
+
+pub const fn cleanup_progress_close_button(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Close",
+        "\u{5173}\u{95ed}",
+        "\u{9589}\u{3058}\u{308b}",
+        "\u{b2eb}\u{ae30}",
     )
 }

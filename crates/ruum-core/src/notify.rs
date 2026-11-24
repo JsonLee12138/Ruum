@@ -575,6 +575,27 @@ pub fn try_ipc_open_window(tag: &str) -> bool {
     try_ipc_open_window_with(&target, &token, tag)
 }
 
+/// Probe whether an active GUI instance is already listening on the given IPC
+/// socket/port without opening or focusing any window.
+pub fn try_ipc_ping_with(socket_or_port: &Path, token: &str) -> bool {
+    send_ipc_ok(
+        socket_or_port,
+        &IpcRequest::Ping {
+            token: token.to_string(),
+        },
+    )
+}
+
+/// Probe whether an active GUI instance is already listening on default IPC
+/// without opening or focusing any window.
+#[must_use]
+pub fn try_ipc_ping() -> bool {
+    let Some((target, token)) = resolve_ipc_target_and_token() else {
+        return false;
+    };
+    try_ipc_ping_with(&target, &token)
+}
+
 /// Notify an active GUI instance over an explicit IPC socket/port of a watchdog
 /// state change.
 pub fn notify_gui_watchdog_update_with(
@@ -1578,5 +1599,35 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(std::fs::read(&home_icon).unwrap(), EMBEDDED_RUUM_SVG);
+    }
+
+    #[test]
+    fn try_ipc_ping_with_verifies_token_and_missing_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = "ping_ipc_token_1234567890123456789012345".to_string();
+
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("ping.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("ping.port");
+
+        assert!(!try_ipc_ping_with(&socket_or_port, &token));
+
+        let listener = IpcListenerGuard::bind(&socket_or_port).unwrap();
+        let server_token = token.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                listener
+                    .accept_and_handle(&server_token, |req| {
+                        assert!(matches!(req, IpcRequest::Ping { .. }));
+                        Ok(IpcResponse::Ok)
+                    })
+                    .unwrap();
+            }
+        });
+
+        assert!(try_ipc_ping_with(&socket_or_port, &token));
+        assert!(!try_ipc_ping_with(&socket_or_port, "wrong_token"));
+        handle.join().unwrap();
     }
 }

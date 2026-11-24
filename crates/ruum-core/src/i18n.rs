@@ -145,6 +145,276 @@ pub const fn recommended_cleanup_title(locale: Locale) -> &'static str {
     }
 }
 
+/// Maximum character count for single-line AI failure notification summaries.
+pub const MAX_AI_FAILURE_SUMMARY_CHARS: usize = 160;
+
+/// Broad category for an AI analysis failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiFailureKind {
+    /// Execution or API request exceeded its allowed timeout.
+    TimedOut,
+    /// Execution, network, credential, or proposal parsing error.
+    Failed,
+}
+
+fn contains_http_timeout_status(lower: &str) -> bool {
+    const PATTERNS: [&str; 16] = [
+        "http 408",
+        "http 504",
+        "http/1.1 408",
+        "http/1.1 504",
+        "status 408",
+        "status 504",
+        "status: 408",
+        "status: 504",
+        "status code 408",
+        "status code 504",
+        "code 408",
+        "code 504",
+        "code: 408",
+        "code: 504",
+        "(408)",
+        "(504)",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
+        || lower.contains("408 request")
+        || lower.contains("504 gateway")
+}
+
+/// Classify a raw AI analysis error string into timeout vs general failure.
+#[must_use]
+pub fn classify_ai_failure(err: &str) -> AiFailureKind {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("timed out")
+        || lower.contains("timedout")
+        || lower.contains("time out")
+        || lower.contains("time-out")
+        || lower.contains("timeout")
+        || lower.contains("deadline has elapsed")
+        || contains_http_timeout_status(&lower)
+    {
+        AiFailureKind::TimedOut
+    } else {
+        AiFailureKind::Failed
+    }
+}
+
+/// Strip ANSI escape sequences and control characters while turning line breaks
+/// into spaces so multi-line errors flatten cleanly.
+fn clean_terminal_sequences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for seq_ch in chars.by_ref() {
+                        if ('@'..='~').contains(&seq_ch) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for seq_ch in chars.by_ref() {
+                        if seq_ch == '\x07' {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if ch == '\r' || ch == '\n' || ch == '\t' {
+            out.push(' ');
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_sk_secret_token(word: &str) -> bool {
+    let trimmed = word.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | '`' | ',' | ';' | '.' | ')' | '(')
+    });
+    trimmed.strip_prefix("sk-").is_some_and(|rest| {
+        rest.len() >= 16
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+fn redact_single_kv(segment: &str) -> Option<String> {
+    let (key, val) = segment.split_once('=')?;
+    let key_lc = key.to_ascii_lowercase();
+    let sensitive = ["api_key", "apikey", "access_token", "authorization"]
+        .iter()
+        .any(|needle| key_lc.ends_with(needle));
+    if !sensitive || val.is_empty() {
+        return None;
+    }
+    Some(format!("{key}=[REDACTED]"))
+}
+
+fn redact_query_or_kv_secret(word: &str) -> Option<String> {
+    if word.contains('&') {
+        let mut changed = false;
+        let parts: Vec<String> = word
+            .split('&')
+            .map(|seg| match redact_single_kv(seg) {
+                Some(r) => {
+                    changed = true;
+                    r
+                }
+                None => seg.to_owned(),
+            })
+            .collect();
+        return changed.then(|| parts.join("&"));
+    }
+    redact_single_kv(word)
+}
+
+/// Sanitize an AI error reason into a clean, redacted single-line string.
+#[must_use]
+pub fn clean_ai_failure_reason(err: &str) -> String {
+    let cleaned = clean_terminal_sequences(err);
+    let mut words = Vec::new();
+    let mut redact_next = false;
+    for raw_word in cleaned.split_whitespace() {
+        if redact_next {
+            words.push("[REDACTED]".to_owned());
+            redact_next = false;
+            continue;
+        }
+        if raw_word.eq_ignore_ascii_case("bearer") {
+            words.push(raw_word.to_owned());
+            redact_next = true;
+            continue;
+        }
+        if is_sk_secret_token(raw_word) {
+            words.push("[REDACTED]".to_owned());
+            continue;
+        }
+        if let Some(redacted) = redact_query_or_kv_secret(raw_word) {
+            words.push(redacted);
+            continue;
+        }
+        words.push(raw_word.to_owned());
+    }
+    words.join(" ")
+}
+
+/// Normalize whitespace to a single line and cap at `max_chars` scalar chars.
+#[must_use]
+pub fn truncate_single_line(text: &str, max_chars: usize) -> String {
+    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= max_chars {
+        return single;
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = single.chars().take(max_chars - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Core notification title for a general AI analysis failure.
+#[must_use]
+pub const fn ai_analysis_failed_title(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "AI Analysis Failed",
+        Locale::Zh => "AI 分析失败",
+        Locale::Ja => "AI 分析失敗",
+        Locale::Ko => "AI 분석 실패",
+    }
+}
+
+/// Core notification title for an AI analysis timeout.
+#[must_use]
+pub const fn ai_analysis_timed_out_title(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "AI Analysis Timed Out",
+        Locale::Zh => "AI 分析超时",
+        Locale::Ja => "AI 分析タイムアウト",
+        Locale::Ko => "AI 분석 시간 초과",
+    }
+}
+
+/// Select the localized core notification title matching `kind`.
+#[must_use]
+pub const fn ai_analysis_failure_title(
+    kind: AiFailureKind,
+    locale: Locale,
+) -> &'static str {
+    match kind {
+        AiFailureKind::TimedOut => ai_analysis_timed_out_title(locale),
+        AiFailureKind::Failed => ai_analysis_failed_title(locale),
+    }
+}
+
+/// Format a raw AI analysis failure into a localized, redacted, single-line
+/// summary capped at 160 characters.
+#[must_use]
+pub fn format_ai_failure_summary(err: &str, locale: Locale) -> String {
+    let kind = classify_ai_failure(err);
+    let detail = clean_ai_failure_reason(err);
+    let msg = if detail.is_empty() {
+        match (kind, locale) {
+            (AiFailureKind::TimedOut, Locale::En) => {
+                "AI analysis timed out.".to_owned()
+            }
+            (AiFailureKind::TimedOut, Locale::Zh) => "AI 分析超时。".to_owned(),
+            (AiFailureKind::TimedOut, Locale::Ja) => {
+                "AI 分析がタイムアウトしました。".to_owned()
+            }
+            (AiFailureKind::TimedOut, Locale::Ko) => {
+                "AI 분석 시간이 초과되었습니다.".to_owned()
+            }
+            (AiFailureKind::Failed, Locale::En) => {
+                "AI analysis failed.".to_owned()
+            }
+            (AiFailureKind::Failed, Locale::Zh) => "AI 分析失败。".to_owned(),
+            (AiFailureKind::Failed, Locale::Ja) => {
+                "AI 分析に失敗しました。".to_owned()
+            }
+            (AiFailureKind::Failed, Locale::Ko) => {
+                "AI 분석에 실패했습니다.".to_owned()
+            }
+        }
+    } else {
+        match (kind, locale) {
+            (AiFailureKind::TimedOut, Locale::En) => {
+                format!("AI analysis timed out: {detail}")
+            }
+            (AiFailureKind::TimedOut, Locale::Zh) => {
+                format!("AI 分析超时：{detail}")
+            }
+            (AiFailureKind::TimedOut, Locale::Ja) => {
+                format!("AI 分析がタイムアウトしました: {detail}")
+            }
+            (AiFailureKind::TimedOut, Locale::Ko) => {
+                format!("AI 분석 시간이 초과되었습니다: {detail}")
+            }
+            (AiFailureKind::Failed, Locale::En) => {
+                format!("AI analysis failed: {detail}")
+            }
+            (AiFailureKind::Failed, Locale::Zh) => {
+                format!("AI 分析失败：{detail}")
+            }
+            (AiFailureKind::Failed, Locale::Ja) => {
+                format!("AI 分析に失敗しました: {detail}")
+            }
+            (AiFailureKind::Failed, Locale::Ko) => {
+                format!("AI 분석에 실패했습니다: {detail}")
+            }
+        }
+    };
+    truncate_single_line(&msg, MAX_AI_FAILURE_SUMMARY_CHARS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +610,79 @@ mod tests {
             dirty.summary_in(Locale::En),
             "3 changed, 1 stash, 2 unpushed"
         );
+    }
+
+    #[test]
+    fn ai_failure_classification_formatting_redaction_and_bounds() {
+        for raw in [
+            "command `/usr/bin/agy` timed out after 180s",
+            "request timed out after 120s",
+            "TimedOut",
+            "API request timeout",
+            "HTTP 504 upstream gateway",
+            "HTTP 408 Request",
+            "HTTP error (status 504): upstream failure",
+            "status: 408 while waiting",
+            "504 Gateway Time-out",
+        ] {
+            assert_eq!(classify_ai_failure(raw), AiFailureKind::TimedOut);
+        }
+        for raw in [
+            "AI CLI exited with code 1: cli crashed",
+            "invalid JSON proposal",
+            "connection refused",
+            "connect 127.0.0.1:50412 failed",
+            "freed 4080 bytes",
+        ] {
+            assert_eq!(classify_ai_failure(raw), AiFailureKind::Failed);
+        }
+
+        let long_cjk = format!("错误详情：\n{}\n{}", "甲".repeat(200), "乙");
+        let secret_err = concat!(
+            "\x1b[31mHTTP 401 Bearer sk-proj-1234567890abcdef1234\x1b[0m\n",
+            "GET https://api.example.com/v1?api_key=raw-secret-1&access_token=tok-secret-2\n",
+            "retry failed"
+        );
+        let locales = [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko];
+
+        let mut timed_out_titles = Vec::new();
+        let mut failed_titles = Vec::new();
+        for locale in locales {
+            let t_title = ai_analysis_timed_out_title(locale);
+            let f_title = ai_analysis_failed_title(locale);
+            assert!(!t_title.is_empty());
+            assert!(!f_title.is_empty());
+            assert_ne!(t_title, f_title);
+            timed_out_titles.push(t_title);
+            failed_titles.push(f_title);
+
+            let timeout_summary = format_ai_failure_summary(
+                "command timed out after 30s",
+                locale,
+            );
+            assert!(timeout_summary.chars().count() <= 160);
+            assert!(!timeout_summary.contains('\n'));
+            assert!(!timeout_summary.contains('\r'));
+
+            let long_summary = format_ai_failure_summary(&long_cjk, locale);
+            assert!(
+                long_summary.chars().count() <= 160,
+                "summary exceeded 160 chars: {}",
+                long_summary.chars().count()
+            );
+            assert!(!long_summary.contains('\n'));
+
+            let redacted = format_ai_failure_summary(secret_err, locale);
+            assert!(!redacted.contains("sk-proj-1234567890abcdef1234"));
+            assert!(!redacted.contains("raw-secret-1"));
+            assert!(!redacted.contains("tok-secret-2"));
+            assert!(redacted.contains("[REDACTED]"));
+            assert!(!redacted.contains('\x1b'));
+            assert!(!redacted.contains('\n'));
+        }
+        for i in 1..locales.len() {
+            assert_ne!(timed_out_titles[i], timed_out_titles[0]);
+            assert_ne!(failed_titles[i], failed_titles[0]);
+        }
     }
 }

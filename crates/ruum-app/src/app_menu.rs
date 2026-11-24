@@ -64,14 +64,28 @@ mod menu_actions {
 
 /// Application lifecycle flags governing tray-resident vs. quit-on-close
 /// behavior.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppLifecycle {
     /// Whether the OS system tray / menu-bar item is currently active.
     pub tray_active: bool,
+    /// Whether closing the last window hides into the tray rather than
+    /// terminating the process.
+    pub close_to_background: bool,
     /// Whether the process was launched solely for `--confirm-cleanup`.
     pub confirm_only: bool,
     /// Whether an explicit quit was requested (`Quit` action or tray Quit).
     pub quitting: bool,
+}
+
+impl Default for AppLifecycle {
+    fn default() -> Self {
+        Self {
+            tray_active: false,
+            close_to_background: true,
+            confirm_only: false,
+            quitting: false,
+        }
+    }
 }
 
 impl Global for AppLifecycle {}
@@ -80,7 +94,10 @@ impl AppLifecycle {
     /// Return whether closing the last window should terminate the process.
     #[must_use]
     pub const fn should_quit_when_empty(self) -> bool {
-        self.quitting || !self.tray_active || self.confirm_only
+        self.quitting
+            || !self.tray_active
+            || !self.close_to_background
+            || self.confirm_only
     }
 }
 
@@ -96,16 +113,28 @@ pub fn set_tray_active(cx: &mut App, active: bool) {
     update_lifecycle(cx, |lifecycle| lifecycle.tray_active = active);
 }
 
+/// Record whether closing all windows keeps Ruum running in the background.
+pub fn set_close_to_background(cx: &mut App, close_to_background: bool) {
+    update_lifecycle(cx, |lifecycle| {
+        lifecycle.close_to_background = close_to_background;
+    });
+}
+
 /// Record whether the process is running in standalone `--confirm-cleanup`
 /// mode.
 pub fn set_confirm_only(cx: &mut App, confirm_only: bool) {
     update_lifecycle(cx, |lifecycle| lifecycle.confirm_only = confirm_only);
 }
 
-/// Mark the application as explicitly quitting and exit GPUI's event loop.
+/// Mark the application as explicitly quitting, cancel/clean up pending
+/// confirm dialogs, release runtime handles, and exit GPUI's event loop.
 pub fn request_quit(cx: &mut App) {
+    if is_quitting(cx) {
+        return;
+    }
     update_lifecycle(cx, |lifecycle| lifecycle.quitting = true);
     crate::cancel_update_tasks_on_quit(cx);
+    crate::cleanup_runtime_on_quit(cx);
     cx.quit();
 }
 
@@ -129,11 +158,16 @@ pub fn install_for(locale: Locale, cx: &mut App) {
         cx.set_global(AppLifecycle::default());
     }
 
-    // Stay resident in the background when the tray icon is active unless an
-    // explicit quit was requested or we are in `--confirm-cleanup` mode.
+    // Stay resident in the background when the tray icon is active and
+    // `close_to_background` is enabled unless an explicit quit was requested
+    // or we are in `--confirm-cleanup` mode.
     cx.on_window_closed(|cx, _| {
-        if cx.windows().is_empty() && should_quit_on_all_windows_closed(cx) {
-            cx.quit();
+        if cx.windows().is_empty() {
+            if should_quit_on_all_windows_closed(cx) {
+                request_quit(cx);
+            } else {
+                crate::enter_background_mode(cx);
+            }
         }
     })
     .detach();
@@ -152,6 +186,14 @@ pub fn install_for(locale: Locale, cx: &mut App) {
             {
                 let _ = remote.update(cx, |this, window, cx| {
                     this.deny(window, cx);
+                });
+            } else if let Some(progress) =
+                window.downcast::<crate::CleanupProgressWindow>()
+            {
+                let _ = progress.update(cx, |_, window, cx| {
+                    crate::CleanupProgressWindow::continue_in_background(
+                        window, cx,
+                    );
                 });
             } else {
                 let _ =
@@ -256,13 +298,23 @@ mod tests {
 
         let tray_only = AppLifecycle {
             tray_active: true,
+            close_to_background: true,
             confirm_only: false,
             quitting: false,
         };
         assert!(!tray_only.should_quit_when_empty());
 
+        let tray_close_to_quit = AppLifecycle {
+            tray_active: true,
+            close_to_background: false,
+            confirm_only: false,
+            quitting: false,
+        };
+        assert!(tray_close_to_quit.should_quit_when_empty());
+
         let tray_with_explicit_quit = AppLifecycle {
             tray_active: true,
+            close_to_background: true,
             confirm_only: false,
             quitting: true,
         };
@@ -270,6 +322,7 @@ mod tests {
 
         let tray_with_confirm_only = AppLifecycle {
             tray_active: true,
+            close_to_background: true,
             confirm_only: true,
             quitting: false,
         };
@@ -289,6 +342,12 @@ mod tests {
             assert!(!is_quitting(cx));
 
             set_tray_active(cx, true);
+            assert!(!should_quit_on_all_windows_closed(cx));
+
+            set_close_to_background(cx, false);
+            assert!(should_quit_on_all_windows_closed(cx));
+
+            set_close_to_background(cx, true);
             assert!(!should_quit_on_all_windows_closed(cx));
 
             set_confirm_only(cx, true);

@@ -1290,6 +1290,9 @@ pub struct WatchdogSettingsDraft {
     pub apparent_size: bool,
     pub include_hidden: bool,
     pub follow_system_appearance: bool,
+    pub close_to_background: bool,
+    pub launch_at_login: bool,
+    pub tray_show_disk_space: bool,
     pub enabled: bool,
     pub background_service: bool,
     pub ai_auto_analyze: bool,
@@ -1323,6 +1326,9 @@ impl WatchdogSettingsDraft {
             apparent_size: app.apparent_size,
             include_hidden: app.include_hidden,
             follow_system_appearance: app.follow_system_appearance,
+            close_to_background: app.close_to_background,
+            launch_at_login: app.launch_at_login,
+            tray_show_disk_space: app.tray_show_disk_space,
             enabled: wd.enabled,
             background_service: wd.background_service,
             ai_auto_analyze: ai.auto_analyze_on_alert,
@@ -1567,8 +1573,6 @@ pub struct Ruum {
     pub webhook_input_name: Option<Entity<InputState>>,
     /// Endpoint IDs currently executing a live test POST.
     pub webhook_testing_ids: FxHashSet<String>,
-    /// True while checking local disk space on the Watchdog page.
-    pub watchdog_checking_space: bool,
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
     pub scan_started: Option<Instant>,
@@ -1588,6 +1592,10 @@ pub struct Ruum {
     pub ai_config: AiConfig,
     /// Latest AI cleanup proposal (`ai_state` table).
     pub ai_proposal: Option<CleanupProposal>,
+    /// Latest AI analysis failure summary (`ai_state.last_error`).
+    pub ai_last_error: Option<String>,
+    /// Unix seconds when `ai_last_error` was recorded.
+    pub ai_last_error_at_secs: Option<u64>,
     /// Unsaved toggle/provider/model selections on the Settings page.
     pub watchdog_draft: WatchdogSettingsDraft,
     /// When true, `views::root` syncs Settings text inputs from committed DB state.
@@ -1687,6 +1695,26 @@ pub struct Ruum {
     pub terminal_os_override: Option<TerminalOs>,
     #[cfg(test)]
     pub terminal_launch_log: Vec<(String, TerminalLaunchPlan)>,
+}
+
+fn open_db_for_window(this: &Ruum) -> Option<StorageDb> {
+    if this.db_path.is_some() {
+        this.open_db().ok()
+    } else if !cfg!(test) {
+        StorageDb::open_default().ok()
+    } else {
+        None
+    }
+}
+
+fn open_db_for_background(db_path: Option<&Path>) -> Option<StorageDb> {
+    if let Some(path) = db_path {
+        StorageDb::open(path).ok()
+    } else if !cfg!(test) {
+        StorageDb::open_default().ok()
+    } else {
+        None
+    }
 }
 
 impl Ruum {
@@ -1802,7 +1830,7 @@ impl Ruum {
             webhook_config,
             webhooks,
             ai_config,
-            ai_proposal,
+            ai_state,
             ssh_profiles,
             watchdog_home_space,
             update_settings,
@@ -1817,7 +1845,7 @@ impl Ruum {
                 WebhookConfig::default(),
                 Vec::new(),
                 AiConfig::default(),
-                None,
+                ruum_core::storage::AiState::default(),
                 Vec::new(),
                 None,
                 UpdateSettings::default(),
@@ -1827,45 +1855,52 @@ impl Ruum {
             let db_path = ruum_watchdog::ruum_db_path();
             let cred_store = shared_cred_store
                 .or_else(|| LazyCredentialStore::open_default().ok());
-            let (app_s, wd_c, wd_s, wh_c, wh_list, ai_c, ai_p, profiles, upd_s) =
-                db_path
-                    .as_deref()
-                    .and_then(|p| StorageDb::open(p).ok())
-                    .map_or_else(
-                        || {
-                            (
-                                AppSettings::default(),
-                                WatchdogConfig::default(),
-                                WatchdogState::default(),
-                                WebhookConfig::default(),
-                                Vec::new(),
-                                AiConfig::default(),
-                                None,
-                                Vec::new(),
-                                UpdateSettings::default(),
-                            )
-                        },
-                        |db| {
-                            let wd = db.watchdog().ok();
-                            (
-                                db.load_app_settings().unwrap_or_default(),
-                                wd.as_ref()
-                                    .and_then(|w| w.load_config().ok())
-                                    .unwrap_or_default(),
-                                wd.as_ref()
-                                    .and_then(|w| w.load_state().ok())
-                                    .unwrap_or_default(),
-                                db.load_webhook_config().unwrap_or_default(),
-                                db.list_webhooks().unwrap_or_default(),
-                                db.load_ai_config().unwrap_or_default(),
-                                db.load_ai_state().ok().and_then(|s| {
-                                    s.parse_proposal().ok().flatten()
-                                }),
-                                db.list_ssh_profiles().unwrap_or_default(),
-                                db.load_update_settings().unwrap_or_default(),
-                            )
-                        },
-                    );
+            let (
+                app_s,
+                wd_c,
+                wd_s,
+                wh_c,
+                wh_list,
+                ai_c,
+                ai_st,
+                profiles,
+                upd_s,
+            ) = db_path
+                .as_deref()
+                .and_then(|p| StorageDb::open(p).ok())
+                .map_or_else(
+                    || {
+                        (
+                            AppSettings::default(),
+                            WatchdogConfig::default(),
+                            WatchdogState::default(),
+                            WebhookConfig::default(),
+                            Vec::new(),
+                            AiConfig::default(),
+                            ruum_core::storage::AiState::default(),
+                            Vec::new(),
+                            UpdateSettings::default(),
+                        )
+                    },
+                    |db| {
+                        let wd = db.watchdog().ok();
+                        (
+                            db.load_app_settings().unwrap_or_default(),
+                            wd.as_ref()
+                                .and_then(|w| w.load_config().ok())
+                                .unwrap_or_default(),
+                            wd.as_ref()
+                                .and_then(|w| w.load_state().ok())
+                                .unwrap_or_default(),
+                            db.load_webhook_config().unwrap_or_default(),
+                            db.list_webhooks().unwrap_or_default(),
+                            db.load_ai_config().unwrap_or_default(),
+                            db.load_ai_state().ok().unwrap_or_default(),
+                            db.list_ssh_profiles().unwrap_or_default(),
+                            db.load_update_settings().unwrap_or_default(),
+                        )
+                    },
+                );
             let home_space = home.as_deref().and_then(|h| space_info(h).ok());
             let install_kind = UpdateFactory::create()
                 .detect_install_kind(&UpdateEnv::current());
@@ -1878,13 +1913,16 @@ impl Ruum {
                 wh_c,
                 wh_list,
                 ai_c,
-                ai_p,
+                ai_st,
                 profiles,
                 home_space,
                 upd_s,
                 install_kind,
             )
         };
+        let ai_proposal = ai_state.parse_proposal().ok().flatten();
+        let ai_last_error = ai_state.last_error;
+        let ai_last_error_at_secs = ai_state.last_error_at_secs;
         let power_choice = if cfg!(test) {
             None
         } else {
@@ -2046,7 +2084,6 @@ impl Ruum {
             webhook_guide_open: true,
             webhook_input_name: None,
             webhook_testing_ids: FxHashSet::default(),
-            watchdog_checking_space: false,
             panel_rems: PANEL_REMS,
             scan_started: None,
             scan_root: PathBuf::new(),
@@ -2057,6 +2094,8 @@ impl Ruum {
             webhook_config,
             ai_config,
             ai_proposal,
+            ai_last_error,
+            ai_last_error_at_secs,
             watchdog_draft,
             watchdog_inputs_need_sync: false,
             setting_input_default_depth: None,
@@ -2379,10 +2418,8 @@ impl Ruum {
             }
         } else if target == Screen::Watchdog {
             self.reload_watchdog_state();
+            self.refresh_watchdog_home_space_silent();
             if !cfg!(test) {
-                self.watchdog_home_space = std::env::home_dir()
-                    .as_deref()
-                    .and_then(|h| space_info(h).ok());
                 Self::probe_system_statuses(cx);
             }
         }
@@ -2959,11 +2996,21 @@ impl Ruum {
             if let Ok(wd) = db.watchdog()
                 && let Ok(st) = wd.load_state()
             {
-                self.watchdog_space_checked_at = st.last_checked_secs;
+                self.watchdog_space_checked_at = match (
+                    self.watchdog_space_checked_at,
+                    st.last_checked_secs,
+                ) {
+                    (Some(cur), Some(db_ts)) => Some(cur.max(db_ts)),
+                    (cur, db_ts) => cur.or(db_ts),
+                };
                 self.watchdog_state = st;
+                self.watchdog_state.last_checked_secs =
+                    self.watchdog_space_checked_at;
             }
             if let Ok(ai_st) = db.load_ai_state() {
                 self.ai_proposal = ai_st.parse_proposal().ok().flatten();
+                self.ai_last_error = ai_st.last_error;
+                self.ai_last_error_at_secs = ai_st.last_error_at_secs;
             }
         }
     }
@@ -3938,6 +3985,9 @@ impl Ruum {
                 .watchdog_draft
                 .follow_system_appearance,
             ssh_session_duration_minutes: ssh_duration_mins,
+            close_to_background: self.watchdog_draft.close_to_background,
+            launch_at_login: self.watchdog_draft.launch_at_login,
+            tray_show_disk_space: self.watchdog_draft.tray_show_disk_space,
             updated_at_secs: now_secs,
         }
         .normalized();
@@ -4020,7 +4070,8 @@ impl Ruum {
 
         let prev_cfg =
             std::mem::replace(&mut self.watchdog_config, next_cfg.clone());
-        self.app_settings = next_app.clone();
+        let prev_app =
+            std::mem::replace(&mut self.app_settings, next_app.clone());
         self.ai_config = next_ai.clone();
         if let Some(preset) =
             crate::power::PowerEfficiency::parse(&next_app.power_preset)
@@ -4038,6 +4089,11 @@ impl Ruum {
         self.watchdog_inputs_need_sync = false;
         self.sync_watchdog_inputs_from_config(window, cx);
 
+        crate::app_menu::set_close_to_background(
+            cx,
+            next_app.close_to_background,
+        );
+
         let threshold_changed = prev_cfg.min_free_gb != next_cfg.min_free_gb;
         let re_enabled = !prev_cfg.enabled && next_cfg.enabled;
         if threshold_changed || re_enabled {
@@ -4053,6 +4109,7 @@ impl Ruum {
         let reset_poll = threshold_changed
             || re_enabled
             || prev_cfg.poll_interval_secs != next_cfg.poll_interval_secs;
+        crate::sync_runtime_app_settings(&next_app, cx);
         crate::notify_watchdog_config_saved(&next_cfg, reset_poll, cx);
 
         if cfg!(test) {
@@ -4064,18 +4121,10 @@ impl Ruum {
             return;
         }
 
-        let enable_service = next_cfg.background_service;
-        let needs_service_sync = if enable_service {
-            !matches!(self.watchdog_service_status, Some(ServiceStatus::Active))
-        } else {
-            matches!(
-                self.watchdog_service_status,
-                Some(ServiceStatus::Active | ServiceStatus::Inactive)
-            ) || (self.watchdog_service_status.is_none()
-                && prev_cfg.background_service)
-        };
-
-        if !needs_service_sync || self.watchdog_saving {
+        let launch_at_login = next_app.launch_at_login;
+        let needs_autostart_sync =
+            launch_at_login || prev_app.launch_at_login != launch_at_login;
+        if !needs_autostart_sync || self.watchdog_saving {
             self.push_toast(
                 crate::i18n::messages::settings_saved(self.locale),
                 Status::Success,
@@ -4084,55 +4133,56 @@ impl Ruum {
             return;
         }
 
-        let cli_exe = crate::resolve_cli_exe();
         self.watchdog_saving = true;
-        crate::with_runtime_mut(cx, |rt| rt.service_sync_in_flight = true);
-        self.push_toast(
-            crate::i18n::messages::settings_saved_updating_service(self.locale),
-            Status::Success,
-            cx,
-        );
-
         let task = cx.background_executor().spawn(async move {
+            use ruum_core::autostart::AutostartStatus;
+
             let runner = ruum_core::ai_cli::TimedCommandRunner::new(
-                Duration::from_secs(10),
+                Duration::from_secs(5),
             );
-            let sync_res = if enable_service {
-                ruum_core::watchdog::install_service(&runner, &cli_exe)
+            let env = crate::background::current_autostart_env();
+            let adapter = crate::background::autostart_adapter();
+            let autostart_res = if launch_at_login {
+                std::env::current_exe()
+                    .and_then(|gui_exe| adapter.enable(&runner, &env, &gui_exe))
             } else {
-                ruum_core::watchdog::uninstall_service(&runner)
+                adapter
+                    .disable(&runner, &env)
+                    .map(|()| AutostartStatus::Disabled)
             };
+            let _ = ruum_core::watchdog::uninstall_legacy_service_if_present(
+                Duration::from_secs(2),
+            );
             let status = ruum_core::watchdog::service_status(&runner).ok();
-            (sync_res, status)
+            (autostart_res, status)
         });
 
         cx.spawn(async move |this, cx| {
-            let (sync_res, status) = task.await;
-            cx.update(|cx| {
-                crate::with_runtime_mut(cx, |rt| {
-                    rt.service_sync_in_flight = false;
-                });
-            });
+            use ruum_core::autostart::AutostartStatus;
+
+            let (autostart_res, status) = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.watchdog_saving = false;
                 this.watchdog_service_status = status;
                 let locale = this.locale;
-                match sync_res {
-                    Ok(()) => {
-                        let service_note =
-                            crate::i18n::messages::service_note(status, locale);
+                match autostart_res {
+                    Ok(AutostartStatus::Enabled | AutostartStatus::Disabled) => {
                         this.push_toast(
-                            crate::i18n::messages::settings_saved_with_service(
-                                service_note,
-                                locale,
-                            ),
+                            crate::i18n::messages::settings_saved(locale),
                             Status::Success,
+                            cx,
+                        );
+                    }
+                    Ok(AutostartStatus::RequiresApproval) => {
+                        this.push_toast(
+                            crate::i18n::messages::settings_saved_autostart_requires_approval(locale),
+                            Status::Warning,
                             cx,
                         );
                     }
                     Err(err) => {
                         this.push_toast(
-                            crate::i18n::messages::settings_saved_service_error(
+                            crate::i18n::messages::settings_saved_autostart_error(
                                 &err.to_string(),
                                 locale,
                             ),
@@ -5076,84 +5126,25 @@ impl Ruum {
         .detach();
     }
 
-    /// Trigger manual space refresh on Watchdog page.
-    pub fn refresh_watchdog_space(&mut self, cx: &mut Context<'_, Self>) {
-        let target = std::env::home_dir()
-            .filter(|p| p.exists())
-            .unwrap_or_else(|| self.root_path.clone());
-        self.reload_watchdog_state();
-
-        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
-        match space_info(&target) {
-            Ok(info) => {
-                self.watchdog_home_space = Some(info);
-                if self.remote.is_none() && self.root_path == target {
-                    self.space = Some(info);
-                }
-                self.watchdog_space_checked_at = Some(now_secs);
-                self.watchdog_state.last_checked_secs = Some(now_secs);
-                if self.db_path.is_some()
-                    && let Ok(db) = self.open_db()
-                    && let Ok(svc) = db.watchdog()
-                {
-                    let _ = svc.save_state(&self.watchdog_state);
-                }
-                let thresh_bytes = self
-                    .watchdog_config
-                    .min_free_gb
-                    .saturating_mul(1024 * 1024 * 1024);
-                let breached = info.available < thresh_bytes;
-                let free = ruum_core::size::human_bytes(info.available);
-                let total = ruum_core::size::human_bytes(info.total);
-                let msg = if breached {
-                    crate::i18n::messages::disk_checked_below(
-                        &free,
-                        &total,
-                        self.watchdog_config.min_free_gb,
-                        self.locale,
-                    )
-                } else {
-                    crate::i18n::messages::disk_checked_healthy(
-                        &free,
-                        &total,
-                        self.watchdog_config.min_free_gb,
-                        self.locale,
-                    )
-                };
-                let status = if breached {
-                    Status::Warning
-                } else {
-                    Status::Success
-                };
-                self.push_toast(msg, status, cx);
-            }
-            Err(err) => {
-                self.push_toast(
-                    crate::i18n::messages::failed_check_disk_space(
-                        &err.to_string(),
-                        self.locale,
-                    ),
-                    Status::Error,
-                    cx,
-                );
-            }
-        }
-
-        if !cfg!(test) {
-            let task = cx.background_executor().spawn(async {
-                let runner = ruum_core::ai_cli::TimedCommandRunner::new(
-                    Duration::from_secs(5),
-                );
-                ruum_core::watchdog::service_status(&runner).ok()
+    /// Silently refresh `watchdog_home_space` and `watchdog_space_checked_at`
+    /// without emitting user-facing toast notices.
+    pub(crate) fn refresh_watchdog_home_space_silent(&mut self) {
+        let target =
+            std::env::home_dir().filter(|p| p.exists()).or_else(|| {
+                (self.remote.is_none() && self.root_path.exists())
+                    .then(|| self.root_path.clone())
             });
-            cx.spawn(async move |this, cx| {
-                let status = task.await;
-                let _ = this.update(cx, |this, cx| {
-                    this.watchdog_service_status = status;
-                    cx.notify();
-                });
-            })
-            .detach();
+        let Some(target) = target else {
+            return;
+        };
+        if let Ok(info) = space_info(&target) {
+            let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+            self.watchdog_home_space = Some(info);
+            if self.remote.is_none() && self.root_path == target {
+                self.space = Some(info);
+            }
+            self.watchdog_space_checked_at = Some(now_secs);
+            self.watchdog_state.last_checked_secs = Some(now_secs);
         }
     }
 
@@ -5191,6 +5182,9 @@ impl Ruum {
                 })
         };
 
+        let db_path = self.db_path.clone();
+        let locale = self.locale;
+
         self.watchdog_analyzing = true;
         self.watchdog_analysis_epoch += 1;
         let epoch = self.watchdog_analysis_epoch;
@@ -5220,76 +5214,141 @@ impl Ruum {
 
         cx.spawn(async move |this, cx| {
             let (home, res) = task.await;
-            let _ = this.update(cx, |this, cx| {
-                if epoch != this.watchdog_analysis_epoch {
-                    return;
-                }
-                this.watchdog_analyzing = false;
-                let locale = this.locale;
-                match res {
-                    Ok(proposal) => {
-                        this.ai_proposal = Some(proposal.clone());
-                        let ai_state =
-                            ruum_core::storage::AiState::from_proposal(
-                                &proposal, now_secs,
-                            )
-                            .unwrap_or_default();
-                        if this.db_path.is_some()
-                            && let Ok(db) = this.open_db()
-                        {
-                            let _ = db.save_ai_state(&ai_state);
+            let err_raw = res.as_ref().err().cloned();
+            cx.update(|cx| {
+                let done_secs =
+                    u64::try_from(now_seconds()).unwrap_or(now_secs);
+                let mut notif: Option<(
+                    ruum_core::watchdog::AiFailureKind,
+                    crate::i18n::Locale,
+                    String,
+                )> = None;
+                let updated = this.update(cx, |this, cx| {
+                    if epoch != this.watchdog_analysis_epoch {
+                        return false;
+                    }
+                    this.watchdog_analyzing = false;
+                    let active_locale = this.locale;
+                    match res {
+                        Ok(proposal) => {
+                            this.ai_proposal = Some(proposal.clone());
+                            this.ai_last_error = None;
+                            this.ai_last_error_at_secs = None;
+                            let ai_state =
+                                ruum_core::storage::AiState::from_proposal(
+                                    &proposal, done_secs,
+                                )
+                                .unwrap_or_default();
+                            if let Some(db) = open_db_for_window(this) {
+                                let _ = db.save_ai_state(&ai_state);
+                            }
+                            if proposal.items.is_empty()
+                                && proposal.docker_targets.is_empty()
+                                && build_docker_confirm_items(
+                                    &this.local_docker_status(),
+                                    &[],
+                                    active_locale,
+                                )
+                                .0
+                                .is_empty()
+                            {
+                                this.push_toast(
+                                    crate::i18n::messages::ai_found_no_files(
+                                        active_locale,
+                                    ),
+                                    Status::Success,
+                                    cx,
+                                );
+                            } else {
+                                let local_docker = this.local_docker_status();
+                                let request =
+                                    proposal_confirm_request_with_docker(
+                                        home,
+                                        &proposal,
+                                        &local_docker,
+                                        active_locale,
+                                    );
+                                let count = request.items.len()
+                                    + request.docker_items.len();
+                                crate::open_local_confirm_window(
+                                    request,
+                                    this.db_path.clone(),
+                                    local_docker,
+                                    cx,
+                                );
+                                crate::refresh_tray_status(cx);
+                                this.push_toast(
+                                    crate::i18n::messages::ai_proposed_items(
+                                        count,
+                                        active_locale,
+                                    ),
+                                    Status::Success,
+                                    cx,
+                                );
+                            }
                         }
-                        if proposal.items.is_empty()
-                            && proposal.docker_targets.is_empty()
-                            && build_docker_confirm_items(
-                                &this.local_docker_status(),
-                                &[],
-                                locale,
-                            )
-                            .0
-                            .is_empty()
-                        {
+                        Err(err) => {
+                            let kind =
+                                ruum_core::watchdog::classify_ai_failure(&err);
+                            let summary =
+                                crate::i18n::messages::ai_analysis_error(
+                                    &err,
+                                    active_locale,
+                                );
+                            this.ai_last_error = Some(summary.clone());
+                            this.ai_last_error_at_secs = Some(done_secs);
+                            if let Some(db) = open_db_for_window(this) {
+                                let _ = db.record_ai_error(&summary, done_secs);
+                            }
                             this.push_toast(
-                                crate::i18n::messages::ai_found_no_files(
-                                    locale,
-                                ),
-                                Status::Success,
+                                summary.clone(),
+                                Status::Error,
                                 cx,
                             );
-                        } else {
-                            let local_docker = this.local_docker_status();
-                            let request = proposal_confirm_request_with_docker(
-                                home,
-                                &proposal,
-                                &local_docker,
-                                locale,
-                            );
-                            let count = request.items.len()
-                                + request.docker_items.len();
-                            crate::open_local_confirm_window(
-                                request,
-                                this.db_path.clone(),
-                                local_docker,
-                                cx,
-                            );
-                            crate::refresh_tray_status(cx);
-                            this.push_toast(
-                                crate::i18n::messages::ai_proposed_items(
-                                    count, locale,
+                            notif = Some((kind, active_locale, summary));
+                        }
+                    }
+                    cx.notify();
+                    true
+                });
+
+                match updated {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        if let Some((kind, notif_locale, summary)) = notif {
+                            crate::post_app_notification(
+                                ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                                crate::i18n::messages::ai_analysis_failure_notif_title(
+                                    kind,
+                                    notif_locale,
                                 ),
-                                Status::Success,
+                                &summary,
                                 cx,
                             );
                         }
                     }
-                    Err(err) => {
-                        this.push_toast(
-                            crate::i18n::messages::ai_analysis_error(
-                                &err, locale,
-                            ),
-                            Status::Error,
-                            cx,
-                        );
+                    Err(_) => {
+                        if let Some(err) = err_raw {
+                            let kind =
+                                ruum_core::watchdog::classify_ai_failure(&err);
+                            let summary =
+                                crate::i18n::messages::ai_analysis_error(
+                                    &err, locale,
+                                );
+                            if let Some(db) =
+                                open_db_for_background(db_path.as_deref())
+                            {
+                                let _ = db.record_ai_error(&summary, done_secs);
+                            }
+                            crate::post_app_notification(
+                                ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                                crate::i18n::messages::ai_analysis_failure_notif_title(
+                                    kind, locale,
+                                ),
+                                &summary,
+                                cx,
+                            );
+                        }
                     }
                 }
             });
@@ -6112,6 +6171,21 @@ impl Ruum {
             .is_some_and(|s| s.remote_scan.is_some())
     }
 
+    /// Report whether an SSH tab has both a known profile and a live session.
+    #[must_use]
+    pub(crate) fn has_connected_ssh_tab(&self, id: &str) -> bool {
+        if !self.ssh_profiles.iter().any(|p| p.id == id) {
+            return false;
+        }
+        let active_live = self.active_host_tab
+            == HostTabKey::Ssh(id.to_owned())
+            && self
+                .active_ssh_session
+                .as_ref()
+                .is_some_and(|s| !s.is_closed() && !s.is_expired());
+        active_live || self.find_live_ssh_session(id).is_some()
+    }
+
     fn find_live_ssh_session(&self, id: &str) -> Option<Arc<SshSession>> {
         if self.active_ssh_profile_id.as_deref() == Some(id)
             && let Some(session) = &self.active_ssh_session
@@ -6441,13 +6515,26 @@ impl Ruum {
         let store = match self.ensure_cred_store() {
             Ok(store) => store,
             Err(err) => {
-                self.push_toast(
-                    crate::i18n::messages::ssh_ai_analyze_failed(
-                        &profile.alias,
-                        &err,
+                let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+                let kind = ruum_core::watchdog::classify_ai_failure(&err);
+                let summary = crate::i18n::messages::ssh_ai_analyze_failed(
+                    &profile.alias,
+                    &err,
+                    self.locale,
+                );
+                self.ai_last_error = Some(summary.clone());
+                self.ai_last_error_at_secs = Some(now_secs);
+                if let Some(db) = open_db_for_window(self) {
+                    let _ = db.record_ai_error(&summary, now_secs);
+                }
+                self.push_toast(summary.clone(), Status::Error, cx);
+                crate::post_app_notification(
+                    ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                    crate::i18n::messages::ai_analysis_failure_notif_title(
+                        kind,
                         self.locale,
                     ),
-                    Status::Error,
+                    &summary,
                     cx,
                 );
                 return;
@@ -6463,6 +6550,8 @@ impl Ruum {
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
         let profile_id = profile.id.clone();
         let alias = profile.alias.clone();
+        let db_path = self.db_path.clone();
+        let locale = self.locale;
 
         self.ssh_analyzing_profiles.insert(profile_id.clone());
         self.push_toast(
@@ -6508,80 +6597,132 @@ impl Ruum {
 
         cx.spawn(async move |this, cx| {
             let res = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.ssh_analyzing_profiles.remove(&profile_id);
-                let locale = this.locale;
-                match res {
-                    Ok((session, header, proposal)) => {
-                        this.store_live_ssh_session(&profile_id, &session);
-                        if let Some(info) = header.space
-                            && this.db_path.is_some()
-                            && let Ok(db) = this.open_db()
-                        {
-                            let _ = db.update_ssh_profile_scan_summary(
-                                &profile_id,
-                                info.total,
-                                info.available,
-                                now_secs,
-                            );
-                            this.reload_ssh_profiles();
-                        }
-                        if proposal.items.is_empty()
-                            && proposal.docker_targets.is_empty()
-                            && build_docker_confirm_items(
-                                &header.docker,
-                                &[],
-                                locale,
-                            )
-                            .0
-                            .is_empty()
-                        {
-                            this.push_toast(
-                                crate::i18n::messages::ai_found_no_files(
-                                    locale,
-                                ),
-                                Status::Success,
-                                cx,
-                            );
-                        } else {
-                            let request =
-                                remote_proposal_confirm_request_with_docker(
-                                    header.root.clone(),
-                                    &alias,
-                                    &proposal,
+            let err_raw = res.as_ref().err().cloned();
+            cx.update(|cx| {
+                let done_secs =
+                    u64::try_from(now_seconds()).unwrap_or(now_secs);
+                let mut notif: Option<(
+                    ruum_core::watchdog::AiFailureKind,
+                    crate::i18n::Locale,
+                    String,
+                )> = None;
+                let updated = this.update(cx, |this, cx| {
+                    this.ssh_analyzing_profiles.remove(&profile_id);
+                    let active_locale = this.locale;
+                    match res {
+                        Ok((session, header, proposal)) => {
+                            this.store_live_ssh_session(&profile_id, &session);
+                            this.ai_last_error = None;
+                            this.ai_last_error_at_secs = None;
+                            if let Some(db) = open_db_for_window(this) {
+                                let _ = db.clear_ai_error(done_secs);
+                                if let Some(info) = header.space {
+                                    let _ = db.update_ssh_profile_scan_summary(
+                                        &profile_id,
+                                        info.total,
+                                        info.available,
+                                        done_secs,
+                                    );
+                                    this.reload_ssh_profiles();
+                                }
+                            }
+                            if proposal.items.is_empty()
+                                && proposal.docker_targets.is_empty()
+                                && build_docker_confirm_items(
                                     &header.docker,
-                                    locale,
+                                    &[],
+                                    active_locale,
+                                )
+                                .0
+                                .is_empty()
+                            {
+                                this.push_toast(
+                                    crate::i18n::messages::ai_found_no_files(
+                                        active_locale,
+                                    ),
+                                    Status::Success,
+                                    cx,
                                 );
-                            let count = request.items.len()
-                                + request.docker_items.len();
-                            crate::open_remote_confirm_window(
-                                request,
-                                profile_id,
-                                session,
-                                header,
-                                this.db_path.clone(),
-                                cx,
-                            );
-                            this.push_toast(
-                                crate::i18n::messages::ai_proposed_items(
-                                    count, locale,
-                                ),
-                                Status::Success,
-                                cx,
-                            );
+                            } else {
+                                let request =
+                                    remote_proposal_confirm_request_with_docker(
+                                        header.root.clone(),
+                                        &alias,
+                                        &proposal,
+                                        &header.docker,
+                                        active_locale,
+                                    );
+                                let count = request.items.len()
+                                    + request.docker_items.len();
+                                crate::open_remote_confirm_window(
+                                    request,
+                                    profile_id,
+                                    session,
+                                    header,
+                                    this.db_path.clone(),
+                                    cx,
+                                );
+                                this.push_toast(
+                                    crate::i18n::messages::ai_proposed_items(
+                                        count,
+                                        active_locale,
+                                    ),
+                                    Status::Success,
+                                    cx,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            let kind =
+                                ruum_core::watchdog::classify_ai_failure(&err);
+                            let summary =
+                                crate::i18n::messages::ssh_ai_analyze_failed(
+                                    &alias,
+                                    &err,
+                                    active_locale,
+                                );
+                            this.ai_last_error = Some(summary.clone());
+                            this.ai_last_error_at_secs = Some(done_secs);
+                            if let Some(db) = open_db_for_window(this) {
+                                let _ = db.record_ai_error(&summary, done_secs);
+                            }
+                            this.push_toast(summary.clone(), Status::Error, cx);
+                            notif = Some((kind, active_locale, summary));
                         }
                     }
-                    Err(err) => {
-                        this.push_toast(
-                            crate::i18n::messages::ssh_ai_analyze_failed(
-                                &alias, &err, locale,
-                            ),
-                            Status::Error,
-                            cx,
-                        );
+                    cx.notify();
+                });
+
+                if let Some((kind, notif_locale, summary)) = notif {
+                    crate::post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                        crate::i18n::messages::ai_analysis_failure_notif_title(
+                            kind,
+                            notif_locale,
+                        ),
+                        &summary,
+                        cx,
+                    );
+                } else if updated.is_err()
+                    && let Some(err) = err_raw
+                {
+                    let kind = ruum_core::watchdog::classify_ai_failure(&err);
+                    let summary = crate::i18n::messages::ssh_ai_analyze_failed(
+                        &alias, &err, locale,
+                    );
+                    if let Some(db) = open_db_for_background(db_path.as_deref())
+                    {
+                        let _ = db.record_ai_error(&summary, done_secs);
                     }
+                    crate::post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                        crate::i18n::messages::ai_analysis_failure_notif_title(
+                            kind, locale,
+                        ),
+                        &summary,
+                        cx,
+                    );
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -7166,6 +7307,9 @@ impl Ruum {
                     self.space = space_info(&self.root_path).ok();
                     self.device = device_for(&self.root_path);
                     self.file_table = file_table_readable(&self.root_path);
+                } else if self.home.as_deref() == Some(self.root_path.as_path())
+                {
+                    self.space = space_info(&self.root_path).ok();
                 }
                 let metric = self.options.metric;
                 self.marks.refresh(&self.root_path, &node, metric);
@@ -7187,6 +7331,11 @@ impl Ruum {
                 self.keep_selection_valid();
                 self.prune_history();
                 self.select_largest(cx);
+                let home_space = (self.home.as_deref()
+                    == Some(self.root_path.as_path()))
+                .then_some(self.space)
+                .flatten();
+                crate::refresh_tray_status_with_space(home_space, cx);
             }
             Err(error) => self.scan_error = Some(error.to_string()),
         }
@@ -7238,6 +7387,11 @@ impl Ruum {
                         let fresh = space_info(&path).ok();
                         if fresh != this.space {
                             this.space = fresh;
+                            if this.home.as_deref() == Some(path.as_path()) {
+                                crate::refresh_tray_status_with_space(
+                                    fresh, cx,
+                                );
+                            }
                             cx.notify();
                         }
                     })
@@ -8761,7 +8915,15 @@ impl Ruum {
         self.run_stage = None;
         if had_files {
             self.marks.clear();
+            if self.remote.is_none() {
+                self.space = space_info(&self.root_path).ok();
+            }
         }
+        let home_space = (self.remote.is_none()
+            && self.home.as_deref() == Some(self.root_path.as_path()))
+        .then_some(self.space)
+        .flatten();
+        crate::refresh_tray_status_with_space(home_space, cx);
         self.focus_request = Some(FocusTarget::Root);
         self.screen = Screen::Done;
         if had_files {

@@ -153,7 +153,7 @@ fn action_button_with_spinner(
         .child(label)
 }
 
-fn spinning_loader(
+pub fn spinning_loader(
     id: impl Into<SharedString>,
     color: Hsla,
 ) -> impl IntoElement {
@@ -1380,60 +1380,6 @@ pub fn watchdog_page(
                 ),
         );
 
-    let actions_card = dialog_popup(cx)
-        .w_full()
-        .child(dialog_title(crate::i18n::pages::actions_title(locale), cx))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap(space::MD)
-                .child(
-                    div()
-                        .debug_selector(|| "watchdog-check-space".into())
-                        .child(
-                            action_button_with_spinner(
-                                "watchdog-check-space",
-                                "watchdog-check-space-spin",
-                                crate::i18n::pages::check_disk_space_now(
-                                    locale,
-                                ),
-                                app.watchdog_checking_space,
-                                ButtonVariant::Secondary,
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.refresh_watchdog_space(cx);
-                                },
-                            )),
-                        ),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "watchdog-ai-analyze".into())
-                        .child(
-                            action_button_with_spinner(
-                                "watchdog-ai-analyze",
-                                "watchdog-ai-analyze-spin",
-                                crate::i18n::pages::run_ai_analysis_now(locale),
-                                app.watchdog_analyzing,
-                                if app.watchdog_analyzing {
-                                    ButtonVariant::Secondary
-                                } else {
-                                    ButtonVariant::Primary
-                                },
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.run_ai_analysis_now(cx);
-                                },
-                            )),
-                        ),
-                ),
-        );
-
     let proposal_card =
         if let Some(ref prop) = app.ai_proposal {
             let total_candidate_bytes: u64 =
@@ -1492,6 +1438,54 @@ pub fn watchdog_page(
                 ))
         };
 
+    let ai_error_card = app.ai_last_error.as_ref().map(|err_summary| {
+        div()
+            .w_full()
+            .debug_selector(|| "watchdog-ai-last-error".into())
+            .child(
+                dialog_popup(cx)
+                    .w_full()
+                    .border_color(theme.danger.opacity(0.45))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .gap(space::SM)
+                            .child(dialog_title(
+                                crate::i18n::pages::latest_ai_error_title(
+                                    locale,
+                                ),
+                                cx,
+                            ))
+                            .when_some(app.ai_last_error_at_secs, |row, ts| {
+                                row.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "watchdog-ai-last-error-at".into()
+                                        })
+                                        .text_size(text::CAPTION)
+                                        .text_color(theme.secondary)
+                                        .child(format_checked_age(
+                                            Some(ts),
+                                            locale,
+                                        )),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| {
+                                "watchdog-ai-last-error-text".into()
+                            })
+                            .text_size(text::BODY)
+                            .text_color(theme.danger)
+                            .child(err_summary.clone()),
+                    ),
+            )
+    });
+
     div()
         .id("watchdog-page")
         .debug_selector(|| "watchdog-page".into())
@@ -1513,7 +1507,7 @@ pub fn watchdog_page(
                 .child(crate::i18n::pages::watchdog_subtitle(locale)),
         )
         .child(status_card)
-        .child(actions_card)
+        .when_some(ai_error_card, gpui_kit::ParentElement::child)
         .child(proposal_card)
 }
 
@@ -1555,11 +1549,17 @@ fn general_settings_section(
     let is_apparent = app.watchdog_draft.apparent_size;
     let is_hidden = app.watchdog_draft.include_hidden;
     let is_follow_appearance = app.watchdog_draft.follow_system_appearance;
+    let is_close_to_background = app.watchdog_draft.close_to_background;
+    let is_launch_at_login = app.watchdog_draft.launch_at_login;
+    let is_tray_show_disk_space = app.watchdog_draft.tray_show_disk_space;
     let current_preset = app.watchdog_draft.power_preset;
 
     let entity_apparent = cx.entity().downgrade();
     let entity_hidden = entity_apparent.clone();
     let entity_appearance = entity_apparent.clone();
+    let entity_close_bg = entity_apparent.clone();
+    let entity_autostart = entity_apparent.clone();
+    let entity_tray_space = entity_apparent.clone();
 
     let mut preset_buttons = div().flex().flex_row().flex_wrap().gap(space::SM);
     for preset in PowerEfficiency::ALL {
@@ -1729,6 +1729,103 @@ fn general_settings_section(
                             ),
                         ),
                 )
+                .child(
+                    div()
+                        .debug_selector(|| "setting-close-to-background".into())
+                        .child(
+                            checkbox(
+                                "setting-close-to-background",
+                                crate::i18n::pages::general_close_to_background(
+                                    locale,
+                                ),
+                                if is_close_to_background {
+                                    CheckboxState::Checked
+                                } else {
+                                    CheckboxState::Unchecked
+                                },
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(
+                                move |_, _, _, cx| {
+                                    let _ = entity_close_bg.update(
+                                        cx,
+                                        |this, cx| {
+                                            this.watchdog_draft
+                                                .close_to_background = !this
+                                                .watchdog_draft
+                                                .close_to_background;
+                                            cx.notify();
+                                        },
+                                    );
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "setting-launch-at-login".into())
+                        .child(
+                            checkbox(
+                                "setting-launch-at-login",
+                                crate::i18n::pages::general_launch_at_login(
+                                    locale,
+                                ),
+                                if is_launch_at_login {
+                                    CheckboxState::Checked
+                                } else {
+                                    CheckboxState::Unchecked
+                                },
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(
+                                move |_, _, _, cx| {
+                                    let _ = entity_autostart.update(
+                                        cx,
+                                        |this, cx| {
+                                            this.watchdog_draft
+                                                .launch_at_login = !this
+                                                .watchdog_draft
+                                                .launch_at_login;
+                                            cx.notify();
+                                        },
+                                    );
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "setting-tray-disk-space".into())
+                        .child(
+                            checkbox(
+                                "setting-tray-disk-space",
+                                crate::i18n::pages::general_tray_show_disk_space(
+                                    locale,
+                                ),
+                                if is_tray_show_disk_space {
+                                    CheckboxState::Checked
+                                } else {
+                                    CheckboxState::Unchecked
+                                },
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_change(move |_, _, _, cx| {
+                                let _ = entity_tray_space.update(
+                                    cx,
+                                    |this, cx| {
+                                        this.watchdog_draft
+                                            .tray_show_disk_space = !this
+                                            .watchdog_draft
+                                            .tray_show_disk_space;
+                                        cx.notify();
+                                    },
+                                );
+                            }),
+                        ),
+                )
                 .child(setting_input_field(
                     "setting-ssh-duration-input",
                     crate::i18n::pages::general_ssh_lease_minutes(locale),
@@ -1763,9 +1860,7 @@ fn watchdog_settings_section(
         .expect("inputs initialized");
 
     let is_enabled = app.watchdog_draft.enabled;
-    let is_service = app.watchdog_draft.background_service;
     let entity_watchdog = cx.entity().downgrade();
-    let entity_service = entity_watchdog.clone();
 
     dialog_popup(cx)
         .w_full()
@@ -1800,37 +1895,6 @@ fn watchdog_settings_section(
                                         |this, cx| {
                                             this.watchdog_draft.enabled =
                                                 !this.watchdog_draft.enabled;
-                                            cx.notify();
-                                        },
-                                    );
-                                },
-                            ),
-                        ),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "setting-enable-service".into())
-                        .child(
-                            checkbox(
-                                "setting-enable-service",
-                                crate::i18n::pages::enable_service(locale),
-                                if is_service {
-                                    CheckboxState::Checked
-                                } else {
-                                    CheckboxState::Unchecked
-                                },
-                                cx,
-                            )
-                            .tab_stop(false)
-                            .on_change(
-                                move |_, _, _, cx| {
-                                    let _ = entity_service.update(
-                                        cx,
-                                        |this, cx| {
-                                            this.watchdog_draft
-                                                .background_service = !this
-                                                .watchdog_draft
-                                                .background_service;
                                             cx.notify();
                                         },
                                     );
@@ -3976,6 +4040,356 @@ pub fn remote_connect_confirm_view(
                 .child(card)
                 .child(div().flex_1()),
         )
+}
+
+/// Standalone compact progress window content for cancellable background cleanup.
+pub fn cleanup_progress_view(
+    snapshot: &crate::CleanupProgressSnapshot,
+    focus: &FocusHandle,
+    locale: crate::i18n::Locale,
+    cx: &Context<'_, crate::CleanupProgressWindow>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let cancelling = snapshot.cancelling;
+    let total = snapshot.total_items;
+    let completed = snapshot.completed_items.min(total);
+    let fraction = if total > 0 {
+        (completed as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let is_completed = matches!(
+        snapshot.completion,
+        Some(crate::CleanupProgressCompletion::Completed { .. })
+    );
+    let display_completed = if is_completed { total } else { completed };
+    let display_fraction = if is_completed { 1.0 } else { fraction };
+    let pct = (display_fraction * 100.0).round() as u64;
+    let counter_text = format!("{display_completed}/{total} \u{00b7} {pct}%");
+    let total_str =
+        (snapshot.total_bytes > 0).then(|| human_bytes(snapshot.total_bytes));
+    let reclaimed_text = crate::i18n::pages::cleanup_reclaimed_so_far(
+        &human_bytes(snapshot.reclaimed_bytes),
+        total_str.as_deref(),
+        locale,
+    );
+
+    let (
+        header_icon,
+        heading_text,
+        subtitle_text,
+        subtitle_color,
+        bar_fill,
+        bottom_text,
+        footer,
+    ) = if let Some(ref completion) = snapshot.completion {
+        let (icon_name, accent, cancelled, failed, subtitle, sub_color) =
+            match completion {
+                crate::CleanupProgressCompletion::Completed {
+                    count,
+                    bytes,
+                } => (
+                    IconName::CircleCheck,
+                    theme.success,
+                    false,
+                    false,
+                    crate::i18n::messages::cleaned_items_summary(
+                        *count, *bytes, locale,
+                    ),
+                    theme.secondary,
+                ),
+                crate::CleanupProgressCompletion::Cancelled {
+                    count,
+                    bytes,
+                } => (
+                    IconName::TriangleAlert,
+                    theme.warning,
+                    true,
+                    false,
+                    crate::i18n::messages::cleanup_cancelled_summary(
+                        *count, *bytes, locale,
+                    ),
+                    theme.warning,
+                ),
+                crate::CleanupProgressCompletion::Failed { message } => (
+                    IconName::CircleX,
+                    theme.danger,
+                    false,
+                    true,
+                    message.clone(),
+                    theme.danger,
+                ),
+            };
+        let icon_el = div()
+            .debug_selector(|| "cleanup-progress-done-icon".into())
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                gpui_omarchy::icon(icon_name)
+                    .size(icon::MD)
+                    .flex_shrink_0()
+                    .text_color(accent),
+            )
+            .into_any_element();
+        let heading = crate::i18n::pages::cleanup_progress_done_heading(
+            cancelled, failed, locale,
+        );
+        let auto_close = crate::i18n::pages::cleanup_progress_auto_closing(
+            crate::CLEANUP_PROGRESS_LINGER.as_secs(),
+            locale,
+        );
+        let footer = div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap(space::SM)
+            .child(
+                div()
+                    .debug_selector(|| "cleanup-progress-close".into())
+                    .child(
+                    dialog_button(
+                        "cleanup-progress-close",
+                        crate::i18n::pages::cleanup_progress_close_button(
+                            locale,
+                        ),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        crate::CleanupProgressWindow::continue_in_background(
+                            window, cx,
+                        );
+                    })),
+                ),
+            )
+            .into_any_element();
+        (
+            icon_el, heading, subtitle, sub_color, accent, auto_close, footer,
+        )
+    } else {
+        let spin_color = if cancelling {
+            theme.warning
+        } else {
+            theme.accent
+        };
+        let fill = if cancelling {
+            theme.warning
+        } else {
+            theme.danger
+        };
+        let current_path_text =
+            snapshot.current_item.clone().unwrap_or_else(|| {
+                crate::i18n::pages::cleanup_progress_preparing(locale)
+                    .to_owned()
+            });
+        let sub_color = if cancelling {
+            theme.warning
+        } else {
+            theme.secondary
+        };
+        let icon_el = spinning_loader("cleanup-progress-spinner", spin_color)
+            .into_any_element();
+        let heading =
+            crate::i18n::pages::cleanup_progress_heading(cancelling, locale);
+        let subtitle =
+            crate::i18n::pages::cleanup_progress_subtitle(cancelling, locale)
+                .to_owned();
+        let footer = div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap(space::SM)
+            .child(
+                div()
+                    .debug_selector(|| "cleanup-progress-background".into())
+                    .child(
+                        dialog_button(
+                            "cleanup-progress-background",
+                            crate::i18n::pages::cleanup_continue_in_background(
+                                locale,
+                            ),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(|_, _, window, cx| {
+                            crate::CleanupProgressWindow::continue_in_background(
+                                window, cx,
+                            );
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "cleanup-progress-cancel".into())
+                    .child(
+                        dialog_button(
+                            "cleanup-progress-cancel",
+                            crate::i18n::pages::cleanup_cancel_button(
+                                cancelling, locale,
+                            ),
+                            if cancelling {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Danger
+                            },
+                            cx,
+                        )
+                        .disabled(cancelling)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_cleanup(cx);
+                        })),
+                    ),
+            )
+            .into_any_element();
+        (
+            icon_el,
+            heading,
+            subtitle,
+            sub_color,
+            fill,
+            current_path_text,
+            footer,
+        )
+    };
+
+    let card = div()
+        .id("cleanup-progress-popup")
+        .debug_selector(|| "cleanup-progress-popup".into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .child(
+            dialog_popup(cx)
+                .w_full()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .justify_between()
+                .gap(space::MD)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XS)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(space::SM)
+                                .child(header_icon)
+                                .child(
+                                    div()
+                                        .text_size(text::TITLE)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.bright)
+                                        .child(heading_text),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(text::CAPTION)
+                                .text_color(subtitle_color)
+                                .child(subtitle_text),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::XS)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(space::SM)
+                                .child(
+                                    div()
+                                        .id("cleanup-progress-counter")
+                                        .debug_selector(|| {
+                                            "cleanup-progress-counter".into()
+                                        })
+                                        .w(size::CLEANUP_COUNTER_LANE)
+                                        .flex_shrink_0()
+                                        .font_family(theme.mono_font.clone())
+                                        .text_size(text::CAPTION)
+                                        .text_color(theme.bright)
+                                        .child(counter_text),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(theme.mono_font.clone())
+                                        .text_size(text::CAPTION)
+                                        .text_color(theme.secondary)
+                                        .child(reclaimed_text),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("cleanup-progress-bar")
+                                .debug_selector(|| {
+                                    "cleanup-progress-bar".into()
+                                })
+                                .w_full()
+                                .h(size::METER)
+                                .bg(theme.foreground.opacity(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(display_fraction))
+                                        .bg(bar_fill),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("cleanup-progress-path")
+                                .debug_selector(|| {
+                                    "cleanup-progress-path".into()
+                                })
+                                .w_full()
+                                .h(size::CLEANUP_PATH_LANE_H)
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.mono_font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(bottom_text),
+                        ),
+                )
+                .child(footer),
+        );
+
+    div()
+        .id("cleanup-progress-window")
+        .debug_selector(|| "cleanup-progress-window".into())
+        .track_focus(focus)
+        .key_context("CleanupProgress")
+        .on_action(cx.listener(
+            |_, _: &crate::app_menu::CloseWindow, window, cx| {
+                crate::CleanupProgressWindow::continue_in_background(
+                    window, cx,
+                );
+            },
+        ))
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .size_full()
+        .p(space::LG)
+        .bg(theme.background)
+        .text_color(theme.foreground)
+        .font_family(theme.font)
+        .text_size(text::BODY)
+        .child(card)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

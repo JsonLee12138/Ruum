@@ -2972,12 +2972,20 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
         Some(gpui_omarchy::Status::Error)
     );
 
-    // 2. Navigate to Watchdog page
-    update(&view, cx, |app, _| app.screen = Screen::Watchdog);
+    // 2. Navigate to Watchdog page (auto-refreshes space without action card)
+    update(&view, cx, |app, cx| {
+        app.watchdog_home_space = None;
+        app.watchdog_space_checked_at = None;
+        app.navigate_rail(Screen::Watchdog, cx);
+    });
     draw(cx);
     assert!(cx.debug_bounds("watchdog-page").is_some());
-    assert!(cx.debug_bounds("watchdog-check-space").is_some());
-    assert!(cx.debug_bounds("watchdog-ai-analyze").is_some());
+    assert!(cx.debug_bounds("watchdog-check-space").is_none());
+    assert!(cx.debug_bounds("watchdog-ai-analyze").is_none());
+    read(&view, cx, |app| {
+        assert!(app.watchdog_home_space.is_some());
+        assert!(app.watchdog_space_checked_at.is_some());
+    });
 
     // 3. Inject mock proposal into watchdog state and open standalone window
     let target_file = temp.path().join("junk/blob.bin");
@@ -3301,24 +3309,25 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
         app.watchdog_benchmarking_models.is_empty()
     }));
 
-    // 2. Watchdog page: Check Disk Space Now produces a floating Toast.
-    update(&view, cx, |app, _| {
+    // 2. Navigating to Watchdog auto-refreshes space and timestamp without
+    //    manual action buttons or inline status noise.
+    update(&view, cx, |app, cx| {
         app.notice = None;
-        app.screen = Screen::Watchdog;
+        app.watchdog_home_space = None;
+        app.watchdog_space_checked_at = None;
+        app.navigate_rail(Screen::Watchdog, cx);
     });
     draw(cx);
     assert!(cx.debug_bounds("watchdog-last-checked").is_some());
-    assert!(cx.debug_bounds("watchdog-action-status").is_none());
-    assert!(cx.debug_bounds("toast-notification").is_none());
-
-    update(&view, cx, Ruum::refresh_watchdog_space);
-    draw(cx);
-    assert!(read(&view, cx, |app| {
-        app.watchdog_space_checked_at.is_some()
-    }));
-    assert!(cx.debug_bounds("toast-notification").is_some());
+    assert!(cx.debug_bounds("watchdog-check-space").is_none());
+    assert!(cx.debug_bounds("watchdog-ai-analyze").is_none());
     assert!(cx.debug_bounds("watchdog-action-status").is_none());
     assert!(cx.debug_bounds("watchdog-notice-line").is_none());
+    assert!(cx.debug_bounds("toast-notification").is_none());
+    assert!(read(&view, cx, |app| {
+        app.watchdog_home_space.is_some()
+            && app.watchdog_space_checked_at.is_some()
+    }));
 }
 
 #[cfg(unix)]
@@ -3548,8 +3557,8 @@ fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
         });
         draw(cx);
         assert!(cx.debug_bounds("watchdog-page").is_some());
-        assert!(cx.debug_bounds("watchdog-check-space").is_some());
-        assert!(cx.debug_bounds("watchdog-ai-analyze").is_some());
+        assert!(cx.debug_bounds("watchdog-check-space").is_none());
+        assert!(cx.debug_bounds("watchdog-ai-analyze").is_none());
 
         // Settings page.
         update(&view, cx, |app, cx| {
@@ -4310,13 +4319,22 @@ fn watchdog_page_handles_none_space_saturating_mul_and_syncs_checked_at(
         app.space = None;
         app.watchdog_config.min_free_gb = u64::MAX;
         app.reload_watchdog_state();
+        assert_eq!(app.watchdog_space_checked_at, Some(1_234_567));
         app.navigate_rail(Screen::Watchdog, cx);
     });
-    draw(cx);
-
     read(&view, cx, |app| {
-        assert_eq!(app.watchdog_space_checked_at, Some(1_234_567));
+        assert!(app.watchdog_home_space.is_some());
+        assert!(
+            app.watchdog_space_checked_at
+                .is_some_and(|ts| ts >= 1_234_567)
+        );
     });
+    update(&view, cx, |app, cx| {
+        app.watchdog_home_space = None;
+        app.space = None;
+        cx.notify();
+    });
+    draw(cx);
     assert!(cx.debug_bounds("watchdog-page").is_some());
     assert!(cx.debug_bounds("watchdog-status-value").is_some());
 }
@@ -5096,6 +5114,7 @@ fn settings_general_watchdog_webhook_and_ai_round_trip_in_sqlite(
             follow_system_appearance: false,
             ssh_session_duration_minutes: 30,
             updated_at_secs: saved_app.updated_at_secs,
+            ..AppSettings::default()
         }
     );
     let saved_wd = db.watchdog().expect("wd").load_config().expect("wd cfg");
@@ -8836,4 +8855,2331 @@ fn settings_api_renders_cleanly_across_all_four_locales(
         assert!(cx.debug_bounds("setting-custom-cmd-input").is_none());
         assert!(cx.debug_bounds("setting-extra-args-input").is_none());
     }
+}
+
+#[gpui_kit::test]
+fn local_ai_analysis_failure_notifies_and_persists_open_and_closed(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::Locale;
+    use ruum_core::removal::RemovalMode;
+    use ruum_core::storage::{AiState, StorageDb};
+    use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
+    use ruum_core::watchdog_config::{
+        AiCliProvider, CleanupProposal, ProposalItem,
+    };
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+
+    let prior = CleanupProposal {
+        timestamp_secs: 100,
+        summary: "Existing local proposal".into(),
+        items: vec![ProposalItem::new(
+            temp.path().join("junk/blob.bin"),
+            1024,
+            RemovalMode::Trash,
+            None,
+            None,
+        )],
+        docker_targets: Vec::new(),
+    };
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        let st = AiState::from_proposal(&prior, 100).expect("state");
+        db.save_ai_state(&st).expect("save prior");
+    }
+
+    let counter = CountingRootSecret::new([0x51; 32]);
+    let store = counter.store_for(&enc_path);
+    store.set_ai_api_key("test-key").expect("save api key");
+
+    // 1. Open main window: timeout error shows Status::Error toast, emits
+    //    NOTIF_TAG_AI_ANALYSIS, preserves existing proposal, and renders on
+    //    Watchdog page.
+    let listener_fail =
+        TcpListener::bind("127.0.0.1:0").expect("bind fail api");
+    let addr_fail = listener_fail.local_addr().expect("addr fail");
+    let stop_fail = Arc::new(AtomicBool::new(false));
+    let stop_fail_srv = Arc::clone(&stop_fail);
+    let server_fail = std::thread::spawn(move || {
+        while !stop_fail_srv.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener_fail.accept() else {
+                break;
+            };
+            if stop_fail_srv.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = read_test_http_request(&mut stream);
+            write_test_http_response(
+                &mut stream,
+                "504 Gateway Timeout",
+                "application/json",
+                r#"{"error":{"message":"upstream request timed out after 30s"}}"#,
+            );
+        }
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store.clone());
+        app.set_locale(Locale::Zh);
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr_fail}/v1");
+        app.ai_config.model = Some("gpt-test".into());
+        app.watchdog_draft.model = Some("gpt-test".into());
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_input_model = None;
+        app.reload_watchdog_state();
+        app.navigate_rail(Screen::Watchdog, cx);
+        app.run_ai_analysis_now(cx);
+    });
+    win_cx.run_until_parked();
+    stop_fail.store(true, Ordering::Release);
+    let _ = TcpStream::connect(addr_fail);
+    server_fail.join().expect("server fail join");
+
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert!(matches!(app.notice, Some((_, gpui_omarchy::Status::Error))));
+        assert!(app.ai_last_error.is_some());
+        assert!(app.ai_proposal.is_some());
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("watchdog-ai-last-error").is_some());
+
+    let shown = win_cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert_eq!(
+        shown[0].title.as_ref(),
+        crate::i18n::messages::ai_analysis_timed_out_notif_title(Locale::Zh)
+    );
+    assert!(shown[0].body.chars().count() <= 160);
+
+    let saved = StorageDb::open(&db_path)
+        .expect("reopen db")
+        .load_ai_state()
+        .expect("load ai state");
+    assert_eq!(saved.last_error.as_deref(), Some(shown[0].body.as_ref()));
+    assert!(saved.last_error_at_secs.is_some());
+    assert!(saved.last_proposal_json.is_some());
+
+    // Subsequent successful analysis clears ai_last_error in memory, DB & UI.
+    let listener_ok = TcpListener::bind("127.0.0.1:0").expect("bind ok api");
+    let addr_ok = listener_ok.local_addr().expect("addr ok");
+    let server_ok = std::thread::spawn(move || {
+        let (mut stream2, _) = listener_ok.accept().expect("accept ok");
+        let _ = read_test_http_request(&mut stream2);
+        let proposal_json = serde_json::json!({
+            "summary": "All clean",
+            "items": []
+        })
+        .to_string();
+        let chunk1 = serde_json::json!({
+            "id": "c-ok",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": proposal_json },
+                "finish_reason": null
+            }]
+        });
+        let chunk2 = serde_json::json!({
+            "id": "c-ok",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        let sse =
+            format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+        write_test_http_response(
+            &mut stream2,
+            "200 OK",
+            "text/event-stream",
+            &sse,
+        );
+    });
+    update(&view, win_cx, |app, cx| {
+        app.ai_config.api_base_url = format!("http://{addr_ok}/v1");
+        app.run_ai_analysis_now(cx);
+    });
+    win_cx.run_until_parked();
+    server_ok.join().expect("server ok join");
+
+    read(&view, win_cx, |app| {
+        assert_eq!(app.ai_last_error, None);
+        assert_eq!(app.ai_last_error_at_secs, None);
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("watchdog-ai-last-error").is_none());
+    let cleared = StorageDb::open(&db_path)
+        .expect("reopen db after success")
+        .load_ai_state()
+        .expect("load ai state after success");
+    assert_eq!(cleared.last_error, None);
+    assert_eq!(cleared.last_error_at_secs, None);
+
+    // 2. Main window closed while AI analysis is in flight: still emits
+    //    NOTIF_TAG_AI_ANALYSIS and persists error to db_path.
+    let db_path2 = cfg_dir.path().join("ruum-closed.db");
+    let listener2 = TcpListener::bind("127.0.0.1:0").expect("bind mock api 2");
+    let addr2 = listener2.local_addr().expect("addr2");
+    let server2 = std::thread::spawn(move || {
+        let (mut stream, _) = listener2.accept().expect("accept2");
+        let _ = read_test_http_request(&mut stream);
+        write_test_http_response(
+            &mut stream,
+            "422 Unprocessable Entity",
+            "application/json",
+            r#"{"error":{"message":"model backend crashed"}}"#,
+        );
+    });
+
+    let root2 = temp.path().to_path_buf();
+    let tree2 = scan(temp.path(), options()).expect("scan");
+    let db_for_win = db_path2.clone();
+    let store_for_win = store;
+    let win2 = cx.add_window(move |_, cx| {
+        let mut app = Ruum::with_tree(root2.clone(), tree2, options(), 3, cx);
+        app.db_path = Some(db_for_win.clone());
+        app.cred_store = Some(store_for_win.clone());
+        app.set_locale(Locale::En);
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr2}/v1");
+        app.ai_config.model = Some("gpt-test".into());
+        app.watchdog_draft.model = Some("gpt-test".into());
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_input_model = None;
+        app
+    });
+
+    win2.update(cx, |app, _, cx| {
+        app.run_ai_analysis_now(cx);
+    })
+    .expect("start analysis");
+    win2.update(cx, |_, window, _| {
+        window.remove_window();
+    })
+    .expect("close win2");
+    cx.run_until_parked();
+    server2.join().expect("server2 join");
+
+    let shown_after = cx.shown_system_notifications();
+    assert_eq!(shown_after.len(), 2);
+    assert_eq!(shown_after[1].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert_eq!(
+        shown_after[1].title.as_ref(),
+        crate::i18n::messages::ai_analysis_failed_notif_title(Locale::En)
+    );
+    assert!(shown_after[1].body.chars().count() <= 160);
+
+    let saved2 = StorageDb::open(&db_path2)
+        .expect("open db2")
+        .load_ai_state()
+        .expect("load ai state 2");
+    assert_eq!(
+        saved2.last_error.as_deref(),
+        Some(shown_after[1].body.as_ref())
+    );
+    assert!(saved2.last_error_at_secs.is_some());
+}
+
+#[gpui_kit::test]
+fn remote_ssh_ai_analysis_failure_notifies_and_persists_open_and_closed(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+    use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-ssh.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x52; 32]);
+
+    let profile = SshProfile {
+        id: "srv-ai-err".into(),
+        alias: "broken-box".into(),
+        host: "127.0.0.1".into(),
+        port: 22,
+        username: "deploy".into(),
+        auth_mode: AuthMode::Password,
+        default_path: Some("~".into()),
+        created_at_secs: 1,
+        updated_at_secs: 1,
+        last_total_bytes: None,
+        last_available_bytes: None,
+        last_scanned_secs: None,
+        pending_script_path: None,
+        pending_script_items: None,
+        pending_reclaim_bytes: None,
+        pending_created_secs: None,
+    };
+
+    // 1. Open main window: failure sends Toast, NOTIF_TAG_AI_ANALYSIS, and
+    //    records ai_state.last_error.
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.ssh_profiles = vec![profile.clone()];
+        app.analyze_ssh_profile("srv-ai-err", cx);
+    });
+    win_cx.run_until_parked();
+
+    read(&view, win_cx, |app| {
+        assert!(!app.ssh_analyzing_profiles.contains("srv-ai-err"));
+        let (msg, status) = app.notice.as_ref().expect("error toast");
+        assert_eq!(*status, gpui_omarchy::Status::Error);
+        assert!(msg.contains("broken-box"));
+        assert!(
+            app.ai_last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("broken-box")
+        );
+    });
+    update(&view, win_cx, |app, cx| {
+        app.navigate_rail(Screen::Watchdog, cx);
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("watchdog-ai-last-error").is_some());
+
+    let shown = win_cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert!(shown[0].body.contains("broken-box"));
+
+    let saved = StorageDb::open(&db_path)
+        .expect("open db")
+        .load_ai_state()
+        .expect("load ai state");
+    assert!(
+        saved
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("broken-box")
+    );
+    assert!(saved.last_error_at_secs.is_some());
+
+    // 2. Closed main window while task runs: still emits NOTIF_TAG_AI_ANALYSIS
+    //    and writes ai_state.last_error.
+    let db_path2 = cfg_dir.path().join("ruum-ssh-closed.db");
+    let root2 = temp.path().to_path_buf();
+    let tree2 = scan(temp.path(), options()).expect("scan");
+    let db_for_win = db_path2.clone();
+    let store2 = counter.store_for(&enc_path);
+    let win2 = cx.add_window(move |_, cx| {
+        let mut app = Ruum::with_tree(root2.clone(), tree2, options(), 3, cx);
+        app.db_path = Some(db_for_win.clone());
+        app.cred_store = Some(store2.clone());
+        app.ssh_profiles = vec![profile];
+        app
+    });
+    win2.update(cx, |app, _, cx| {
+        app.analyze_ssh_profile("srv-ai-err", cx);
+    })
+    .expect("start remote analysis");
+    win2.update(cx, |_, window, _| {
+        window.remove_window();
+    })
+    .expect("close win2 before task finishes");
+    cx.run_until_parked();
+
+    let shown_after = cx.shown_system_notifications();
+    assert_eq!(shown_after.len(), 2);
+    assert_eq!(shown_after[1].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert!(shown_after[1].body.contains("broken-box"));
+
+    let saved2 = StorageDb::open(&db_path2)
+        .expect("open db2")
+        .load_ai_state()
+        .expect("load ai state 2");
+    assert!(
+        saved2
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("broken-box")
+    );
+    assert!(saved2.last_error_at_secs.is_some());
+}
+
+#[gpui_kit::test]
+fn watchdog_runtime_ai_failure_notification_notifies_and_toasts_open_window(
+    cx: &mut TestAppContext,
+) {
+    use crate::watchdog_runtime::WatchdogIpcEvent;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
+    use std::sync::mpsc::channel;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-watchdog-runtime.db");
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.record_ai_error(
+            "AI analysis timed out: upstream timeout",
+            1_700_000_111,
+        )
+        .expect("record initial error");
+    }
+
+    let tree = scan(temp.path(), options()).expect("scan");
+    let root_path = temp.path().to_path_buf();
+    let db_for_win = db_path.clone();
+    let win = cx.add_window(move |_, cx| {
+        let mut app =
+            Ruum::with_tree(root_path.clone(), tree, options(), 3, cx);
+        app.db_path = Some(db_for_win);
+        app
+    });
+
+    let (ipc_tx, ipc_rx) = channel();
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(win),
+            cx,
+        );
+        crate::with_runtime_mut(cx, |rt| {
+            rt.ipc_rx = Some(ipc_rx);
+            let _ = rt.in_proc_notif_tx.send((
+                NOTIF_TAG_AI_ANALYSIS.to_owned(),
+                "ruum AI Analysis Timed Out".to_owned(),
+                "AI analysis timed out: upstream timeout".to_owned(),
+            ));
+        });
+        crate::poll_app_runtime(cx);
+    });
+
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert_eq!(shown[0].title.as_ref(), "ruum AI Analysis Timed Out");
+    assert_eq!(
+        shown[0].body.as_ref(),
+        "AI analysis timed out: upstream timeout"
+    );
+    win.read_with(cx, |app, _| {
+        assert_eq!(
+            app.notice.as_ref(),
+            Some(&(
+                "AI analysis timed out: upstream timeout".to_owned(),
+                gpui_omarchy::Status::Error,
+            ))
+        );
+        assert_eq!(
+            app.ai_last_error.as_deref(),
+            Some("AI analysis timed out: upstream timeout")
+        );
+        assert_eq!(app.ai_last_error_at_secs, Some(1_700_000_111));
+    })
+    .expect("read open window after in_proc_notif");
+
+    // External watchdog daemon IPC ShowNotification also triggers toast + reload.
+    win.update(cx, |app, _, _| {
+        app.notice = None;
+        app.ai_last_error = None;
+        app.ai_last_error_at_secs = None;
+    })
+    .expect("reset window state");
+    StorageDb::open(&db_path)
+        .expect("reopen db")
+        .record_ai_error("AI analysis failed: cli crashed", 1_700_000_222)
+        .expect("record second error");
+    ipc_tx
+        .send(WatchdogIpcEvent::ShowNotification {
+            tag: NOTIF_TAG_AI_ANALYSIS.to_owned(),
+            title: "ruum AI Analysis Failed".to_owned(),
+            body: "AI analysis failed: cli crashed".to_owned(),
+        })
+        .expect("send ipc notification");
+    cx.update(crate::poll_app_runtime);
+
+    let shown_after = cx.shown_system_notifications();
+    assert_eq!(shown_after.len(), 2);
+    assert_eq!(shown_after[1].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert_eq!(shown_after[1].title.as_ref(), "ruum AI Analysis Failed");
+    assert_eq!(
+        shown_after[1].body.as_ref(),
+        "AI analysis failed: cli crashed"
+    );
+    win.read_with(cx, |app, _| {
+        assert_eq!(
+            app.notice.as_ref(),
+            Some(&(
+                "AI analysis failed: cli crashed".to_owned(),
+                gpui_omarchy::Status::Error,
+            ))
+        );
+        assert_eq!(
+            app.ai_last_error.as_deref(),
+            Some("AI analysis failed: cli crashed")
+        );
+        assert_eq!(app.ai_last_error_at_secs, Some(1_700_000_222));
+    })
+    .expect("read open window after ipc ShowNotification");
+}
+
+#[gpui_kit::test]
+fn tray_background_ai_analysis_failure_notifies_persists_and_toasts_reopened_window(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::Locale;
+    use ruum_core::storage::{AiConfig, StorageDb};
+    use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
+    use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-tray.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x53; 32]);
+    let store = counter.store_for(&enc_path);
+    store.set_ai_api_key("test-key").expect("save api key");
+
+    let listener_504 = TcpListener::bind("127.0.0.1:0").expect("bind 504");
+    let addr_504 = listener_504.local_addr().expect("addr 504");
+    let stop_504 = Arc::new(AtomicBool::new(false));
+    let stop_504_srv = Arc::clone(&stop_504);
+    let server_504 = std::thread::spawn(move || {
+        while !stop_504_srv.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener_504.accept() else {
+                break;
+            };
+            if stop_504_srv.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = read_test_http_request(&mut stream);
+            write_test_http_response(
+                &mut stream,
+                "504 Gateway Timeout",
+                "application/json",
+                r#"{"error":{"message":"upstream request timed out"}}"#,
+            );
+        }
+    });
+
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.save_ai_config(&AiConfig {
+            provider: AiCliProvider::Api,
+            api_protocol: ApiProtocol::OpenAi,
+            api_base_url: format!("http://{addr_504}/v1"),
+            model: Some("gpt-test".into()),
+            ..AiConfig::default()
+        })
+        .expect("save ai config");
+    }
+
+    let store_rt = store;
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+        crate::with_runtime_mut(cx, |rt| {
+            rt.cred_store = Some(store_rt);
+        });
+        crate::trigger_background_ai_analysis_with(
+            Some(db_path.clone()),
+            Some(temp.path().to_path_buf()),
+            Locale::Zh,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    stop_504.store(true, Ordering::Release);
+    let _ = TcpStream::connect(addr_504);
+    server_504.join().expect("server 504 join");
+
+    let shown = cx.shown_system_notifications();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert_eq!(
+        shown[0].title.as_ref(),
+        crate::i18n::messages::ai_analysis_timed_out_notif_title(Locale::Zh)
+    );
+    let saved = StorageDb::open(&db_path)
+        .expect("reopen db")
+        .load_ai_state()
+        .expect("load ai state");
+    assert_eq!(saved.last_error.as_deref(), Some(shown[0].body.as_ref()));
+    assert!(saved.last_error_at_secs.is_some());
+    assert!(cx.read(|cx| {
+        !cx.global::<crate::AppRuntime>()
+            .background_analysis_in_flight
+    }));
+
+    // 2. Main window opens while background AI analysis is running:
+    //    emits notification, persists error, reloads ai_last_error, and
+    //    pushes Status::Error toast to the opened main window.
+    let listener_422 = TcpListener::bind("127.0.0.1:0").expect("bind 422");
+    let addr_422 = listener_422.local_addr().expect("addr 422");
+    let server_422 = std::thread::spawn(move || {
+        let (mut stream, _) = listener_422.accept().expect("accept 422");
+        let _ = read_test_http_request(&mut stream);
+        write_test_http_response(
+            &mut stream,
+            "422 Unprocessable Entity",
+            "application/json",
+            r#"{"error":{"message":"model backend crashed"}}"#,
+        );
+    });
+    {
+        let db = StorageDb::open(&db_path).expect("reopen db 2");
+        db.clear_ai_error(1_700_000_333).expect("clear err");
+        db.save_ai_config(&AiConfig {
+            provider: AiCliProvider::Api,
+            api_protocol: ApiProtocol::OpenAi,
+            api_base_url: format!("http://{addr_422}/v1"),
+            model: Some("gpt-test".into()),
+            ..AiConfig::default()
+        })
+        .expect("save 422 ai config");
+    }
+
+    cx.update(|cx| {
+        crate::trigger_background_ai_analysis_with(
+            Some(db_path.clone()),
+            Some(temp.path().to_path_buf()),
+            Locale::En,
+            cx,
+        );
+    });
+
+    let root_reopen = temp.path().to_path_buf();
+    let tree_reopen = scan(temp.path(), options()).expect("scan");
+    let db_reopen = db_path.clone();
+    let win = cx.add_window(move |_, cx| {
+        let mut app =
+            Ruum::with_tree(root_reopen.clone(), tree_reopen, options(), 3, cx);
+        app.db_path = Some(db_reopen);
+        app.set_locale(Locale::En);
+        app
+    });
+    cx.update(|cx| {
+        crate::with_runtime_mut(cx, |rt| rt.main_window = Some(win));
+    });
+    cx.run_until_parked();
+    server_422.join().expect("server 422 join");
+
+    let shown_after = cx.shown_system_notifications();
+    assert_eq!(shown_after.len(), 2);
+    assert_eq!(shown_after[1].tag.as_ref(), NOTIF_TAG_AI_ANALYSIS);
+    assert_eq!(
+        shown_after[1].title.as_ref(),
+        crate::i18n::messages::ai_analysis_failed_notif_title(Locale::En)
+    );
+    let expected_body = shown_after[1].body.to_string();
+
+    let saved2 = StorageDb::open(&db_path)
+        .expect("reopen db after 422")
+        .load_ai_state()
+        .expect("load ai state 2");
+    assert_eq!(saved2.last_error.as_deref(), Some(expected_body.as_str()));
+    assert!(saved2.last_error_at_secs.is_some());
+
+    win.read_with(cx, |app, _| {
+        assert_eq!(
+            app.notice.as_ref(),
+            Some(&(expected_body.clone(), gpui_omarchy::Status::Error))
+        );
+        assert_eq!(app.ai_last_error.as_deref(), Some(expected_body.as_str()));
+        assert!(app.ai_last_error_at_secs.is_some());
+    })
+    .expect("read reopened main window toast and error");
+}
+
+#[gpui_kit::test]
+fn settings_general_persists_background_and_autostart_without_legacy_service_toggle(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(1400.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    let close_bg_box = cx
+        .debug_bounds("setting-close-to-background")
+        .expect("close-to-background toggle");
+    let autostart_box = cx
+        .debug_bounds("setting-launch-at-login")
+        .expect("launch-at-login toggle");
+    cx.simulate_click(close_bg_box.center(), Modifiers::none());
+    cx.simulate_click(autostart_box.center(), Modifiers::none());
+    draw(cx);
+
+    // Legacy headless service toggle must no longer be rendered in Watchdog.
+    let wd_tab = cx.debug_bounds("setting-tab-watchdog").expect("wd tab");
+    cx.simulate_click(wd_tab.center(), Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("setting-enable-watchdog").is_some());
+    assert!(cx.debug_bounds("setting-enable-service").is_none());
+
+    let save_btn = cx.debug_bounds("setting-save-btn").expect("save btn");
+    cx.simulate_click(save_btn.center(), Modifiers::none());
+    draw(cx);
+
+    let saved = StorageDb::open(&db_path)
+        .expect("open db")
+        .load_app_settings()
+        .expect("load saved settings");
+    assert!(!saved.close_to_background);
+    assert!(saved.launch_at_login);
+
+    cx.update(|_, cx| {
+        crate::app_menu::set_tray_active(cx, true);
+        assert!(crate::app_menu::should_quit_on_all_windows_closed(cx));
+    });
+
+    let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
+    update(&fresh_view, fresh_cx, |app, _| {
+        app.db_path = Some(db_path.clone());
+        app.reload_watchdog_config_and_prepare_settings();
+    });
+    read(&fresh_view, fresh_cx, |app| {
+        assert!(!app.app_settings.close_to_background);
+        assert!(app.app_settings.launch_at_login);
+        assert!(!app.watchdog_draft.close_to_background);
+        assert!(app.watchdog_draft.launch_at_login);
+    });
+}
+
+#[gpui_kit::test]
+fn tray_toggle_watchdog_flips_db_runtime_and_open_window(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::StorageDb;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let root = temp.path().to_path_buf();
+    let tree = scan(temp.path(), options()).expect("scan");
+    let db_for_win = db_path.clone();
+    let win = cx.add_window(move |_, cx| {
+        let mut app = Ruum::with_tree(root, tree, options(), 3, cx);
+        app.db_path = Some(db_for_win);
+        app
+    });
+
+    cx.update(|cx| {
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(win),
+            cx,
+        );
+        crate::toggle_watchdog_in_db(Some(&db_path), cx);
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.watchdog_config.enabled);
+    });
+
+    let enabled_in_db = StorageDb::open(&db_path)
+        .unwrap()
+        .watchdog()
+        .unwrap()
+        .load_config()
+        .unwrap()
+        .enabled;
+    assert!(enabled_in_db);
+    win.read_with(cx, |app, _| {
+        assert!(app.watchdog_config.enabled);
+        assert!(app.watchdog_draft.enabled);
+    })
+    .expect("read enabled main window");
+
+    cx.update(|cx| {
+        crate::toggle_watchdog_in_db(Some(&db_path), cx);
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(!rt.watchdog_config.enabled);
+    });
+
+    let disabled_in_db = StorageDb::open(&db_path)
+        .unwrap()
+        .watchdog()
+        .unwrap()
+        .load_config()
+        .unwrap()
+        .enabled;
+    assert!(!disabled_in_db);
+    win.read_with(cx, |app, _| {
+        assert!(!app.watchdog_config.enabled);
+        assert!(!app.watchdog_draft.enabled);
+    })
+    .expect("read disabled main window");
+}
+
+#[test]
+fn has_actionable_proposal_counts_docker_targets() {
+    use ruum_core::docker_adapter::DockerCleanTarget;
+    use ruum_core::watchdog_config::CleanupProposal;
+
+    let empty = CleanupProposal {
+        timestamp_secs: 1,
+        summary: "none".to_owned(),
+        items: Vec::new(),
+        docker_targets: Vec::new(),
+    };
+    assert!(!crate::has_actionable_proposal(&empty));
+
+    let docker_only = CleanupProposal {
+        timestamp_secs: 1,
+        summary: "docker".to_owned(),
+        items: Vec::new(),
+        docker_targets: vec![DockerCleanTarget::BuildCache],
+    };
+    assert!(crate::has_actionable_proposal(&docker_only));
+}
+
+#[gpui_kit::test]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "gpui_kit::test passes &mut TestAppContext"
+)]
+fn request_quit_cancels_pending_ipc_confirm_windows_without_deadlock(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::confirm::{
+        CleanupConfirmDecision, CleanupConfirmRequest, IpcListenerGuard,
+        IpcRequest, IpcResponse, RemoteConnectConfirmDecision,
+        RemoteConnectConfirmRequest, send_ipc_message,
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let socket_or_port = temp.path().join("quit-ipc.sock");
+    #[cfg(windows)]
+    let socket_or_port = temp.path().join("quit-ipc.port");
+
+    let listener = IpcListenerGuard::bind(&socket_or_port).expect("bind");
+    let token = "quit_test_token_12345678901234567890".to_owned();
+    let (server, rx) =
+        crate::watchdog_runtime::WatchdogIpcServer::start_with_listener(
+            listener,
+            token.clone(),
+        )
+        .expect("start ipc server");
+
+    cx.update(|cx| {
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+        crate::with_runtime_mut(cx, |rt| rt.ipc_server = Some(server));
+    });
+
+    let ep1 = socket_or_port.clone();
+    let tok1 = token.clone();
+    let confirm_handle = std::thread::spawn(move || {
+        send_ipc_message(
+            &ep1,
+            &IpcRequest::ConfirmCleanup {
+                token: tok1,
+                request: CleanupConfirmRequest {
+                    root: PathBuf::from("/tmp"),
+                    title: "Pending Confirm".to_owned(),
+                    summary: None,
+                    items: Vec::new(),
+                    docker_items: Vec::new(),
+                    docker_permission_hint: None,
+                },
+            },
+        )
+    });
+
+    let ep2 = socket_or_port;
+    let remote_handle = std::thread::spawn(move || {
+        send_ipc_message(
+            &ep2,
+            &IpcRequest::ConfirmRemoteConnect {
+                token,
+                request: RemoteConnectConfirmRequest {
+                    target_label: "prod".to_owned(),
+                    alias: Some("prod".to_owned()),
+                    host: "10.0.0.1".to_owned(),
+                    port: 22,
+                    username: "deploy".to_owned(),
+                    auth_mode: "private_key".to_owned(),
+                    tool_name: "scan_directory".to_owned(),
+                },
+            },
+        )
+    });
+
+    let mut clean_ev = None;
+    let mut remote_ev = None;
+    for _ in 0..2 {
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("ipc ev")
+        {
+            crate::watchdog_runtime::WatchdogIpcEvent::Confirm {
+                request,
+                responder,
+            } => clean_ev = Some((request, responder)),
+            crate::watchdog_runtime::WatchdogIpcEvent::ConfirmRemoteConnect {
+                request,
+                responder,
+            } => remote_ev = Some((request, responder)),
+            other => panic!("unexpected ipc event: {other:?}"),
+        }
+    }
+
+    let (c_req, c_resp) = clean_ev.expect("clean ev");
+    let (r_req, r_resp) = remote_ev.expect("remote ev");
+
+    cx.update(|cx| {
+        crate::open_confirm_window(c_req, Some(c_resp), None, cx);
+        crate::open_remote_connect_confirm_window_with_mode(
+            r_req,
+            Some(r_resp),
+            None,
+            false,
+            cx,
+        );
+        crate::app_menu::request_quit(cx);
+        assert!(crate::app_menu::is_quitting(cx));
+    });
+
+    assert_eq!(
+        confirm_handle.join().unwrap().expect("confirm ipc resp"),
+        IpcResponse::ConfirmDecision {
+            decision: CleanupConfirmDecision::Cancelled
+        }
+    );
+    assert_eq!(
+        remote_handle.join().unwrap().expect("remote ipc resp"),
+        IpcResponse::RemoteConnectDecision {
+            decision: RemoteConnectConfirmDecision::Denied
+        }
+    );
+}
+
+#[gpui_kit::test]
+fn settings_general_persists_tray_show_disk_space_and_syncs_runtime(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.update(|_, cx| {
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+    });
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(1400.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(!rt.tray_show_disk_space);
+    });
+
+    let tray_toggle = cx
+        .debug_bounds("setting-tray-disk-space")
+        .expect("tray disk space toggle");
+    cx.simulate_click(tray_toggle.center(), Modifiers::none());
+    draw(cx);
+
+    let save_btn = cx.debug_bounds("setting-save-btn").expect("save btn");
+    cx.simulate_click(save_btn.center(), Modifiers::none());
+    draw(cx);
+
+    let saved = StorageDb::open(&db_path)
+        .expect("open db")
+        .load_app_settings()
+        .expect("load saved settings");
+    assert!(saved.tray_show_disk_space);
+    cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.tray_show_disk_space);
+    });
+
+    // Fresh Ruum reloads tray_show_disk_space from SQLite into settings & draft.
+    let (fresh_view, fresh_cx) = view_over(temp.path(), &mut cx.cx);
+    fresh_cx.simulate_resize(gpui_kit::size(px(1100.), px(1400.)));
+    update(&fresh_view, fresh_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.reload_watchdog_config_and_prepare_settings();
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(fresh_cx);
+    read(&fresh_view, fresh_cx, |app| {
+        assert!(app.app_settings.tray_show_disk_space);
+        assert!(app.watchdog_draft.tray_show_disk_space);
+    });
+
+    // Toggling back off persists false and clears AppRuntime cache on save.
+    let tray_toggle_off = fresh_cx
+        .debug_bounds("setting-tray-disk-space")
+        .expect("tray disk space toggle off");
+    fresh_cx.simulate_click(tray_toggle_off.center(), Modifiers::none());
+    draw(fresh_cx);
+    let save_btn_2 = fresh_cx
+        .debug_bounds("setting-save-btn")
+        .expect("save btn 2");
+    fresh_cx.simulate_click(save_btn_2.center(), Modifiers::none());
+    draw(fresh_cx);
+
+    let saved_off = StorageDb::open(&db_path)
+        .expect("reopen db")
+        .load_app_settings()
+        .expect("load saved settings off");
+    assert!(!saved_off.tray_show_disk_space);
+    fresh_cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(!rt.tray_show_disk_space);
+    });
+}
+
+#[gpui_kit::test]
+fn settings_general_tray_disk_space_waits_for_save_before_persisting_and_applying(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.update(|_, cx| {
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+    });
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(1400.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+
+    // 1. Toggling `setting-tray-disk-space` updates only draft until Save.
+    let tray_toggle = cx
+        .debug_bounds("setting-tray-disk-space")
+        .expect("tray disk space toggle");
+    cx.simulate_click(tray_toggle.center(), Modifiers::none());
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert!(app.watchdog_draft.tray_show_disk_space);
+        assert!(!app.app_settings.tray_show_disk_space);
+    });
+    cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(!rt.tray_show_disk_space);
+    });
+    let before_save = StorageDb::open(&db_path)
+        .expect("open db before save")
+        .load_app_settings()
+        .expect("load settings before save");
+    assert!(!before_save.tray_show_disk_space);
+
+    // 2. Clicking Save Settings persists to SQLite, updates state & runtime.
+    let save_btn = cx.debug_bounds("setting-save-btn").expect("save btn");
+    cx.simulate_click(save_btn.center(), Modifiers::none());
+    draw(cx);
+
+    let saved_on = StorageDb::open(&db_path)
+        .expect("open db after save")
+        .load_app_settings()
+        .expect("load saved settings on");
+    assert!(saved_on.tray_show_disk_space);
+    read(&view, cx, |app| {
+        assert!(app.app_settings.tray_show_disk_space);
+        assert!(app.watchdog_draft.tray_show_disk_space);
+    });
+    cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.tray_show_disk_space);
+    });
+
+    // 3. Toggling back off keeps persisted, applied, and runtime values true
+    // until Save Settings is clicked again.
+    let tray_toggle_off = cx
+        .debug_bounds("setting-tray-disk-space")
+        .expect("tray disk space toggle off");
+    cx.simulate_click(tray_toggle_off.center(), Modifiers::none());
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert!(!app.watchdog_draft.tray_show_disk_space);
+        assert!(app.app_settings.tray_show_disk_space);
+    });
+    cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.tray_show_disk_space);
+    });
+    let before_save_off = StorageDb::open(&db_path)
+        .expect("reopen db before save off")
+        .load_app_settings()
+        .expect("load settings before save off");
+    assert!(before_save_off.tray_show_disk_space);
+
+    // 4. Clicking Save Settings again persists and applies false.
+    let save_btn_off =
+        cx.debug_bounds("setting-save-btn").expect("save btn off");
+    cx.simulate_click(save_btn_off.center(), Modifiers::none());
+    draw(cx);
+
+    read(&view, cx, |app| {
+        assert!(!app.app_settings.tray_show_disk_space);
+        assert!(!app.watchdog_draft.tray_show_disk_space);
+    });
+    cx.update(|_, cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(!rt.tray_show_disk_space);
+    });
+    let saved_off = StorageDb::open(&db_path)
+        .expect("reopen db after save off")
+        .load_app_settings()
+        .expect("load saved settings off");
+    assert!(!saved_off.tray_show_disk_space);
+}
+
+#[gpui_kit::test]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "gpui_kit::test passes &mut TestAppContext"
+)]
+fn tray_space_refresh_throttle_only_polls_when_enabled_and_due(
+    cx: &mut TestAppContext,
+) {
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let t29 = t0 + Duration::from_secs(29);
+    let t30 = t0 + Duration::from_secs(30);
+    assert!(!crate::should_refresh_tray_disk_space(
+        false, true, None, t0
+    ));
+    assert!(!crate::should_refresh_tray_disk_space(
+        true, false, None, t0
+    ));
+    assert!(crate::should_refresh_tray_disk_space(true, true, None, t0));
+    assert!(!crate::should_refresh_tray_disk_space(
+        true,
+        true,
+        Some(t0),
+        t29,
+    ));
+    assert!(crate::should_refresh_tray_disk_space(
+        true,
+        true,
+        Some(t0),
+        t30,
+    ));
+
+    // When disabled, poll_app_runtime must not probe or stamp refresh time.
+    let temp = tempfile::tempdir().expect("tempdir");
+    cx.update(|cx| {
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+        crate::poll_app_runtime(cx);
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.last_tray_space_refresh.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn cleanup_progress_window_opens_on_confirm_background_keeps_running_tray_reopens_and_cancel_stops(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{AiState, StorageDb};
+    use ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE;
+    use ruum_core::watchdog_config::{CleanupProposal, ProposalItem};
+    use std::sync::atomic::Ordering;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+
+    let file_a = temp.path().join("junk/cancel_a.bin");
+    let file_b = temp.path().join("junk/cancel_b.bin");
+    std::fs::write(&file_a, vec![b'a'; 1024]).expect("write a");
+    std::fs::write(&file_b, vec![b'b'; 2048]).expect("write b");
+
+    let proposal = CleanupProposal {
+        timestamp_secs: 1_700_000_000,
+        summary: "Test cancellable cleanup".into(),
+        items: vec![
+            ProposalItem::new(
+                file_a.clone(),
+                1024,
+                RemovalMode::Permanent,
+                Some("stale".into()),
+                None,
+            ),
+            ProposalItem::new(
+                file_b.clone(),
+                2048,
+                RemovalMode::Permanent,
+                Some("stale".into()),
+                None,
+            ),
+        ],
+        docker_targets: Vec::new(),
+    };
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        let st = AiState::from_proposal(&proposal, 1_700_000_000).expect("st");
+        db.save_ai_state(&st).expect("save ai state");
+    }
+
+    let tree = scan(temp.path(), options()).expect("scan fixture");
+    let root_path = temp.path().to_path_buf();
+    let db_for_win = db_path.clone();
+    let main_win = cx.add_window(move |_, cx| {
+        let mut app = Ruum::with_tree(root_path, tree, options(), 3, cx);
+        app.locale = crate::i18n::Locale::En;
+        app.db_path = Some(db_for_win);
+        app.reload_watchdog_state();
+        app
+    });
+    let cleanup_gate = std::sync::Arc::new(crate::AsyncSignal::default());
+    let cleanup_gate_rt = std::sync::Arc::clone(&cleanup_gate);
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::app_menu::install_for(crate::i18n::Locale::En, cx);
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(main_win),
+            cx,
+        );
+        crate::with_runtime_mut(cx, |rt| {
+            rt.test_cleanup_gate = Some(cleanup_gate_rt);
+        });
+    });
+
+    let req = crate::state::proposal_confirm_request(
+        temp.path().to_path_buf(),
+        &proposal,
+        crate::i18n::Locale::En,
+    );
+    let confirm_win = cx
+        .update(|cx| {
+            crate::open_local_confirm_window(
+                req,
+                Some(db_path),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
+        })
+        .expect("open local confirm window");
+    let _ = confirm_win.update(cx, |win, _, _| {
+        win.set_locale(crate::i18n::Locale::En);
+    });
+    let mut confirm_cx = VisualTestContext::from_window(confirm_win.into(), cx);
+    draw(&mut confirm_cx);
+    let confirm_btn = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    confirm_cx
+        .simulate_click(confirm_btn.center(), gpui_kit::Modifiers::none());
+
+    // Immediately after confirm (before background executor drains):
+    // confirm window closed, active_cleanup registered, CleanupProgressWindow opened.
+    let (progress_win, cancel_arc) = cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        let prog_win = rt
+            .cleanup_progress_window
+            .expect("CleanupProgressWindow opened on confirm");
+        let task = rt
+            .active_cleanup
+            .as_ref()
+            .expect("ActiveCleanupTask stored on AppRuntime");
+        (prog_win, std::sync::Arc::clone(&task.cancel))
+    });
+    assert!(!cancel_arc.load(Ordering::Acquire));
+    assert_eq!(
+        cx.read(crate::current_tray_cleanup_status),
+        Some(crate::tray_menu::TrayCleanupStatus {
+            completed: 0,
+            total: 2,
+            cancelling: false,
+        })
+    );
+
+    let mut prog_cx = VisualTestContext::from_window(progress_win.into(), cx);
+    draw(&mut prog_cx);
+    assert!(prog_cx.debug_bounds("cleanup-progress-spinner").is_some());
+    assert!(prog_cx.debug_bounds("cleanup-progress-bar").is_some());
+    assert!(prog_cx.debug_bounds("cleanup-progress-counter").is_some());
+    assert!(prog_cx.debug_bounds("cleanup-progress-path").is_some());
+    let bg_btn = prog_cx
+        .debug_bounds("cleanup-progress-background")
+        .expect("background continue button");
+    assert!(prog_cx.debug_bounds("cleanup-progress-cancel").is_some());
+
+    // Clicking "Continue in Background" closes the window without cancelling.
+    prog_cx.simulate_click(bg_btn.center(), gpui_kit::Modifiers::none());
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+        assert!(rt.active_cleanup.is_some());
+    });
+    assert!(!cancel_arc.load(Ordering::Acquire));
+
+    // Tray ShowCleanupProgress reopens CleanupProgressWindow.
+    let reopened = cx.update(|cx| {
+        crate::handle_tray_action(
+            crate::tray_menu::TrayAction::ShowCleanupProgress,
+            cx,
+        );
+        cx.global::<crate::AppRuntime>()
+            .cleanup_progress_window
+            .expect("reopened progress window")
+    });
+    let mut reopened_cx = VisualTestContext::from_window(reopened.into(), cx);
+    draw(&mut reopened_cx);
+    assert!(
+        reopened_cx
+            .debug_bounds("cleanup-progress-cancel")
+            .is_some()
+    );
+
+    // CloseWindow shortcut (Cmd+W / Ctrl+W) hides without cancelling either.
+    reopened_cx.dispatch_action(crate::app_menu::CloseWindow);
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+        assert!(rt.active_cleanup.is_some());
+    });
+    assert!(!cancel_arc.load(Ordering::Acquire));
+
+    // Reopen once more and click "Cancel Cleanup".
+    let reopened2 = cx.update(|cx| {
+        crate::handle_tray_action(
+            crate::tray_menu::TrayAction::ShowCleanupProgress,
+            cx,
+        );
+        cx.global::<crate::AppRuntime>()
+            .cleanup_progress_window
+            .expect("reopened2 progress window")
+    });
+    let mut reopened2_cx = VisualTestContext::from_window(reopened2.into(), cx);
+    draw(&mut reopened2_cx);
+    let cancel_btn = reopened2_cx
+        .debug_bounds("cleanup-progress-cancel")
+        .expect("cancel button");
+    reopened2_cx
+        .simulate_click(cancel_btn.center(), gpui_kit::Modifiers::none());
+    assert!(cancel_arc.load(Ordering::Acquire));
+    assert_eq!(
+        cx.read(crate::current_tray_cleanup_status),
+        Some(crate::tray_menu::TrayCleanupStatus {
+            completed: 0,
+            total: 2,
+            cancelling: true,
+        })
+    );
+    draw(&mut reopened2_cx);
+    // Repeated click while stopping stays safe and disabled.
+    reopened2_cx
+        .simulate_click(cancel_btn.center(), gpui_kit::Modifiers::none());
+    assert!(cancel_arc.load(Ordering::Acquire));
+
+    // Release the gate and drain background cleanup: cancelled before
+    // executing items -> files stay, active_cleanup clears,
+    // NOTIF_TAG_CLEANUP_DONE sent, and progress window lingers for 3 seconds.
+    cleanup_gate.notify();
+    cx.run_until_parked();
+    assert!(file_a.exists());
+    assert!(file_b.exists());
+    let prog_win = cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.active_cleanup.is_none());
+        rt.cleanup_progress_window
+            .expect("progress window lingers after cancellation")
+    });
+    assert!(cx.read(crate::current_tray_cleanup_status).is_none());
+    let notifs = cx.shown_system_notifications();
+    assert_eq!(
+        notifs.last().map(|n| n.tag.as_ref()),
+        Some(NOTIF_TAG_CLEANUP_DONE)
+    );
+    assert!(
+        notifs
+            .last()
+            .is_some_and(|n| n.body.to_lowercase().contains("cancel"))
+    );
+
+    let mut done_cx = VisualTestContext::from_window(prog_win.into(), cx);
+    draw(&mut done_cx);
+    assert!(done_cx.debug_bounds("cleanup-progress-done-icon").is_some());
+    assert!(done_cx.debug_bounds("cleanup-progress-close").is_some());
+    assert!(done_cx.debug_bounds("cleanup-progress-cancel").is_none());
+
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_some());
+    });
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn cleanup_progress_window_renders_under_csd_and_refreshes_main_window_on_completion(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::{
+        AppContext as _, Decorations, Modifiers, ParentElement as _, Render,
+        Styled as _, Tiling, WindowControls, div, size,
+    };
+    use ruum_core::storage::{AiState, StorageDb};
+    use ruum_core::watchdog_config::{CleanupProposal, ProposalItem};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct CsdProgressHost {
+        inner: Entity<crate::CleanupProgressWindow>,
+    }
+
+    impl Render for CsdProgressHost {
+        fn render(
+            &mut self,
+            window: &mut gpui_kit::Window,
+            _: &mut Context<'_, Self>,
+        ) -> impl gpui_kit::IntoElement {
+            let state = crate::window_chrome::WindowChromeState {
+                decorations: Decorations::Client {
+                    tiling: Tiling::default(),
+                },
+                controls: WindowControls {
+                    fullscreen: false,
+                    maximize: false,
+                    minimize: true,
+                    window_menu: true,
+                },
+                button_layout:
+                    crate::window_chrome::default_linux_button_layout(),
+                is_maximized: false,
+                is_window_active: true,
+                window_size: window.bounds().size,
+            };
+            let entity = self.inner.clone();
+            let actions = crate::window_chrome::WindowChromeActions::new(
+                move |window, cx| {
+                    crate::CleanupProgressWindow::close_from_chrome(
+                        &entity.downgrade(),
+                        window,
+                        cx,
+                    );
+                },
+            );
+            crate::window_chrome::wrap_window_chrome_with(
+                "CSD Cleanup Progress",
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .child(self.inner.clone()),
+                state,
+                actions,
+            )
+        }
+    }
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Mutex::new(crate::CleanupProgressSnapshot {
+        total_items: 4,
+        total_bytes: 4096,
+        completed_items: 2,
+        reclaimed_bytes: 2048,
+        current_item: Some("~/junk/very/long/nested/path/cache.bin".into()),
+        cancelling: false,
+        completion: None,
+    }));
+    let cancel_check = Arc::clone(&cancel);
+    let (host_win, host_cx) = cx.add_window_view(move |_, cx| {
+        let inner = cx
+            .new(|cx| crate::CleanupProgressWindow::new(cancel, progress, cx));
+        CsdProgressHost { inner }
+    });
+    host_cx.simulate_resize(size(px(540.0), px(300.0)));
+    draw(host_cx);
+    let bg_b = host_cx
+        .debug_bounds("cleanup-progress-background")
+        .expect("bg button at default");
+    let cancel_b = host_cx
+        .debug_bounds("cleanup-progress-cancel")
+        .expect("cancel button at default");
+    let bar_b = host_cx.debug_bounds("csd-title-bar").expect("csd titlebar");
+    assert!(bg_b.top() >= bar_b.bottom());
+    assert!(bg_b.bottom() <= px(300.0));
+    assert!(cancel_b.bottom() <= px(300.0));
+
+    // Verify rendering across all 4 locales at minimum size 460x280.
+    host_cx.simulate_resize(size(px(460.0), px(280.0)));
+    for locale in [
+        crate::i18n::Locale::En,
+        crate::i18n::Locale::Zh,
+        crate::i18n::Locale::Ja,
+        crate::i18n::Locale::Ko,
+    ] {
+        host_win.update(host_cx, |host, cx| {
+            host.inner.update(cx, |win, cx| {
+                win.set_locale(locale);
+                cx.notify();
+            });
+        });
+        draw(host_cx);
+        let min_cancel_b = host_cx
+            .debug_bounds("cleanup-progress-cancel")
+            .expect("cancel button at min size");
+        assert!(min_cancel_b.bottom() <= px(280.0));
+    }
+
+    // Closing via Linux CSD close button must NOT set cancel.
+    let close_btn = host_cx
+        .debug_bounds("csd-btn-close")
+        .expect("csd close button");
+    host_cx.simulate_click(close_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert!(!cancel_check.load(Ordering::Acquire));
+    drop(host_win);
+
+    // End-to-end completion refreshes main window watchdog_home_space,
+    // ai_proposal, DB, and clears active_cleanup.
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let junk_file = temp.path().join("junk/done_item.bin");
+    std::fs::write(&junk_file, vec![b'z'; 512]).expect("write junk");
+    let proposal = CleanupProposal {
+        timestamp_secs: 1_700_000_100,
+        summary: "Complete test".into(),
+        items: vec![ProposalItem::new(
+            junk_file.clone(),
+            512,
+            RemovalMode::Permanent,
+            None,
+            None,
+        )],
+        docker_targets: Vec::new(),
+    };
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        let st = AiState::from_proposal(&proposal, 1_700_000_100).expect("st");
+        db.save_ai_state(&st).expect("save st");
+    }
+    let tree = scan(temp.path(), options()).expect("scan");
+    let root_path = temp.path().to_path_buf();
+    let db_for_win = db_path.clone();
+    let main_win = cx.add_window(move |_, cx| {
+        let mut app = Ruum::with_tree(root_path, tree, options(), 3, cx);
+        app.db_path = Some(db_for_win);
+        app.watchdog_home_space = None;
+        app.reload_watchdog_state();
+        app
+    });
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(main_win),
+            cx,
+        );
+    });
+    let req = crate::state::proposal_confirm_request(
+        temp.path().to_path_buf(),
+        &proposal,
+        crate::i18n::Locale::En,
+    );
+    let confirm_win = cx
+        .update(|cx| {
+            crate::open_local_confirm_window(
+                req,
+                Some(db_path.clone()),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
+        })
+        .expect("confirm win");
+    let mut confirm_cx = VisualTestContext::from_window(confirm_win.into(), cx);
+    draw(&mut confirm_cx);
+    let confirm_btn = confirm_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm button");
+    confirm_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(!junk_file.exists());
+    main_win
+        .read_with(cx, |app, _| {
+            assert!(app.ai_proposal.is_none());
+            assert!(app.watchdog_home_space.is_some());
+            assert!(app.watchdog_space_checked_at.is_some());
+        })
+        .expect("read main win after completion");
+    let reloaded = StorageDb::open(&db_path)
+        .expect("reopen db")
+        .load_ai_state()
+        .expect("load ai state");
+    assert!(reloaded.last_proposal_json.is_none());
+    let prog_win = cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.active_cleanup.is_none());
+        rt.cleanup_progress_window
+            .expect("progress window lingers in Completed state")
+    });
+    let mut prog_cx = VisualTestContext::from_window(prog_win.into(), cx);
+    draw(&mut prog_cx);
+    assert!(prog_cx.debug_bounds("cleanup-progress-done-icon").is_some());
+    assert!(prog_cx.debug_bounds("cleanup-progress-close").is_some());
+    assert!(prog_cx.debug_bounds("cleanup-progress-cancel").is_none());
+
+    cx.background_executor
+        .advance_clock(crate::CLEANUP_PROGRESS_LINGER);
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn cleanup_progress_completion_states_manual_close_background_and_locales(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::{
+        AppContext as _, Decorations, Modifiers, ParentElement as _, Render,
+        Styled as _, Tiling, WindowControls, div, size,
+    };
+    use ruum_core::storage::{AiState, StorageDb};
+    use ruum_core::watchdog_config::{CleanupProposal, ProposalItem};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct CsdDoneHost {
+        inner: Entity<crate::CleanupProgressWindow>,
+    }
+
+    impl Render for CsdDoneHost {
+        fn render(
+            &mut self,
+            window: &mut gpui_kit::Window,
+            _: &mut Context<'_, Self>,
+        ) -> impl gpui_kit::IntoElement {
+            let state = crate::window_chrome::WindowChromeState {
+                decorations: Decorations::Client {
+                    tiling: Tiling::default(),
+                },
+                controls: WindowControls {
+                    fullscreen: false,
+                    maximize: false,
+                    minimize: true,
+                    window_menu: true,
+                },
+                button_layout:
+                    crate::window_chrome::default_linux_button_layout(),
+                is_maximized: false,
+                is_window_active: true,
+                window_size: window.bounds().size,
+            };
+            let entity = self.inner.clone();
+            let actions = crate::window_chrome::WindowChromeActions::new(
+                move |window, cx| {
+                    crate::CleanupProgressWindow::close_from_chrome(
+                        &entity.downgrade(),
+                        window,
+                        cx,
+                    );
+                },
+            );
+            crate::window_chrome::wrap_window_chrome_with(
+                "CSD Cleanup Done",
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .child(self.inner.clone()),
+                state,
+                actions,
+            )
+        }
+    }
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+
+    // 1. Render Completed, Cancelled, and Failed completion states across all
+    //    4 locales at minimum size 460x280 under CSD without footer overflow.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Mutex::new(crate::CleanupProgressSnapshot {
+        total_items: 3,
+        total_bytes: 4096,
+        completed_items: 3,
+        reclaimed_bytes: 4096,
+        current_item: None,
+        cancelling: false,
+        completion: Some(crate::CleanupProgressCompletion::Completed {
+            count: 3,
+            bytes: 4096,
+        }),
+    }));
+    let progress_handle = Arc::clone(&progress);
+    let (host_win, host_cx) = cx.add_window_view(move |_, cx| {
+        let inner = cx
+            .new(|cx| crate::CleanupProgressWindow::new(cancel, progress, cx));
+        CsdDoneHost { inner }
+    });
+    host_cx.simulate_resize(size(px(460.0), px(280.0)));
+    let completions = [
+        crate::CleanupProgressCompletion::Completed {
+            count: 3,
+            bytes: 4096,
+        },
+        crate::CleanupProgressCompletion::Cancelled {
+            count: 1,
+            bytes: 1024,
+        },
+        crate::CleanupProgressCompletion::Failed {
+            message: "Docker cleanup failed: daemon unavailable".into(),
+        },
+    ];
+    for comp in completions {
+        if let Ok(mut snap) = progress_handle.lock() {
+            snap.completion = Some(comp);
+        }
+        for locale in crate::i18n::ALL_LOCALES {
+            host_win.update(host_cx, |host, cx| {
+                host.inner.update(cx, |win, cx| {
+                    win.set_locale(locale);
+                    cx.notify();
+                });
+            });
+            draw(host_cx);
+            assert!(
+                host_cx.debug_bounds("cleanup-progress-done-icon").is_some()
+            );
+            assert!(host_cx.debug_bounds("cleanup-progress-spinner").is_none());
+            assert!(host_cx.debug_bounds("cleanup-progress-cancel").is_none());
+            assert!(
+                host_cx
+                    .debug_bounds("cleanup-progress-background")
+                    .is_none()
+            );
+            let close_b = host_cx
+                .debug_bounds("cleanup-progress-close")
+                .expect("close button at min size");
+            assert!(
+                close_b.bottom() <= px(280.0),
+                "close button overflowed 460x280 in {locale:?}: {close_b:?}"
+            );
+        }
+    }
+    drop(host_win);
+
+    // 2. Manual early click on `cleanup-progress-close` closes immediately and
+    //    advancing the clock past 3s produces no error or stale close.
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let early_file = temp.path().join("junk/early_close.bin");
+    std::fs::write(&early_file, vec![b'e'; 512]).expect("write early file");
+    let proposal_a = CleanupProposal {
+        timestamp_secs: 1_700_000_200,
+        summary: "Early close test".into(),
+        items: vec![ProposalItem::new(
+            early_file.clone(),
+            512,
+            RemovalMode::Permanent,
+            None,
+            None,
+        )],
+        docker_targets: Vec::new(),
+    };
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        let st =
+            AiState::from_proposal(&proposal_a, 1_700_000_200).expect("st");
+        db.save_ai_state(&st).expect("save st");
+    }
+    cx.update(|cx| {
+        crate::install_notification_handler(cx);
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+    });
+    let req_a = crate::state::proposal_confirm_request(
+        temp.path().to_path_buf(),
+        &proposal_a,
+        crate::i18n::Locale::En,
+    );
+    let confirm_a = cx
+        .update(|cx| {
+            crate::open_local_confirm_window(
+                req_a,
+                Some(db_path.clone()),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
+        })
+        .expect("confirm win a");
+    let mut confirm_a_cx = VisualTestContext::from_window(confirm_a.into(), cx);
+    draw(&mut confirm_a_cx);
+    let confirm_btn_a = confirm_a_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm btn a");
+    confirm_a_cx.simulate_click(confirm_btn_a.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert!(!early_file.exists());
+
+    let prog_a = cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.active_cleanup.is_none());
+        rt.cleanup_progress_window
+            .expect("lingering window before manual close")
+    });
+    let mut prog_a_cx = VisualTestContext::from_window(prog_a.into(), cx);
+    draw(&mut prog_a_cx);
+    let close_btn = prog_a_cx
+        .debug_bounds("cleanup-progress-close")
+        .expect("cleanup-progress-close");
+    prog_a_cx.simulate_click(close_btn.center(), Modifiers::none());
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+        assert!(!cx.windows().contains(&prog_a.into()));
+    });
+    cx.background_executor
+        .advance_clock(crate::CLEANUP_PROGRESS_LINGER + Duration::from_secs(1));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+    });
+
+    // 3. Clicking `Continue in Background` before completion keeps
+    //    `cleanup_progress_window` as `None` when cleanup finishes (no reopen).
+    let bg_file = temp.path().join("junk/bg_finish.bin");
+    std::fs::write(&bg_file, vec![b'b'; 512]).expect("write bg file");
+    let proposal_b = CleanupProposal {
+        timestamp_secs: 1_700_000_300,
+        summary: "Background finish test".into(),
+        items: vec![ProposalItem::new(
+            bg_file.clone(),
+            512,
+            RemovalMode::Permanent,
+            None,
+            None,
+        )],
+        docker_targets: Vec::new(),
+    };
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        let st =
+            AiState::from_proposal(&proposal_b, 1_700_000_300).expect("st");
+        db.save_ai_state(&st).expect("save st");
+    }
+    let cleanup_gate = Arc::new(crate::AsyncSignal::default());
+    let cleanup_gate_rt = Arc::clone(&cleanup_gate);
+    cx.update(|cx| {
+        crate::with_runtime_mut(cx, |rt| {
+            rt.test_cleanup_gate = Some(cleanup_gate_rt);
+        });
+    });
+    let req_b = crate::state::proposal_confirm_request(
+        temp.path().to_path_buf(),
+        &proposal_b,
+        crate::i18n::Locale::En,
+    );
+    let confirm_b = cx
+        .update(|cx| {
+            crate::open_local_confirm_window(
+                req_b,
+                Some(db_path),
+                ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+                cx,
+            )
+        })
+        .expect("confirm win b");
+    let mut confirm_b_cx = VisualTestContext::from_window(confirm_b.into(), cx);
+    draw(&mut confirm_b_cx);
+    let confirm_btn_b = confirm_b_cx
+        .debug_bounds("confirm-clean")
+        .expect("confirm btn b");
+    confirm_b_cx.simulate_click(confirm_btn_b.center(), Modifiers::none());
+
+    let prog_b = cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.active_cleanup.is_some());
+        rt.cleanup_progress_window
+            .expect("progress window open before background")
+    });
+    let mut prog_b_cx = VisualTestContext::from_window(prog_b.into(), cx);
+    draw(&mut prog_b_cx);
+    let bg_btn = prog_b_cx
+        .debug_bounds("cleanup-progress-background")
+        .expect("background button");
+    prog_b_cx.simulate_click(bg_btn.center(), Modifiers::none());
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+        assert!(rt.active_cleanup.is_some());
+    });
+
+    cleanup_gate.notify();
+    cx.run_until_parked();
+    assert!(!bg_file.exists());
+    cx.read(|cx| {
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.active_cleanup.is_none());
+        assert!(rt.cleanup_progress_window.is_none());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "gpui_kit::test passes &mut TestAppContext"
+)]
+fn request_quit_cancels_active_cleanup_and_closes_progress_window(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_bg = Arc::clone(&cancel);
+    let progress = Arc::new(Mutex::new(crate::CleanupProgressSnapshot {
+        total_items: 5,
+        total_bytes: 5000,
+        completed_items: 1,
+        reclaimed_bytes: 1000,
+        current_item: Some("~/junk/item.bin".into()),
+        cancelling: false,
+        completion: None,
+    }));
+
+    cx.update(|cx| {
+        crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
+        crate::with_runtime_mut(cx, |rt| {
+            rt.active_cleanup = Some(crate::ActiveCleanupTask {
+                cancel: Arc::clone(&cancel),
+                progress,
+            });
+        });
+        let win = crate::open_cleanup_progress_window(cx)
+            .expect("open progress window");
+        assert!(cx.windows().contains(&win.into()));
+        crate::app_menu::request_quit(cx);
+        assert!(crate::app_menu::is_quitting(cx));
+        let rt = cx.global::<crate::AppRuntime>();
+        assert!(rt.cleanup_progress_window.is_none());
+        assert!(rt.active_cleanup.is_none());
+    });
+    assert!(cancel_bg.load(Ordering::Acquire));
+}
+
+#[gpui_kit::test]
+fn explore_top_bar_ai_button_layout_icons_and_locales(cx: &mut TestAppContext) {
+    use gpui_kit::AssetSource as _;
+    use gpui_kit::assets::IconName;
+
+    assert!(
+        crate::RuumAssets
+            .load(IconName::Bot.path().as_ref())
+            .expect("bot icon load")
+            .is_some()
+    );
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    let assert_inside =
+        |name: &str, bounds: Bounds<Pixels>, width: f32, height: f32| {
+            assert!(
+                bounds.origin.x >= px(0.)
+                    && bounds.right() <= px(width)
+                    && bounds.origin.y >= px(0.)
+                    && bounds.bottom() <= px(height),
+                "{name} out of {width}x{height} bounds: {bounds:?}"
+            );
+        };
+
+    for (width, height) in [(1440., 900.), (900., 600.)] {
+        cx.simulate_resize(gpui_kit::size(px(width), px(height)));
+        for locale in crate::i18n::ALL_LOCALES {
+            update(&view, cx, |app, cx| {
+                app.set_locale(locale);
+                app.watchdog_analyzing = false;
+                cx.notify();
+            });
+            draw(cx);
+            let switch_b = cx
+                .debug_bounds("trail-switch-root")
+                .expect("trail-switch-root");
+            let ai_b = cx
+                .debug_bounds("trail-ai-analyze")
+                .expect("trail-ai-analyze");
+            assert_inside("trail-switch-root", switch_b, width, height);
+            assert_inside("trail-ai-analyze", ai_b, width, height);
+            assert!(
+                ai_b.left() >= switch_b.right(),
+                "expected trail-ai-analyze beside trail-switch-root in \
+                 {locale:?}: switch={switch_b:?}, ai={ai_b:?}"
+            );
+            assert!(
+                (ai_b.center().y - switch_b.center().y).abs() < px(10.),
+                "top bar buttons misaligned in {locale:?}: \
+                 switch={switch_b:?}, ai={ai_b:?}"
+            );
+            assert!(cx.debug_bounds("trail-ai-analyze-spin").is_none());
+        }
+    }
+
+    update(&view, cx, |app, cx| {
+        app.watchdog_analyzing = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("trail-ai-analyze").is_some());
+    assert!(cx.debug_bounds("trail-ai-analyze-spin").is_some());
+}
+
+#[gpui_kit::test]
+fn explore_ai_button_local_click_dispatches_and_guards_reentry(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+
+    let counter = CountingRootSecret::new([0x61; 32]);
+    let store = counter.store_for(&enc_path);
+    store.set_ai_api_key("test-key").expect("save api key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock api");
+    let addr = listener.local_addr().expect("mock addr");
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let req_count_srv = Arc::clone(&req_count);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            if stop_srv.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = read_test_http_request(&mut stream);
+            req_count_srv.fetch_add(1, Ordering::AcqRel);
+            let proposal_json = serde_json::json!({
+                "summary": "All clean",
+                "items": []
+            })
+            .to_string();
+            let chunk1 = serde_json::json!({
+                "id": "c-local",
+                "object": "chat.completion.chunk",
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": proposal_json },
+                    "finish_reason": null
+                }]
+            });
+            let chunk2 = serde_json::json!({
+                "id": "c-local",
+                "object": "chat.completion.chunk",
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            let sse =
+                format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+            write_test_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                &sse,
+            );
+        }
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    let home_root =
+        std::env::home_dir().unwrap_or_else(|| temp.path().to_path_buf());
+    update(&view, win_cx, |app, cx| {
+        app.root_path = home_root;
+        app.db_path = Some(db_path);
+        app.cred_store = Some(store);
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr}/v1");
+        app.ai_config.model = Some("gpt-test".into());
+        app.watchdog_draft.model = Some("gpt-test".into());
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_input_model = None;
+        cx.notify();
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_none());
+
+    // 1. Clicking `trail-ai-analyze` on HostTabKey::Local dispatches
+    //    `run_ai_analysis_now` and settles on Explore.
+    let ai_bounds = win_cx
+        .debug_bounds("trail-ai-analyze")
+        .expect("trail-ai-analyze");
+    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+        assert!(!app.watchdog_analyzing);
+        let expected = crate::i18n::messages::ai_found_no_files(app.locale);
+        assert_eq!(
+            app.notice.as_ref().map(|(m, _)| m.as_str()),
+            Some(expected)
+        );
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_none());
+    assert_eq!(req_count.load(Ordering::Acquire), 1);
+
+    // 2. While `watchdog_analyzing` is true, `trail-ai-analyze-spin` renders
+    //    and clicking `trail-ai-analyze` is guarded against re-entry.
+    update(&view, win_cx, |app, cx| {
+        app.notice = None;
+        app.run_ai_analysis_now(cx);
+    });
+    draw(win_cx);
+    let in_flight_epoch = read(&view, win_cx, |app| {
+        assert!(app.watchdog_analyzing);
+        app.watchdog_analysis_epoch
+    });
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_some());
+
+    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
+    win_cx.run_until_parked();
+
+    stop.store(true, Ordering::Release);
+    let _ = TcpStream::connect(addr);
+    server.join().expect("server join");
+
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert_eq!(app.watchdog_analysis_epoch, in_flight_epoch);
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_none());
+    assert_eq!(req_count.load(Ordering::Acquire), 2);
+}
+
+#[gpui_kit::test]
+fn explore_ai_button_ssh_tab_dispatches_and_respects_state(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::{ExploreHostTab, ExploreSessionSnapshot, HostTabKey};
+    use gpui_kit::Modifiers;
+    use ruum_core::credentials::SshCredentialSecret;
+    use ruum_core::ssh_session::{SshAuthMaterial, SshEndpoint, SshSession};
+    use ruum_core::storage::{AuthMode, SshProfile};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x62; 32]);
+
+    // Closed ephemeral port ensures instant ECONNREFUSED if SSH runs.
+    let closed_port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind port")
+        .local_addr()
+        .expect("addr")
+        .port();
+
+    let profile = SshProfile {
+        id: "srv-explore-ai".into(),
+        alias: "prod-ai".into(),
+        host: "127.0.0.1".into(),
+        port: closed_port,
+        username: "deploy".into(),
+        auth_mode: AuthMode::Password,
+        default_path: Some("~".into()),
+        created_at_secs: 1,
+        updated_at_secs: 1,
+        last_total_bytes: None,
+        last_available_bytes: None,
+        last_scanned_secs: None,
+        pending_script_path: None,
+        pending_script_items: None,
+        pending_reclaim_bytes: None,
+        pending_created_secs: None,
+    };
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    let mut remote_snap = ExploreSessionSnapshot::default();
+    remote_snap.root_path = PathBuf::from("/home/deploy");
+    remote_snap.scan_root = PathBuf::from("/home/deploy");
+    remote_snap.tree =
+        Some(Arc::new(scan(temp.path(), options()).expect("scan")));
+    remote_snap.remote = Some("prod-ai".into());
+    remote_snap.remote_platform = "linux".into();
+    remote_snap.active_ssh_profile_id = Some(profile.id.clone());
+
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path);
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.ssh_profiles = vec![profile.clone()];
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh(profile.id.clone()),
+            label: "prod-ai".into(),
+            session: Some(remote_snap),
+        });
+        app.switch_host_tab(HostTabKey::Ssh(profile.id.clone()), cx);
+    });
+    draw(win_cx);
+
+    // 1. Disconnected SSH tab (`active_ssh_session == None`): button is
+    //    disabled and click does not dispatch analysis.
+    let ai_bounds = win_cx
+        .debug_bounds("trail-ai-analyze")
+        .expect("trail-ai-analyze");
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_none());
+    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(!app.ssh_analyzing_profiles.contains("srv-explore-ai"));
+        assert!(app.notice.is_none());
+    });
+
+    // 2. Closed SSH session is also treated as disconnected.
+    let endpoint = SshEndpoint::from_profile(&profile).expect("endpoint");
+    let material = SshAuthMaterial::from_credential_secret(
+        &SshCredentialSecret::Password {
+            password: "dummy-password".into(),
+        },
+    );
+    let mut closed_session =
+        SshSession::start(endpoint.clone(), material.clone(), 15)
+            .expect("start closed session");
+    closed_session.close();
+    update(&view, win_cx, |app, cx| {
+        app.active_ssh_session = Some(Arc::new(closed_session));
+        cx.notify();
+    });
+    draw(win_cx);
+    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(!app.ssh_analyzing_profiles.contains("srv-explore-ai"));
+        assert!(app.notice.is_none());
+    });
+
+    // 3. Live SSH session shows spinner while in-flight and ignores clicks.
+    let live_session =
+        Arc::new(SshSession::start(endpoint, material, 15).expect("live"));
+    update(&view, win_cx, |app, cx| {
+        app.active_ssh_session = Some(live_session);
+        app.ssh_analyzing_profiles.insert("srv-explore-ai".into());
+        cx.notify();
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_some());
+    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(app.notice.is_none());
+    });
+
+    // 4. Connected idle SSH tab dispatches `analyze_ssh_profile(&id, cx)`.
+    update(&view, win_cx, |app, cx| {
+        app.ssh_analyzing_profiles.remove("srv-explore-ai");
+        cx.notify();
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_none());
+
+    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        assert!(!app.ssh_analyzing_profiles.contains("srv-explore-ai"));
+        let (msg, status) = app.notice.as_ref().expect("ssh analyze notice");
+        assert_eq!(*status, gpui_omarchy::Status::Error);
+        assert!(msg.contains("prod-ai"), "unexpected notice: {msg}");
+    });
 }

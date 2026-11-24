@@ -10,6 +10,8 @@ pub mod access;
 pub mod ai_cli;
 #[cfg(feature = "service")]
 pub mod auth;
+#[cfg(feature = "service")]
+pub mod autostart;
 pub mod classify;
 #[cfg(feature = "service")]
 pub mod cli_install;

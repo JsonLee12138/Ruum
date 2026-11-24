@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -180,6 +180,9 @@ pub enum IpcRequest {
     OpenWindow {
         token: String,
         tag: String,
+    },
+    Ping {
+        token: String,
     },
 }
 
@@ -390,7 +393,8 @@ where
         | IpcRequest::ConfirmRemoteConnect { token, .. }
         | IpcRequest::NotifyWatchdogUpdate { token }
         | IpcRequest::ShowNotification { token, .. }
-        | IpcRequest::OpenWindow { token, .. } => token.as_str(),
+        | IpcRequest::OpenWindow { token, .. }
+        | IpcRequest::Ping { token } => token.as_str(),
     };
 
     let response = if token == expected_token {
@@ -413,6 +417,14 @@ where
     stream.flush()?;
     Ok(())
 }
+
+/// Connected IPC stream returned by [`IpcListenerGuard::accept`].
+#[cfg(unix)]
+pub type IpcStream = UnixStream;
+
+/// Connected IPC stream returned by [`IpcListenerGuard::accept`].
+#[cfg(windows)]
+pub type IpcStream = TcpStream;
 
 /// Guarded local IPC server listener that removes its socket/port on drop.
 #[cfg(unix)]
@@ -445,6 +457,17 @@ impl IpcListenerGuard {
         })
     }
 
+    /// Accept a single incoming IPC connection with bounded header I/O
+    /// timeouts so stalled probes cannot wedge worker threads.
+    pub fn accept(&self) -> io::Result<IpcStream> {
+        let (stream, _) = self.listener.accept()?;
+        let _ =
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let _ =
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+        Ok(stream)
+    }
+
     pub fn accept_and_handle<H>(
         &self,
         expected_token: &str,
@@ -453,7 +476,7 @@ impl IpcListenerGuard {
     where
         H: Fn(IpcRequest) -> io::Result<IpcResponse>,
     {
-        let (stream, _) = self.listener.accept()?;
+        let stream = self.accept()?;
         handle_ipc_stream(stream, expected_token, handler)
     }
 
@@ -480,6 +503,21 @@ pub struct IpcListenerGuard {
 #[cfg(windows)]
 impl IpcListenerGuard {
     pub fn bind(port_path: &Path) -> io::Result<Self> {
+        if port_path.exists()
+            && let Ok(content) = fs::read_to_string(port_path)
+            && let Ok(port) = content.trim().parse::<u16>()
+            && let Ok(addr) = format!("127.0.0.1:{port}").parse::<SocketAddr>()
+            && TcpStream::connect_timeout(
+                &addr,
+                std::time::Duration::from_millis(200),
+            )
+            .is_ok()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "ruum IPC port already in use",
+            ));
+        }
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         if let Some(parent) = port_path.parent() {
@@ -492,6 +530,17 @@ impl IpcListenerGuard {
         })
     }
 
+    /// Accept a single incoming IPC connection with bounded header I/O
+    /// timeouts so stalled probes cannot wedge worker threads.
+    pub fn accept(&self) -> io::Result<IpcStream> {
+        let (stream, _) = self.listener.accept()?;
+        let _ =
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let _ =
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+        Ok(stream)
+    }
+
     pub fn accept_and_handle<H>(
         &self,
         expected_token: &str,
@@ -500,7 +549,7 @@ impl IpcListenerGuard {
     where
         H: Fn(IpcRequest) -> io::Result<IpcResponse>,
     {
-        let (stream, _) = self.listener.accept()?;
+        let stream = self.accept()?;
         handle_ipc_stream(stream, expected_token, handler)
     }
 
@@ -536,7 +585,8 @@ pub const fn ipc_read_timeout(request: &IpcRequest) -> std::time::Duration {
         | IpcRequest::ConfirmRemoteConnect { .. } => IPC_CONFIRM_READ_TIMEOUT,
         IpcRequest::NotifyWatchdogUpdate { .. }
         | IpcRequest::ShowNotification { .. }
-        | IpcRequest::OpenWindow { .. } => IPC_NOTIFY_READ_TIMEOUT,
+        | IpcRequest::OpenWindow { .. }
+        | IpcRequest::Ping { .. } => IPC_NOTIFY_READ_TIMEOUT,
     }
 }
 
@@ -1257,7 +1307,8 @@ mod tests {
                     }
                     IpcRequest::NotifyWatchdogUpdate { .. }
                     | IpcRequest::ShowNotification { .. }
-                    | IpcRequest::OpenWindow { .. } => Ok(IpcResponse::Ok),
+                    | IpcRequest::OpenWindow { .. }
+                    | IpcRequest::Ping { .. } => Ok(IpcResponse::Ok),
                 })
                 .unwrap();
 
@@ -1413,7 +1464,41 @@ mod tests {
         let open_json = serde_json::to_string(&open_req).unwrap();
         let open_parsed: IpcRequest = serde_json::from_str(&open_json).unwrap();
         assert_eq!(open_parsed, open_req);
-        assert_eq!(ipc_read_timeout(&open_req), IPC_NOTIFY_READ_TIMEOUT);
+        let ping_req = IpcRequest::Ping {
+            token: "tok".to_string(),
+        };
+        let ping_json = serde_json::to_string(&ping_req).unwrap();
+        let ping_parsed: IpcRequest = serde_json::from_str(&ping_json).unwrap();
+        assert_eq!(ping_parsed, ping_req);
+        assert_eq!(ipc_read_timeout(&ping_req), IPC_NOTIFY_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn ipc_listener_accept_separates_stream_handling_and_handles_ping() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = "accept_token_123456789012345678901234".to_string();
+
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("accept.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("accept.port");
+
+        let listener = IpcListenerGuard::bind(&socket_or_port).unwrap();
+        let server_token = token.clone();
+        let handle = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            handle_ipc_stream(stream, &server_token, |req| match req {
+                IpcRequest::Ping { .. } => Ok(IpcResponse::Ok),
+                other => panic!("unexpected req: {other:?}"),
+            })
+            .unwrap();
+        });
+
+        let resp =
+            send_ipc_message(&socket_or_port, &IpcRequest::Ping { token })
+                .unwrap();
+        assert_eq!(resp, IpcResponse::Ok);
+        handle.join().unwrap();
     }
 
     #[test]

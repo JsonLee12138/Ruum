@@ -83,6 +83,57 @@ pub fn service_status(runner: &dyn CommandRunner) -> io::Result<ServiceStatus> {
     ruum_watchdog::service::service_status(&bridge)
 }
 
+/// Fast check whether the legacy headless `ruum watchdog` OS service has any
+/// residue in the given OS/environment.
+#[must_use]
+pub fn has_legacy_service_residue_in(
+    os: ServiceOs,
+    env: &ServiceEnv,
+    runner: &dyn CommandRunner,
+) -> bool {
+    let bridge = CommandServiceRunner::new(runner);
+    ruum_watchdog::service::has_service_residue_in(os, env, &bridge)
+}
+
+/// Fast check whether the legacy headless `ruum watchdog` OS service has any
+/// residue on the current host.
+#[must_use]
+pub fn has_legacy_service_residue(runner: &dyn CommandRunner) -> bool {
+    has_legacy_service_residue_in(
+        ServiceAdapterFactory::current_os(),
+        &ServiceEnv::current(),
+        runner,
+    )
+}
+
+/// Uninstall the legacy headless `ruum watchdog` OS service only when residue
+/// is detected.
+pub fn uninstall_legacy_service_if_present_in(
+    os: ServiceOs,
+    env: &ServiceEnv,
+    runner: &dyn CommandRunner,
+) -> io::Result<bool> {
+    if !has_legacy_service_residue_in(os, env, runner) {
+        return Ok(false);
+    }
+    let bridge = CommandServiceRunner::new(runner);
+    ServiceAdapterFactory::create_for(os).uninstall(&bridge, env)?;
+    Ok(true)
+}
+
+/// Uninstall the legacy headless `ruum watchdog` OS service on the current
+/// host only when residue is detected, bounded by `timeout`.
+pub fn uninstall_legacy_service_if_present(
+    timeout: std::time::Duration,
+) -> io::Result<bool> {
+    let runner = crate::ai_cli::TimedCommandRunner::new(timeout);
+    uninstall_legacy_service_if_present_in(
+        ServiceAdapterFactory::current_os(),
+        &ServiceEnv::current(),
+        &runner,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +215,41 @@ mod tests {
             calls[1].2,
             vec![("RUUM_EXE".to_string(), r"C:\Ruum\ruum.exe".to_string())]
         );
+    }
+
+    #[test]
+    fn uninstall_legacy_service_skips_subprocess_when_no_residue_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = ServiceEnv {
+            home: Some(temp.path().to_path_buf()),
+            xdg_config_home: Some(temp.path().join("xdg")),
+            appdata: Some(temp.path().join("AppData")),
+        };
+        let cmd_runner = RecordingCommandRunner::default();
+
+        let uninstalled = uninstall_legacy_service_if_present_in(
+            ServiceOs::MacOs,
+            &env,
+            &cmd_runner,
+        )
+        .unwrap();
+        assert!(!uninstalled);
+        assert!(cmd_runner.calls.lock().unwrap().is_empty());
+
+        let plist = temp
+            .path()
+            .join("Library/LaunchAgents/com.ruum.watchdog.plist");
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "legacy").unwrap();
+
+        let uninstalled = uninstall_legacy_service_if_present_in(
+            ServiceOs::MacOs,
+            &env,
+            &cmd_runner,
+        )
+        .unwrap();
+        assert!(uninstalled);
+        assert!(!plist.exists());
+        assert_eq!(cmd_runner.calls.lock().unwrap().len(), 1);
     }
 }

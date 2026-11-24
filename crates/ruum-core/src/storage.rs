@@ -24,6 +24,9 @@ use ruum_watchdog::WatchdogConfigService;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::i18n::{
+    MAX_AI_FAILURE_SUMMARY_CHARS, clean_ai_failure_reason, truncate_single_line,
+};
 use crate::watchdog_config::{AiCliProvider, ApiProtocol, CleanupProposal};
 
 /// Default scan power preset.
@@ -70,6 +73,9 @@ CREATE TABLE IF NOT EXISTS app_settings (
     include_hidden INTEGER NOT NULL DEFAULT 1,
     follow_system_appearance INTEGER NOT NULL DEFAULT 1,
     ssh_session_duration_minutes INTEGER NOT NULL DEFAULT 15,
+    close_to_background INTEGER NOT NULL DEFAULT 1,
+    launch_at_login INTEGER NOT NULL DEFAULT 0,
+    tray_show_disk_space INTEGER NOT NULL DEFAULT 0,
     updated_at_secs INTEGER NOT NULL DEFAULT 0
 );
 
@@ -127,6 +133,8 @@ CREATE TABLE IF NOT EXISTS ai_config (
 CREATE TABLE IF NOT EXISTS ai_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_proposal_json TEXT,
+    last_error TEXT,
+    last_error_at_secs INTEGER,
     updated_at_secs INTEGER NOT NULL DEFAULT 0
 );
 
@@ -152,6 +160,9 @@ pub struct AppSettings {
     pub include_hidden: bool,
     pub follow_system_appearance: bool,
     pub ssh_session_duration_minutes: u64,
+    pub close_to_background: bool,
+    pub launch_at_login: bool,
+    pub tray_show_disk_space: bool,
     pub updated_at_secs: u64,
 }
 
@@ -164,6 +175,9 @@ impl Default for AppSettings {
             include_hidden: true,
             follow_system_appearance: true,
             ssh_session_duration_minutes: DEFAULT_SSH_SESSION_DURATION_MINUTES,
+            close_to_background: true,
+            launch_at_login: false,
+            tray_show_disk_space: false,
             updated_at_secs: 0,
         }
     }
@@ -187,6 +201,9 @@ impl AppSettings {
             ssh_session_duration_minutes: self
                 .ssh_session_duration_minutes
                 .max(MIN_SSH_SESSION_DURATION_MINUTES),
+            close_to_background: self.close_to_background,
+            launch_at_login: self.launch_at_login,
+            tray_show_disk_space: self.tray_show_disk_space,
             updated_at_secs: self.updated_at_secs,
         }
     }
@@ -547,6 +564,8 @@ impl AiConfig {
 #[serde(default)]
 pub struct AiState {
     pub last_proposal_json: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at_secs: Option<u64>,
     pub updated_at_secs: u64,
 }
 
@@ -579,6 +598,8 @@ impl AiState {
         })?;
         Ok(Self {
             last_proposal_json: Some(json),
+            last_error: None,
+            last_error_at_secs: None,
             updated_at_secs,
         })
     }
@@ -988,6 +1009,60 @@ fn migrate_ai_config_api_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_ai_state_error_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(ai_state)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            existing.insert(name);
+        }
+    }
+    for (col_name, col_def) in
+        [("last_error", "TEXT"), ("last_error_at_secs", "INTEGER")]
+    {
+        if !existing.contains(col_name) {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE ai_state ADD COLUMN {col_name} {col_def}"
+                ),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_app_settings_background_columns(
+    conn: &Connection,
+) -> rusqlite::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(app_settings)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            existing.insert(name);
+        }
+    }
+    for (col_name, col_def) in [
+        ("close_to_background", "INTEGER NOT NULL DEFAULT 1"),
+        ("launch_at_login", "INTEGER NOT NULL DEFAULT 0"),
+        ("tray_show_disk_space", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !existing.contains(col_name) {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE app_settings ADD COLUMN {col_name} {col_def}"
+                ),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate_legacy_webhook_config(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO webhook_endpoints (
@@ -1107,8 +1182,10 @@ impl StorageDb {
                 "PRAGMA busy_timeout = 5000;\nPRAGMA journal_mode = WAL;",
             )?;
             conn.execute_batch(SCHEMA_SQL)?;
+            migrate_app_settings_background_columns(&conn)?;
             migrate_ssh_profiles_pending_columns(&conn)?;
             migrate_ai_config_api_columns(&conn)?;
+            migrate_ai_state_error_columns(&conn)?;
             migrate_legacy_webhook_config(&conn)
         })?;
         Ok(Self {
@@ -1168,7 +1245,8 @@ impl StorageDb {
             conn.query_row(
                 "SELECT power_preset, default_depth, apparent_size, \
                  include_hidden, follow_system_appearance, \
-                 ssh_session_duration_minutes, updated_at_secs \
+                 ssh_session_duration_minutes, close_to_background, \
+                 launch_at_login, tray_show_disk_space, updated_at_secs \
                  FROM app_settings WHERE id = 1",
                 [],
                 |row| {
@@ -1178,7 +1256,10 @@ impl StorageDb {
                     let include_hidden: i64 = row.get(3)?;
                     let follow_system_appearance: i64 = row.get(4)?;
                     let ssh_duration: i64 = row.get(5)?;
-                    let updated_at_secs: i64 = row.get(6)?;
+                    let close_to_background: i64 = row.get(6)?;
+                    let launch_at_login: i64 = row.get(7)?;
+                    let tray_show_disk_space: i64 = row.get(8)?;
+                    let updated_at_secs: i64 = row.get(9)?;
                     Ok(AppSettings {
                         power_preset,
                         default_depth: u32::try_from(default_depth)
@@ -1189,6 +1270,9 @@ impl StorageDb {
                         ssh_session_duration_minutes: sqlite_i64_to_u64(
                             ssh_duration,
                         ),
+                        close_to_background: close_to_background != 0,
+                        launch_at_login: launch_at_login != 0,
+                        tray_show_disk_space: tray_show_disk_space != 0,
                         updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
                     })
                 },
@@ -1206,8 +1290,9 @@ impl StorageDb {
                 "INSERT INTO app_settings (
                     id, power_preset, default_depth, apparent_size,
                     include_hidden, follow_system_appearance,
-                    ssh_session_duration_minutes, updated_at_secs
-                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ssh_session_duration_minutes, close_to_background,
+                    launch_at_login, tray_show_disk_space, updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(id) DO UPDATE SET
                     power_preset = excluded.power_preset,
                     default_depth = excluded.default_depth,
@@ -1216,6 +1301,9 @@ impl StorageDb {
                     follow_system_appearance = excluded.follow_system_appearance,
                     ssh_session_duration_minutes =
                         excluded.ssh_session_duration_minutes,
+                    close_to_background = excluded.close_to_background,
+                    launch_at_login = excluded.launch_at_login,
+                    tray_show_disk_space = excluded.tray_show_disk_space,
                     updated_at_secs = excluded.updated_at_secs",
                 params![
                     norm.power_preset,
@@ -1224,6 +1312,9 @@ impl StorageDb {
                     i64::from(norm.include_hidden),
                     i64::from(norm.follow_system_appearance),
                     u64_to_sqlite_i64(norm.ssh_session_duration_minutes),
+                    i64::from(norm.close_to_background),
+                    i64::from(norm.launch_at_login),
+                    i64::from(norm.tray_show_disk_space),
                     u64_to_sqlite_i64(norm.updated_at_secs),
                 ],
             )
@@ -1975,14 +2066,19 @@ impl StorageDb {
     pub fn load_ai_state(&self) -> io::Result<AiState> {
         let row = self.with_conn_retry(|conn| {
             conn.query_row(
-                "SELECT last_proposal_json, updated_at_secs \
-                 FROM ai_state WHERE id = 1",
+                "SELECT last_proposal_json, last_error, last_error_at_secs, \
+                 updated_at_secs FROM ai_state WHERE id = 1",
                 [],
                 |row| {
                     let last_proposal_json: Option<String> = row.get(0)?;
-                    let updated_at_secs: i64 = row.get(1)?;
+                    let last_error: Option<String> = row.get(1)?;
+                    let last_error_at_secs: Option<i64> = row.get(2)?;
+                    let updated_at_secs: i64 = row.get(3)?;
                     Ok(AiState {
                         last_proposal_json,
+                        last_error,
+                        last_error_at_secs: last_error_at_secs
+                            .and_then(|v| u64::try_from(v).ok()),
                         updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
                     })
                 },
@@ -1993,6 +2089,9 @@ impl StorageDb {
     }
 
     /// Persist `ai_state`, validating `last_proposal_json` when present.
+    ///
+    /// Saving a non-empty proposal automatically clears `last_error` and
+    /// `last_error_at_secs`.
     pub fn save_ai_state(&self, state: &AiState) -> io::Result<()> {
         let clean_json = match state.last_proposal_json.as_deref() {
             Some(raw) => {
@@ -2013,14 +2112,92 @@ impl StorageDb {
             None => None,
         };
 
+        let (clean_error, clean_error_at) = if clean_json.is_some() {
+            (None, None)
+        } else {
+            let err = state
+                .last_error
+                .as_deref()
+                .map(clean_ai_failure_reason)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    truncate_single_line(&s, MAX_AI_FAILURE_SUMMARY_CHARS)
+                });
+            let err_at = err
+                .as_ref()
+                .and(state.last_error_at_secs)
+                .map(u64_to_sqlite_i64);
+            (err, err_at)
+        };
+
         self.with_conn_retry(|conn| {
             conn.execute(
-                "INSERT INTO ai_state (id, last_proposal_json, updated_at_secs)
-                 VALUES (1, ?1, ?2)
+                "INSERT INTO ai_state (
+                    id, last_proposal_json, last_error,
+                    last_error_at_secs, updated_at_secs
+                 )
+                 VALUES (1, ?1, ?2, ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
                     last_proposal_json = excluded.last_proposal_json,
+                    last_error = excluded.last_error,
+                    last_error_at_secs = excluded.last_error_at_secs,
                     updated_at_secs = excluded.updated_at_secs",
-                params![clean_json, u64_to_sqlite_i64(state.updated_at_secs)],
+                params![
+                    clean_json,
+                    clean_error,
+                    clean_error_at,
+                    u64_to_sqlite_i64(state.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Record the latest AI analysis error summary without overwriting any
+    /// existing `last_proposal_json`.
+    pub fn record_ai_error(
+        &self,
+        err_summary: &str,
+        now_secs: u64,
+    ) -> io::Result<()> {
+        let cleaned = clean_ai_failure_reason(err_summary);
+        let summary = if cleaned.is_empty() {
+            "AI analysis failed".to_owned()
+        } else {
+            truncate_single_line(&cleaned, MAX_AI_FAILURE_SUMMARY_CHARS)
+        };
+        let ts = u64_to_sqlite_i64(now_secs);
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO ai_state (
+                    id, last_proposal_json, last_error,
+                    last_error_at_secs, updated_at_secs
+                 )
+                 VALUES (1, NULL, ?1, ?2, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    last_error = excluded.last_error,
+                    last_error_at_secs = excluded.last_error_at_secs,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![summary, ts],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Clear `last_error` and `last_error_at_secs` without overwriting any
+    /// existing `last_proposal_json`.
+    pub fn clear_ai_error(&self, now_secs: u64) -> io::Result<()> {
+        let ts = u64_to_sqlite_i64(now_secs);
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "UPDATE ai_state
+                 SET last_error = NULL,
+                     last_error_at_secs = NULL,
+                     updated_at_secs = ?1
+                 WHERE id = 1
+                   AND (last_error IS NOT NULL
+                        OR last_error_at_secs IS NOT NULL)",
+                params![ts],
             )
             .map(|_| ())
         })
@@ -2039,14 +2216,20 @@ impl StorageDb {
                 conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let row = tx
                 .query_row(
-                    "SELECT last_proposal_json, updated_at_secs \
+                    "SELECT last_proposal_json, last_error, \
+                     last_error_at_secs, updated_at_secs \
                      FROM ai_state WHERE id = 1",
                     [],
                     |row| {
                         let last_proposal_json: Option<String> = row.get(0)?;
-                        let updated_at_secs: i64 = row.get(1)?;
+                        let last_error: Option<String> = row.get(1)?;
+                        let last_error_at_secs: Option<i64> = row.get(2)?;
+                        let updated_at_secs: i64 = row.get(3)?;
                         Ok(AiState {
                             last_proposal_json,
+                            last_error,
+                            last_error_at_secs: last_error_at_secs
+                                .and_then(|v| u64::try_from(v).ok()),
                             updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
                         })
                     },
@@ -2270,6 +2453,9 @@ mod tests {
         assert!(defaults.include_hidden);
         assert!(defaults.follow_system_appearance);
         assert_eq!(defaults.ssh_session_duration_minutes, 15);
+        assert!(defaults.close_to_background);
+        assert!(!defaults.launch_at_login);
+        assert!(!defaults.tray_show_disk_space);
         assert_eq!(defaults.updated_at_secs, 0);
 
         let custom = AppSettings {
@@ -2279,6 +2465,9 @@ mod tests {
             include_hidden: false,
             follow_system_appearance: false,
             ssh_session_duration_minutes: 0,
+            close_to_background: false,
+            launch_at_login: true,
+            tray_show_disk_space: true,
             updated_at_secs: 1_700_000_010,
         };
         db.save_app_settings(&custom).unwrap();
@@ -2293,6 +2482,9 @@ mod tests {
                 include_hidden: false,
                 follow_system_appearance: false,
                 ssh_session_duration_minutes: 1,
+                close_to_background: false,
+                launch_at_login: true,
+                tray_show_disk_space: true,
                 updated_at_secs: 1_700_000_010,
             }
         );
@@ -2577,6 +2769,7 @@ mod tests {
         let invalid_state = AiState {
             last_proposal_json: Some("{not-json".to_owned()),
             updated_at_secs: 1,
+            ..AiState::default()
         };
         assert_eq!(
             db.save_ai_state(&invalid_state).unwrap_err().kind(),
@@ -2694,6 +2887,7 @@ mod tests {
                         follow_system_appearance: true,
                         ssh_session_duration_minutes: 15 + iter,
                         updated_at_secs: ts,
+                        ..AppSettings::default()
                     })
                     .unwrap();
 
@@ -2740,6 +2934,7 @@ mod tests {
                             r#"{{"iter":{iter}}}"#
                         )),
                         updated_at_secs: ts,
+                        ..AiState::default()
                     })
                     .unwrap();
 
@@ -3183,6 +3378,7 @@ mod tests {
             follow_system_appearance: false,
             ssh_session_duration_minutes: 20,
             updated_at_secs: 1_700_000_555,
+            ..AppSettings::default()
         };
         with_contended_write_lock(&db_path, Duration::from_millis(120), || {
             db.save_app_settings(&settings).unwrap();
@@ -3396,5 +3592,181 @@ mod tests {
         });
         assert_eq!(db.load_update_settings().unwrap(), updated);
         assert_eq!(db.ensure_update_client_id().unwrap(), ensured);
+    }
+
+    #[test]
+    fn ai_state_migrates_error_columns_and_preserves_proposal_on_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy-ai-state.db");
+
+        let old_proposal = CleanupProposal {
+            timestamp_secs: 1_700_000_100,
+            summary: "Existing proposal".to_owned(),
+            items: vec![ProposalItem::new(
+                PathBuf::from("/tmp/old-cache"),
+                2048,
+                RemovalMode::Trash,
+                Some("stale cache".to_owned()),
+                None,
+            )],
+            docker_targets: Vec::new(),
+        };
+        let old_json = serde_json::to_string(&old_proposal).unwrap();
+
+        {
+            let conn = Connection::open(&legacy_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ai_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_proposal_json TEXT,
+                    updated_at_secs INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ai_state (id, last_proposal_json, updated_at_secs)
+                 VALUES (1, ?1, 1700000100)",
+                params![old_json],
+            )
+            .unwrap();
+        }
+
+        // Opening twice must be idempotent and keep existing proposal intact.
+        let db = StorageDb::open(&legacy_path).unwrap();
+        drop(db);
+        let db = StorageDb::open(&legacy_path).unwrap();
+
+        let migrated = db.load_ai_state().unwrap();
+        assert_eq!(
+            migrated.last_proposal_json.as_deref(),
+            Some(old_json.as_str())
+        );
+        assert_eq!(migrated.last_error, None);
+        assert_eq!(migrated.last_error_at_secs, None);
+        assert_eq!(migrated.updated_at_secs, 1_700_000_100);
+
+        // Recording an error preserves existing last_proposal_json and collapses
+        // multi-line text onto a single line.
+        db.record_ai_error("line 1 failed\n  line 2 detail", 1_700_000_500)
+            .unwrap();
+        let after_err = db.load_ai_state().unwrap();
+        assert_eq!(
+            after_err.last_proposal_json.as_deref(),
+            Some(old_json.as_str())
+        );
+        assert_eq!(
+            after_err.last_error.as_deref(),
+            Some("line 1 failed line 2 detail")
+        );
+        assert_eq!(after_err.last_error_at_secs, Some(1_700_000_500));
+        assert_eq!(after_err.updated_at_secs, 1_700_000_500);
+
+        // Errors longer than 160 chars are truncated cleanly while keeping proposal.
+        let long_err = "e".repeat(220);
+        db.record_ai_error(&long_err, 1_700_000_600).unwrap();
+        let after_long = db.load_ai_state().unwrap();
+        let recorded = after_long.last_error.as_deref().unwrap();
+        assert!(recorded.chars().count() <= 160);
+        assert!(!recorded.contains('\n'));
+        assert_eq!(after_long.last_error_at_secs, Some(1_700_000_600));
+        assert_eq!(
+            after_long.last_proposal_json.as_deref(),
+            Some(old_json.as_str())
+        );
+
+        // Saving a new proposal clears last_error and last_error_at_secs.
+        let new_proposal = CleanupProposal {
+            timestamp_secs: 1_700_000_700,
+            summary: "Fresh proposal".to_owned(),
+            items: Vec::new(),
+            docker_targets: Vec::new(),
+        };
+        let fresh_state =
+            AiState::from_proposal(&new_proposal, 1_700_000_700).unwrap();
+        db.save_ai_state(&fresh_state).unwrap();
+        let cleared = db.load_ai_state().unwrap();
+        assert_eq!(cleared.last_error, None);
+        assert_eq!(cleared.last_error_at_secs, None);
+        assert_eq!(cleared.parse_proposal().unwrap(), Some(new_proposal));
+
+        // clear_ai_error clears error without dropping existing proposal.
+        db.record_ai_error("temporary remote timeout", 1_700_000_800)
+            .unwrap();
+        assert!(db.load_ai_state().unwrap().last_error.is_some());
+        db.clear_ai_error(1_700_000_900).unwrap();
+        let after_clear = db.load_ai_state().unwrap();
+        assert_eq!(after_clear.last_error, None);
+        assert_eq!(after_clear.last_error_at_secs, None);
+        assert!(after_clear.last_proposal_json.is_some());
+
+        // Recording an error on an empty ai_state row creates row id=1 safely.
+        let empty_db = StorageDb::open(temp.path().join("empty.db")).unwrap();
+        empty_db
+            .record_ai_error("initial failure", 1_700_001_000)
+            .unwrap();
+        let empty_loaded = empty_db.load_ai_state().unwrap();
+        assert_eq!(empty_loaded.last_proposal_json, None);
+        assert_eq!(empty_loaded.last_error.as_deref(), Some("initial failure"));
+        assert_eq!(empty_loaded.last_error_at_secs, Some(1_700_001_000));
+    }
+
+    #[test]
+    fn app_settings_migrates_legacy_table_and_roundtrips_background_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy_settings.db");
+
+        {
+            let conn = Connection::open(&legacy_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE app_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    power_preset TEXT NOT NULL DEFAULT 'balanced',
+                    default_depth INTEGER NOT NULL DEFAULT 3,
+                    apparent_size INTEGER NOT NULL DEFAULT 0,
+                    include_hidden INTEGER NOT NULL DEFAULT 1,
+                    follow_system_appearance INTEGER NOT NULL DEFAULT 1,
+                    ssh_session_duration_minutes INTEGER NOT NULL DEFAULT 15,
+                    updated_at_secs INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO app_settings (
+                    id, power_preset, default_depth, apparent_size,
+                    include_hidden, follow_system_appearance,
+                    ssh_session_duration_minutes, updated_at_secs
+                ) VALUES (1, 'miser', 4, 1, 0, 0, 25, 1700000123);",
+            )
+            .unwrap();
+        }
+
+        // Opening twice must be idempotent and retain existing preferences
+        // while supplying default background / tray values.
+        let db = StorageDb::open(&legacy_path).unwrap();
+        drop(db);
+        let db = StorageDb::open(&legacy_path).unwrap();
+
+        let migrated = db.load_app_settings().unwrap();
+        assert_eq!(migrated.power_preset, "miser");
+        assert_eq!(migrated.default_depth, 4);
+        assert!(migrated.apparent_size);
+        assert!(!migrated.include_hidden);
+        assert!(!migrated.follow_system_appearance);
+        assert_eq!(migrated.ssh_session_duration_minutes, 25);
+        assert!(migrated.close_to_background);
+        assert!(!migrated.launch_at_login);
+        assert!(!migrated.tray_show_disk_space);
+        assert_eq!(migrated.updated_at_secs, 1_700_000_123);
+
+        let updated = AppSettings {
+            close_to_background: false,
+            launch_at_login: true,
+            tray_show_disk_space: true,
+            updated_at_secs: 1_700_000_999,
+            ..migrated
+        };
+        db.save_app_settings(&updated).unwrap();
+        let reloaded = db.load_app_settings().unwrap();
+        assert!(!reloaded.close_to_background);
+        assert!(reloaded.launch_at_login);
+        assert!(reloaded.tray_show_disk_space);
+        assert_eq!(reloaded.updated_at_secs, 1_700_000_999);
     }
 }

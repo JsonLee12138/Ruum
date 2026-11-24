@@ -25,14 +25,42 @@ rustc-hash = { workspace = true }
 tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSAppearance",
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "std",
+] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSAppleEventDescriptor",
+    "NSAppleEventManager",
     "NSBundle",
+    "NSError",
+    "NSProcessInfo",
     "NSString",
+    "objc2-core-services",
+    "std",
+] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = [
+    "SMAppService",
+    "SMErrors",
+    "objc2",
+    "objc2-foundation",
     "std",
 ] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_System_Registry",
+] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = { version = "0.25", default-features = false }

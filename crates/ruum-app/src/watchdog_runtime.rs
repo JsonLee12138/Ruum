@@ -1,18 +1,17 @@
 //! In-process IPC server coordinating background watchdog and MCP cleanup
 //! confirmation with the graphical user interface.
 
-#![allow(dead_code, reason = "IPC runtime hooked into GUI state in Slice 6")]
-
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use ruum_core::confirm::{
     CleanupConfirmDecision, CleanupConfirmRequest, IpcListenerGuard,
     IpcRequest, IpcResponse, RemoteConnectConfirmDecision,
-    RemoteConnectConfirmRequest, load_or_create_ipc_token,
+    RemoteConnectConfirmRequest, handle_ipc_stream, load_or_create_ipc_token,
 };
 use ruum_core::watchdog_config::ipc_token_path;
 
@@ -108,6 +107,68 @@ impl WatchdogIpcServer {
     }
 }
 
+fn handle_ipc_request(
+    req: IpcRequest,
+    event_tx: &Sender<WatchdogIpcEvent>,
+) -> IpcResponse {
+    match req {
+        IpcRequest::ConfirmCleanup { request, .. } => {
+            let (resp_tx, resp_rx) = channel();
+            if event_tx
+                .send(WatchdogIpcEvent::Confirm {
+                    request,
+                    responder: resp_tx,
+                })
+                .is_err()
+            {
+                return IpcResponse::ConfirmDecision {
+                    decision: CleanupConfirmDecision::Cancelled,
+                };
+            }
+            let decision =
+                resp_rx.recv().unwrap_or(CleanupConfirmDecision::Cancelled);
+            IpcResponse::ConfirmDecision { decision }
+        }
+        IpcRequest::ConfirmRemoteConnect { request, .. } => {
+            let (resp_tx, resp_rx) = channel();
+            if event_tx
+                .send(WatchdogIpcEvent::ConfirmRemoteConnect {
+                    request,
+                    responder: resp_tx,
+                })
+                .is_err()
+            {
+                return IpcResponse::RemoteConnectDecision {
+                    decision: RemoteConnectConfirmDecision::Denied,
+                };
+            }
+            let decision = resp_rx
+                .recv()
+                .unwrap_or(RemoteConnectConfirmDecision::Denied);
+            IpcResponse::RemoteConnectDecision { decision }
+        }
+        IpcRequest::NotifyWatchdogUpdate { .. } => {
+            let _ = event_tx.send(WatchdogIpcEvent::WatchdogUpdated);
+            IpcResponse::Ok
+        }
+        IpcRequest::ShowNotification {
+            tag, title, body, ..
+        } => {
+            let _ = event_tx.send(WatchdogIpcEvent::ShowNotification {
+                tag,
+                title,
+                body,
+            });
+            IpcResponse::Ok
+        }
+        IpcRequest::OpenWindow { tag, .. } => {
+            let _ = event_tx.send(WatchdogIpcEvent::OpenWindow { tag });
+            IpcResponse::Ok
+        }
+        IpcRequest::Ping { .. } => IpcResponse::Ok,
+    }
+}
+
 fn run_listener_loop(
     listener: &IpcListenerGuard,
     token: &str,
@@ -115,64 +176,26 @@ fn run_listener_loop(
     cancelled: &AtomicBool,
 ) {
     while !cancelled.load(Ordering::Relaxed) {
-        let event_tx = tx.clone();
-        let res = listener.accept_and_handle(token, move |req| match req {
-            IpcRequest::ConfirmCleanup { request, .. } => {
-                let (resp_tx, resp_rx) = channel();
-                if event_tx
-                    .send(WatchdogIpcEvent::Confirm {
-                        request,
-                        responder: resp_tx,
-                    })
-                    .is_err()
-                {
-                    return Ok(IpcResponse::ConfirmDecision {
-                        decision: CleanupConfirmDecision::Cancelled,
-                    });
+        match listener.accept() {
+            Ok(stream) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
                 }
-                let decision =
-                    resp_rx.recv().unwrap_or(CleanupConfirmDecision::Cancelled);
-                Ok(IpcResponse::ConfirmDecision { decision })
-            }
-            IpcRequest::ConfirmRemoteConnect { request, .. } => {
-                let (resp_tx, resp_rx) = channel();
-                if event_tx
-                    .send(WatchdogIpcEvent::ConfirmRemoteConnect {
-                        request,
-                        responder: resp_tx,
-                    })
-                    .is_err()
-                {
-                    return Ok(IpcResponse::RemoteConnectDecision {
-                        decision: RemoteConnectConfirmDecision::Denied,
+                let event_tx = tx.clone();
+                let expected_token = token.to_owned();
+                let _ = thread::Builder::new()
+                    .name("ruum-ipc-worker".to_string())
+                    .spawn(move || {
+                        let _ =
+                            handle_ipc_stream(stream, &expected_token, |req| {
+                                Ok(handle_ipc_request(req, &event_tx))
+                            });
                     });
-                }
-                let decision = resp_rx
-                    .recv()
-                    .unwrap_or(RemoteConnectConfirmDecision::Denied);
-                Ok(IpcResponse::RemoteConnectDecision { decision })
             }
-            IpcRequest::NotifyWatchdogUpdate { .. } => {
-                let _ = event_tx.send(WatchdogIpcEvent::WatchdogUpdated);
-                Ok(IpcResponse::Ok)
+            Err(_) if cancelled.load(Ordering::Relaxed) => break,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(10));
             }
-            IpcRequest::ShowNotification {
-                tag, title, body, ..
-            } => {
-                let _ = event_tx.send(WatchdogIpcEvent::ShowNotification {
-                    tag,
-                    title,
-                    body,
-                });
-                Ok(IpcResponse::Ok)
-            }
-            IpcRequest::OpenWindow { tag, .. } => {
-                let _ = event_tx.send(WatchdogIpcEvent::OpenWindow { tag });
-                Ok(IpcResponse::Ok)
-            }
-        });
-        if res.is_err() && cancelled.load(Ordering::Relaxed) {
-            break;
         }
     }
 }
@@ -329,6 +352,89 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+
+        drop(server);
+    }
+
+    #[test]
+    fn ipc_server_serves_open_window_and_ping_while_confirm_is_blocked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let socket_or_port = temp.path().join("concurrent.sock");
+        #[cfg(windows)]
+        let socket_or_port = temp.path().join("concurrent.port");
+
+        let listener =
+            IpcListenerGuard::bind(&socket_or_port).expect("bind listener");
+        let token = "concurrent_ipc_token_1234567890123456789".to_string();
+
+        let (server, rx) =
+            WatchdogIpcServer::start_with_listener(listener, token.clone())
+                .expect("start server");
+
+        let confirm_req = IpcRequest::ConfirmCleanup {
+            token: token.clone(),
+            request: CleanupConfirmRequest {
+                root: PathBuf::from("/tmp"),
+                title: "Blocked Confirm".to_string(),
+                summary: None,
+                items: Vec::new(),
+                docker_items: Vec::new(),
+                docker_permission_hint: None,
+            },
+        };
+        let confirm_endpoint = socket_or_port.clone();
+        let confirm_thread = std::thread::spawn(move || {
+            send_ipc_message(&confirm_endpoint, &confirm_req)
+        });
+
+        // Hold the confirm responder open to simulate user reviewing dialog.
+        let held_responder = match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recv confirm")
+        {
+            WatchdogIpcEvent::Confirm { responder, .. } => responder,
+            other => panic!("unexpected event: {other:?}"),
+        };
+
+        // Ping and OpenWindow must NOT block behind the pending ConfirmCleanup!
+        let ping_resp = send_ipc_message(
+            &socket_or_port,
+            &IpcRequest::Ping {
+                token: token.clone(),
+            },
+        )
+        .expect("ping while confirm blocked");
+        assert_eq!(ping_resp, IpcResponse::Ok);
+
+        let open_resp = send_ipc_message(
+            &socket_or_port,
+            &IpcRequest::OpenWindow {
+                token,
+                tag: String::new(),
+            },
+        )
+        .expect("open window while confirm blocked");
+        assert_eq!(open_resp, IpcResponse::Ok);
+
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recv open window")
+        {
+            WatchdogIpcEvent::OpenWindow { tag } => assert!(tag.is_empty()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // Release held responder and confirm clean shutdown without deadlock.
+        let _ = held_responder.send(CleanupConfirmDecision::Cancelled);
+        let confirm_resp =
+            confirm_thread.join().unwrap().expect("confirm reply");
+        assert_eq!(
+            confirm_resp,
+            IpcResponse::ConfirmDecision {
+                decision: CleanupConfirmDecision::Cancelled
+            }
+        );
 
         drop(server);
     }

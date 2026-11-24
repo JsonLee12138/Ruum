@@ -25,6 +25,8 @@ pub mod space {
     pub const XXS: Rems = Rems(0.125);
     /// Parts of one control: icon and label, title and its description.
     pub const XS: Rems = Rems(0.25);
+    /// Square icon-button padding matching `gpui_omarchy::icon_button`.
+    pub const ICON_BUTTON: Rems = Rems(0.375);
     /// Closely related controls: a button group, dialog actions.
     pub const SM: Rems = Rems(0.5);
     /// One content group: columns of a row, compact form rows.
@@ -129,6 +131,12 @@ pub mod size {
     pub const SETTINGS_NAV: Rems = Rems(12.5);
     /// Height (and square button width) of the Linux CSD titlebar.
     pub const TITLE_BAR: Rems = Rems(2.125);
+    /// Fixed width for the monospace item/percent counter in the cleanup
+    /// progress window.
+    pub const CLEANUP_COUNTER_LANE: Rems = Rems(10.0);
+    /// Fixed single-line height for the current-path lane in the cleanup
+    /// progress window.
+    pub const CLEANUP_PATH_LANE_H: Rems = Rems(1.25);
 }
 
 /// Interface zoom steps, as a factor of the 16 px default rem.

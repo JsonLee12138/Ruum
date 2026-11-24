@@ -1,6 +1,11 @@
 //! Localized toast notices and status feedback strings for `state.rs`.
 
-use ruum_core::watchdog::ServiceStatus;
+use ruum_core::i18n::{
+    MAX_AI_FAILURE_SUMMARY_CHARS, clean_ai_failure_reason, truncate_single_line,
+};
+use ruum_core::watchdog::{
+    AiFailureKind, classify_ai_failure, format_ai_failure_summary,
+};
 
 use crate::i18n::{Locale, path_count, pick};
 
@@ -74,67 +79,25 @@ pub const fn settings_saved(locale: Locale) -> &'static str {
     )
 }
 
-pub const fn settings_saved_updating_service(locale: Locale) -> &'static str {
+pub const fn settings_saved_autostart_requires_approval(
+    locale: Locale,
+) -> &'static str {
     pick(
         locale,
-        "Settings saved; updating background service\u{2026}",
-        "设置已保存；正在更新后台服务\u{2026}",
-        "設定を保存しました。バックグラウンドサービスを更新中\u{2026}",
-        "설정이 저장되었습니다. 백그라운드 서비스를 업데이트하는 중\u{2026}",
+        "Settings saved; allow Ruum in System Settings \u{2192} Login Items \
+         to launch at login.",
+        "设置已保存；请在「系统设置 → 通用 → 登录项」中允许 Ruum 开机启动。",
+        "設定を保存しました。「システム設定 → ログイン項目」で Ruum を許可してください。",
+        "설정이 저장되었습니다. 시스템 설정 \u{2192} 로그인 항목에서 Ruum을 허용해 주세요.",
     )
 }
 
-pub const fn service_note(
-    status: Option<ServiceStatus>,
-    locale: Locale,
-) -> &'static str {
-    match status {
-        Some(ServiceStatus::Active) => pick(
-            locale,
-            "Service: Active",
-            "服务：运行中",
-            "サービス: 有効",
-            "서비스: 활성",
-        ),
-        Some(ServiceStatus::Inactive) => pick(
-            locale,
-            "Service: Inactive",
-            "服务：已停止",
-            "サービス: 停止",
-            "서비스: 비활성",
-        ),
-        Some(ServiceStatus::NotInstalled) | None => pick(
-            locale,
-            "Service: Off",
-            "服务：关闭",
-            "サービス: オフ",
-            "서비스: 꺼짐",
-        ),
-        Some(ServiceStatus::Unsupported) => pick(
-            locale,
-            "Service: Unsupported",
-            "服务：不支持",
-            "サービス: 非対応",
-            "서비스: 지원 안 됨",
-        ),
-    }
-}
-
-pub fn settings_saved_with_service(note: &str, locale: Locale) -> String {
+pub fn settings_saved_autostart_error(err: &str, locale: Locale) -> String {
     match locale {
-        Locale::En => format!("Settings saved ({note})"),
-        Locale::Zh => format!("设置已保存（{note}）"),
-        Locale::Ja => format!("設定を保存しました（{note}）"),
-        Locale::Ko => format!("설정이 저장되었습니다({note})"),
-    }
-}
-
-pub fn settings_saved_service_error(err: &str, locale: Locale) -> String {
-    match locale {
-        Locale::En => format!("Settings saved; service error: {err}"),
-        Locale::Zh => format!("设置已保存；后台服务错误：{err}"),
-        Locale::Ja => format!("設定を保存しました（サービスエラー: {err}）"),
-        Locale::Ko => format!("설정이 저장되었습니다(서비스 오류: {err})"),
+        Locale::En => format!("Settings saved; autostart error: {err}"),
+        Locale::Zh => format!("设置已保存；开机自启设置失败：{err}"),
+        Locale::Ja => format!("設定を保存しました（自動起動エラー: {err}）"),
+        Locale::Ko => format!("설정이 저장되었습니다(자동 실행 오류: {err})"),
     }
 }
 
@@ -257,64 +220,6 @@ pub fn speed_test_finished(
     }
 }
 
-pub fn disk_checked_below(
-    free: &str,
-    total: &str,
-    min_gb: u64,
-    locale: Locale,
-) -> String {
-    match locale {
-        Locale::En => format!(
-            "Checked: {free} free of {total} \u{2014} below {min_gb} GB \
-             threshold"
-        ),
-        Locale::Zh => format!(
-            "检查完成：可用 {free} / 共 {total} \u{2014} 低于 {min_gb} GB 阈值"
-        ),
-        Locale::Ja => format!(
-            "確認済み: 空き {free} / {total} \u{2014} {min_gb} GB しきい値未満"
-        ),
-        Locale::Ko => format!(
-            "확인됨: 여유 {free} / {total} \u{2014} {min_gb} GB 임계값 미만"
-        ),
-    }
-}
-
-pub fn disk_checked_healthy(
-    free: &str,
-    total: &str,
-    min_gb: u64,
-    locale: Locale,
-) -> String {
-    match locale {
-        Locale::En => format!(
-            "Checked: {free} free of {total} \u{2014} healthy (above \
-             {min_gb} GB threshold)"
-        ),
-        Locale::Zh => format!(
-            "检查完成：可用 {free} / 共 {total} \u{2014} 健康（高于 \
-             {min_gb} GB 阈值）"
-        ),
-        Locale::Ja => format!(
-            "確認済み: 空き {free} / {total} \u{2014} 正常（{min_gb} GB \
-             しきい値以上）"
-        ),
-        Locale::Ko => format!(
-            "확인됨: 여유 {free} / {total} \u{2014} 정상({min_gb} GB \
-             임계값 이상)"
-        ),
-    }
-}
-
-pub fn failed_check_disk_space(err: &str, locale: Locale) -> String {
-    match locale {
-        Locale::En => format!("Failed to check disk space: {err}"),
-        Locale::Zh => format!("检查磁盘空间失败：{err}"),
-        Locale::Ja => format!("ディスク空き容量の確認に失敗しました: {err}"),
-        Locale::Ko => format!("디스크 공간 확인 실패: {err}"),
-    }
-}
-
 pub const fn cannot_find_home_dir(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -356,12 +261,7 @@ pub fn ai_proposed_items(count: usize, locale: Locale) -> String {
 }
 
 pub fn ai_analysis_error(err: &str, locale: Locale) -> String {
-    match locale {
-        Locale::En => format!("AI analysis error: {err}"),
-        Locale::Zh => format!("AI 分析出错：{err}"),
-        Locale::Ja => format!("AI 分析エラー: {err}"),
-        Locale::Ko => format!("AI 분석 오류: {err}"),
-    }
+    format_ai_failure_summary(err, locale)
 }
 
 pub fn power_saved(label: &str, locale: Locale) -> String {
@@ -819,18 +719,76 @@ pub fn ssh_check_space_failed(
 }
 
 pub fn ssh_ai_analyze_failed(alias: &str, err: &str, locale: Locale) -> String {
-    match locale {
-        Locale::En => format!("Remote AI analysis failed for `{alias}`: {err}"),
-        Locale::Zh => format!(
-            "\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d} AI \u{5206}\u{6790}\u{5931}\u{8d25}\u{ff1a}{err}"
-        ),
-        Locale::Ja => format!(
-            "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e} AI \u{5206}\u{6790}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {err}"
-        ),
-        Locale::Ko => format!(
-            "\u{c6d0}\u{aca9} `{alias}` AI \u{bd84}\u{c11d} \u{c2e4}\u{d328}: {err}"
-        ),
-    }
+    let kind = classify_ai_failure(err);
+    let detail = clean_ai_failure_reason(err);
+    let msg = if detail.is_empty() {
+        match (kind, locale) {
+            (AiFailureKind::TimedOut, Locale::En) => {
+                format!("Remote AI analysis timed out for `{alias}`.")
+            }
+            (AiFailureKind::TimedOut, Locale::Zh) => {
+                format!(
+                    "\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d} AI \u{5206}\u{6790}\u{8d85}\u{65f6}\u{3002}"
+                )
+            }
+            (AiFailureKind::TimedOut, Locale::Ja) => {
+                format!(
+                    "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e} AI \u{5206}\u{6790}\u{304c}\u{30bf}\u{30a4}\u{30e0}\u{30a2}\u{30a6}\u{30c8}\u{3057}\u{307e}\u{3057}\u{305f}\u{3002}"
+                )
+            }
+            (AiFailureKind::TimedOut, Locale::Ko) => {
+                format!(
+                    "\u{c6d0}\u{aca9} `{alias}` AI \u{bd84}\u{c11d} \u{c2dc}\u{ac04}\u{c774} \u{cd08}\u{acfc}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}."
+                )
+            }
+            (AiFailureKind::Failed, Locale::En) => {
+                format!("Remote AI analysis failed for `{alias}`.")
+            }
+            (AiFailureKind::Failed, Locale::Zh) => {
+                format!(
+                    "\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d} AI \u{5206}\u{6790}\u{5931}\u{8d25}\u{3002}"
+                )
+            }
+            (AiFailureKind::Failed, Locale::Ja) => {
+                format!(
+                    "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e} AI \u{5206}\u{6790}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}\u{3002}"
+                )
+            }
+            (AiFailureKind::Failed, Locale::Ko) => {
+                format!(
+                    "\u{c6d0}\u{aca9} `{alias}` AI \u{bd84}\u{c11d} \u{c2e4}\u{d328}."
+                )
+            }
+        }
+    } else {
+        match (kind, locale) {
+            (AiFailureKind::TimedOut, Locale::En) => {
+                format!("Remote AI analysis timed out for `{alias}`: {detail}")
+            }
+            (AiFailureKind::TimedOut, Locale::Zh) => format!(
+                "\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d} AI \u{5206}\u{6790}\u{8d85}\u{65f6}\u{ff1a}{detail}"
+            ),
+            (AiFailureKind::TimedOut, Locale::Ja) => format!(
+                "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e} AI \u{5206}\u{6790}\u{304c}\u{30bf}\u{30a4}\u{30e0}\u{30a2}\u{30a6}\u{30c8}\u{3057}\u{307e}\u{3057}\u{305f}: {detail}"
+            ),
+            (AiFailureKind::TimedOut, Locale::Ko) => format!(
+                "\u{c6d0}\u{aca9} `{alias}` AI \u{bd84}\u{c11d} \u{c2dc}\u{ac04} \u{cd08}\u{acfc}: {detail}"
+            ),
+            (AiFailureKind::Failed, Locale::En) => {
+                format!("Remote AI analysis failed for `{alias}`: {detail}")
+            }
+            (AiFailureKind::Failed, Locale::Zh) => format!(
+                "\u{8fdc}\u{7a0b}\u{4e3b}\u{673a}\u{300c}{alias}\u{300d} AI \u{5206}\u{6790}\u{5931}\u{8d25}\u{ff1a}{detail}"
+            ),
+            (AiFailureKind::Failed, Locale::Ja) => format!(
+                "\u{30ea}\u{30e2}\u{30fc}\u{30c8} `{alias}` \u{306e} AI \u{5206}\u{6790}\u{306b}\u{5931}\u{6557}\u{3057}\u{307e}\u{3057}\u{305f}: {detail}"
+            ),
+            (AiFailureKind::Failed, Locale::Ko) => format!(
+                "\u{c6d0}\u{aca9} `{alias}` AI \u{bd84}\u{c11d} \u{c2e4}\u{d328}: {detail}"
+            ),
+        }
+    };
+    truncate_single_line(&msg, MAX_AI_FAILURE_SUMMARY_CHARS)
 }
 
 pub fn webhook_saved(name: &str, locale: Locale) -> String {

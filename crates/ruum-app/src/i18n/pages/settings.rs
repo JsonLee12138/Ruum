@@ -43,16 +43,6 @@ pub const fn enable_watchdog(locale: Locale) -> &'static str {
     )
 }
 
-pub const fn enable_service(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Run as OS Background Service at Login (launchd / systemd / Windows)",
-        "\u{767b}\u{5f55}\u{65f6}\u{4f5c}\u{4e3a}\u{7cfb}\u{7edf}\u{540e}\u{53f0}\u{670d}\u{52a1}\u{8fd0}\u{884c} (launchd / systemd / Windows)",
-        "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{6642}\u{306b} OS \u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{30b5}\u{30fc}\u{30d3}\u{30b9}\u{3068}\u{3057}\u{3066}\u{5b9f}\u{884c} (launchd / systemd / Windows)",
-        "\u{b85c}\u{adf8}\u{c778} \u{c2dc} OS \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c11c}\u{be44}\u{c2a4}\u{b85c} \u{c2e4}\u{d589} (launchd / systemd / Windows)",
-    )
-}
-
 pub const fn ai_auto_analyze(locale: Locale) -> &'static str {
     pick(
         locale,
@@ -594,6 +584,36 @@ pub const fn general_ssh_lease_minutes(locale: Locale) -> &'static str {
         "SSH \u{4f1a}\u{8bdd}\u{4e0e} MCP \u{6388}\u{6743}\u{6709}\u{6548}\u{671f}\u{ff08}\u{5206}\u{949f}\u{ff09}\u{ff1a}",
         "SSH \u{30bb}\u{30c3}\u{30b7}\u{30e7}\u{30f3}\u{304a}\u{3088}\u{3073} MCP \u{8a31}\u{53ef}\u{671f}\u{9593}\u{ff08}\u{5206}\u{ff09}:",
         "SSH \u{c138}\u{c158} \u{bc0f} MCP \u{c2b9}\u{c778} \u{c720}\u{d6a8} \u{ae30}\u{ac04}(\u{bd84}):",
+    )
+}
+
+pub const fn general_close_to_background(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Keep Running in System Tray When Closing Window",
+        "\u{5173}\u{95ed}\u{7a97}\u{53e3}\u{65f6}\u{4fdd}\u{6301}\u{5728}\u{7cfb}\u{7edf}\u{6258}\u{76d8}\u{540e}\u{53f0}\u{8fd0}\u{884c}",
+        "\u{30a6}\u{30a3}\u{30f3}\u{30c9}\u{30a6}\u{3092}\u{9589}\u{3058}\u{3066}\u{3082}\u{30c8}\u{30ec}\u{30a4}\u{3067}\u{5f85}\u{6a5f}\u{3059}\u{308b}",
+        "\u{cc3d}\u{c744} \u{b2eb}\u{c744} \u{b54c} \u{c2dc}\u{c2a4}\u{d15c} \u{d2b8}\u{b808}\u{c774}\u{c5d0}\u{c11c} \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c2e4}\u{d589} \u{c720}\u{c9c0}",
+    )
+}
+
+pub const fn general_launch_at_login(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Launch Silently in Background at Login",
+        "\u{5f00}\u{673a}\u{767b}\u{5f55}\u{65f6}\u{9759}\u{9ed8}\u{540e}\u{53f0}\u{542f}\u{52a8}",
+        "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{6642}\u{306b}\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{3067}\u{81ea}\u{52d5}\u{8d77}\u{52d5}\u{3059}\u{308b}",
+        "\u{b85c}\u{adf8}\u{c778} \u{c2dc} \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc}\u{c5d0}\u{c11c} \u{c790}\u{b3d9} \u{c2e4}\u{d589}",
+    )
+}
+
+pub const fn general_tray_show_disk_space(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Show Free Disk Space Progress in Menu Bar / Tray",
+        "\u{5728}\u{83dc}\u{5355}\u{680f}/\u{6258}\u{76d8}\u{663e}\u{793a}\u{78c1}\u{76d8}\u{5269}\u{4f59}\u{7a7a}\u{95f4}\u{8fdb}\u{5ea6}\u{6761}",
+        "\u{30e1}\u{30cb}\u{30e5}\u{30fc}\u{30d0}\u{30fc}/\u{30c8}\u{30ec}\u{30a4}\u{306b}\u{30c7}\u{30a3}\u{30b9}\u{30af}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{30d0}\u{30fc}\u{3092}\u{8868}\u{793a}",
+        "\u{ba54}\u{b274} \u{b9c9}\u{b300}/\u{d2b8}\u{b808}\u{c774}\u{c5d0} \u{b514}\u{c2a4}\u{d06c} \u{c5ec}\u{c720} \u{acf5}\u{ac04} \u{c9c4}\u{d589}\u{b960} \u{d45c}\u{c2dc}",
     )
 }
 

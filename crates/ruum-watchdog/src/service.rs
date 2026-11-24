@@ -658,6 +658,49 @@ pub fn service_status(runner: &dyn ServiceRunner) -> io::Result<ServiceStatus> {
     ServiceAdapterFactory::create().status(runner, &ServiceEnv::current())
 }
 
+/// Fast check whether the legacy headless `ruum watchdog` OS service has any
+/// on-disk or registry residue (`plist` / `systemd` unit / Windows `watchdog.pid`
+/// or `HKCU\...\Run` `RuumWatchdog`).
+#[must_use]
+pub fn has_service_residue_in(
+    os: ServiceOs,
+    env: &ServiceEnv,
+    runner: &dyn ServiceRunner,
+) -> bool {
+    match os {
+        ServiceOs::MacOs => {
+            MacOsServiceAdapter::plist_path_in(env).is_some_and(|p| p.exists())
+        }
+        ServiceOs::Linux => {
+            LinuxServiceAdapter::unit_path_in(env).is_some_and(|p| p.exists())
+        }
+        ServiceOs::Windows => {
+            if WindowsServiceAdapter::pid_path_in(env)
+                .is_some_and(|p| p.exists())
+            {
+                return true;
+            }
+            runner
+                .run(
+                    Path::new("reg"),
+                    &["query", WIN_RUN_KEY, "/v", WIN_RUN_VALUE],
+                )
+                .is_ok_and(|out| out.success())
+        }
+    }
+}
+
+/// Fast check for legacy headless `ruum watchdog` OS service residue on the
+/// current OS.
+#[must_use]
+pub fn has_service_residue(runner: &dyn ServiceRunner) -> bool {
+    has_service_residue_in(
+        ServiceAdapterFactory::current_os(),
+        &ServiceEnv::current(),
+        runner,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,5 +1013,58 @@ mod tests {
         let fb_calls = runner_un_fallback.calls();
         assert_eq!(fb_calls[1].0, PathBuf::from("powershell.exe"));
         assert!(fb_calls[1].1.iter().any(|a| a.contains("Win32_Process")));
+    }
+
+    #[test]
+    fn residue_check_detects_macos_linux_and_windows_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = ServiceEnv {
+            home: Some(temp.path().to_path_buf()),
+            xdg_config_home: Some(temp.path().join("xdg")),
+            appdata: Some(temp.path().join("AppData")),
+        };
+        let runner_none = ScriptedRunner::with_default(err_out(1, "absent"));
+
+        assert!(!has_service_residue_in(
+            ServiceOs::MacOs,
+            &env,
+            &runner_none
+        ));
+        assert!(runner_none.calls().is_empty());
+        let plist = MacOsServiceAdapter::plist_path_in(&env).unwrap();
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, "plist").unwrap();
+        assert!(has_service_residue_in(ServiceOs::MacOs, &env, &runner_none));
+
+        assert!(!has_service_residue_in(
+            ServiceOs::Linux,
+            &env,
+            &runner_none
+        ));
+        let unit = LinuxServiceAdapter::unit_path_in(&env).unwrap();
+        fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        fs::write(&unit, "unit").unwrap();
+        assert!(has_service_residue_in(ServiceOs::Linux, &env, &runner_none));
+
+        assert!(!has_service_residue_in(
+            ServiceOs::Windows,
+            &env,
+            &runner_none
+        ));
+        let runner_reg = ScriptedRunner::with_default(ok_out("RuumWatchdog"));
+        assert!(has_service_residue_in(
+            ServiceOs::Windows,
+            &env,
+            &runner_reg
+        ));
+
+        let pid_path = WindowsServiceAdapter::pid_path_in(&env).unwrap();
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        fs::write(&pid_path, "1234\n").unwrap();
+        assert!(has_service_residue_in(
+            ServiceOs::Windows,
+            &env,
+            &runner_none
+        ));
     }
 }

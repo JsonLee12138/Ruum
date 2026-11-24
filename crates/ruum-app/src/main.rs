@@ -13,6 +13,7 @@
 
 mod app_menu;
 mod appearance;
+mod background;
 pub use ruum_core::git;
 mod i18n;
 mod marks;
@@ -23,6 +24,7 @@ mod rail_pages;
 mod state;
 #[cfg(test)]
 mod tests;
+mod tray_gauge;
 mod tray_menu;
 mod treemap_view;
 mod ui;
@@ -107,6 +109,7 @@ pub(crate) struct GuiArgs {
     depth: u32,
     power: Option<power::PowerEfficiency>,
     initial_screen: Option<Screen>,
+    background: bool,
 }
 
 fn main() -> Result<()> {
@@ -149,6 +152,20 @@ fn run() -> Result<()> {
     args.options.apparent_size = app_settings.apparent_size;
     args.options.include_hidden = app_settings.include_hidden;
 
+    // Single-instance guard: probe an active local GUI over IPC before
+    // opening any window or detaching.
+    if args.background {
+        if ruum_core::notify::try_ipc_ping() {
+            return Ok(());
+        }
+    } else {
+        let wake_tag =
+            args.initial_screen.map(screen_open_tag).unwrap_or_default();
+        if ruum_core::notify::try_ipc_open_window(wake_tag) {
+            return Ok(());
+        }
+    }
+
     // When the app executable is reached through a terminal launcher,
     // cmux sends SIGTERM to its foreground process group as AppKit takes
     // focus. Spawn once into a separate group before AppKit starts. Restrict
@@ -172,6 +189,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    let start_background_flag = args.background;
     let depth = args.depth;
     let title_root = args.root.clone();
     let home_at_boot = std::env::home_dir();
@@ -180,6 +198,8 @@ fn run() -> Result<()> {
     } else {
         appearance::follows_system(home_at_boot.as_deref())
     };
+    let close_to_background = app_settings.close_to_background;
+    let tray_show_disk_space = app_settings.tray_show_disk_space;
     let launch = LaunchConfig {
         root: args.root,
         options: args.options.clone(),
@@ -194,12 +214,14 @@ fn run() -> Result<()> {
 
     let app = gpui_kit::application().with_assets(RuumAssets);
     app.on_reopen(|cx| {
+        enter_foreground_mode(cx);
         open_or_navigate_main_window(None, cx);
     });
     app.run(move |cx| {
         gpui_omarchy::init(cx);
         install_notification_handler(cx);
         app_menu::install_for(i18n::Locale::current(), cx);
+        app_menu::set_close_to_background(cx, close_to_background);
         if native_look {
             appearance::apply(cx.window_appearance(), cx);
         }
@@ -233,7 +255,9 @@ fn run() -> Result<()> {
             cred_store: shared_cred_store.clone(),
             main_window: None,
             confirm_window: None,
+            cleanup_progress_window: None,
             remote_connect_window: None,
+            active_cleanup: None,
             tray: None,
             ipc_rx,
             ipc_server,
@@ -242,9 +266,10 @@ fn run() -> Result<()> {
             in_proc_notif_tx,
             in_proc_notif_rx,
             last_watchdog_poll: None,
+            tray_show_disk_space,
+            last_tray_space_refresh: None,
             background_analysis_in_flight: false,
-            service_sync_in_flight: false,
-            watchdog_config: initial_watchdog_config.clone(),
+            watchdog_config: initial_watchdog_config,
             update_state: state::UpdateUiState::Idle,
             update_settings: initial_update_settings,
             update_install_kind: initial_install_kind,
@@ -252,6 +277,8 @@ fn run() -> Result<()> {
             update_download_cancel: None,
             update_last_error: None,
             update_quitting: Arc::clone(&update_quitting),
+            #[cfg(test)]
+            test_cleanup_gate: None,
         });
         if !cfg!(test)
             && let Some(store) = shared_cred_store
@@ -295,12 +322,21 @@ fn run() -> Result<()> {
             open_or_navigate_main_window(None, cx);
         });
 
-        let window = open_main_window(cx, Some(title_root));
-        with_runtime_mut(cx, |rt| rt.main_window = Some(window));
+        let bg_adapter = background::BackgroundPresentationFactory::create();
+        let start_in_background =
+            start_background_flag || bg_adapter.launched_as_login_item();
+        let initial_window = if start_in_background {
+            bg_adapter.enter_background(cx);
+            None
+        } else {
+            let window = open_main_window(cx, Some(title_root));
+            with_runtime_mut(cx, |rt| rt.main_window = Some(window));
+            bg_adapter.enter_foreground(cx);
+            Some(window)
+        };
         if !cfg!(test) {
             spawn_startup_update_and_sync(
-                window,
-                initial_watchdog_config.background_service,
+                initial_window,
                 initial_install_kind,
                 update_quitting,
                 cx,
@@ -309,7 +345,8 @@ fn run() -> Result<()> {
 
         // Install tray icon on the next GUI loop turn once platform status
         // bar integration is initialized. Failure keeps tray inactive so
-        // closing the main window still quits normally.
+        // closing the main window (or failing in `--background` mode) exits
+        // cleanly without leaving a zombie process.
         let tray_signal = Arc::new(AsyncSignal::default());
         let waker_signal = Arc::clone(&tray_signal);
         cx.defer(move |cx| {
@@ -324,6 +361,11 @@ fn run() -> Result<()> {
                 Err(err) => {
                     eprintln!("ruum: tray icon unavailable: {err}");
                     app_menu::set_tray_active(cx, false);
+                    if cx.windows().is_empty()
+                        && app_menu::should_quit_on_all_windows_closed(cx)
+                    {
+                        app_menu::request_quit(cx);
+                    }
                 }
             }
         });
@@ -361,8 +403,6 @@ fn run() -> Result<()> {
             }
         })
         .detach();
-
-        cx.activate(true);
     });
     Ok(())
 }
@@ -484,10 +524,19 @@ impl CleanupConfirmWindow {
         if self.handled || self.modal.selected_count() == 0 {
             return;
         }
-        self.handled = true;
         // Read before calling `modal.confirm()`, which consumes `responder`.
         let is_in_app = self.modal.responder.is_none()
             && self.modal.response_file.is_none();
+        if is_in_app
+            && self.modal.remote_profile_id.is_none()
+            && cx
+                .try_global::<AppRuntime>()
+                .is_some_and(|rt| rt.active_cleanup.is_some())
+        {
+            open_cleanup_progress_window(cx);
+            return;
+        }
+        self.handled = true;
         let selected_bytes = self.modal.selected_bytes();
         let decision = self.modal.confirm();
         let confirm_only = self.confirm_only;
@@ -546,6 +595,7 @@ impl CleanupConfirmWindow {
                 }
             }
         }
+        with_runtime_mut(cx, |rt| rt.confirm_window = None);
         window.remove_window();
         if let Some((title, body)) = sync_fallback_notif {
             let _ = ruum_core::watchdog::send_fallback_os_notification(
@@ -759,7 +809,7 @@ impl CleanupConfirmWindow {
         if approved_items.is_empty() && selected_docker_targets.is_empty() {
             return;
         }
-        let root = self.modal.request.root.clone();
+        let task_root = self.modal.request.root.clone();
         let db_path = self.db_path.clone();
         let docker_status = self.docker.clone();
         let docker_estimates: Vec<(
@@ -772,19 +822,122 @@ impl CleanupConfirmWindow {
             .iter()
             .map(|i| (i.target.clone(), i.reclaimable_bytes))
             .collect();
+        let home_dir = std::env::home_dir();
+        let initial_item = approved_items
+            .first()
+            .map(|i| marks::display_path(&i.path, home_dir.as_deref()))
+            .or_else(|| {
+                (!selected_docker_targets.is_empty()).then(|| {
+                    i18n::messages::cleanup_docker_stage("cleanup", locale)
+                        .to_owned()
+                })
+            });
+        let docker_total = selected_docker_targets.len();
+        let total_items = approved_items.len() + docker_total;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(CleanupProgressSnapshot {
+            total_items,
+            total_bytes: selected_bytes,
+            completed_items: 0,
+            reclaimed_bytes: 0,
+            current_item: initial_item,
+            cancelling: false,
+            completion: None,
+        }));
+        with_runtime_mut(cx, |rt| {
+            rt.active_cleanup = Some(ActiveCleanupTask {
+                cancel: Arc::clone(&cancel),
+                progress: Arc::clone(&progress),
+            });
+        });
+        let _ = open_cleanup_progress_window_with_locale(Some(locale), cx);
+        refresh_tray_cleanup_status(cx);
+
+        let cancel_bg = Arc::clone(&cancel);
+        let progress_bg = Arc::clone(&progress);
+        let progress_signal = Arc::new(AsyncSignal::default());
+        let bg_signal = Arc::clone(&progress_signal);
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let bg_done = Arc::clone(&done_flag);
+        #[cfg(test)]
+        let test_gate = cx
+            .try_global::<AppRuntime>()
+            .and_then(|rt| rt.test_cleanup_gate.as_ref().map(Arc::clone));
+
         let task = cx.background_executor().spawn(async move {
-            let (mut total_bytes, mut total_count, mut pruned_paths) =
-                if approved_items.is_empty() {
-                    (0_u64, 0_usize, Vec::new())
-                } else {
-                    ruum_core::watchdog::execute_confirmed_cleanup_tracked(
+            use ruum_core::watchdog::CleanupProgressEvent;
+
+            #[cfg(test)]
+            if let Some(gate) = test_gate {
+                gate.wait().await;
+            }
+
+            let mut total_bytes = 0_u64;
+            let mut total_count = 0_usize;
+            let mut pruned_paths = Vec::new();
+            let mut cancelled = cancel_bg.load(Ordering::Acquire);
+            let mut file_completed = 0_usize;
+
+            if !approved_items.is_empty() {
+                let (bytes, count, paths, files_cancelled) =
+                    ruum_core::watchdog::execute_confirmed_cleanup_cancellable(
                         &approved_items,
-                        &root,
-                    )
-                };
-            for item in &approved_items {
-                if !item.path.exists() && !pruned_paths.contains(&item.path) {
-                    pruned_paths.push(item.path.clone());
+                        &task_root,
+                        &cancel_bg,
+                        &mut |ev| {
+                            if let Ok(mut snap) = progress_bg.lock() {
+                                match ev {
+                                    CleanupProgressEvent::Start {
+                                        total_items: file_planned,
+                                        ..
+                                    } => {
+                                        snap.total_items =
+                                            file_planned + docker_total;
+                                    }
+                                    CleanupProgressEvent::ItemDone {
+                                        path,
+                                        bytes,
+                                        outcome,
+                                    } => {
+                                        file_completed += 1;
+                                        snap.completed_items = file_completed;
+                                        if outcome.is_ok() {
+                                            snap.reclaimed_bytes = snap
+                                                .reclaimed_bytes
+                                                .saturating_add(bytes);
+                                        }
+                                        snap.current_item =
+                                            Some(marks::display_path(
+                                                &path,
+                                                home_dir.as_deref(),
+                                            ));
+                                    }
+                                    CleanupProgressEvent::Finished {
+                                        reclaimed_bytes,
+                                        cancelled: fin_cancelled,
+                                        ..
+                                    } => {
+                                        snap.reclaimed_bytes = reclaimed_bytes;
+                                        if fin_cancelled {
+                                            snap.cancelling = true;
+                                        }
+                                    }
+                                }
+                            }
+                            bg_signal.notify();
+                        },
+                    );
+                total_bytes = bytes;
+                total_count = count;
+                pruned_paths = paths;
+                cancelled |= files_cancelled;
+            }
+            if !cancelled {
+                for item in &approved_items {
+                    if !item.path.exists() && !pruned_paths.contains(&item.path)
+                    {
+                        pruned_paths.push(item.path.clone());
+                    }
                 }
             }
             if !pruned_paths.is_empty()
@@ -794,17 +947,47 @@ impl CleanupConfirmWindow {
                 let _ = db.prune_ai_state_paths(&pruned_paths, now_unix_secs());
             }
             let mut docker_err: Option<String> = None;
-            let fresh_docker = if selected_docker_targets.is_empty() {
+            let fresh_docker = if selected_docker_targets.is_empty()
+                || cancelled
+                || cancel_bg.load(Ordering::Acquire)
+            {
+                if !selected_docker_targets.is_empty() {
+                    cancelled = true;
+                }
                 None
             } else {
                 let adapter = DockerFactory::create();
                 let env = DockerEnv::current();
                 if let DockerProbeStatus::Available(summary) = docker_status {
-                    let outcomes = adapter.run_clean_targets(
-                        &env,
-                        &summary,
-                        &selected_docker_targets,
-                    );
+                    if let Ok(mut snap) = progress_bg.lock() {
+                        snap.current_item = Some(
+                            i18n::messages::cleanup_docker_stage(
+                                "cleanup", locale,
+                            )
+                            .to_owned(),
+                        );
+                    }
+                    bg_signal.notify();
+                    let outcomes = adapter
+                        .run_clean_targets_with_env_progress_cancellable(
+                            &env,
+                            &summary,
+                            &selected_docker_targets,
+                            Some(&cancel_bg),
+                            &mut |stage, done, _total| {
+                                if let Ok(mut snap) = progress_bg.lock() {
+                                    snap.completed_items =
+                                        file_completed + done;
+                                    snap.current_item = Some(
+                                        i18n::messages::cleanup_docker_stage(
+                                            stage, locale,
+                                        )
+                                        .to_owned(),
+                                    );
+                                }
+                                bg_signal.notify();
+                            },
+                        );
                     for outcome in outcomes {
                         let est = docker_estimates
                             .iter()
@@ -821,68 +1004,65 @@ impl CleanupConfirmWindow {
                             Err(_) => {}
                         }
                     }
+                    if cancel_bg.load(Ordering::Acquire) {
+                        cancelled = true;
+                    }
                 } else {
                     docker_err =
                         Some("Docker summary unavailable for cleanup".into());
                 }
                 Some(adapter.probe(&env))
             };
-            let fresh_space = ruum_core::space::space_info(&root).ok();
-            (
-                total_bytes,
-                total_count,
-                pruned_paths,
-                fresh_space,
-                fresh_docker,
-                docker_err,
-            )
-        });
-        cx.spawn(async move |_, cx| {
-            let (
-                bytes,
-                count,
-                pruned_paths,
-                fresh_space,
-                fresh_docker,
-                docker_err,
-            ) = task.await;
-            let summary =
-                i18n::messages::cleaned_items_summary(count, bytes, locale);
-            cx.update(|cx| {
-                if count > 0 {
-                    post_app_notification(
-                        ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
-                        i18n::messages::cleanup_complete_notif_title(locale),
-                        &summary,
-                        cx,
-                    );
+            let fresh_space = ruum_core::space::space_info(&task_root).ok();
+            let home_space = std::env::home_dir().and_then(|h| {
+                if h == task_root {
+                    fresh_space
+                } else {
+                    ruum_core::space::space_info(&h).ok()
                 }
-                refresh_tray_status(cx);
-                update_open_main_window(cx, |app, cx| {
-                    app.prune_local_ai_proposal(&pruned_paths);
-                    if let Some(space) = fresh_space {
-                        app.space = Some(space);
-                    }
-                    if let Some(docker) = fresh_docker {
-                        app.apply_local_docker_status(docker);
-                    }
-                    app.reload_watchdog_state();
-                    app.notice = Some(
-                        if let Some(err) = docker_err
-                            && count == 0
-                        {
-                            (err, gpui_omarchy::Status::Error)
-                        } else {
-                            (
-                                i18n::messages::cleaned_items_summary(
-                                    count, bytes, app.locale,
-                                ),
-                                gpui_omarchy::Status::Success,
-                            )
-                        },
-                    );
-                    cx.notify();
+            });
+            bg_done.store(true, Ordering::Release);
+            bg_signal.notify();
+            CleanupTaskOutcome {
+                root: task_root,
+                locale,
+                bytes: total_bytes,
+                count: total_count,
+                pruned_paths,
+                fresh_space,
+                home_space,
+                fresh_docker,
+                docker_err,
+                cancelled,
+            }
+        });
+
+        let obs_signal = Arc::clone(&progress_signal);
+        let obs_done = Arc::clone(&done_flag);
+        cx.spawn(async move |_, cx| {
+            loop {
+                if obs_done.load(Ordering::Acquire) {
+                    break;
+                }
+                obs_signal.wait().await;
+                if obs_done.load(Ordering::Acquire) {
+                    break;
+                }
+                cx.update(|cx| {
+                    refresh_cleanup_progress_ui(cx);
                 });
+            }
+        })
+        .detach();
+
+        let fin_signal = Arc::clone(&progress_signal);
+        let fin_done = Arc::clone(&done_flag);
+        cx.spawn(async move |_, cx| {
+            let outcome = task.await;
+            fin_done.store(true, Ordering::Release);
+            fin_signal.notify();
+            cx.update(|cx| {
+                finish_active_cleanup_task(outcome, cx);
             });
         })
         .detach();
@@ -992,7 +1172,7 @@ fn open_confirm_window_with_mode(
             window.activate_window();
         });
         if updated.is_ok() {
-            cx.activate(true);
+            enter_foreground_mode(cx);
             return Some(handle);
         }
     }
@@ -1061,9 +1241,447 @@ fn open_confirm_window_with_mode(
         window.focus(&focus, cx);
         window.activate_window();
     });
-    cx.activate(true);
+    enter_foreground_mode(cx);
 
     with_runtime_mut(cx, |rt| rt.confirm_window = Some(window));
+    Some(window)
+}
+
+/// How long the standalone progress window lingers after cleanup completes
+/// before automatically closing.
+pub(crate) const CLEANUP_PROGRESS_LINGER: Duration = Duration::from_secs(3);
+
+/// Terminal state of an in-app cleanup run displayed while lingering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanupProgressCompletion {
+    Completed { count: usize, bytes: u64 },
+    Cancelled { count: usize, bytes: u64 },
+    Failed { message: String },
+}
+
+/// Snapshot of the currently executing in-app background cleanup task.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CleanupProgressSnapshot {
+    pub total_items: usize,
+    pub total_bytes: u64,
+    pub completed_items: usize,
+    pub reclaimed_bytes: u64,
+    pub current_item: Option<String>,
+    pub cancelling: bool,
+    pub completion: Option<CleanupProgressCompletion>,
+}
+
+/// Standalone floating progress window for an active local cleanup job.
+#[derive(Debug)]
+pub struct CleanupProgressWindow {
+    pub focus: FocusHandle,
+    pub locale: i18n::Locale,
+    pub cancel: Arc<AtomicBool>,
+    pub progress: Arc<Mutex<CleanupProgressSnapshot>>,
+    linger_epoch: u64,
+}
+
+struct CleanupTaskOutcome {
+    root: PathBuf,
+    locale: i18n::Locale,
+    bytes: u64,
+    count: usize,
+    pruned_paths: Vec<PathBuf>,
+    fresh_space: Option<ruum_core::space::SpaceInfo>,
+    home_space: Option<ruum_core::space::SpaceInfo>,
+    fresh_docker: Option<DockerProbeStatus>,
+    docker_err: Option<String>,
+    cancelled: bool,
+}
+
+fn finish_active_cleanup_task(outcome: CleanupTaskOutcome, cx: &mut App) {
+    let quitting = app_menu::is_quitting(cx);
+    let windows = cx.windows();
+    let progress_win = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.cleanup_progress_window)
+        .filter(|h| windows.contains(&(*h).into()));
+
+    with_runtime_mut(cx, |rt| {
+        rt.active_cleanup = None;
+        if progress_win.is_none() || quitting {
+            rt.cleanup_progress_window = None;
+        }
+    });
+    if quitting {
+        if let Some(handle) = progress_win {
+            let _ = handle.update(cx, |_, window, _| {
+                window.remove_window();
+            });
+        }
+        return;
+    }
+    if let Some(handle) = progress_win {
+        let completion = if outcome.cancelled {
+            CleanupProgressCompletion::Cancelled {
+                count: outcome.count,
+                bytes: outcome.bytes,
+            }
+        } else if outcome.count == 0
+            && let Some(ref err) = outcome.docker_err
+        {
+            CleanupProgressCompletion::Failed {
+                message: err.clone(),
+            }
+        } else {
+            CleanupProgressCompletion::Completed {
+                count: outcome.count,
+                bytes: outcome.bytes,
+            }
+        };
+        let scheduled = handle.update(cx, |win, _, cx| {
+            let total =
+                win.progress.lock().map_or(outcome.count, |g| g.total_items);
+            let final_completed = if outcome.cancelled {
+                outcome.count
+            } else {
+                total.max(outcome.count)
+            };
+            let epoch =
+                win.mark_finished(completion, final_completed, outcome.bytes);
+            cx.notify();
+            epoch
+        });
+        if let Ok(scheduled_epoch) = scheduled {
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(CLEANUP_PROGRESS_LINGER)
+                    .await;
+                cx.update(|cx| {
+                    if app_menu::is_quitting(cx)
+                        || !cx.windows().contains(&handle.into())
+                    {
+                        return;
+                    }
+                    let should_close = handle
+                        .read_with(cx, |win, _| {
+                            win.linger_epoch == scheduled_epoch
+                        })
+                        .unwrap_or(false);
+                    if !should_close {
+                        return;
+                    }
+                    with_runtime_mut(cx, |rt| {
+                        if rt.cleanup_progress_window == Some(handle) {
+                            rt.cleanup_progress_window = None;
+                        }
+                    });
+                    let _ = handle.update(cx, |_, window, _| {
+                        window.remove_window();
+                    });
+                });
+            })
+            .detach();
+        } else {
+            with_runtime_mut(cx, |rt| {
+                if rt.cleanup_progress_window == Some(handle) {
+                    rt.cleanup_progress_window = None;
+                }
+            });
+        }
+    }
+
+    let locale = outcome.locale;
+    if outcome.cancelled {
+        let summary = i18n::messages::cleanup_cancelled_summary(
+            outcome.count,
+            outcome.bytes,
+            locale,
+        );
+        post_app_notification(
+            ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
+            i18n::messages::cleanup_cancelled_notif_title(locale),
+            &summary,
+            cx,
+        );
+    } else if outcome.count > 0 {
+        let summary = i18n::messages::cleaned_items_summary(
+            outcome.count,
+            outcome.bytes,
+            locale,
+        );
+        post_app_notification(
+            ruum_core::watchdog::NOTIF_TAG_CLEANUP_DONE,
+            i18n::messages::cleanup_complete_notif_title(locale),
+            &summary,
+            cx,
+        );
+    }
+
+    refresh_tray_status_with_space(outcome.home_space, cx);
+    update_open_main_window(cx, |app, cx| {
+        app.prune_local_ai_proposal(&outcome.pruned_paths);
+        if let Some(space) = outcome.fresh_space {
+            if app.active_host_tab == state::HostTabKey::Local
+                && app.root_path == outcome.root
+            {
+                app.space = Some(space);
+            } else if let Some(local_tab) = app
+                .host_tabs
+                .iter_mut()
+                .find(|t| t.key == state::HostTabKey::Local)
+                && let Some(snap) = &mut local_tab.session
+            {
+                snap.space = Some(space);
+            }
+        }
+        if let Some(hs) = outcome.home_space {
+            app.watchdog_home_space = Some(hs);
+            let checked_at = now_unix_secs();
+            app.watchdog_space_checked_at = Some(checked_at);
+            app.watchdog_state.last_checked_secs = Some(checked_at);
+        }
+        if let Some(docker) = outcome.fresh_docker {
+            app.apply_local_docker_status(docker);
+        }
+        app.reload_watchdog_state();
+        app.notice = Some(if outcome.cancelled {
+            (
+                i18n::messages::cleanup_cancelled_summary(
+                    outcome.count,
+                    outcome.bytes,
+                    app.locale,
+                ),
+                gpui_omarchy::Status::Neutral,
+            )
+        } else if let Some(err) = outcome.docker_err
+            && outcome.count == 0
+        {
+            (err, gpui_omarchy::Status::Error)
+        } else {
+            (
+                i18n::messages::cleaned_items_summary(
+                    outcome.count,
+                    outcome.bytes,
+                    app.locale,
+                ),
+                gpui_omarchy::Status::Success,
+            )
+        });
+        cx.notify();
+    });
+}
+
+fn refresh_cleanup_progress_ui(cx: &mut App) {
+    let windows = cx.windows();
+    let progress_win = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.cleanup_progress_window)
+        .filter(|h| windows.contains(&(*h).into()));
+    if let Some(handle) = progress_win {
+        let _ = handle.update(cx, |_, _, cx| cx.notify());
+    }
+    refresh_tray_cleanup_status(cx);
+}
+
+impl CleanupProgressWindow {
+    pub fn new(
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<CleanupProgressSnapshot>>,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            locale: i18n::Locale::current(),
+            cancel,
+            progress,
+            linger_epoch: 0,
+        }
+    }
+
+    pub fn replace_task(
+        &mut self,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<CleanupProgressSnapshot>>,
+    ) {
+        if !Arc::ptr_eq(&self.progress, &progress) {
+            self.linger_epoch = self.linger_epoch.wrapping_add(1);
+        }
+        self.cancel = cancel;
+        self.progress = progress;
+    }
+
+    pub(crate) fn mark_finished(
+        &mut self,
+        completion: CleanupProgressCompletion,
+        completed_items: usize,
+        reclaimed_bytes: u64,
+    ) -> u64 {
+        if let Ok(mut snap) = self.progress.lock() {
+            snap.completed_items = completed_items;
+            snap.reclaimed_bytes = reclaimed_bytes;
+            snap.cancelling = false;
+            snap.current_item = None;
+            snap.completion = Some(completion);
+        }
+        self.linger_epoch = self.linger_epoch.wrapping_add(1);
+        self.linger_epoch
+    }
+
+    #[cfg(test)]
+    pub const fn set_locale(&mut self, locale: i18n::Locale) {
+        self.locale = locale;
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> CleanupProgressSnapshot {
+        self.progress
+            .lock()
+            .map_or_else(|_| CleanupProgressSnapshot::default(), |g| g.clone())
+    }
+
+    pub fn close_from_chrome(
+        _entity: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::continue_in_background(window, cx);
+    }
+
+    pub fn continue_in_background(window: &mut Window, cx: &mut App) {
+        with_runtime_mut(cx, |rt| rt.cleanup_progress_window = None);
+        window.remove_window();
+    }
+
+    pub fn cancel_cleanup(&mut self, cx: &mut gpui_kit::Context<'_, Self>) {
+        self.cancel.store(true, Ordering::Release);
+        if let Ok(mut snap) = self.progress.lock() {
+            snap.cancelling = true;
+        }
+        refresh_tray_cleanup_status(cx);
+        cx.notify();
+    }
+}
+
+impl Render for CleanupProgressWindow {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> impl IntoElement {
+        let snap = self.snapshot();
+        let content = rail_pages::cleanup_progress_view(
+            &snap,
+            &self.focus,
+            self.locale,
+            cx,
+        );
+        let entity = cx.entity().downgrade();
+        window_chrome::wrap_window_chrome(
+            i18n::messages::title_cleanup_progress(self.locale),
+            content,
+            move |window, cx| {
+                Self::close_from_chrome(&entity, window, cx);
+            },
+        )
+    }
+}
+
+/// Open or focus the compact background cleanup progress window when an active
+/// cleanup task exists.
+pub fn open_cleanup_progress_window(
+    cx: &mut App,
+) -> Option<WindowHandle<CleanupProgressWindow>> {
+    open_cleanup_progress_window_with_locale(None, cx)
+}
+
+fn open_cleanup_progress_window_with_locale(
+    locale_override: Option<i18n::Locale>,
+    cx: &mut App,
+) -> Option<WindowHandle<CleanupProgressWindow>> {
+    let windows = cx.windows();
+    let existing = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.cleanup_progress_window)
+        .filter(|h| windows.contains(&(*h).into()));
+    let active_task = cx
+        .try_global::<AppRuntime>()
+        .and_then(|rt| rt.active_cleanup.as_ref())
+        .map(|task| (Arc::clone(&task.cancel), Arc::clone(&task.progress)));
+
+    if let Some(handle) = existing {
+        let updated = handle.update(cx, |win, window, cx| {
+            if let Some((cancel, progress)) = active_task {
+                win.replace_task(cancel, progress);
+            }
+            if let Some(loc) = locale_override {
+                win.locale = loc;
+            }
+            let focus = win.focus.clone();
+            window.focus(&focus, cx);
+            window.activate_window();
+            cx.notify();
+        });
+        if updated.is_ok() {
+            enter_foreground_mode(cx);
+            return Some(handle);
+        }
+    }
+
+    let (cancel, progress, native_look) = {
+        let rt = cx.try_global::<AppRuntime>()?;
+        let task = rt.active_cleanup.as_ref()?;
+        (
+            Arc::clone(&task.cancel),
+            Arc::clone(&task.progress),
+            rt.launch.native_look,
+        )
+    };
+    let initial_locale = locale_override.unwrap_or_else(i18n::Locale::current);
+
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::centered(
+                    size(px(540.), px(300.)),
+                    cx,
+                )),
+                titlebar: Some(gpui_kit::TitlebarOptions {
+                    title: Some(
+                        i18n::messages::title_cleanup_progress(initial_locale)
+                            .into(),
+                    ),
+                    ..Default::default()
+                }),
+                app_id: Some("ruum".to_owned()),
+                window_min_size: Some(size(px(460.), px(280.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                if native_look {
+                    appearance::follow(window);
+                }
+                window_chrome::observe_window_chrome(window);
+                let entity = cx.new(|cx| {
+                    let mut win =
+                        CleanupProgressWindow::new(cancel, progress, cx);
+                    win.locale = initial_locale;
+                    win
+                });
+                window.on_window_should_close(cx, move |_, cx| {
+                    with_runtime_mut(cx, |rt| {
+                        rt.cleanup_progress_window = None;
+                    });
+                    true
+                });
+                entity
+            },
+        )
+        .ok()?;
+
+    let _ = window.update(cx, |win, window, cx| {
+        let focus = win.focus.clone();
+        window.focus(&focus, cx);
+        window.activate_window();
+    });
+    enter_foreground_mode(cx);
+
+    with_runtime_mut(cx, |rt| rt.cleanup_progress_window = Some(window));
     Some(window)
 }
 
@@ -1217,7 +1835,7 @@ pub(crate) fn open_remote_connect_confirm_window_with_mode(
             window.activate_window();
         });
         if updated.is_ok() {
-            cx.activate(true);
+            enter_foreground_mode(cx);
             return Some(handle);
         }
     }
@@ -1286,7 +1904,7 @@ pub(crate) fn open_remote_connect_confirm_window_with_mode(
         window.focus(&focus, cx);
         window.activate_window();
     });
-    cx.activate(true);
+    enter_foreground_mode(cx);
 
     with_runtime_mut(cx, |rt| rt.remote_connect_window = Some(window));
     Some(window)
@@ -1298,8 +1916,54 @@ pub(crate) fn with_runtime_mut(cx: &mut App, f: impl FnOnce(&mut AppRuntime)) {
     }
 }
 
+/// Return whether a cleanup proposal has any actionable filesystem or Docker
+/// items.
+#[must_use]
+pub(crate) const fn has_actionable_proposal(
+    proposal: &ruum_core::watchdog_config::CleanupProposal,
+) -> bool {
+    !proposal.items.is_empty() || !proposal.docker_targets.is_empty()
+}
+
+const TRAY_SPACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Return whether the periodic 30s tray disk-space refresh should fire.
+#[must_use]
+pub(crate) fn should_refresh_tray_disk_space(
+    has_tray: bool,
+    tray_show_disk_space: bool,
+    last_refresh: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !has_tray || !tray_show_disk_space {
+        return false;
+    }
+    last_refresh.is_none_or(|prev| {
+        now.saturating_duration_since(prev) >= TRAY_SPACE_REFRESH_INTERVAL
+    })
+}
+
+/// Update cached `AppRuntime` fields derived from `AppSettings`.
+pub(crate) fn sync_runtime_app_settings(
+    settings: &ruum_core::storage::AppSettings,
+    cx: &mut App,
+) {
+    with_runtime_mut(cx, |rt| {
+        rt.tray_show_disk_space = settings.tray_show_disk_space;
+    });
+}
+
 /// Refresh tray menu status lines if a tray icon is active.
 pub fn refresh_tray_status(cx: &mut App) {
+    refresh_tray_status_with_space(None, cx);
+}
+
+/// Refresh tray menu status and disk gauge, reusing `home_space_override` when
+/// the caller has already measured the home volume.
+pub(crate) fn refresh_tray_status_with_space(
+    home_space_override: Option<ruum_core::space::SpaceInfo>,
+    cx: &mut App,
+) {
     let Some(rt) = cx.try_global::<AppRuntime>() else {
         return;
     };
@@ -1307,21 +1971,103 @@ pub fn refresh_tray_status(cx: &mut App) {
         return;
     }
     let watchdog_enabled = rt.watchdog_config.enabled;
-    let home = std::env::home_dir();
-    let free_bytes = home
-        .as_deref()
-        .and_then(|h| ruum_core::space::space_info(h).ok())
-        .map(|s| s.available);
+    let show_disk_space = rt.tray_show_disk_space;
+    let space = home_space_override.or_else(|| {
+        std::env::home_dir()
+            .as_deref()
+            .and_then(|h| ruum_core::space::space_info(h).ok())
+    });
     let has_proposal = StorageDb::open_default()
         .ok()
         .and_then(|db| db.load_ai_state().ok())
         .and_then(|s| s.parse_proposal().ok().flatten())
-        .is_some_and(|p| !p.items.is_empty());
+        .is_some_and(|p| has_actionable_proposal(&p));
 
+    let cleanup_status = current_tray_cleanup_status(cx);
+    let now = Instant::now();
     if let Some(rt) = cx.try_global::<AppRuntime>()
         && let Some(tray) = &rt.tray
     {
-        tray.update_status(free_bytes, watchdog_enabled, has_proposal);
+        tray.update_status(
+            space,
+            watchdog_enabled,
+            has_proposal,
+            show_disk_space,
+        );
+        tray.set_cleanup_progress(cleanup_status);
+    }
+    with_runtime_mut(cx, |rt| {
+        rt.last_tray_space_refresh = Some(now);
+    });
+}
+
+pub(crate) fn refresh_tray_cleanup_status(cx: &App) {
+    let cleanup_status = current_tray_cleanup_status(cx);
+    if let Some(rt) = cx.try_global::<AppRuntime>()
+        && let Some(tray) = &rt.tray
+    {
+        tray.set_cleanup_progress(cleanup_status);
+    }
+}
+
+/// Transition the process into tray-resident background presentation mode.
+pub(crate) fn enter_background_mode(cx: &mut App) {
+    background::BackgroundPresentationFactory::create().enter_background(cx);
+}
+
+/// Transition the process back into foreground presentation mode.
+pub(crate) fn enter_foreground_mode(cx: &mut App) {
+    background::BackgroundPresentationFactory::create().enter_foreground(cx);
+}
+
+/// Cancel/deny pending confirmation windows, drop runtime IPC/tray handles,
+/// and remove any legacy headless `ruum watchdog` OS service residue before
+/// quitting so `WatchdogIpcServer::drop` never deadlocks.
+pub(crate) fn cleanup_runtime_on_quit(cx: &mut App) {
+    for win in cx.windows() {
+        if let Some(confirm) = win.downcast::<CleanupConfirmWindow>() {
+            let _ = confirm.update(cx, |this, window, _| {
+                this.ensure_cancelled();
+                window.remove_window();
+            });
+        } else if let Some(remote) =
+            win.downcast::<RemoteConnectConfirmWindow>()
+        {
+            let _ = remote.update(cx, |this, window, _| {
+                this.ensure_denied();
+                window.remove_window();
+            });
+        } else if let Some(progress) = win.downcast::<CleanupProgressWindow>() {
+            let _ = progress.update(cx, |this, window, _| {
+                this.cancel.store(true, Ordering::Release);
+                window.remove_window();
+            });
+        }
+    }
+
+    let (tray, ipc_server) = if cx.has_global::<AppRuntime>() {
+        let rt = cx.global_mut::<AppRuntime>();
+        if let Some(task) = rt.active_cleanup.take() {
+            task.cancel.store(true, Ordering::Release);
+            if let Ok(mut snap) = task.progress.lock() {
+                snap.cancelling = true;
+            }
+        }
+        rt.confirm_window = None;
+        rt.cleanup_progress_window = None;
+        rt.remote_connect_window = None;
+        rt.ipc_rx = None;
+        (rt.tray.take(), rt.ipc_server.take())
+    } else {
+        (None, None)
+    };
+    drop(tray);
+    drop(ipc_server);
+
+    if !cfg!(test) {
+        let _ = ruum_core::watchdog::uninstall_legacy_service_if_present(
+            Duration::from_secs(2),
+        );
     }
 }
 
@@ -1358,26 +2104,31 @@ type ConfirmChannelPayload =
 type NotificationChannelPayload = (String, String, String);
 
 #[derive(Debug)]
+pub(crate) struct ActiveCleanupTask {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) progress: Arc<Mutex<CleanupProgressSnapshot>>,
+}
+
+#[derive(Debug)]
 pub(crate) struct AppRuntime {
     launch: LaunchConfig,
     pub(crate) cred_store: Option<ruum_core::credentials::LazyCredentialStore>,
     pub(crate) main_window: Option<WindowHandle<Ruum>>,
     confirm_window: Option<WindowHandle<CleanupConfirmWindow>>,
+    cleanup_progress_window: Option<WindowHandle<CleanupProgressWindow>>,
     remote_connect_window: Option<WindowHandle<RemoteConnectConfirmWindow>>,
+    pub(crate) active_cleanup: Option<ActiveCleanupTask>,
     tray: Option<tray_menu::TrayMenu>,
     ipc_rx: Option<Receiver<watchdog_runtime::WatchdogIpcEvent>>,
-    #[allow(
-        dead_code,
-        reason = "keeps background IPC listener alive across window closes"
-    )]
     ipc_server: Option<watchdog_runtime::WatchdogIpcServer>,
     in_proc_confirm_tx: Sender<ConfirmChannelPayload>,
     in_proc_confirm_rx: Receiver<ConfirmChannelPayload>,
     in_proc_notif_tx: Sender<NotificationChannelPayload>,
     in_proc_notif_rx: Receiver<NotificationChannelPayload>,
     last_watchdog_poll: Option<Instant>,
+    pub(crate) tray_show_disk_space: bool,
+    pub(crate) last_tray_space_refresh: Option<Instant>,
     background_analysis_in_flight: bool,
-    pub(crate) service_sync_in_flight: bool,
     watchdog_config: ruum_watchdog::WatchdogConfig,
     pub(crate) update_state: state::UpdateUiState,
     pub(crate) update_settings: ruum_core::storage::UpdateSettings,
@@ -1386,6 +2137,8 @@ pub(crate) struct AppRuntime {
     pub(crate) update_download_cancel: Option<Arc<AtomicBool>>,
     pub(crate) update_last_error: Option<String>,
     pub(crate) update_quitting: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) test_cleanup_gate: Option<Arc<AsyncSignal>>,
 }
 
 impl Global for AppRuntime {}
@@ -1414,7 +2167,9 @@ pub(crate) fn install_test_runtime(
         cred_store: None,
         main_window,
         confirm_window: None,
+        cleanup_progress_window: None,
         remote_connect_window: None,
+        active_cleanup: None,
         tray: None,
         ipc_rx: None,
         ipc_server: None,
@@ -1423,8 +2178,9 @@ pub(crate) fn install_test_runtime(
         in_proc_notif_tx,
         in_proc_notif_rx,
         last_watchdog_poll: None,
+        tray_show_disk_space: false,
+        last_tray_space_refresh: None,
         background_analysis_in_flight: false,
-        service_sync_in_flight: false,
         watchdog_config: ruum_watchdog::WatchdogConfig::default(),
         update_state: state::UpdateUiState::Idle,
         update_settings: ruum_core::storage::UpdateSettings::default(),
@@ -1433,6 +2189,8 @@ pub(crate) fn install_test_runtime(
         update_download_cancel: None,
         update_last_error: None,
         update_quitting: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        test_cleanup_gate: None,
     });
 }
 
@@ -1701,11 +2459,28 @@ pub(crate) fn install_notification_handler(cx: &App) {
     }
 }
 
+const fn screen_open_tag(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Explore | Screen::Review | Screen::Running | Screen::Done => {
+            "ruum.screen.explore"
+        }
+        Screen::Docker => "ruum.screen.docker",
+        Screen::Remote => "ruum.screen.remote",
+        Screen::Watchdog => "ruum.screen.watchdog",
+        Screen::Settings => "ruum.screen.settings",
+    }
+}
+
 #[must_use]
 pub(crate) fn target_screen_for_notification_tag(tag: &str) -> Option<Screen> {
     match tag {
         ruum_core::watchdog::NOTIF_TAG_LOW_SPACE
-        | ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS => Some(Screen::Watchdog),
+        | ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS
+        | "ruum.screen.watchdog" => Some(Screen::Watchdog),
+        "ruum.screen.explore" => Some(Screen::Explore),
+        "ruum.screen.docker" => Some(Screen::Docker),
+        "ruum.screen.remote" => Some(Screen::Remote),
+        "ruum.screen.settings" => Some(Screen::Settings),
         _ => None,
     }
 }
@@ -1772,7 +2547,7 @@ pub(crate) fn open_or_navigate_main_window(
             window.focus(&focus, cx);
             window.activate_window();
         });
-        cx.activate(true);
+        enter_foreground_mode(cx);
         return;
     }
 
@@ -1786,7 +2561,7 @@ pub(crate) fn open_or_navigate_main_window(
         });
     }
     with_runtime_mut(cx, |rt| rt.main_window = Some(window));
-    cx.activate(true);
+    enter_foreground_mode(cx);
 }
 
 pub(crate) fn update_open_main_window_checked<F>(cx: &mut App, f: F) -> bool
@@ -1874,8 +2649,7 @@ fn trigger_check_for_updates_from_menu_or_tray(cx: &mut App) {
 }
 
 fn spawn_startup_update_and_sync(
-    main_window: WindowHandle<Ruum>,
-    watchdog_bg_service: bool,
+    main_window: Option<WindowHandle<Ruum>>,
     install_kind: ruum_core::updater::InstallKind,
     quitting: Arc<AtomicBool>,
     cx: &App,
@@ -1883,9 +2657,8 @@ fn spawn_startup_update_and_sync(
     if cfg!(test) {
         return;
     }
-    let weak_ruum =
-        main_window.entity(cx).ok().map(|entity| entity.downgrade());
-    let cli_exe = resolve_cli_exe();
+    let weak_ruum = main_window
+        .and_then(|win| win.entity(cx).ok().map(|entity| entity.downgrade()));
     let lang = state::locale_code(i18n::Locale::current());
     let (tx, rx) = channel();
     let signal = Arc::new(AsyncSignal::default());
@@ -1895,20 +2668,11 @@ fn spawn_startup_update_and_sync(
         .name("ruum-startup-update".to_owned())
         .spawn(move || {
             // [RISK-NOTE 7] Sync installed Windows CLI copy after updates and
-            // keep background watchdog service running when enabled.
+            // retire any legacy headless `ruum watchdog` OS service residue.
             let _ = ruum_core::updater::sync_installed_windows_cli_if_needed();
-            if watchdog_bg_service {
-                let runner = ruum_core::ai_cli::TimedCommandRunner::new(
-                    Duration::from_secs(5),
-                );
-                if !matches!(
-                    ruum_core::watchdog::service_status(&runner),
-                    Ok(ruum_core::watchdog::ServiceStatus::Active)
-                ) {
-                    let _ =
-                        ruum_core::watchdog::install_service(&runner, &cli_exe);
-                }
-            }
+            let _ = ruum_core::watchdog::uninstall_legacy_service_if_present(
+                Duration::from_secs(2),
+            );
 
             if ruum_core::updater::is_auto_check_disabled() {
                 return;
@@ -1985,39 +2749,77 @@ fn drain_tray_actions(cx: &mut App) {
         }
     }
     for action in actions {
-        match action {
-            tray_menu::TrayAction::OpenRuum => {
-                open_or_navigate_main_window(None, cx);
-            }
-            tray_menu::TrayAction::OpenRemote => {
-                open_or_navigate_main_window(Some(Screen::Remote), cx);
-            }
-            tray_menu::TrayAction::OpenWatchdog => {
-                open_or_navigate_main_window(Some(Screen::Watchdog), cx);
-            }
-            tray_menu::TrayAction::OpenSettings => {
-                open_or_navigate_main_window(Some(Screen::Settings), cx);
-            }
-            tray_menu::TrayAction::CheckForUpdates => {
-                trigger_check_for_updates_from_menu_or_tray(cx);
-            }
-            tray_menu::TrayAction::CheckDiskSpaceNow => {
-                trigger_tray_space_check(cx);
-            }
-            tray_menu::TrayAction::RunAiAnalysisNow => {
-                trigger_background_ai_analysis(cx);
-            }
-            tray_menu::TrayAction::ReviewLatestProposal => {
-                review_latest_proposal_from_tray(cx);
-            }
-            tray_menu::TrayAction::Quit => {
-                app_menu::request_quit(cx);
-            }
+        handle_tray_action(action, cx);
+    }
+}
+
+pub(crate) fn handle_tray_action(action: tray_menu::TrayAction, cx: &mut App) {
+    match action {
+        tray_menu::TrayAction::OpenRuum => {
+            open_or_navigate_main_window(None, cx);
+        }
+        tray_menu::TrayAction::OpenRemote => {
+            open_or_navigate_main_window(Some(Screen::Remote), cx);
+        }
+        tray_menu::TrayAction::OpenWatchdog => {
+            open_or_navigate_main_window(Some(Screen::Watchdog), cx);
+        }
+        tray_menu::TrayAction::OpenSettings => {
+            open_or_navigate_main_window(Some(Screen::Settings), cx);
+        }
+        tray_menu::TrayAction::CheckForUpdates => {
+            trigger_check_for_updates_from_menu_or_tray(cx);
+        }
+        tray_menu::TrayAction::ToggleWatchdog => {
+            toggle_watchdog_from_tray(cx);
+        }
+        tray_menu::TrayAction::RunAiAnalysisNow => {
+            trigger_background_ai_analysis(cx);
+        }
+        tray_menu::TrayAction::ReviewLatestProposal => {
+            review_latest_proposal_from_tray(cx);
+        }
+        tray_menu::TrayAction::ShowCleanupProgress => {
+            open_cleanup_progress_window(cx);
+        }
+        tray_menu::TrayAction::Quit => {
+            app_menu::request_quit(cx);
         }
     }
 }
 
-fn poll_app_runtime(cx: &mut App) {
+pub(crate) fn current_tray_cleanup_status(
+    cx: &App,
+) -> Option<tray_menu::TrayCleanupStatus> {
+    let rt = cx.try_global::<AppRuntime>()?;
+    let task = rt.active_cleanup.as_ref()?;
+    let (completed, total, cancelling) = {
+        let snap = task.progress.lock().ok()?;
+        (snap.completed_items, snap.total_items, snap.cancelling)
+    };
+    Some(tray_menu::TrayCleanupStatus {
+        completed,
+        total,
+        cancelling,
+    })
+}
+
+fn dispatch_runtime_notification(
+    tag: &str,
+    title: &str,
+    body: &str,
+    cx: &mut App,
+) {
+    post_app_notification(tag, title, body, cx);
+    if tag == ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS {
+        update_open_main_window(cx, |app, cx| {
+            app.reload_watchdog_state();
+            app.push_toast(body.to_owned(), gpui_omarchy::Status::Error, cx);
+        });
+    }
+}
+
+pub(crate) fn poll_app_runtime(cx: &mut App) {
     drain_tray_actions(cx);
 
     let mut ipc_events = Vec::new();
@@ -2046,18 +2848,24 @@ fn poll_app_runtime(cx: &mut App) {
                 open_confirm_window(request, Some(responder), None, cx);
             }
             watchdog_runtime::WatchdogIpcEvent::WatchdogUpdated => {
+                let home_space = std::env::home_dir()
+                    .as_deref()
+                    .and_then(|h| ruum_core::space::space_info(h).ok());
                 update_open_main_window(cx, |app, cx| {
                     app.reload_watchdog_state();
+                    if let Some(hs) = home_space {
+                        app.watchdog_home_space = Some(hs);
+                    }
                     cx.notify();
                 });
-                refresh_tray_status(cx);
+                refresh_tray_status_with_space(home_space, cx);
             }
             watchdog_runtime::WatchdogIpcEvent::ShowNotification {
                 tag,
                 title,
                 body,
             } => {
-                post_app_notification(&tag, &title, &body, cx);
+                dispatch_runtime_notification(&tag, &title, &body, cx);
             }
             watchdog_runtime::WatchdogIpcEvent::OpenWindow { tag } => {
                 activate_window_for_notification_tag(&tag, cx);
@@ -2084,17 +2892,30 @@ fn poll_app_runtime(cx: &mut App) {
     }
 
     for (tag, title, body) in in_proc_notifs {
-        post_app_notification(&tag, &title, &body, cx);
+        dispatch_runtime_notification(&tag, &title, &body, cx);
     }
 
     maybe_run_in_app_watchdog_tick(cx);
+
+    let should_refresh_space =
+        cx.try_global::<AppRuntime>().is_some_and(|rt| {
+            should_refresh_tray_disk_space(
+                rt.tray.is_some(),
+                rt.tray_show_disk_space,
+                rt.last_tray_space_refresh,
+                Instant::now(),
+            )
+        });
+    if should_refresh_space {
+        refresh_tray_status(cx);
+    }
 }
 
 fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
     let Some(rt) = cx.try_global::<AppRuntime>() else {
         return;
     };
-    if rt.background_analysis_in_flight || rt.service_sync_in_flight {
+    if rt.background_analysis_in_flight {
         return;
     }
     let cfg = &rt.watchdog_config;
@@ -2117,75 +2938,93 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
 
     let task = cx.background_executor().spawn(async move {
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
-        if matches!(
-            ruum_core::watchdog::service_status(&runner),
-            Ok(ruum_core::watchdog::ServiceStatus::Active)
-        ) {
-            return;
+        if ruum_core::watchdog::has_legacy_service_residue(&runner)
+            && matches!(
+                ruum_core::watchdog::service_status(&runner),
+                Ok(ruum_core::watchdog::ServiceStatus::Active)
+            )
+        {
+            return None;
         }
         let Ok(db) = StorageDb::open_default() else {
-            return;
+            return None;
         };
-        let Some(home) = std::env::home_dir() else {
-            return;
-        };
+        let home = std::env::home_dir()?;
         let now_secs = now_unix_secs();
         let adapter = InProcessConfirmAdapter { tx: confirm_tx };
         let notifier = InProcessNotificationAdapter { tx: notif_tx };
         let _ = ruum_core::watchdog::run_once_with_db(
             &db, &home, &exe, now_secs, &runner, &adapter, &notifier,
         );
+        ruum_core::space::space_info(&home).ok()
     });
 
     cx.spawn(async move |cx| {
-        task.await;
+        let home_space = task.await;
         cx.update(|cx| {
             with_runtime_mut(cx, |rt| {
                 rt.background_analysis_in_flight = false;
             });
             update_open_main_window(cx, |app, cx| {
                 app.reload_watchdog_state();
+                if let Some(hs) = home_space {
+                    app.watchdog_home_space = Some(hs);
+                }
                 cx.notify();
             });
-            refresh_tray_status(cx);
+            refresh_tray_status_with_space(home_space, cx);
         });
     })
     .detach();
 }
 
-fn trigger_tray_space_check(cx: &App) {
-    let task = cx.background_executor().spawn(async {
-        let home = std::env::home_dir()?;
-        let info = ruum_core::space::space_info(&home).ok()?;
-        let now_secs = now_unix_secs();
-        if let Ok(db) = StorageDb::open_default()
-            && let Ok(svc) = db.watchdog()
-        {
+fn toggle_watchdog_from_tray(cx: &mut App) {
+    toggle_watchdog_in_db(None, cx);
+}
+
+pub(crate) fn toggle_watchdog_in_db(
+    db_path: Option<&std::path::Path>,
+    cx: &mut App,
+) {
+    let db_opt = match db_path {
+        Some(path) => StorageDb::open(path).ok(),
+        None => StorageDb::open_default().ok(),
+    };
+    let prev_cfg = db_opt
+        .as_ref()
+        .and_then(|db| db.watchdog().ok())
+        .and_then(|svc| svc.load_config().ok())
+        .or_else(|| {
+            cx.try_global::<AppRuntime>()
+                .map(|rt| rt.watchdog_config.clone())
+        })
+        .unwrap_or_default();
+
+    let prev_enabled = prev_cfg.enabled;
+    let mut next_cfg = prev_cfg;
+    next_cfg.enabled = !prev_enabled;
+    next_cfg.updated_at_secs = now_unix_secs();
+    let next_cfg = next_cfg.normalized();
+
+    if let Some(ref db) = db_opt
+        && let Ok(svc) = db.watchdog()
+    {
+        let _ = svc.save_config(&next_cfg);
+        if !prev_enabled && next_cfg.enabled {
             let mut st = svc.load_state().unwrap_or_default();
-            st.last_checked_secs = Some(now_secs);
+            st.last_triggered_secs = None;
+            st.last_triggered_threshold_gb = None;
             let _ = svc.save_state(&st);
         }
-        Some((info, now_secs))
+    }
+
+    notify_watchdog_config_saved(&next_cfg, next_cfg.enabled, cx);
+    update_open_main_window(cx, |app, cx| {
+        app.watchdog_config = next_cfg.clone();
+        app.watchdog_draft.enabled = next_cfg.enabled;
+        app.reload_watchdog_state();
+        cx.notify();
     });
-    cx.spawn(async move |cx| {
-        let result = task.await;
-        cx.update(|cx| {
-            if let Some((info, checked_at)) = result {
-                update_open_main_window(cx, |app, cx| {
-                    app.watchdog_home_space = Some(info);
-                    app.reload_watchdog_state();
-                    app.watchdog_space_checked_at = Some(checked_at);
-                    let msg = i18n::messages::disk_check_available(
-                        info.available,
-                        app.locale,
-                    );
-                    app.push_toast(msg, gpui_omarchy::Status::Success, cx);
-                });
-            }
-            refresh_tray_status(cx);
-        });
-    })
-    .detach();
 }
 
 fn trigger_background_ai_analysis(cx: &mut App) {
@@ -2201,6 +3040,20 @@ fn trigger_background_ai_analysis(cx: &mut App) {
         return;
     }
 
+    trigger_background_ai_analysis_with(
+        None,
+        None,
+        i18n::Locale::current(),
+        cx,
+    );
+}
+
+pub(crate) fn trigger_background_ai_analysis_with(
+    db_path: Option<PathBuf>,
+    home_override: Option<PathBuf>,
+    locale: i18n::Locale,
+    cx: &mut App,
+) {
     if let Some(rt) = cx.try_global::<AppRuntime>()
         && rt.background_analysis_in_flight
     {
@@ -2213,13 +3066,29 @@ fn trigger_background_ai_analysis(cx: &mut App) {
     with_runtime_mut(cx, |rt| rt.background_analysis_in_flight = true);
 
     let task = cx.background_executor().spawn(async move {
-        let home = std::env::home_dir().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "cannot find home directory",
-            )
-        })?;
-        let db = StorageDb::open_default().map_err(std::io::Error::other)?;
+        let home =
+            home_override
+                .or_else(std::env::home_dir)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "cannot find home directory",
+                    )
+                })?;
+        let db = match db_path.as_deref() {
+            Some(path) => {
+                StorageDb::open(path).map_err(std::io::Error::other)?
+            }
+            None if !cfg!(test) => {
+                StorageDb::open_default().map_err(std::io::Error::other)?
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no test db_path configured",
+                ));
+            }
+        };
         let ai_cfg = db.load_ai_config().unwrap_or_default();
         let now_secs = now_unix_secs();
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
@@ -2228,16 +3097,27 @@ fn trigger_background_ai_analysis(cx: &mut App) {
             ai_ctx = ai_ctx.with_credential_store(store);
         }
         let proposal =
-            ruum_core::ai_cli::run_analysis_with_tree_for_config_with_context(
+            match ruum_core::ai_cli::run_analysis_with_tree_for_config_with_context(
                 &ai_cfg, &home, &exe, now_secs, None, &runner, &ai_ctx,
-            )
-            .map_err(std::io::Error::other)?;
+            ) {
+                Ok(proposal) => proposal,
+                Err(err) => {
+                    let err_secs = now_unix_secs();
+                    let summary = ruum_core::watchdog::format_ai_failure_summary(
+                        &err, locale,
+                    );
+                    let _ = db.record_ai_error(&summary, err_secs);
+                    return Err(std::io::Error::other(err));
+                }
+            };
+        let done_secs = now_unix_secs();
         let ai_state =
-            ruum_core::storage::AiState::from_proposal(&proposal, now_secs)
+            ruum_core::storage::AiState::from_proposal(&proposal, done_secs)
                 .unwrap_or_default();
         let _ = db.save_ai_state(&ai_state);
+        let resolved_db_path = db.db_path().to_path_buf();
         let docker = DockerFactory::create().probe(&DockerEnv::current());
-        Ok::<_, std::io::Error>((home, proposal, docker))
+        Ok::<_, std::io::Error>((home, proposal, docker, resolved_db_path))
     });
 
     cx.spawn(async move |cx| {
@@ -2246,14 +3126,13 @@ fn trigger_background_ai_analysis(cx: &mut App) {
             with_runtime_mut(cx, |rt| {
                 rt.background_analysis_in_flight = false;
             });
-            update_open_main_window(cx, |app, cx| {
-                app.reload_watchdog_state();
-                cx.notify();
-            });
             refresh_tray_status(cx);
-            let locale = i18n::Locale::current();
             match res {
-                Ok((home, proposal, docker)) => {
+                Ok((home, proposal, docker, resolved_db_path)) => {
+                    update_open_main_window(cx, |app, cx| {
+                        app.reload_watchdog_state();
+                        cx.notify();
+                    });
                     let request = state::proposal_confirm_request_with_docker(
                         home, &proposal, &docker, locale,
                     );
@@ -2267,19 +3146,37 @@ fn trigger_background_ai_analysis(cx: &mut App) {
                             cx,
                         );
                     } else {
-                        let db_path = StorageDb::open_default()
-                            .ok()
-                            .map(|db| db.db_path().to_path_buf());
-                        open_local_confirm_window(request, db_path, docker, cx);
+                        open_local_confirm_window(
+                            request,
+                            Some(resolved_db_path),
+                            docker,
+                            cx,
+                        );
                     }
                 }
                 Err(err) => {
+                    let raw = err.to_string();
+                    let kind = ruum_core::watchdog::classify_ai_failure(&raw);
+                    let summary =
+                        ruum_core::watchdog::format_ai_failure_summary(
+                            &raw, locale,
+                        );
                     post_app_notification(
                         ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
-                        i18n::messages::ai_analysis_failed_notif_title(locale),
-                        &err.to_string(),
+                        i18n::messages::ai_analysis_failure_notif_title(
+                            kind, locale,
+                        ),
+                        &summary,
                         cx,
                     );
+                    update_open_main_window(cx, |app, cx| {
+                        app.reload_watchdog_state();
+                        app.push_toast(
+                            summary.clone(),
+                            gpui_omarchy::Status::Error,
+                            cx,
+                        );
+                    });
                 }
             }
         });
@@ -2566,6 +3463,7 @@ fn parse_gui_args_with_power(
         ..ScanOptions::default()
     };
     let mut initial_screen = None;
+    let mut background = false;
     let text = |value: Option<std::ffi::OsString>, need: &str| {
         value
             .and_then(|value| value.into_string().ok())
@@ -2575,6 +3473,9 @@ fn parse_gui_args_with_power(
     let mut args = args;
     while let Some(arg) = args.next() {
         match arg.to_str().unwrap_or_default() {
+            "--background" => {
+                background = true;
+            }
             "--open-screen" => {
                 let value = text(
                     args.next(),
@@ -2612,6 +3513,7 @@ fn parse_gui_args_with_power(
         depth: 3,
         power: Some(preset),
         initial_screen,
+        background,
     })
 }
 
@@ -2670,6 +3572,26 @@ mod argument_tests {
         assert_eq!(parsed.root, expected_home);
         assert_eq!(parsed.depth, 3);
         assert_eq!(parsed.initial_screen, None);
+        assert!(!parsed.background);
+    }
+
+    #[test]
+    fn background_flag_sets_background_launch_mode() {
+        let parsed = parse_gui_args(
+            std::iter::once("--background").map(std::ffi::OsString::from),
+        )
+        .expect("parses --background");
+        assert!(parsed.background);
+        assert_eq!(parsed.initial_screen, None);
+
+        let with_screen = parse_gui_args(arguments(&[
+            "--background",
+            "--open-screen",
+            "settings",
+        ]))
+        .expect("parses --background with screen");
+        assert!(with_screen.background);
+        assert_eq!(with_screen.initial_screen, Some(Screen::Settings));
     }
 
     #[test]
@@ -2834,6 +3756,32 @@ mod argument_tests {
             Some(Screen::Watchdog)
         );
         assert_eq!(
+            target_screen_for_notification_tag(screen_open_tag(
+                Screen::Explore
+            )),
+            Some(Screen::Explore)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(screen_open_tag(Screen::Docker)),
+            Some(Screen::Docker)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(screen_open_tag(Screen::Remote)),
+            Some(Screen::Remote)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(screen_open_tag(
+                Screen::Watchdog
+            )),
+            Some(Screen::Watchdog)
+        );
+        assert_eq!(
+            target_screen_for_notification_tag(screen_open_tag(
+                Screen::Settings
+            )),
+            Some(Screen::Settings)
+        );
+        assert_eq!(
             target_screen_for_notification_tag(NOTIF_TAG_CLEANUP_STARTED),
             None
         );
@@ -2870,6 +3818,12 @@ mod argument_tests {
             RuumAssets
                 .load(IconName::Folder.path().as_ref())
                 .expect("default folder icon lookup")
+                .is_some()
+        );
+        assert!(
+            RuumAssets
+                .load(IconName::Bot.path().as_ref())
+                .expect("bot icon lookup")
                 .is_some()
         );
     }

@@ -693,6 +693,7 @@ fn top_bar(
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
         .child(switch_root_button(app, cx))
+        .child(explore_ai_button(app, cx))
         .when(
             app.remote.is_some()
                 && matches!(
@@ -4467,6 +4468,78 @@ fn switch_root_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
             })),
             crate::i18n::explore::switch_directory_tooltip(app.locale),
         ))
+}
+
+fn explore_ai_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
+    let (analyzing, ssh_disconnected, target_ssh_id, tooltip) =
+        match &app.active_host_tab {
+            HostTabKey::Local => {
+                let analyzing = app.watchdog_analyzing;
+                let tip = if analyzing {
+                    crate::i18n::explore::ai_analyze_running_tooltip(app.locale)
+                } else {
+                    crate::i18n::explore::ai_analyze_local_tooltip(app.locale)
+                };
+                (analyzing, false, None, tip)
+            }
+            HostTabKey::Ssh(id) => {
+                let analyzing = app.ssh_analyzing_profiles.contains(id);
+                let disconnected = !app.has_connected_ssh_tab(id);
+                let tip = if analyzing {
+                    crate::i18n::explore::ai_analyze_running_tooltip(app.locale)
+                } else if disconnected {
+                    crate::i18n::explore::ai_analyze_disconnected_tooltip(
+                        app.locale,
+                    )
+                } else {
+                    crate::i18n::explore::ai_analyze_remote_tooltip(app.locale)
+                };
+                (analyzing, disconnected, Some(id.clone()), tip)
+            }
+        };
+    let disabled = analyzing || ssh_disconnected;
+    let spin_color = cx.omarchy().foreground;
+    let btn = if analyzing {
+        button("trail-ai-analyze", "", ButtonVariant::Secondary, cx)
+            .accessibility_label(tooltip)
+            .p(space::ICON_BUTTON)
+            .justify_center()
+            .child(crate::rail_pages::spinning_loader(
+                "trail-ai-analyze-spin",
+                spin_color,
+            ))
+    } else {
+        gpui_omarchy::icon_button(
+            "trail-ai-analyze",
+            IconName::Bot,
+            tooltip,
+            ButtonVariant::Secondary,
+            cx,
+        )
+    }
+    .disabled(disabled)
+    .on_click(cx.listener(move |this, _, window, cx| {
+        match &target_ssh_id {
+            None => {
+                if !this.watchdog_analyzing {
+                    this.run_ai_analysis_now(cx);
+                }
+            }
+            Some(id) => {
+                if !this.ssh_analyzing_profiles.contains(id)
+                    && this.has_connected_ssh_tab(id)
+                {
+                    this.analyze_ssh_profile(id, cx);
+                }
+            }
+        }
+        this.apply_focus(window, cx);
+    }));
+
+    div()
+        .flex_shrink_0()
+        .debug_selector(|| "trail-ai-analyze".into())
+        .child(with_tooltip(btn, tooltip))
 }
 
 fn remote_docker_button(

@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::de::Deserializer;
@@ -193,6 +193,22 @@ pub trait DockerCommandRunner: Send + Sync {
         args: &[&str],
         timeout: Duration,
     ) -> io::Result<DockerCommandOutput>;
+
+    fn run_cancellable(
+        &self,
+        program: &Path,
+        args: &[&str],
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<DockerCommandOutput> {
+        if is_cancelled(cancel) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "docker command cancelled",
+            ));
+        }
+        self.run(program, args, timeout)
+    }
 }
 
 /// Production [`DockerCommandRunner`] with `stdin = null`, `CREATE_NO_WINDOW`,
@@ -207,7 +223,17 @@ impl DockerCommandRunner for StdDockerCommandRunner {
         args: &[&str],
         timeout: Duration,
     ) -> io::Result<DockerCommandOutput> {
-        run_docker_command(program, args, timeout)
+        run_docker_command_cancellable(program, args, timeout, None)
+    }
+
+    fn run_cancellable(
+        &self,
+        program: &Path,
+        args: &[&str],
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<DockerCommandOutput> {
+        run_docker_command_cancellable(program, args, timeout, cancel)
     }
 }
 
@@ -279,11 +305,12 @@ pub trait DockerAdapter: Send + Sync + std::fmt::Debug {
         runner: &dyn DockerCommandRunner,
         on_progress: &mut dyn FnMut(&str, usize, usize),
     ) -> Vec<DockerCleanOutcome> {
-        execute_clean_targets_with_progress(
+        self.run_clean_targets_with_progress_cancellable(
             binary,
             summary,
             targets,
             runner,
+            None,
             on_progress,
         )
     }
@@ -295,6 +322,45 @@ pub trait DockerAdapter: Send + Sync + std::fmt::Debug {
         targets: &[DockerCleanTarget],
         on_progress: &mut dyn FnMut(&str, usize, usize),
     ) -> Vec<DockerCleanOutcome> {
+        self.run_clean_targets_with_env_progress_cancellable(
+            env,
+            summary,
+            targets,
+            None,
+            on_progress,
+        )
+    }
+
+    fn run_clean_targets_with_progress_cancellable(
+        &self,
+        binary: &Path,
+        summary: &DockerUsageSummary,
+        targets: &[DockerCleanTarget],
+        runner: &dyn DockerCommandRunner,
+        cancel: Option<&AtomicBool>,
+        on_progress: &mut dyn FnMut(&str, usize, usize),
+    ) -> Vec<DockerCleanOutcome> {
+        execute_clean_targets_with_progress(
+            binary,
+            summary,
+            targets,
+            runner,
+            cancel,
+            on_progress,
+        )
+    }
+
+    fn run_clean_targets_with_env_progress_cancellable(
+        &self,
+        env: &DockerEnv,
+        summary: &DockerUsageSummary,
+        targets: &[DockerCleanTarget],
+        cancel: Option<&AtomicBool>,
+        on_progress: &mut dyn FnMut(&str, usize, usize),
+    ) -> Vec<DockerCleanOutcome> {
+        if is_cancelled(cancel) {
+            return Vec::new();
+        }
         let Some(binary) = self.resolve_binary(env) else {
             return targets
                 .iter()
@@ -305,11 +371,12 @@ pub trait DockerAdapter: Send + Sync + std::fmt::Debug {
                 })
                 .collect();
         };
-        self.run_clean_targets_with_progress(
+        self.run_clean_targets_with_progress_cancellable(
             &binary,
             summary,
             targets,
             &StdDockerCommandRunner,
+            cancel,
             on_progress,
         )
     }
@@ -795,13 +862,18 @@ fn container_cli_arg(target: &DockerCleanTarget) -> Result<String, String> {
     Ok(id.clone())
 }
 
-fn run_checked_docker_args(
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
+fn run_checked_docker_args_cancellable(
     binary: &Path,
     args: &[&str],
     timeout: Duration,
     runner: &dyn DockerCommandRunner,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
-    match runner.run(binary, args, timeout) {
+    match runner.run_cancellable(binary, args, timeout, cancel) {
         Ok(out) if out.status_code == 0 => Ok(()),
         Ok(out) => {
             let msg = out.stderr.trim();
@@ -819,14 +891,16 @@ fn execute_single_target(
     binary: &Path,
     target: &DockerCleanTarget,
     runner: &dyn DockerCommandRunner,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
     let args = command_args_for_target(target)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_checked_docker_args(
+    run_checked_docker_args_cancellable(
         binary,
         &arg_refs,
         timeout_for_target(target),
         runner,
+        cancel,
     )
 }
 
@@ -841,6 +915,7 @@ fn execute_clean_targets(
         summary,
         targets,
         runner,
+        None,
         &mut |_, _, _| {},
     )
 }
@@ -850,8 +925,13 @@ fn execute_clean_targets_with_progress(
     summary: &DockerUsageSummary,
     targets: &[DockerCleanTarget],
     runner: &dyn DockerCommandRunner,
+    cancel: Option<&AtomicBool>,
     on_progress: &mut dyn FnMut(&str, usize, usize),
 ) -> Vec<DockerCleanOutcome> {
+    if is_cancelled(cancel) {
+        return Vec::new();
+    }
+
     let validated = validate_targets_against_summary(targets, summary);
     let total = validated.len();
     let mut containers = Vec::new();
@@ -870,20 +950,43 @@ fn execute_clean_targets_with_progress(
 
     if !containers.is_empty() {
         on_progress("containers", outcomes.len(), total);
-        execute_container_phase(binary, containers, runner, &mut outcomes);
+        if is_cancelled(cancel) {
+            return outcomes;
+        }
+        execute_container_phase(
+            binary,
+            containers,
+            runner,
+            cancel,
+            &mut outcomes,
+        );
         on_progress("containers", outcomes.len(), total);
+    }
+
+    if is_cancelled(cancel) {
+        return outcomes;
     }
 
     if !images.is_empty() {
         on_progress("images", outcomes.len(), total);
-        execute_image_phase(binary, images, runner, &mut outcomes);
+        if is_cancelled(cancel) {
+            return outcomes;
+        }
+        execute_image_phase(binary, images, runner, cancel, &mut outcomes);
         on_progress("images", outcomes.len(), total);
+    }
+
+    if is_cancelled(cancel) {
+        return outcomes;
     }
 
     if has_build_cache {
         on_progress("build_cache", outcomes.len(), total);
+        if is_cancelled(cancel) {
+            return outcomes;
+        }
         let target = DockerCleanTarget::BuildCache;
-        let result = execute_single_target(binary, &target, runner);
+        let result = execute_single_target(binary, &target, runner, cancel);
         outcomes.push(DockerCleanOutcome { target, result });
         on_progress("build_cache", outcomes.len(), total);
     }
@@ -895,36 +998,57 @@ fn execute_container_phase(
     binary: &Path,
     containers: Vec<DockerCleanTarget>,
     runner: &dyn DockerCommandRunner,
+    cancel: Option<&AtomicBool>,
     outcomes: &mut Vec<DockerCleanOutcome>,
 ) {
+    if is_cancelled(cancel) {
+        return;
+    }
     if containers.len() > 1 {
         let batch_ids: Result<Vec<String>, String> =
             containers.iter().map(container_cli_arg).collect();
         if let Ok(ids) = batch_ids {
             let mut args = vec!["container", "rm", "--"];
             args.extend(ids.iter().map(String::as_str));
-            if run_checked_docker_args(
+            match run_checked_docker_args_cancellable(
                 binary,
                 &args,
                 timeout_for_target(&containers[0]),
                 runner,
-            )
-            .is_ok()
-            {
-                for target in containers {
-                    outcomes.push(DockerCleanOutcome {
-                        target,
-                        result: Ok(()),
-                    });
+                cancel,
+            ) {
+                Ok(()) => {
+                    for target in containers {
+                        outcomes.push(DockerCleanOutcome {
+                            target,
+                            result: Ok(()),
+                        });
+                    }
+                    return;
                 }
-                return;
+                Err(err) if is_cancelled(cancel) => {
+                    for target in containers {
+                        outcomes.push(DockerCleanOutcome {
+                            target,
+                            result: Err(err.clone()),
+                        });
+                    }
+                    return;
+                }
+                Err(_) => {}
             }
         }
     }
 
     for target in containers {
-        let result = execute_single_target(binary, &target, runner);
+        if is_cancelled(cancel) {
+            break;
+        }
+        let result = execute_single_target(binary, &target, runner, cancel);
         outcomes.push(DockerCleanOutcome { target, result });
+        if is_cancelled(cancel) {
+            break;
+        }
     }
 }
 
@@ -932,29 +1056,44 @@ fn execute_image_phase(
     binary: &Path,
     images: Vec<DockerCleanTarget>,
     runner: &dyn DockerCommandRunner,
+    cancel: Option<&AtomicBool>,
     outcomes: &mut Vec<DockerCleanOutcome>,
 ) {
+    if is_cancelled(cancel) {
+        return;
+    }
     if images.len() > 1 {
         let batch_refs: Result<Vec<String>, String> =
             images.iter().map(image_cli_arg).collect();
         if let Ok(refs) = batch_refs {
             let mut args = vec!["image", "rm", "--"];
             args.extend(refs.iter().map(String::as_str));
-            if run_checked_docker_args(
+            match run_checked_docker_args_cancellable(
                 binary,
                 &args,
                 timeout_for_target(&images[0]),
                 runner,
-            )
-            .is_ok()
-            {
-                for target in images {
-                    outcomes.push(DockerCleanOutcome {
-                        target,
-                        result: Ok(()),
-                    });
+                cancel,
+            ) {
+                Ok(()) => {
+                    for target in images {
+                        outcomes.push(DockerCleanOutcome {
+                            target,
+                            result: Ok(()),
+                        });
+                    }
+                    return;
                 }
-                return;
+                Err(err) if is_cancelled(cancel) => {
+                    for target in images {
+                        outcomes.push(DockerCleanOutcome {
+                            target,
+                            result: Err(err.clone()),
+                        });
+                    }
+                    return;
+                }
+                Err(_) => {}
             }
         }
     }
@@ -963,18 +1102,28 @@ fn execute_image_phase(
     let mut any_succeeded = false;
     let mut failed_indices = Vec::new();
     for (idx, target) in images.iter().enumerate() {
-        let res = execute_single_target(binary, target, runner);
+        if is_cancelled(cancel) {
+            break;
+        }
+        let res = execute_single_target(binary, target, runner, cancel);
         if res.is_ok() {
             any_succeeded = true;
         } else {
             failed_indices.push(idx);
         }
         results.push(res);
+        if is_cancelled(cancel) {
+            break;
+        }
     }
 
-    if any_succeeded {
+    if any_succeeded && !is_cancelled(cancel) {
         for idx in failed_indices {
-            results[idx] = execute_single_target(binary, &images[idx], runner);
+            if is_cancelled(cancel) {
+                break;
+            }
+            results[idx] =
+                execute_single_target(binary, &images[idx], runner, cancel);
         }
     }
 
@@ -1383,11 +1532,18 @@ fn spawn_activity_reader(
     })
 }
 
-fn run_docker_command(
+fn run_docker_command_cancellable(
     program: &Path,
     args: &[&str],
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<DockerCommandOutput> {
+    if is_cancelled(cancel) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "docker command cancelled",
+        ));
+    }
     let mut cmd = Command::new(program);
     cmd.args(args);
     cmd.stdin(Stdio::null());
@@ -1422,6 +1578,17 @@ fn run_docker_command(
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
+        }
+        if is_cancelled(cancel) {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Do not join reader threads on cancel: child/grandchild processes
+            // holding the pipe write end open would block indefinitely.
+            drop((stdout_handle, stderr_handle));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "docker command cancelled",
+            ));
         }
         let total_elapsed = start.elapsed();
         let total_ns =
@@ -1783,10 +1950,11 @@ mod tests {
         .unwrap();
 
         let started = Instant::now();
-        let err = run_docker_command(
+        let err = run_docker_command_cancellable(
             &script,
             &["system", "df"],
             Duration::from_millis(80),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -2366,10 +2534,11 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_docker_command(
+        let out = run_docker_command_cancellable(
             &script,
             &["builder", "prune", "-f"],
             Duration::from_millis(600),
+            None,
         )
         .expect("streaming output should extend idle timeout");
         assert_eq!(out.status_code, 0);
@@ -2390,16 +2559,170 @@ mod tests {
         )
         .unwrap();
 
-        let err = run_docker_command(
+        let err = run_docker_command_cancellable(
             &script,
             &["system", "df"],
             Duration::from_millis(80),
+            None,
         )
         .expect_err("silent command should hit idle timeout");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(
             err.to_string().contains("80ms"),
             "expected 80ms in error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_clean_targets_with_progress_cancellable_skips_remaining_targets_when_cancelled()
+     {
+        let img_id = format!("sha256:{}", "3".repeat(64));
+        let summary = DockerUsageSummary {
+            build_cache_reclaimable_bytes: 1024,
+            removable_images: vec![DockerImageEntry {
+                id: img_id.clone(),
+                repository: "demo/app".to_owned(),
+                tag: "v1".to_owned(),
+                created_since: "1d".to_owned(),
+                size_bytes: 500,
+                unique_bytes: 500,
+                dangling: false,
+            }],
+            stopped_containers: vec![DockerContainerEntry {
+                id: "111122223333".to_owned(),
+                name: "job-1".to_owned(),
+                image: "demo/app:v1".to_owned(),
+                state: "exited".to_owned(),
+                status: "Exited (0)".to_owned(),
+                size_bytes: 100,
+            }],
+            detailed: true,
+            ..DockerUsageSummary::default()
+        };
+        let requested = vec![
+            DockerCleanTarget::Container {
+                id: "111122223333".to_owned(),
+                name: "job-1".to_owned(),
+            },
+            DockerCleanTarget::Image {
+                id: img_id,
+                reference: Some("demo/app:v1".to_owned()),
+                dangling: false,
+            },
+            DockerCleanTarget::BuildCache,
+        ];
+        let runner = MockRunner::new(|_, _| {
+            Ok(DockerCommandOutput {
+                status_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let adapter = DockerFactory::create_for(DockerOs::Linux);
+        let cancel = AtomicBool::new(false);
+        let mut stages = Vec::new();
+        let outcomes = adapter.run_clean_targets_with_progress_cancellable(
+            Path::new("/usr/bin/docker"),
+            &summary,
+            &requested,
+            &runner,
+            Some(&cancel),
+            &mut |stage, done, total| {
+                stages.push((stage.to_owned(), done, total));
+                if done > 0 {
+                    cancel.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_ok());
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(
+            runner.calls()[0].1,
+            vec!["container", "rm", "--", "111122223333"]
+        );
+        assert!(stages.iter().all(|(s, _, _)| s == "containers"));
+    }
+
+    #[test]
+    fn run_clean_targets_with_env_progress_cancellable_pre_cancelled_skips_execution()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_docker = dir.path().join(if cfg!(windows) {
+            "docker.exe"
+        } else {
+            "docker"
+        });
+        std::fs::write(&fake_docker, b"").unwrap();
+        let env = DockerEnv {
+            home: None,
+            path: Some(dir.path().as_os_str().to_os_string()),
+            program_files: None,
+        };
+        let summary = DockerUsageSummary {
+            build_cache_reclaimable_bytes: 2048,
+            detailed: true,
+            ..DockerUsageSummary::default()
+        };
+        let cancel = AtomicBool::new(true);
+        let adapter = DockerFactory::create();
+        let mut progress_calls = 0usize;
+        let outcomes = adapter.run_clean_targets_with_env_progress_cancellable(
+            &env,
+            &summary,
+            &[DockerCleanTarget::BuildCache],
+            Some(&cancel),
+            &mut |_, _, _| {
+                progress_calls += 1;
+            },
+        );
+        assert!(outcomes.is_empty());
+        assert_eq!(progress_calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_docker_command_cancellable_kills_active_child_and_drops_pipes_without_deadlock()
+     {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("slow-docker");
+        // Spawn a grandchild holding stdout pipe open; killing parent alone
+        // would leave pipe open, so dropping reader handles without `.join()`
+        // is essential to avoid blocking.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n(sleep 5) &\necho started\nsleep 5\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = Arc::clone(&cancel);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            cancel_bg.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let err = run_docker_command_cancellable(
+            &script,
+            &["builder", "prune", "-f"],
+            Duration::from_secs(10),
+            Some(&cancel),
+        )
+        .expect_err("cancelled docker command must abort with Interrupted");
+        let elapsed = started.elapsed();
+        setter.join().expect("setter thread");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel took too long ({elapsed:?}), likely blocked on pipe join"
         );
     }
 }

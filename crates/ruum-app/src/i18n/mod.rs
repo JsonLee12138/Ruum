@@ -260,8 +260,23 @@ mod tests {
                 !messages::ssh_ai_analyze_failed("prod", "err", locale)
                     .is_empty()
             );
+            assert!(
+                !messages::ssh_ai_analyze_failed(
+                    "prod",
+                    "request timed out",
+                    locale,
+                )
+                .is_empty()
+            );
+            assert!(!messages::ai_analysis_error("err", locale).is_empty());
+            assert!(
+                !messages::ai_analysis_failed_notif_title(locale).is_empty()
+            );
+            assert!(
+                !messages::ai_analysis_timed_out_notif_title(locale).is_empty()
+            );
+            assert!(!pages::latest_ai_error_title(locale).is_empty());
             assert!(!pages::ai_auto_analyze(locale).is_empty());
-            assert!(pages::enable_service(locale).contains("Windows"));
             assert!(!messages::invalid_watchdog_number(locale).is_empty());
             assert!(
                 !messages::cli_installed("/usr/local/bin/ruum", locale)
@@ -283,6 +298,23 @@ mod tests {
             assert!(!pages::remote_connect_approve(locale).is_empty());
             assert!(!pages::remote_connect_deny(locale).is_empty());
             assert!(!pages::general_settings_title(locale).is_empty());
+            assert!(!pages::general_close_to_background(locale).is_empty());
+            assert!(!pages::general_launch_at_login(locale).is_empty());
+            assert!(!pages::general_tray_show_disk_space(locale).is_empty());
+            assert!(!common::tray_toggle_watchdog(false, locale).is_empty());
+            assert!(!common::tray_toggle_watchdog(true, locale).is_empty());
+            assert_ne!(
+                common::tray_toggle_watchdog(false, locale),
+                common::tray_toggle_watchdog(true, locale)
+            );
+            assert!(
+                !messages::settings_saved_autostart_requires_approval(locale)
+                    .is_empty()
+            );
+            assert!(
+                !messages::settings_saved_autostart_error("err", locale)
+                    .is_empty()
+            );
             assert!(!pages::webhook_title(locale).is_empty());
             assert!(!messages::ssh_invalid_input("err", locale).is_empty());
             assert!(!pages::enable_webhook(locale).is_empty());
@@ -300,6 +332,12 @@ mod tests {
             assert!(!explore::crumb_switch_root_tooltip(locale).is_empty());
             assert!(!explore::switch_directory_tooltip(locale).is_empty());
             assert!(!explore::remote_docker_tooltip(locale).is_empty());
+            assert!(!explore::ai_analyze_local_tooltip(locale).is_empty());
+            assert!(!explore::ai_analyze_remote_tooltip(locale).is_empty());
+            assert!(!explore::ai_analyze_running_tooltip(locale).is_empty());
+            assert!(
+                !explore::ai_analyze_disconnected_tooltip(locale).is_empty()
+            );
             assert!(!pages::docker_close_button(locale).is_empty());
             assert!(!pages::ssh_browse_dirs_tooltip(locale).is_empty());
             assert!(!pages::modal_mounts_local_title(locale).is_empty());
@@ -393,6 +431,28 @@ mod tests {
         }
         for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
             assert_ne!(
+                pages::latest_ai_error_title(locale),
+                pages::latest_ai_error_title(Locale::En)
+            );
+            assert_ne!(
+                messages::ai_analysis_timed_out_notif_title(locale),
+                messages::ai_analysis_timed_out_notif_title(Locale::En)
+            );
+            assert_ne!(
+                messages::ai_analysis_failed_notif_title(locale),
+                messages::ai_analysis_failed_notif_title(Locale::En)
+            );
+            assert!(
+                messages::ssh_ai_analyze_failed(
+                    "prod",
+                    &"x".repeat(220),
+                    locale
+                )
+                .chars()
+                .count()
+                    <= 160
+            );
+            assert_ne!(
                 pages::api_protocol_label(locale),
                 pages::api_protocol_label(Locale::En)
             );
@@ -477,6 +537,10 @@ mod tests {
                 pages::general_settings_title(Locale::En)
             );
             assert_ne!(
+                pages::general_tray_show_disk_space(locale),
+                pages::general_tray_show_disk_space(Locale::En)
+            );
+            assert_ne!(
                 messages::title_confirm_remote_connect(locale),
                 messages::title_confirm_remote_connect(Locale::En)
             );
@@ -543,6 +607,22 @@ mod tests {
             assert_ne!(
                 explore::remote_docker_tooltip(locale),
                 explore::remote_docker_tooltip(Locale::En)
+            );
+            assert_ne!(
+                explore::ai_analyze_local_tooltip(locale),
+                explore::ai_analyze_local_tooltip(Locale::En)
+            );
+            assert_ne!(
+                explore::ai_analyze_remote_tooltip(locale),
+                explore::ai_analyze_remote_tooltip(Locale::En)
+            );
+            assert_ne!(
+                explore::ai_analyze_running_tooltip(locale),
+                explore::ai_analyze_running_tooltip(Locale::En)
+            );
+            assert_ne!(
+                explore::ai_analyze_disconnected_tooltip(locale),
+                explore::ai_analyze_disconnected_tooltip(Locale::En)
             );
             assert_ne!(
                 pages::docker_not_installed_title(locale),
@@ -650,6 +730,68 @@ mod tests {
             assert!(!pages::update_restart_warning_marks(2, locale).is_empty());
             assert!(!pages::update_restart_warning_scan(locale).is_empty());
             assert!(!messages::update_command_copied(locale).is_empty());
+            assert!(!messages::title_cleanup_progress(locale).is_empty());
+            assert!(
+                !messages::cleanup_cancelled_notif_title(locale).is_empty()
+            );
+            assert!(
+                !messages::cleanup_cancelled_summary(2, 4096, locale)
+                    .is_empty()
+            );
+            assert!(
+                !messages::cleanup_docker_stage("containers", locale)
+                    .is_empty()
+            );
+            assert!(
+                !messages::cleanup_docker_stage("images", locale).is_empty()
+            );
+            assert!(
+                !messages::cleanup_docker_stage("build_cache", locale)
+                    .is_empty()
+            );
+            assert!(!common::tray_cleanup_progress_idle(locale).is_empty());
+            assert!(
+                !common::tray_cleanup_progress_active(3, 12, false, locale)
+                    .is_empty()
+            );
+            assert!(
+                !common::tray_cleanup_progress_active(3, 12, true, locale)
+                    .is_empty()
+            );
+            assert!(!pages::cleanup_progress_heading(false, locale).is_empty());
+            assert!(!pages::cleanup_progress_heading(true, locale).is_empty());
+            assert!(
+                !pages::cleanup_progress_subtitle(false, locale).is_empty()
+            );
+            assert!(!pages::cleanup_progress_subtitle(true, locale).is_empty());
+            assert!(!pages::cleanup_progress_preparing(locale).is_empty());
+            assert!(
+                !pages::cleanup_reclaimed_so_far(
+                    "1.2 GiB",
+                    Some("4.0 GiB"),
+                    locale
+                )
+                .is_empty()
+            );
+            assert!(!pages::cleanup_continue_in_background(locale).is_empty());
+            assert!(!pages::cleanup_cancel_button(false, locale).is_empty());
+            assert!(!pages::cleanup_cancel_button(true, locale).is_empty());
+            assert!(
+                !pages::cleanup_progress_done_heading(false, false, locale)
+                    .is_empty()
+            );
+            assert!(
+                !pages::cleanup_progress_done_heading(true, false, locale)
+                    .is_empty()
+            );
+            assert!(
+                !pages::cleanup_progress_done_heading(false, true, locale)
+                    .is_empty()
+            );
+            assert!(
+                !pages::cleanup_progress_auto_closing(3, locale).is_empty()
+            );
+            assert!(!pages::cleanup_progress_close_button(locale).is_empty());
 
             assert_ne!(
                 pages::settings_tab_updates(locale),
@@ -680,6 +822,60 @@ mod tests {
             messages::cleanup_started_notif_body(2, 1_500_000, Locale::Zh)
                 .contains("请稍等")
         );
+        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert_ne!(
+                messages::title_cleanup_progress(locale),
+                messages::title_cleanup_progress(Locale::En)
+            );
+            assert_ne!(
+                messages::cleanup_cancelled_notif_title(locale),
+                messages::cleanup_cancelled_notif_title(Locale::En)
+            );
+            assert_ne!(
+                messages::cleanup_cancelled_summary(1, 512, locale),
+                messages::cleanup_cancelled_summary(1, 512, Locale::En)
+            );
+            assert_ne!(
+                common::tray_cleanup_progress_idle(locale),
+                common::tray_cleanup_progress_idle(Locale::En)
+            );
+            assert_ne!(
+                common::tray_cleanup_progress_active(3, 12, false, locale),
+                common::tray_cleanup_progress_active(3, 12, false, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_continue_in_background(locale),
+                pages::cleanup_continue_in_background(Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_cancel_button(false, locale),
+                pages::cleanup_cancel_button(false, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_cancel_button(true, locale),
+                pages::cleanup_cancel_button(true, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_progress_done_heading(false, false, locale),
+                pages::cleanup_progress_done_heading(false, false, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_progress_done_heading(true, false, locale),
+                pages::cleanup_progress_done_heading(true, false, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_progress_done_heading(false, true, locale),
+                pages::cleanup_progress_done_heading(false, true, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_progress_auto_closing(3, locale),
+                pages::cleanup_progress_auto_closing(3, Locale::En)
+            );
+            assert_ne!(
+                pages::cleanup_progress_close_button(locale),
+                pages::cleanup_progress_close_button(Locale::En)
+            );
+        }
     }
 
     #[test]

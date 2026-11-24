@@ -1,6 +1,6 @@
 # ruum
 
-[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [☕ 커피 한 잔 사주기](https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal)
 
 ![ruum 트리맵 창 스크린샷: 왼쪽 아이콘 레일, 상단 경로 탐색줄과 보기 컨트롤, 범주 범례, 정리 가능 공간이 빗금으로 표시된 색상별 트리맵, 오른쪽 선택 항목 및 확인 권장 패널, 실시간 디스크 여유 공간 미터](assets/screenshot.png)
 
@@ -23,7 +23,8 @@
 5. [AI 에이전트를 위한 MCP 서버 연동](#ai-에이전트를-위한-mcp-서버-연동)
 6. [CLI 명령어 및 단축키 참조](#cli-명령어-및-단축키-참조)
 7. [안전 보호 장치, 측정 방식 및 개발 안내](#안전-보호-장치-측정-방식-및-개발-안내)
-8. [라이선스](#라이선스)
+8. [커피 한 잔 사주기](#커피-한-잔-사주기)
+9. [라이선스](#라이선스)
 
 ---
 
@@ -443,6 +444,16 @@ Windows에서는 `cargo xtask lint`, `cargo xtask test`, `cargo build --release`
 | `crates/ruum-scan` | GUI 의존성이 없는 경량 헤드리스 원격 SSH 스캐너 바이너리 |
 | `crates/ruum-app` | GPUI 데스크톱 인터페이스, 상태/단축키, 4개 국어 현지화(`en`/`zh`/`ja`/`ko`), 트레이 및 창 테스트 |
 | `xtask/`, `packaging/`, `assets/` | 릴리스 패키징, 크로스 플랫폼 설치 프로그램, 아이콘 및 데스크톱 항목 템플릿 |
+
+---
+
+## 커피 한 잔 사주기
+
+**ruum**이 디스크 공간을 되찾고 정리 시간을 줄이는 데 도움이 되었다면, 커피 한 잔으로 응원해 주세요 ☕
+
+<a href="https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal"><img src="https://ko-fi.com/img/githubbutton_sm.svg" height="36" alt="Ko-fi에서 커피 한 잔 사주기" /></a>
+
+링크로 후원하기: [☕ Ko-fi에서 커피 한 잔 사주기](https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal)
 
 ---
 

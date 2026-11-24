@@ -1,6 +1,6 @@
 # ruum
 
-[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [☕ 请我喝杯咖啡](#请我喝杯咖啡)
 
 ![ruum 树状图界面截图：左侧图标导航栏、顶部面包屑与视图控件、分类图例、带斜纹标记可清理空间的树状图、右侧当前选中与值得关注面板以及实时磁盘可用空间计量条](assets/screenshot.png)
 
@@ -23,7 +23,8 @@
 5. [接入 MCP 服务器（供 AI Agent 调用）](#接入-mcp-服务器供-ai-agent-调用)
 6. [CLI 命令与快捷键速查](#cli-命令与快捷键速查)
 7. [安全防护、统计说明与开发指南](#安全防护统计说明与开发指南)
-8. [开源协议](#开源协议)
+8. [请我喝杯咖啡](#请我喝杯咖啡)
+9. [开源协议](#开源协议)
 
 ---
 
@@ -443,6 +444,14 @@ Windows 下请直接运行 `cargo xtask lint`、`cargo xtask test` 与 `cargo bu
 | `crates/ruum-scan` | 无 GUI 依赖的轻量级远程 SSH 静态扫描辅助二进制 |
 | `crates/ruum-app` | GPUI 桌面端界面、状态与快捷键映射、四语本地化（`en`/`zh`/`ja`/`ko`）、托盘及窗口测试 |
 | `xtask/`, `packaging/`, `assets/` | 打包构建脚本、跨平台安装器、图标与桌面入口模板 |
+
+---
+
+## 请我喝杯咖啡
+
+如果 **ruum** 帮你找回了宝贵的磁盘空间或节省了排查时间，欢迎请我喝杯咖啡 ☕，你的支持是我持续维护的动力！
+
+<img src="assets/wechat-reward.jpg" width="240" alt="Json Lee 的微信赞赏码（请我喝杯咖啡）" />
 
 ---
 

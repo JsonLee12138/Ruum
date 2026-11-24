@@ -1,6 +1,6 @@
 # ruum
 
-[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [☕ コーヒーを一杯おごる](https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal)
 
 ![ruum ツリーマップ画面のスクリーンショット：左側のアイコンレール、上部のパンくずリストと表示コントロール、カテゴリ凡例、削除可能領域を斜線で示したカラーツリーマップ、右側の選択中・要チェックパネル、ライブの空き容量メーター](assets/screenshot.png)
 
@@ -23,7 +23,8 @@
 5. [AI エージェント向け MCP サーバー連携](#ai-エージェント向け-mcp-サーバー連携)
 6. [CLI コマンドとキーボードショートカット一覧](#cli-コマンドとキーボードショートカット一覧)
 7. [安全保護・計測仕様・開発ガイド](#安全保護計測仕様開発ガイド)
-8. [ライセンス](#ライセンス)
+8. [コーヒーを一杯おごる](#コーヒーを一杯おごる)
+9. [ライセンス](#ライセンス)
 
 ---
 
@@ -443,6 +444,16 @@ Windows では `cargo xtask lint`、`cargo xtask test`、`cargo build --release`
 | `crates/ruum-scan` | GUI 依存なしの軽量ヘッドレスリモート SSH スキャナバイナリ |
 | `crates/ruum-app` | GPUI デスクトップ UI、状態・キーバインド、多言語対応（`en`/`zh`/`ja`/`ko`）、トレイ、ウィンドウテスト |
 | `xtask/`, `packaging/`, `assets/` | リリースバンドル、クロスプラットフォームインストーラー、アイコン、デスクトップエントリテンプレート |
+
+---
+
+## コーヒーを一杯おごる
+
+**ruum** がディスクの空き容量の確保や調査時間の短縮に役立ちましたら、コーヒーを一杯おごっていただけると励みになります ☕
+
+<a href="https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal"><img src="https://ko-fi.com/img/githubbutton_sm.svg" height="36" alt="Ko-fi でコーヒーをおごる" /></a>
+
+リンクから支援する：[☕ Ko-fi でコーヒーを一杯おごる](https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal)
 
 ---
 

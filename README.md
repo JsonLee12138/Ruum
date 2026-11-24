@@ -1,6 +1,6 @@
 # ruum
 
-[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.md) | [简体中文](README.zh.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [☕ Buy me a coffee](https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal)
 
 ![ruum treemap window showing the left icon rail, category legend, color-coded treemap with hatched reclaimable space, Selection and Worth a look side panel, and live disk free-space meter](assets/screenshot.png)
 
@@ -23,7 +23,8 @@ Find what is filling a disk, mark what should go, and clean it up safely — wit
 5. [MCP Server Integration for AI Agents](#mcp-server-integration-for-ai-agents)
 6. [CLI & Keyboard Shortcuts Reference](#cli--keyboard-shortcuts-reference)
 7. [Safety Guards, Measurement Notes & Development](#safety-guards-measurement-notes--development)
-8. [License](#license)
+8. [Buy Me a Coffee](#buy-me-a-coffee)
+9. [License](#license)
 
 ---
 
@@ -443,6 +444,16 @@ On Windows, run `cargo xtask lint`, `cargo xtask test`, and `cargo build --relea
 | `crates/ruum-scan` | Lightweight headless remote SSH scanner binary (no GUI dependencies) |
 | `crates/ruum-app` | GPUI desktop interface, state/keybindings, localization (`en`/`zh`/`ja`/`ko`), tray & window-harness tests |
 | `xtask/`, `packaging/`, `assets/` | Release bundling, cross-platform installers, icons, and desktop entry templates |
+
+---
+
+## Buy Me a Coffee
+
+If **ruum** helped you reclaim disk space or saved you time, consider buying me a coffee ☕ — your support helps keep the project going!
+
+<a href="https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal"><img src="https://ko-fi.com/img/githubbutton_sm.svg" height="36" alt="Buy Me a Coffee on Ko-fi" /></a>
+
+Or via link: [☕ Buy me a coffee on Ko-fi](https://ko-fi.com/post/Tired-of-Disk-Almost-Full-Meet-ruum-A-Lightwe-H5R12AZHO7#checkoutModal)
 
 ---
 

@@ -2,6 +2,12 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.5-beta.1] - 2026-11-25
+
+### Changes
+
+- Prepare release `0.2.5-beta.1`.
+
 ## [0.2.4] - 2026-11-24
 
 ### Features

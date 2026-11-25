@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rand_core::{OsRng, RngCore as _};
 use rusqlite::{
     Connection, ErrorCode, OptionalExtension as _, Row, TransactionBehavior,
     params,
@@ -61,6 +63,10 @@ pub const DEFAULT_WEBHOOK_ID: &str = "default";
 
 /// Canonical `name` used when migrating legacy single-row `webhook_config`.
 pub const DEFAULT_WEBHOOK_NAME: &str = "Default";
+
+/// Default Ruum Cloud gateway base URL.
+pub const DEFAULT_CLOUD_GATEWAY_BASE_URL: &str =
+    "https://ruum-api.jsonlee12138.com";
 
 static NEXT_PROFILE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -127,6 +133,24 @@ CREATE TABLE IF NOT EXISTS ai_config (
     model TEXT,
     api_protocol TEXT NOT NULL DEFAULT 'openai',
     api_base_url TEXT NOT NULL DEFAULT '',
+    setup_completed INTEGER NOT NULL DEFAULT 0,
+    updated_at_secs INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS cloud_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    gateway_base_url TEXT NOT NULL DEFAULT 'https://ruum-api.jsonlee12138.com',
+    device_id TEXT,
+    subject_id TEXT,
+    access_token TEXT,
+    token_expires_at_secs INTEGER NOT NULL DEFAULT 0,
+    entitlement_json TEXT,
+    models_json TEXT,
+    selected_model_id TEXT,
+    plans_json TEXT,
+    plans_cached_at_secs INTEGER NOT NULL DEFAULT 0,
+    install_salt TEXT,
+    last_synced_at_secs INTEGER NOT NULL DEFAULT 0,
     updated_at_secs INTEGER NOT NULL DEFAULT 0
 );
 
@@ -518,6 +542,7 @@ pub struct AiConfig {
     pub model: Option<String>,
     pub api_protocol: ApiProtocol,
     pub api_base_url: String,
+    pub setup_completed: bool,
     pub updated_at_secs: u64,
 }
 
@@ -531,6 +556,7 @@ impl Default for AiConfig {
             model: None,
             api_protocol: ApiProtocol::OpenAi,
             api_base_url: String::new(),
+            setup_completed: false,
             updated_at_secs: 0,
         }
     }
@@ -554,6 +580,151 @@ impl AiConfig {
             model,
             api_protocol: self.api_protocol,
             api_base_url: self.api_base_url.trim().to_owned(),
+            setup_completed: self.setup_completed,
+            updated_at_secs: self.updated_at_secs,
+        }
+    }
+}
+
+/// Validate a Ruum Cloud gateway base URL, allowing only `https://` or
+/// loopback `http://` (`127.0.0.1`, `localhost`, `[::1]`).
+pub fn validate_cloud_base_url(raw: &str) -> io::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cloud gateway base URL must be non-empty without whitespace",
+        ));
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid cloud gateway base URL: {e}"),
+        )
+    })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cloud gateway base URL must not contain embedded credentials",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cloud gateway base URL must not contain query or fragment",
+        ));
+    }
+    match parsed.scheme() {
+        "https" => {
+            if parsed.host().is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cloud gateway base URL must specify a host",
+                ));
+            }
+        }
+        "http" => {
+            let is_loopback = match parsed.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                Some(url::Host::Domain(domain)) => {
+                    domain.eq_ignore_ascii_case("localhost")
+                }
+                None => false,
+            };
+            if !is_loopback {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "plain http:// cloud gateway URL is restricted to loopback \
+                     hosts (127.0.0.1, localhost, [::1])",
+                ));
+            }
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported cloud gateway scheme `{other}`; expected \
+                     https or loopback http"
+                ),
+            ));
+        }
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+fn trim_non_empty(opt: Option<&str>) -> Option<String> {
+    opt.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Persistent Ruum Cloud device registration, token, entitlement, and model
+/// cache stored in `cloud_state`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudState {
+    pub gateway_base_url: String,
+    pub device_id: Option<String>,
+    pub subject_id: Option<String>,
+    pub access_token: Option<String>,
+    pub token_expires_at_secs: u64,
+    pub entitlement_json: Option<String>,
+    pub models_json: Option<String>,
+    pub selected_model_id: Option<String>,
+    pub plans_json: Option<String>,
+    pub plans_cached_at_secs: u64,
+    pub install_salt: Option<String>,
+    pub last_synced_at_secs: u64,
+    pub updated_at_secs: u64,
+}
+
+impl Default for CloudState {
+    fn default() -> Self {
+        Self {
+            gateway_base_url: DEFAULT_CLOUD_GATEWAY_BASE_URL.to_owned(),
+            device_id: None,
+            subject_id: None,
+            access_token: None,
+            token_expires_at_secs: 0,
+            entitlement_json: None,
+            models_json: None,
+            selected_model_id: None,
+            plans_json: None,
+            plans_cached_at_secs: 0,
+            install_salt: None,
+            last_synced_at_secs: 0,
+            updated_at_secs: 0,
+        }
+    }
+}
+
+impl CloudState {
+    /// Normalize gateway base URL and optional string fields.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        let base = self.gateway_base_url.trim().trim_end_matches('/');
+        Self {
+            gateway_base_url: if base.is_empty() {
+                DEFAULT_CLOUD_GATEWAY_BASE_URL.to_owned()
+            } else {
+                base.to_owned()
+            },
+            device_id: trim_non_empty(self.device_id.as_deref()),
+            subject_id: trim_non_empty(self.subject_id.as_deref()),
+            access_token: trim_non_empty(self.access_token.as_deref()),
+            token_expires_at_secs: self.token_expires_at_secs,
+            entitlement_json: trim_non_empty(self.entitlement_json.as_deref()),
+            models_json: trim_non_empty(self.models_json.as_deref()),
+            selected_model_id: trim_non_empty(
+                self.selected_model_id.as_deref(),
+            ),
+            plans_json: trim_non_empty(self.plans_json.as_deref()),
+            plans_cached_at_secs: self.plans_cached_at_secs,
+            install_salt: trim_non_empty(self.install_salt.as_deref()),
+            last_synced_at_secs: self.last_synced_at_secs,
             updated_at_secs: self.updated_at_secs,
         }
     }
@@ -983,7 +1154,7 @@ fn migrate_ssh_profiles_pending_columns(
     Ok(())
 }
 
-fn migrate_ai_config_api_columns(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_ai_config_columns(conn: &Connection) -> rusqlite::Result<()> {
     let mut existing = std::collections::HashSet::new();
     {
         let mut stmt = conn.prepare("PRAGMA table_info(ai_config)")?;
@@ -1006,6 +1177,26 @@ fn migrate_ai_config_api_columns(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    if !existing.contains("setup_completed") {
+        conn.execute(
+            "ALTER TABLE ai_config ADD COLUMN setup_completed INTEGER NOT \
+             NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE ai_config
+             SET setup_completed = 1
+             WHERE updated_at_secs > 0
+                OR provider != 'agy'
+                OR custom_command != ''
+                OR extra_args != ''
+                OR (model IS NOT NULL AND TRIM(model) != '')
+                OR api_protocol != 'openai'
+                OR api_base_url != ''
+                OR auto_analyze_on_alert = 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1026,6 +1217,32 @@ fn migrate_ai_state_error_columns(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute(
                 &format!(
                     "ALTER TABLE ai_state ADD COLUMN {col_name} {col_def}"
+                ),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_cloud_state_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(cloud_state)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            existing.insert(name);
+        }
+    }
+    for (col_name, col_def) in [
+        ("plans_json", "TEXT"),
+        ("plans_cached_at_secs", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !existing.contains(col_name) {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE cloud_state ADD COLUMN {col_name} {col_def}"
                 ),
                 [],
             )?;
@@ -1184,8 +1401,9 @@ impl StorageDb {
             conn.execute_batch(SCHEMA_SQL)?;
             migrate_app_settings_background_columns(&conn)?;
             migrate_ssh_profiles_pending_columns(&conn)?;
-            migrate_ai_config_api_columns(&conn)?;
+            migrate_ai_config_columns(&conn)?;
             migrate_ai_state_error_columns(&conn)?;
+            migrate_cloud_state_columns(&conn)?;
             migrate_legacy_webhook_config(&conn)
         })?;
         Ok(Self {
@@ -1973,7 +2191,7 @@ impl StorageDb {
             conn.query_row(
                 "SELECT auto_analyze_on_alert, provider, custom_command, \
                  extra_args, model, api_protocol, api_base_url, \
-                 updated_at_secs \
+                 setup_completed, updated_at_secs \
                  FROM ai_config WHERE id = 1",
                 [],
                 |row| {
@@ -1984,7 +2202,8 @@ impl StorageDb {
                     let model: Option<String> = row.get(4)?;
                     let protocol_raw: String = row.get(5)?;
                     let api_base_url: String = row.get(6)?;
-                    let updated_at_secs: i64 = row.get(7)?;
+                    let setup_completed: i64 = row.get(7)?;
+                    let updated_at_secs: i64 = row.get(8)?;
                     let provider = AiCliProvider::from_id(&provider_raw)
                         .ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
@@ -2019,6 +2238,7 @@ impl StorageDb {
                         model,
                         api_protocol,
                         api_base_url,
+                        setup_completed: setup_completed != 0,
                         updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
                     })
                 },
@@ -2036,8 +2256,8 @@ impl StorageDb {
                 "INSERT INTO ai_config (
                     id, auto_analyze_on_alert, provider, custom_command,
                     extra_args, model, api_protocol, api_base_url,
-                    updated_at_secs
-                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    setup_completed, updated_at_secs
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                     auto_analyze_on_alert = excluded.auto_analyze_on_alert,
                     provider = excluded.provider,
@@ -2046,6 +2266,7 @@ impl StorageDb {
                     model = excluded.model,
                     api_protocol = excluded.api_protocol,
                     api_base_url = excluded.api_base_url,
+                    setup_completed = excluded.setup_completed,
                     updated_at_secs = excluded.updated_at_secs",
                 params![
                     i64::from(norm.auto_analyze_on_alert),
@@ -2055,6 +2276,7 @@ impl StorageDb {
                     norm.model,
                     norm.api_protocol.id(),
                     norm.api_base_url,
+                    i64::from(norm.setup_completed),
                     u64_to_sqlite_i64(norm.updated_at_secs),
                 ],
             )
@@ -2374,6 +2596,160 @@ impl StorageDb {
             Ok(persisted.trim().to_owned())
         })
     }
+
+    /// Load `cloud_state`, returning defaults if no row has been saved yet.
+    pub fn load_cloud_state(&self) -> io::Result<CloudState> {
+        let row = self.with_conn_retry(|conn| {
+            conn.query_row(
+                "SELECT gateway_base_url, device_id, subject_id, \
+                 access_token, token_expires_at_secs, entitlement_json, \
+                 models_json, selected_model_id, plans_json, \
+                 plans_cached_at_secs, install_salt, last_synced_at_secs, \
+                 updated_at_secs \
+                 FROM cloud_state WHERE id = 1",
+                [],
+                |row| {
+                    let gateway_base_url: String = row.get(0)?;
+                    let device_id: Option<String> = row.get(1)?;
+                    let subject_id: Option<String> = row.get(2)?;
+                    let access_token: Option<String> = row.get(3)?;
+                    let token_expires_at_secs: i64 = row.get(4)?;
+                    let entitlement_json: Option<String> = row.get(5)?;
+                    let models_json: Option<String> = row.get(6)?;
+                    let selected_model_id: Option<String> = row.get(7)?;
+                    let plans_json: Option<String> = row.get(8)?;
+                    let plans_cached_at_secs: i64 = row.get(9)?;
+                    let install_salt: Option<String> = row.get(10)?;
+                    let last_synced_at_secs: i64 = row.get(11)?;
+                    let updated_at_secs: i64 = row.get(12)?;
+                    Ok(CloudState {
+                        gateway_base_url,
+                        device_id,
+                        subject_id,
+                        access_token,
+                        token_expires_at_secs: sqlite_i64_to_u64(
+                            token_expires_at_secs,
+                        ),
+                        entitlement_json,
+                        models_json,
+                        selected_model_id,
+                        plans_json,
+                        plans_cached_at_secs: sqlite_i64_to_u64(
+                            plans_cached_at_secs,
+                        ),
+                        install_salt,
+                        last_synced_at_secs: sqlite_i64_to_u64(
+                            last_synced_at_secs,
+                        ),
+                        updated_at_secs: sqlite_i64_to_u64(updated_at_secs),
+                    })
+                },
+            )
+            .optional()
+        })?;
+        Ok(row.unwrap_or_default().normalized())
+    }
+
+    /// Validate `gateway_base_url` and persist normalized `cloud_state`.
+    pub fn save_cloud_state(&self, state: &CloudState) -> io::Result<()> {
+        let mut norm = state.normalized();
+        norm.gateway_base_url =
+            validate_cloud_base_url(&norm.gateway_base_url)?;
+        self.with_conn_retry(|conn| {
+            conn.execute(
+                "INSERT INTO cloud_state (
+                    id, gateway_base_url, device_id, subject_id,
+                    access_token, token_expires_at_secs, entitlement_json,
+                    models_json, selected_model_id, plans_json,
+                    plans_cached_at_secs, install_salt, last_synced_at_secs,
+                    updated_at_secs
+                 ) VALUES (
+                    1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                 )
+                 ON CONFLICT(id) DO UPDATE SET
+                    gateway_base_url = excluded.gateway_base_url,
+                    device_id = excluded.device_id,
+                    subject_id = excluded.subject_id,
+                    access_token = excluded.access_token,
+                    token_expires_at_secs = excluded.token_expires_at_secs,
+                    entitlement_json = excluded.entitlement_json,
+                    models_json = excluded.models_json,
+                    selected_model_id = excluded.selected_model_id,
+                    plans_json = excluded.plans_json,
+                    plans_cached_at_secs = excluded.plans_cached_at_secs,
+                    install_salt = excluded.install_salt,
+                    last_synced_at_secs = excluded.last_synced_at_secs,
+                    updated_at_secs = excluded.updated_at_secs",
+                params![
+                    norm.gateway_base_url,
+                    norm.device_id,
+                    norm.subject_id,
+                    norm.access_token,
+                    u64_to_sqlite_i64(norm.token_expires_at_secs),
+                    norm.entitlement_json,
+                    norm.models_json,
+                    norm.selected_model_id,
+                    norm.plans_json,
+                    u64_to_sqlite_i64(norm.plans_cached_at_secs),
+                    norm.install_salt,
+                    u64_to_sqlite_i64(norm.last_synced_at_secs),
+                    u64_to_sqlite_i64(norm.updated_at_secs),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Return the persisted `cloud_state.install_salt`, lazily generating and
+    /// persisting a 32-byte random hex salt once if currently absent or empty.
+    pub fn ensure_install_salt(&self) -> io::Result<String> {
+        let candidate = generate_install_salt();
+        let now = now_unix_secs();
+        self.with_conn_retry(|conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT install_salt FROM cloud_state WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(Some(salt)) = existing
+                && !salt.trim().is_empty()
+            {
+                tx.commit()?;
+                return Ok(salt.trim().to_owned());
+            }
+            tx.execute(
+                "INSERT INTO cloud_state (id, install_salt, updated_at_secs)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    install_salt = excluded.install_salt,
+                    updated_at_secs = excluded.updated_at_secs
+                 WHERE cloud_state.install_salt IS NULL
+                    OR TRIM(cloud_state.install_salt) = ''",
+                params![candidate, u64_to_sqlite_i64(now)],
+            )?;
+            let persisted: String = tx.query_row(
+                "SELECT install_salt FROM cloud_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(persisted.trim().to_owned())
+        })
+    }
+}
+
+fn generate_install_salt() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -2425,6 +2801,7 @@ mod tests {
                 "ai_config",
                 "ai_state",
                 "app_settings",
+                "cloud_state",
                 "ssh_profiles",
                 "update_settings",
                 "webhook_config",
@@ -2804,6 +3181,8 @@ mod tests {
         assert_eq!(migrated.api_protocol, ApiProtocol::OpenAi);
         assert_eq!(migrated.api_base_url, "");
 
+        assert!(migrated.setup_completed);
+
         let api_cfg = AiConfig {
             auto_analyze_on_alert: true,
             provider: AiCliProvider::Api,
@@ -2812,6 +3191,7 @@ mod tests {
             model: Some("claude-sonnet-4-6".to_owned()),
             api_protocol: ApiProtocol::Anthropic,
             api_base_url: "https://api.xiaomimimo.com/anthropic".to_owned(),
+            setup_completed: true,
             updated_at_secs: 1_700_000_999,
         };
         migrated_db.save_ai_config(&api_cfg).unwrap();
@@ -2829,6 +3209,7 @@ mod tests {
             "INSERT INTO webhook_config (id) VALUES (2)",
             "INSERT INTO ai_config (id) VALUES (2)",
             "INSERT INTO ai_state (id) VALUES (2)",
+            "INSERT INTO cloud_state (id) VALUES (2)",
             "INSERT INTO update_settings (id) VALUES (2)",
         ] {
             assert!(
@@ -3768,5 +4149,267 @@ mod tests {
         assert!(reloaded.launch_at_login);
         assert!(reloaded.tray_show_disk_space);
         assert_eq!(reloaded.updated_at_secs, 1_700_000_999);
+    }
+
+    #[test]
+    fn ai_config_setup_completed_defaults_and_legacy_migration() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // Fresh DB defaults setup_completed to false.
+        let fresh_db = StorageDb::open(temp.path().join("fresh.db")).unwrap();
+        let fresh_cfg = fresh_db.load_ai_config().unwrap();
+        assert!(!fresh_cfg.setup_completed);
+
+        // Save setup_completed = true and verify roundtrip.
+        let completed_cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            updated_at_secs: 1_700_000_010,
+            ..AiConfig::default()
+        };
+        fresh_db.save_ai_config(&completed_cfg).unwrap();
+        assert_eq!(fresh_db.load_ai_config().unwrap(), completed_cfg);
+
+        // Legacy DB with untouched default row stays setup_completed = false.
+        let untouched_path = temp.path().join("legacy-untouched.db");
+        {
+            let conn = Connection::open(&untouched_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ai_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    auto_analyze_on_alert INTEGER NOT NULL DEFAULT 1,
+                    provider TEXT NOT NULL DEFAULT 'agy',
+                    custom_command TEXT NOT NULL DEFAULT '',
+                    extra_args TEXT NOT NULL DEFAULT '',
+                    model TEXT,
+                    api_protocol TEXT NOT NULL DEFAULT 'openai',
+                    api_base_url TEXT NOT NULL DEFAULT '',
+                    updated_at_secs INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO ai_config (id) VALUES (1);",
+            )
+            .unwrap();
+        }
+        let untouched_db = StorageDb::open(&untouched_path).unwrap();
+        assert!(!untouched_db.load_ai_config().unwrap().setup_completed);
+
+        // Legacy DBs matching any configured signal migrate to setup_completed = true.
+        let cases = [
+            (
+                "updated_at",
+                "INSERT INTO ai_config (id, updated_at_secs) VALUES (1, 10)",
+            ),
+            (
+                "provider",
+                "INSERT INTO ai_config (id, provider) VALUES (1, 'pi')",
+            ),
+            (
+                "custom_command",
+                "INSERT INTO ai_config (id, custom_command) VALUES (1, 'my-cli')",
+            ),
+            (
+                "extra_args",
+                "INSERT INTO ai_config (id, extra_args) VALUES (1, '--fast')",
+            ),
+            (
+                "model",
+                "INSERT INTO ai_config (id, model) VALUES (1, 'gpt-5')",
+            ),
+            (
+                "api_protocol",
+                "INSERT INTO ai_config (id, api_protocol) VALUES (1, 'anthropic')",
+            ),
+            (
+                "api_base_url",
+                "INSERT INTO ai_config (id, api_base_url) VALUES (1, 'https://api.example.com')",
+            ),
+            (
+                "auto_analyze_off",
+                "INSERT INTO ai_config (id, auto_analyze_on_alert) VALUES (1, 0)",
+            ),
+        ];
+        for (name, insert_sql) in cases {
+            let db_path = temp.path().join(format!("legacy-{name}.db"));
+            {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE ai_config (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        auto_analyze_on_alert INTEGER NOT NULL DEFAULT 1,
+                        provider TEXT NOT NULL DEFAULT 'agy',
+                        custom_command TEXT NOT NULL DEFAULT '',
+                        extra_args TEXT NOT NULL DEFAULT '',
+                        model TEXT,
+                        api_protocol TEXT NOT NULL DEFAULT 'openai',
+                        api_base_url TEXT NOT NULL DEFAULT '',
+                        updated_at_secs INTEGER NOT NULL DEFAULT 0
+                    );",
+                )
+                .unwrap();
+                conn.execute(insert_sql, []).unwrap();
+            }
+            let db = StorageDb::open(&db_path).unwrap();
+            assert!(
+                db.load_ai_config().unwrap().setup_completed,
+                "legacy case `{name}` should migrate setup_completed = true"
+            );
+            // Re-opening must be idempotent even if explicitly reset to false.
+            let mut reset = db.load_ai_config().unwrap();
+            reset.setup_completed = false;
+            db.save_ai_config(&reset).unwrap();
+            drop(db);
+            let reopened = StorageDb::open(&db_path).unwrap();
+            assert!(
+                !reopened.load_ai_config().unwrap().setup_completed,
+                "reopen must not clobber explicit setup_completed = false"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_state_crud_install_salt_and_base_url_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = StorageDb::open(temp.path().join("cloud.db")).unwrap();
+
+        let def = db.load_cloud_state().unwrap();
+        assert_eq!(def.gateway_base_url, DEFAULT_CLOUD_GATEWAY_BASE_URL);
+        assert_eq!(def.device_id, None);
+        assert_eq!(def.plans_json, None);
+        assert_eq!(def.plans_cached_at_secs, 0);
+        assert_eq!(def.install_salt, None);
+        assert_eq!(def.token_expires_at_secs, 0);
+
+        let salt1 = db.ensure_install_salt().unwrap();
+        assert_eq!(salt1.len(), 64);
+        assert!(
+            salt1
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        let salt2 = db.ensure_install_salt().unwrap();
+        assert_eq!(salt1, salt2);
+
+        let updated = CloudState {
+            gateway_base_url: "http://127.0.0.1:8787".to_owned(),
+            device_id: Some("dev_0123456789abcdef0123456789abcdef".to_owned()),
+            subject_id: Some("sub_123".to_owned()),
+            access_token: Some("jwt.token.here".to_owned()),
+            token_expires_at_secs: 1_700_000_900,
+            entitlement_json: Some(r#"{"isPaid":false}"#.to_owned()),
+            models_json: Some(r#"{"data":[]}"#.to_owned()),
+            selected_model_id: Some("ruum-free".to_owned()),
+            plans_json: Some(r#"{"capabilityStatus":"ENABLED"}"#.to_owned()),
+            plans_cached_at_secs: 1_700_000_050,
+            install_salt: Some(salt1),
+            last_synced_at_secs: 1_700_000_100,
+            updated_at_secs: 1_700_000_100,
+        };
+        db.save_cloud_state(&updated).unwrap();
+        assert_eq!(db.load_cloud_state().unwrap(), updated);
+
+        // Allowed URLs.
+        assert_eq!(
+            validate_cloud_base_url("https://ruum-api.jsonlee12138.com/")
+                .unwrap(),
+            "https://ruum-api.jsonlee12138.com"
+        );
+        assert_eq!(
+            validate_cloud_base_url("http://127.0.0.1:8787").unwrap(),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            validate_cloud_base_url("http://localhost:8787/").unwrap(),
+            "http://localhost:8787"
+        );
+        assert_eq!(
+            validate_cloud_base_url("http://[::1]:8787").unwrap(),
+            "http://[::1]:8787"
+        );
+
+        // Rejected URLs.
+        for bad in [
+            "",
+            "   ",
+            "http://example.com",
+            "http://192.168.1.10:8787",
+            "ftp://ruum-api.jsonlee12138.com",
+            "https://user:pass@ruum-api.jsonlee12138.com",
+            "https://ruum-api.jsonlee12138.com?q=1",
+        ] {
+            assert!(
+                validate_cloud_base_url(bad).is_err(),
+                "expected URL validation failure for `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_state_migrates_legacy_table_and_roundtrips_plans_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("legacy-cloud.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cloud_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    gateway_base_url TEXT NOT NULL DEFAULT 'https://ruum-api.jsonlee12138.com',
+                    device_id TEXT,
+                    subject_id TEXT,
+                    access_token TEXT,
+                    token_expires_at_secs INTEGER NOT NULL DEFAULT 0,
+                    entitlement_json TEXT,
+                    models_json TEXT,
+                    selected_model_id TEXT,
+                    install_salt TEXT,
+                    last_synced_at_secs INTEGER NOT NULL DEFAULT 0,
+                    updated_at_secs INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO cloud_state (
+                    id, gateway_base_url, device_id, subject_id, selected_model_id
+                ) VALUES (
+                    1, 'https://ruum-api.jsonlee12138.com', 'dev_legacy',
+                    'sub_legacy', 'ruum-pro'
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = StorageDb::open(&db_path).unwrap();
+        let loaded = db.load_cloud_state().unwrap();
+        assert_eq!(loaded.device_id.as_deref(), Some("dev_legacy"));
+        assert_eq!(loaded.subject_id.as_deref(), Some("sub_legacy"));
+        assert_eq!(loaded.selected_model_id.as_deref(), Some("ruum-pro"));
+        assert_eq!(loaded.plans_json, None);
+        assert_eq!(loaded.plans_cached_at_secs, 0);
+
+        let mut updated = loaded;
+        updated.plans_json =
+            Some("  {\"capabilityStatus\":\"ENABLED\"}  ".to_owned());
+        updated.plans_cached_at_secs = 1_700_123_456;
+        db.save_cloud_state(&updated).unwrap();
+
+        let reloaded = db.load_cloud_state().unwrap();
+        assert_eq!(
+            reloaded.plans_json.as_deref(),
+            Some("{\"capabilityStatus\":\"ENABLED\"}")
+        );
+        assert_eq!(reloaded.plans_cached_at_secs, 1_700_123_456);
+
+        // Re-opening must be idempotent and preserve cached plans.
+        drop(db);
+        let reopened = StorageDb::open(&db_path).unwrap();
+        let after_reopen = reopened.load_cloud_state().unwrap();
+        assert_eq!(
+            after_reopen.plans_json.as_deref(),
+            Some("{\"capabilityStatus\":\"ENABLED\"}")
+        );
+        assert_eq!(after_reopen.plans_cached_at_secs, 1_700_123_456);
+
+        // Blank plans_json normalizes to None.
+        let mut cleared = after_reopen;
+        cleared.plans_json = Some("   \n\t ".to_owned());
+        cleared.plans_cached_at_secs = 0;
+        reopened.save_cloud_state(&cleared).unwrap();
+        assert_eq!(reopened.load_cloud_state().unwrap().plans_json, None);
     }
 }

@@ -27,8 +27,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, HostTabKey, PANEL_REMS, Ruum, Screen, UpdateUiState,
-    panel_width,
+    AiSetupChoice, ColorMode, Crumb, HostTabKey, PANEL_REMS, Ruum, Screen,
+    UpdateUiState, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -60,6 +60,10 @@ pub fn root(
             app.webhook_form_needs_sync = false;
             app.sync_webhook_form_inputs(window, cx);
         }
+    }
+    if app.cloud_redeem_inputs_need_clear {
+        app.cloud_redeem_inputs_need_clear = false;
+        app.clear_cloud_redeem_inputs(window, cx);
     }
     if app.screen == Screen::Docker {
         app.ensure_local_docker_initialized();
@@ -218,6 +222,12 @@ pub fn root(
     if app.update_modal_open {
         root = root.child(crate::rail_pages::update_modal(app, cx));
     }
+    if let Some(dialog) = ai_setup_choice_dialog(app, cx) {
+        root = root.child(dialog);
+    }
+    if let Some(dialog) = billing_modal_dialog(app, cx) {
+        root = root.child(dialog);
+    }
     if let Some(toast) = toast_overlay(app, cx) {
         root = root.child(toast);
     }
@@ -351,6 +361,997 @@ fn delete_dialog(app: &Ruum, cx: &mut Context<'_, Ruum>) -> impl IntoElement {
             false
         })
         .popup(centred)
+}
+
+fn ai_setup_choice_card(
+    id: &'static str,
+    title: &'static str,
+    desc: &'static str,
+    badge: Option<&'static str>,
+    highlighted: bool,
+    choice: AiSetupChoice,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .cursor_pointer()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .p(space::MD)
+        .rounded(space::XS)
+        .border_1()
+        .border_color(if highlighted {
+            theme.accent.opacity(0.65)
+        } else {
+            theme.control_border()
+        })
+        .bg(if highlighted {
+            theme.accent.opacity(0.1)
+        } else {
+            theme.normal_fill()
+        })
+        .hover(|s| s.bg(theme.hover_fill()))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.confirm_ai_setup_choice(choice, cx);
+            this.apply_focus(window, cx);
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .text_color(if highlighted {
+                            theme.accent
+                        } else {
+                            theme.bright
+                        })
+                        .child(title),
+                )
+                .when_some(badge, |row, pill| {
+                    row.child(
+                        div()
+                            .px(space::XS)
+                            .py(space::XXS)
+                            .rounded(space::XXS)
+                            .bg(theme.accent.opacity(0.18))
+                            .text_size(text::CAPTION)
+                            .text_color(theme.accent)
+                            .child(pill),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(desc),
+        )
+}
+
+fn ai_setup_choice_dialog(
+    app: &Ruum,
+    cx: &mut Context<'_, Ruum>,
+) -> Option<impl IntoElement> {
+    let _modal = app.ai_setup_choice_modal.as_ref()?;
+    let locale = app.locale;
+    let cancel = cx.entity().downgrade();
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::MD)
+        .child(dialog_title(
+            crate::i18n::pages::ai_setup_choice_title(locale),
+            cx,
+        ))
+        .child(
+            div()
+                .debug_selector(|| "ai-setup-choice-close".into())
+                .child(
+                    gpui_omarchy::icon_button(
+                        "ai-setup-choice-close",
+                        IconName::Close,
+                        crate::i18n::review::cancel(locale),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.cancel_ai_setup_choice(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+        );
+
+    let cards = div()
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .child(ai_setup_choice_card(
+            "ai-setup-choice-cloud",
+            crate::i18n::pages::ai_setup_choice_cloud_title(locale),
+            crate::i18n::pages::ai_setup_choice_cloud_desc(locale),
+            Some(crate::i18n::pages::ai_setup_choice_recommended(locale)),
+            true,
+            AiSetupChoice::RuumCloud,
+            cx,
+        ))
+        .child(ai_setup_choice_card(
+            "ai-setup-choice-api",
+            crate::i18n::pages::ai_setup_choice_api_title(locale),
+            crate::i18n::pages::ai_setup_choice_api_desc(locale),
+            None,
+            false,
+            AiSetupChoice::CustomApi,
+            cx,
+        ))
+        .child(ai_setup_choice_card(
+            "ai-setup-choice-cli",
+            crate::i18n::pages::ai_setup_choice_cli_title(locale),
+            crate::i18n::pages::ai_setup_choice_cli_desc(locale),
+            None,
+            false,
+            AiSetupChoice::LocalCli,
+            cx,
+        ));
+
+    let actions = div().flex().flex_row().justify_end().gap(space::SM).child(
+        div()
+            .debug_selector(|| "ai-setup-choice-cancel".into())
+            .child(
+                dialog_button(
+                    "ai-setup-choice-cancel",
+                    crate::i18n::review::cancel(locale),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.cancel_ai_setup_choice(cx);
+                        this.apply_focus(window, cx);
+                    },
+                )),
+            ),
+    );
+
+    let popup = div()
+        .debug_selector(|| "ai-setup-choice-modal".into())
+        .child(
+            dialog_popup(cx)
+                .w(size::AI_SETUP_MODAL)
+                .max_w_full()
+                .child(header)
+                .child(dialog_description(
+                    crate::i18n::pages::ai_setup_choice_desc(locale),
+                    cx,
+                ))
+                .child(cards)
+                .child(actions),
+        );
+
+    let centred = centred_popup(popup, {
+        let close = cancel.clone();
+        move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.cancel_ai_setup_choice(cx);
+                this.apply_focus(window, cx);
+            });
+        }
+    });
+
+    Some(
+        alert_dialog(&app.ai_setup_choice_focus, cx)
+            .open(true)
+            .on_cancel(move |_, window, cx| {
+                let _ = cancel.update(cx, |this, cx| {
+                    this.cancel_ai_setup_choice(cx);
+                    this.apply_focus(window, cx);
+                });
+                false
+            })
+            .popup(centred),
+    )
+}
+
+fn billing_modal_dialog(
+    app: &Ruum,
+    cx: &mut Context<'_, Ruum>,
+) -> Option<impl IntoElement> {
+    use crate::state::BillingModalStep;
+
+    let modal = app.billing_modal.as_ref()?;
+    let locale = app.locale;
+    let theme = cx.omarchy().clone();
+    let close = cx.entity().downgrade();
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::MD)
+        .child(dialog_title(
+            crate::i18n::pages::cloud_billing_modal_title(locale),
+            cx,
+        ))
+        .child(
+            div().debug_selector(|| "cloud-billing-close".into()).child(
+                gpui_omarchy::icon_button(
+                    "cloud-billing-close",
+                    IconName::Close,
+                    crate::i18n::review::cancel(locale),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.close_billing_modal(cx);
+                        this.apply_focus(window, cx);
+                    },
+                )),
+            ),
+        );
+
+    let body = billing_modal_body(app, modal, locale, &theme, cx);
+
+    let confirm_disabled = modal.loading_plans
+        || modal.plans_unavailable
+        || modal.selected_sku_id.is_none()
+        || modal.creating_order;
+
+    let actions = div()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .gap(space::SM)
+        .when(
+            modal.step == BillingModalStep::Checkout
+                && modal.creating_order
+                && modal.active_order.is_none(),
+            |row| {
+                row.child(
+                    div()
+                        .debug_selector(|| "cloud-billing-back-plans".into())
+                        .child(
+                            dialog_button(
+                                "cloud-billing-back-plans",
+                                crate::i18n::pages::cloud_billing_back_to_plans(
+                                    locale,
+                                ),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.back_to_billing_plans(cx);
+                                    this.apply_focus(window, cx);
+                                },
+                            )),
+                        ),
+                )
+            },
+        )
+        .child(
+            dialog_button(
+                "cloud-billing-dismiss",
+                crate::i18n::review::cancel(locale),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_billing_modal(cx);
+                this.apply_focus(window, cx);
+            })),
+        )
+        .when(modal.step == BillingModalStep::SelectPlan, |row| {
+            row.child(
+                div()
+                    .debug_selector(|| "cloud-billing-confirm-btn".into())
+                    .child(
+                        dialog_button(
+                            "cloud-billing-confirm-btn",
+                            crate::i18n::pages::cloud_billing_confirm(locale),
+                            ButtonVariant::Primary,
+                            cx,
+                        )
+                        .disabled(confirm_disabled)
+                        .when(
+                            !confirm_disabled,
+                            |btn| {
+                                btn.on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.confirm_billing_plan(cx);
+                                        this.apply_focus(window, cx);
+                                    },
+                                ))
+                            },
+                        ),
+                    ),
+            )
+        });
+
+    let popup = div().debug_selector(|| "cloud-billing-modal".into()).child(
+        dialog_popup(cx)
+            .w(size::CLOUD_BILLING_MODAL)
+            .max_w_full()
+            .child(header)
+            .child(dialog_description(
+                crate::i18n::pages::cloud_billing_modal_desc(locale),
+                cx,
+            ))
+            .child(body)
+            .child(actions),
+    );
+
+    let centred = centred_popup(popup, {
+        let close_outside = close.clone();
+        move |_, window, cx| {
+            let _ = close_outside.update(cx, |this, cx| {
+                this.close_billing_modal(cx);
+                this.apply_focus(window, cx);
+            });
+        }
+    });
+
+    Some(
+        alert_dialog(&app.billing_focus, cx)
+            .open(true)
+            .on_cancel(move |_, window, cx| {
+                let _ = close.update(cx, |this, cx| {
+                    this.close_billing_modal(cx);
+                    this.apply_focus(window, cx);
+                });
+                false
+            })
+            .popup(centred),
+    )
+}
+
+fn billing_active_sku_summary(
+    sku: &ruum_core::cloud_client::ChargingOption,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id("cloud-billing-active-sku")
+        .debug_selector(|| "cloud-billing-active-sku".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(space::MD)
+        .py(space::SM)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.inset)
+        .child(
+            div()
+                .text_size(text::BODY)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.bright)
+                .child(sku.display_name.clone()),
+        )
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.accent)
+                .child(sku.price.clone()),
+        )
+}
+
+fn billing_modal_body(
+    app: &Ruum,
+    modal: &crate::state::BillingModalState,
+    locale: crate::i18n::Locale,
+    theme: &Theme,
+    cx: &Context<'_, Ruum>,
+) -> Div {
+    use crate::state::BillingModalStep;
+
+    let mut body = div().flex().flex_col().gap(space::MD);
+
+    match modal.step {
+        BillingModalStep::SelectPlan => {
+            if modal.loading_plans {
+                return body.child(
+                    div()
+                        .id("cloud-billing-loading")
+                        .debug_selector(|| "cloud-billing-loading".into())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::SM)
+                        .p(space::MD)
+                        .border_1()
+                        .border_color(theme.divider())
+                        .bg(theme.inset)
+                        .text_size(text::BODY)
+                        .text_color(theme.secondary)
+                        .child(crate::rail_pages::spinning_loader(
+                            "cloud-billing-loading-spin",
+                            theme.accent,
+                        ))
+                        .child(
+                            crate::i18n::pages::cloud_billing_loading_plans(
+                                locale,
+                            ),
+                        ),
+                );
+            }
+
+            if modal.plans_unavailable {
+                return body.child(
+                    div()
+                        .id("cloud-billing-unavailable")
+                        .debug_selector(|| "cloud-billing-unavailable".into())
+                        .flex()
+                        .flex_col()
+                        .gap(space::SM)
+                        .p(space::MD)
+                        .border_1()
+                        .border_color(theme.warning.opacity(0.5))
+                        .bg(theme.warning.opacity(0.08))
+                        .child(
+                            div()
+                                .text_size(text::BODY)
+                                .text_color(theme.warning)
+                                .child(
+                                    crate::i18n::pages::cloud_billing_unavailable_notice(
+                                        locale,
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div().flex().flex_row().justify_end().child(
+                                button(
+                                    "cloud-billing-retry-btn",
+                                    crate::i18n::pages::cloud_billing_retry(
+                                        locale,
+                                    ),
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.retry_billing_plans(cx);
+                                        this.apply_focus(window, cx);
+                                    },
+                                )),
+                            ),
+                        ),
+                );
+            }
+
+            if let Some(plans) = modal.plans.as_ref() {
+                body = body
+                    .child(billing_plans_list(modal, plans, locale, theme, cx));
+            }
+        }
+        BillingModalStep::Checkout => {
+            if let Some(order) = modal.active_order.as_ref() {
+                body = body.child(billing_qr_checkout_view(
+                    app, modal, order, locale, theme, cx,
+                ));
+            } else {
+                if let Some(sku) = modal.active_sku.as_ref() {
+                    body = body.child(billing_active_sku_summary(sku, theme));
+                }
+                if modal.creating_order {
+                    body = body.child(
+                        div()
+                            .id("cloud-billing-creating-order")
+                            .debug_selector(|| {
+                                "cloud-billing-creating-order".into()
+                            })
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::SM)
+                            .p(space::MD)
+                            .border_1()
+                            .border_color(theme.divider())
+                            .bg(theme.inset)
+                            .text_size(text::BODY)
+                            .text_color(theme.secondary)
+                            .child(crate::rail_pages::spinning_loader(
+                                "cloud-billing-order-spin",
+                                theme.accent,
+                            ))
+                            .child(
+                                crate::i18n::pages::cloud_billing_creating_order(
+                                    locale,
+                                ),
+                            ),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(err) = modal.error.as_ref() {
+        body = body.child(billing_error_box(err, modal, locale, theme, cx));
+    }
+
+    body
+}
+
+fn billing_error_box(
+    err: &str,
+    modal: &crate::state::BillingModalState,
+    locale: crate::i18n::Locale,
+    theme: &Theme,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    use crate::state::BillingModalStep;
+
+    let can_retry = modal.step == BillingModalStep::SelectPlan
+        && modal.plans.is_none()
+        && modal.active_order.is_none();
+    let can_retry_order = modal.step == BillingModalStep::Checkout
+        && modal.active_order.is_none()
+        && !modal.creating_order;
+
+    div()
+        .id("cloud-billing-error")
+        .debug_selector(|| "cloud-billing-error".into())
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .p(space::MD)
+        .border_1()
+        .border_color(theme.danger.opacity(0.5))
+        .bg(theme.danger.opacity(0.08))
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.danger)
+                .child(err.to_owned()),
+        )
+        .when(can_retry, |box_div| {
+            box_div.child(
+                div().flex().flex_row().justify_end().child(
+                    button(
+                        "cloud-billing-retry-btn",
+                        crate::i18n::pages::cloud_billing_retry(locale),
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.retry_billing_plans(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+            )
+        })
+        .when(can_retry_order, |box_div| {
+            let back_label =
+                crate::i18n::pages::cloud_billing_back_to_plans(locale);
+            let retry_label = crate::i18n::pages::cloud_billing_retry(locale);
+            box_div.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(space::SM)
+                    .child(
+                        div()
+                            .debug_selector(|| {
+                                "cloud-billing-back-plans".into()
+                            })
+                            .child(
+                                button(
+                                    "cloud-billing-back-plans",
+                                    back_label,
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.back_to_billing_plans(cx);
+                                        this.apply_focus(window, cx);
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| {
+                                "cloud-billing-retry-order-btn".into()
+                            })
+                            .child(
+                                button(
+                                    "cloud-billing-retry-order-btn",
+                                    retry_label,
+                                    ButtonVariant::Primary,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        if let Some(sku_id) = this
+                                            .billing_modal
+                                            .as_ref()
+                                            .and_then(|m| {
+                                                m.selected_sku_id.clone()
+                                            })
+                                        {
+                                            this.purchase_billing_sku(
+                                                sku_id, cx,
+                                            );
+                                        }
+                                        this.apply_focus(window, cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+        })
+}
+
+fn billing_plans_list(
+    modal: &crate::state::BillingModalState,
+    plans: &ruum_core::cloud_client::BillingPlansSnapshot,
+    locale: crate::i18n::Locale,
+    theme: &Theme,
+    cx: &Context<'_, Ruum>,
+) -> Div {
+    let mut list = div().flex().flex_col().gap(space::SM).child(
+        div()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(crate::i18n::pages::cloud_billing_select_plan(locale)),
+    );
+
+    let uniform_policy = plans.uniform_usage_policy();
+    if let Some(policy) = uniform_policy {
+        list = list.child(
+            div()
+                .id("cloud-billing-usage-banner")
+                .debug_selector(|| "cloud-billing-usage-banner".into())
+                .px(space::MD)
+                .py(space::SM)
+                .border_1()
+                .border_color(theme.divider())
+                .bg(theme.inset)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_billing_usage_shared(
+                    policy.estimated_daily_analyses,
+                    policy.estimated_monthly_analyses,
+                    policy.soft_fallback_percent,
+                    locale,
+                )),
+        );
+    }
+
+    for (idx, opt) in plans.charging_options.iter().enumerate() {
+        let selected =
+            modal.selected_sku_id.as_deref() == Some(opt.sku_id.as_str());
+        let sku_id = opt.sku_id.clone();
+        let period_pill = opt
+            .duration_period
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|p| {
+                crate::i18n::pages::cloud_billing_duration_label(p, locale)
+            });
+        let expanded_policy = if uniform_policy.is_none() && selected {
+            opt.usage_policy.as_ref().or(plans.usage_policy.as_ref())
+        } else {
+            None
+        };
+
+        let card = div()
+            .id(("cloud-billing-sku", idx))
+            .debug_selector(move || format!("cloud-billing-sku-{idx}"))
+            .flex()
+            .flex_col()
+            .gap(space::XS)
+            .px(space::MD)
+            .py(space::SM)
+            .border_1()
+            .border_color(if selected {
+                theme.accent
+            } else {
+                theme.divider()
+            })
+            .bg(if selected {
+                theme.accent.opacity(0.1)
+            } else {
+                theme.inset
+            })
+            .when(!modal.creating_order, |c| {
+                c.cursor_pointer()
+                    .hover(|s| s.border_color(theme.accent.opacity(0.75)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_billing_sku(sku_id.clone(), cx);
+                    }))
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::MD)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::SM)
+                            .child(
+                                div()
+                                    .text_size(text::BODY)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.bright)
+                                    .child(opt.display_name.clone()),
+                            )
+                            .when_some(period_pill, |row, pill| {
+                                row.child(
+                                    div()
+                                        .px(space::XS)
+                                        .py(space::XXS)
+                                        .bg(theme.accent.opacity(0.16))
+                                        .text_size(text::CAPTION)
+                                        .text_color(theme.accent)
+                                        .child(pill),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(text::TITLE)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.accent)
+                            .child(opt.price.clone()),
+                    ),
+            )
+            .when_some(expanded_policy, |card_div, policy| {
+                card_div.child(
+                    div()
+                        .id(("cloud-billing-sku-limit", idx))
+                        .debug_selector(move || {
+                            format!("cloud-billing-sku-limit-{idx}")
+                        })
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(
+                            crate::i18n::pages::cloud_billing_usage_per_plan(
+                                policy.estimated_daily_analyses,
+                                policy.estimated_monthly_analyses,
+                                policy.soft_fallback_percent,
+                                locale,
+                            ),
+                        ),
+                )
+            });
+
+        list = list.child(card);
+    }
+
+    list
+}
+
+fn billing_qr_checkout_view(
+    app: &Ruum,
+    modal: &crate::state::BillingModalState,
+    order: &ruum_core::cloud_client::PurchaseOrderSnapshot,
+    locale: crate::i18n::Locale,
+    theme: &Theme,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let safe_url = crate::state::select_safe_billing_browser_url(
+        order.purchase_url.as_deref(),
+        order.purchase_qr_code.as_deref(),
+    );
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expiry_hint =
+        order.expires_at.filter(|exp| *exp > now_secs).map(|exp| {
+            let mins = (exp - now_secs).div_ceil(60).max(1);
+            crate::i18n::pages::cloud_billing_expiry_minutes(mins, locale)
+        });
+    let busy = modal.refreshing_status || app.cloud_refreshing;
+
+    let mut box_div = div()
+        .id("cloud-billing-qr-section")
+        .debug_selector(|| "cloud-billing-qr-section".into())
+        .flex()
+        .flex_col()
+        .gap(space::MD);
+
+    if let Some(sku) = modal.active_sku.as_ref() {
+        box_div = box_div.child(billing_active_sku_summary(sku, theme));
+    }
+
+    let mut qr_col = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(space::SM)
+        .p(space::MD)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.inset);
+
+    if let Some(matrix) = modal.qr_matrix.as_ref() {
+        qr_col = qr_col.child(crate::qr::qr_canvas(
+            std::sync::Arc::clone(matrix),
+            size::CLOUD_QR_CODE,
+            "cloud-billing-qr-canvas",
+        ));
+    }
+
+    qr_col = qr_col
+        .child(
+            div()
+                .text_size(text::BODY)
+                .text_color(theme.bright)
+                .child(crate::i18n::pages::cloud_billing_scan_qr_hint(locale)),
+        )
+        .when_some(expiry_hint, |col, hint| {
+            col.child(
+                div()
+                    .id("cloud-billing-expiry-hint")
+                    .debug_selector(|| "cloud-billing-expiry-hint".into())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(hint),
+            )
+        })
+        .child(
+            div()
+                .id("cloud-billing-poll-status")
+                .debug_selector(|| "cloud-billing-poll-status".into())
+                .text_size(text::CAPTION)
+                .text_color(if modal.polling_timed_out {
+                    theme.warning
+                } else {
+                    theme.secondary
+                })
+                .child(if modal.polling_timed_out {
+                    crate::i18n::pages::cloud_billing_poll_timed_out(locale)
+                } else {
+                    crate::i18n::pages::cloud_billing_polling_status(locale)
+                }),
+        );
+
+    box_div = box_div.child(qr_col);
+
+    if safe_url.is_none() {
+        box_div = box_div.child(
+            div()
+                .id("cloud-billing-mobile-only-hint")
+                .debug_selector(|| "cloud-billing-mobile-only-hint".into())
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_billing_mobile_only_hint(
+                    locale,
+                )),
+        );
+    }
+
+    box_div
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .debug_selector(|| "cloud-billing-open-browser".into())
+                        .child(
+                            button(
+                                "cloud-billing-open-browser",
+                                crate::i18n::pages::cloud_billing_open_browser(
+                                    locale,
+                                ),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .disabled(safe_url.is_none())
+                            .when(
+                                safe_url.is_some(),
+                                |btn| {
+                                    btn.on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.open_billing_browser_url(cx);
+                                        },
+                                    ))
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "cloud-billing-support-btn".into())
+                        .child(
+                            button(
+                                "cloud-billing-support-btn",
+                                crate::i18n::pages::cloud_billing_support_btn(
+                                    locale,
+                                ),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.open_support_website(cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "cloud-billing-refresh-btn".into())
+                        .child(
+                            crate::rail_pages::action_button_with_spinner(
+                                "cloud-billing-refresh-btn",
+                                "cloud-billing-refresh-spin",
+                                crate::i18n::pages::cloud_billing_refresh_now(
+                                    locale,
+                                ),
+                                busy,
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .disabled(busy)
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.refresh_billing_order_status(cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "cloud-billing-back-plans".into())
+                        .child(
+                            button(
+                                "cloud-billing-back-plans",
+                                crate::i18n::pages::cloud_billing_back_to_plans(
+                                    locale,
+                                ),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.back_to_billing_plans(cx);
+                                    this.apply_focus(window, cx);
+                                },
+                            )),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .id("cloud-billing-support-hint")
+                .debug_selector(|| "cloud-billing-support-hint".into())
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_billing_support_contact_hint(
+                    locale,
+                )),
+        )
 }
 
 fn remote_connect_dialog(
@@ -2372,6 +3373,8 @@ fn update_banner_overlay(
     cx: &Context<'_, Ruum>,
 ) -> Option<Stateful<Div>> {
     if app.update_modal_open
+        || app.ai_setup_choice_modal.is_some()
+        || app.billing_modal.is_some()
         || matches!(app.screen, Screen::Review | Screen::Running)
         || app.confirm_open
         || app.volumes_open

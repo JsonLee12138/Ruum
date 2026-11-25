@@ -175,10 +175,11 @@ pub const fn ai_assistant_cli_title(locale: Locale) -> &'static str {
 pub const fn ai_assistant_cli_desc(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Select which AI CLI to invoke when free space drops below threshold.",
-        "\u{9009}\u{62e9}\u{5f53}\u{53ef}\u{7528}\u{7a7a}\u{95f4}\u{4f4e}\u{4e8e}\u{9608}\u{503c}\u{65f6}\u{8c03}\u{7528}\u{7684} AI CLI\u{3002}",
-        "\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{304c}\u{3057}\u{304d}\u{3044}\u{5024}\u{3092}\u{4e0b}\u{56de}\u{3063}\u{305f}\u{3068}\u{304d}\u{306b}\u{547c}\u{3073}\u{51fa}\u{3059} AI CLI \u{3092}\u{9078}\u{629e}\u{3057}\u{307e}\u{3059}\u{3002}",
-        "\u{c5ec}\u{c720} \u{acf5}\u{ac04}\u{c774} \u{c784}\u{acc4}\u{ac12} \u{bbf8}\u{b9cc}\u{c73c}\u{b85c} \u{b5a8}\u{c5b4}\u{c9c8} \u{b54c} \u{d638}\u{cd9c}\u{d560} AI CLI\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{c138}\u{c694}.",
+        "Select which AI analysis backend to invoke when free space drops \
+         below threshold.",
+        "\u{9009}\u{62e9}\u{5f53}\u{53ef}\u{7528}\u{7a7a}\u{95f4}\u{4f4e}\u{4e8e}\u{9608}\u{503c}\u{65f6}\u{8c03}\u{7528}\u{7684} AI \u{5206}\u{6790}\u{3002}",
+        "\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{304c}\u{3057}\u{304d}\u{3044}\u{5024}\u{3092}\u{4e0b}\u{56de}\u{3063}\u{305f}\u{3068}\u{304d}\u{306b}\u{547c}\u{3073}\u{51fa}\u{3059} AI \u{5206}\u{6790}\u{3092}\u{9078}\u{629e}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{c5ec}\u{c720} \u{acf5}\u{ac04}\u{c774} \u{c784}\u{acc4}\u{ac12} \u{bbf8}\u{b9cc}\u{c73c}\u{b85c} \u{b5a8}\u{c5b4}\u{c9c8} \u{b54c} \u{d638}\u{cd9c}\u{d560} AI \u{bd84}\u{c11d}\u{c744} \u{c120}\u{d0dd}\u{d558}\u{c138}\u{c694}.",
     )
 }
 
@@ -1698,5 +1699,688 @@ pub const fn webhook_guide_cli_label(locale: Locale) -> &'static str {
         "\u{8fdc}\u{7a0b}\u{670d}\u{52a1}\u{5668} CLI \u{914d}\u{7f6e}\u{793a}\u{4f8b}\u{ff1a}",
         "\u{30b5}\u{30fc}\u{30d0}\u{30fc} CLI \u{8a2d}\u{5b9a}\u{4f8b}:",
         "\u{c11c}\u{bc84} CLI \u{c124}\u{c815} \u{c608}\u{c2dc}:",
+    )
+}
+
+// ── AI setup onboarding modal & Ruum Cloud settings ─────────────────────
+
+pub const fn ai_setup_choice_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Choose Your AI Cleanup Backend",
+        "\u{9009}\u{62e9} AI \u{5206}\u{6790}\u{5f15}\u{64ce}",
+        "AI \u{5206}\u{6790}\u{30d0}\u{30c3}\u{30af}\u{30a8}\u{30f3}\u{30c9}\u{3092}\u{9078}\u{629e}",
+        "AI \u{bd84}\u{c11d} \u{bc31}\u{c5d4}\u{b4dc} \u{c120}\u{d0dd}",
+    )
+}
+
+pub const fn ai_setup_choice_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Pick how Ruum analyzes reclaimable directories. Nothing is \
+         activated until you choose.",
+        "\u{8bf7}\u{9009}\u{62e9} Ruum \u{7684}\u{667a}\u{80fd}\u{5206}\u{6790}\u{65b9}\u{5f0f}\u{ff1b}\u{53d6}\u{6d88}\u{4e0d}\u{4f1a}\u{6ce8}\u{518c}\u{8bbe}\u{5907}\u{6216}\u{6d88}\u{8017}\u{4f53}\u{9a8c}\u{6b21}\u{6570}\u{3002}",
+        "Ruum \u{304c}\u{30c7}\u{30a3}\u{30ec}\u{30af}\u{30c8}\u{30ea}\u{3092}\u{5206}\u{6790}\u{3059}\u{308b}\u{65b9}\u{6cd5}\u{3092}\u{9078}\u{629e}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "Ruum\u{c774} \u{c815}\u{b9ac} \u{b300}\u{c0c1}\u{c744} \u{bd84}\u{c11d}\u{d558}\u{b294} \u{bc29}\u{c2dd}\u{c744} \u{c120}\u{d0dd}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn ai_setup_choice_recommended(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Recommended",
+        "\u{63a8}\u{8350}",
+        "\u{63a8}\u{5968}",
+        "\u{cd94}\u{cc9c}",
+    )
+}
+
+pub const fn ai_setup_choice_cloud_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Built-in Ruum Cloud",
+        "\u{5185}\u{7f6e} Ruum \u{4e91}\u{7aef} AI",
+        "\u{5185}\u{8535} Ruum Cloud AI",
+        "\u{b0b4}\u{c7a5} Ruum Cloud AI",
+    )
+}
+
+pub const fn ai_setup_choice_cloud_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Zero-config hosted AI with 3 free trials, Alipay Cloud Pro & \
+         redemption code support.",
+        "\u{514d}\u{914d}\u{7f6e}\u{5373}\u{7528}\u{ff0c}\u{542b} 3 \u{6b21}\u{514d}\u{8d39}\u{4f53}\u{9a8c}\u{ff0c}\u{652f}\u{6301}\u{652f}\u{4ed8}\u{5b9d}\u{626b}\u{7801}\u{4e0e}\u{5151}\u{6362}\u{7801}\u{3002}",
+        "\u{8a2d}\u{5b9a}\u{4e0d}\u{8981}\u{3067} 3 \u{56de}\u{306e}\u{7121}\u{6599}\u{30c8}\u{30e9}\u{30a4}\u{30a2}\u{30eb}\u{30fb}Alipay\u{30fb}\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}\u{306b}\u{5bfe}\u{5fdc}\u{3002}",
+        "\u{bcc4}\u{b3c4} \u{c124}\u{c815} \u{c5c6}\u{c774} 3\u{d68c} \u{bb34}\u{b8cc} \u{ccb4}\u{d5d8}, Alipay \u{bc0f} \u{ad50}\u{d658} \u{cf54}\u{b4dc}\u{b97c} \u{c9c0}\u{c6d0}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn ai_setup_choice_api_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Custom API (BYOK)",
+        "\u{81ea}\u{5e26} API Key (BYOK)",
+        "\u{30ab}\u{30b9}\u{30bf}\u{30e0} API (BYOK)",
+        "\u{c0ac}\u{c6a9}\u{c790} \u{c9c0}\u{c815} API (BYOK)",
+    )
+}
+
+pub const fn ai_setup_choice_api_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Bring your own OpenAI or Anthropic compatible endpoint and key.",
+        "\u{4f7f}\u{7528}\u{81ea}\u{5df1}\u{7684} OpenAI \u{6216} Anthropic \u{517c}\u{5bb9}\u{63a5}\u{53e3}\u{4e0e}\u{5bc6}\u{94a5}\u{3002}",
+        "\u{304a}\u{6301}\u{3061}\u{306e} OpenAI / Anthropic \u{4e92}\u{63db} API \u{30ad}\u{30fc}\u{3092}\u{4f7f}\u{7528}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{bcf4}\u{c720}\u{d55c} OpenAI \u{b610}\u{b294} Anthropic \u{d638}\u{d658} \u{d0a4}\u{b97c} \u{c0ac}\u{c6a9}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn ai_setup_choice_cli_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Local CLI",
+        "\u{672c}\u{5730} AI CLI",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb} CLI",
+        "\u{b85c}\u{ceec} CLI",
+    )
+}
+
+pub const fn ai_setup_choice_cli_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run your installed Claude, Codex, Pi, or custom CLI agent locally.",
+        "\u{8c03}\u{7528}\u{672c}\u{673a}\u{5df2}\u{5b89}\u{88c5}\u{7684} Claude / Codex / Pi \u{6216}\u{81ea}\u{5b9a}\u{4e49}\u{547d}\u{4ee4}\u{884c}\u{5de5}\u{5177}\u{3002}",
+        "\u{30ed}\u{30fc}\u{30ab}\u{30eb}\u{306e} Claude / Codex / Pi / \u{30ab}\u{30b9}\u{30bf}\u{30e0} CLI \u{3092}\u{4f7f}\u{7528}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{b85c}\u{ceec}\u{c5d0} \u{c124}\u{ce58}\u{b41c} Claude / Codex / Pi / \u{c0ac}\u{c6a9}\u{c790} CLI\u{b97c} \u{c2e4}\u{d589}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn cloud_card_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Ruum Cloud AI",
+        "Ruum \u{4e91}\u{7aef} AI",
+        "Ruum Cloud AI",
+        "Ruum Cloud AI",
+    )
+}
+
+pub const fn cloud_card_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Built-in platform Cloud AI gateway",
+        "\u{5e73}\u{53f0}\u{81ea}\u{5e26}\u{4e91}\u{7aef}AI\u{7f51}\u{5173}",
+        "\u{30d7}\u{30e9}\u{30c3}\u{30c8}\u{30d5}\u{30a9}\u{30fc}\u{30e0}\u{5185}\u{8535}\u{30af}\u{30e9}\u{30a6}\u{30c9} AI \u{30b2}\u{30fc}\u{30c8}\u{30a6}\u{30a7}\u{30a4}",
+        "\u{d50c}\u{b7ab}\u{d3fc} \u{b0b4}\u{c7a5} \u{d074}\u{b77c}\u{c6b0}\u{b4dc} AI \u{ac8c}\u{c774}\u{d2b8}\u{c6e8}\u{c774}",
+    )
+}
+
+pub const fn cloud_status_not_activated(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Not Activated",
+        "\u{672a}\u{6fc0}\u{6d3b}",
+        "\u{672a}\u{6709}\u{52b9}\u{5316}",
+        "\u{be44}\u{d65c}\u{c131}\u{d654}",
+    )
+}
+
+pub fn cloud_status_trial(remaining: u64, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Trial {remaining}/3"),
+        Locale::Zh => {
+            format!("\u{5269}\u{4f59}\u{4f53}\u{9a8c} {remaining}/3 \u{6b21}")
+        }
+        Locale::Ja => format!(
+            "\u{30c8}\u{30e9}\u{30a4}\u{30a2}\u{30eb} \u{6b8b}\u{308a} {remaining}/3 \u{56de}"
+        ),
+        Locale::Ko => {
+            format!("\u{ccb4}\u{d5d8} \u{c794}\u{c5ec} {remaining}/3\u{d68c}")
+        }
+    }
+}
+
+pub fn cloud_source_label(source: &str, locale: Locale) -> &'static str {
+    match source.trim().to_ascii_lowercase().as_str() {
+        "alipay" => pick(
+            locale,
+            "Alipay",
+            "\u{652f}\u{4ed8}\u{5b9d}",
+            "Alipay",
+            "Alipay",
+        ),
+        "grant" | "redemption" => pick(
+            locale,
+            "Redemption",
+            "\u{5151}\u{6362}\u{7801}",
+            "\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}",
+            "\u{ad50}\u{d658} \u{cf54}\u{b4dc}",
+        ),
+        "both" => pick(
+            locale,
+            "Alipay + Redemption",
+            "\u{652f}\u{4ed8}\u{5b9d} + \u{5151}\u{6362}\u{7801}",
+            "Alipay + \u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}",
+            "Alipay + \u{ad50}\u{d658} \u{cf54}\u{b4dc}",
+        ),
+        _ => pick(
+            locale,
+            "Cloud Pro",
+            "\u{4e91}\u{7aef}\u{4f1a}\u{5458}",
+            "\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{4f1a}\u{54e1}",
+            "\u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{d504}\u{b85c}",
+        ),
+    }
+}
+
+pub fn cloud_status_paid_until(
+    date: &str,
+    source: &str,
+    locale: Locale,
+) -> String {
+    let src = cloud_source_label(source, locale);
+    match locale {
+        Locale::En => format!("Paid until {date} ({src})"),
+        Locale::Zh => format!(
+            "\u{4f1a}\u{5458}\u{6709}\u{6548}\u{671f}\u{81f3} {date}\u{ff08}{src}\u{ff09}"
+        ),
+        Locale::Ja => {
+            format!("\u{6709}\u{52b9}\u{671f}\u{9650}: {date} ({src})")
+        }
+        Locale::Ko => {
+            format!("\u{c720}\u{d6a8} \u{ae30}\u{ac04}: {date} ({src})")
+        }
+    }
+}
+
+pub const fn cloud_status_expired(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Expired",
+        "\u{5df2}\u{5230}\u{671f}",
+        "\u{671f}\u{9650}\u{5207}\u{308c}",
+        "\u{b9cc}\u{b8cc}\u{b428}",
+    )
+}
+
+pub fn cloud_fup_label(zone: &str, locale: Locale) -> &'static str {
+    match zone.trim().to_ascii_lowercase().as_str() {
+        "yellow" => pick(
+            locale,
+            "Usage: High (Light Mode)",
+            "\u{7528}\u{91cf}\u{504f}\u{9ad8}\u{ff08}\u{8f7b}\u{91cf}\u{6a21}\u{5f0f}\u{ff09}",
+            "\u{5229}\u{7528}\u{91cf}: \u{9ad8}\u{3081}\u{ff08}\u{8efd}\u{91cf}\u{30e2}\u{30fc}\u{30c9}\u{ff09}",
+            "\u{c0ac}\u{c6a9}\u{b7c9}: \u{b192}\u{c74c}(\u{acbd}\u{b7c9} \u{baa8}\u{b4dc})",
+        ),
+        "red" => pick(
+            locale,
+            "Usage Limit Reached",
+            "\u{7528}\u{91cf}\u{5df2}\u{8fbe}\u{4e0a}\u{9650}",
+            "\u{5229}\u{7528}\u{4e0a}\u{9650}\u{306b}\u{9054}\u{3057}\u{307e}\u{3057}\u{305f}",
+            "\u{c0ac}\u{c6a9} \u{d55c}\u{b3c4} \u{b3c4}\u{b2ec}",
+        ),
+        _ => pick(
+            locale,
+            "Usage: Normal",
+            "\u{7528}\u{91cf}\u{6b63}\u{5e38}",
+            "\u{5229}\u{7528}\u{91cf}: \u{6b63}\u{5e38}",
+            "\u{c0ac}\u{c6a9}\u{b7c9}: \u{c815}\u{c0c1}",
+        ),
+    }
+}
+
+pub const fn cloud_upgrade_pass(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Get Cloud Pro",
+        "\u{5f00}\u{901a}\u{4e91}\u{7aef}\u{4f1a}\u{5458}",
+        "\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{4f1a}\u{54e1}\u{3092}\u{8cfc}\u{5165}",
+        "\u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{d504}\u{b85c} \u{ac00}\u{c785}",
+    )
+}
+
+pub const fn cloud_renew_pass(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Renew Cloud Pro",
+        "\u{7eed}\u{8d39}\u{4e91}\u{7aef}\u{4f1a}\u{5458}",
+        "\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{4f1a}\u{54e1}\u{3092}\u{66f4}\u{65b0}",
+        "\u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{d504}\u{b85c} \u{ac31}\u{c2e0}",
+    )
+}
+
+pub const fn cloud_alipay_active_renew_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Renew after expiry \u{b7} Redemption codes stack anytime",
+        "\u{5230}\u{671f}\u{540e}\u{53ef}\u{7eed}\u{8d39} \u{b7} \
+         \u{5151}\u{6362}\u{7801}\u{53ef}\u{968f}\u{65f6}\u{53e0}\u{52a0}",
+        "\u{671f}\u{9650}\u{5207}\u{308c}\u{5f8c}\u{306b}\u{66f4}\u{65b0}\
+         \u{53ef}\u{80fd}\u{30fb}\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}\
+         \u{306f}\u{3044}\u{3064}\u{3067}\u{3082}\u{4f75}\u{7528}\u{53ef}",
+        "\u{b9cc}\u{b8cc} \u{d6c4} \u{ac31}\u{c2e0} \u{ac00}\u{b2a5} \u{b7} \
+         \u{ad50}\u{d658} \u{cf54}\u{b4dc}\u{b294} \u{c5b8}\u{c81c}\u{b4e0} \
+         \u{d569}\u{c0b0} \u{ac00}\u{b2a5}",
+    )
+}
+
+pub const fn cloud_refresh_entitlement(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Refresh Entitlement",
+        "\u{5237}\u{65b0}\u{6743}\u{76ca}",
+        "\u{5229}\u{7528}\u{6a29}\u{9650}\u{3092}\u{66f4}\u{65b0}",
+        "\u{ad8c}\u{d55c} \u{c0c8}\u{b85c}\u{ace0}\u{ce68}",
+    )
+}
+
+pub const fn cloud_test_connection(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Test Connection",
+        "\u{6d4b}\u{8bd5}\u{8fde}\u{63a5}",
+        "\u{63a5}\u{7d9a}\u{30c6}\u{30b9}\u{30c8}",
+        "\u{c5f0}\u{acb0} \u{d14c}\u{c2a4}\u{d2b8}",
+    )
+}
+
+pub const fn cloud_fetch_models_btn(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Fetch Models",
+        "\u{83b7}\u{53d6}\u{6a21}\u{578b}\u{5217}\u{8868}",
+        "\u{30e2}\u{30c7}\u{30eb}\u{4e00}\u{89a7}\u{3092}\u{53d6}\u{5f97}",
+        "\u{baa8}\u{b378} \u{baa9}\u{b85d} \u{ac00}\u{c838}\u{c624}\u{ae30}",
+    )
+}
+
+pub const fn cloud_model_auto_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Auto (Recommended)",
+        "\u{81ea}\u{52a8}\u{ff08}\u{63a8}\u{8350}\u{ff09}",
+        "\u{81ea}\u{52d5}\u{ff08}\u{63a8}\u{5968}\u{ff09}",
+        "\u{c790}\u{b3d9}(\u{cd94}\u{cc9c})",
+    )
+}
+
+pub const fn cloud_model_auto_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Automatically select the best available Cloud model under your \
+         current entitlement.",
+        "\u{81ea}\u{52a8}\u{9009}\u{62e9}\u{5f53}\u{524d}\u{6743}\u{76ca}\u{4e0b}\u{6700}\u{4f18}\u{53ef}\u{7528}\u{4e91}\u{7aef}\u{6a21}\u{578b}\u{3002}",
+        "\u{73fe}\u{5728}\u{306e}\u{5229}\u{7528}\u{6a29}\u{9650}\u{3067}\u{5229}\u{7528}\u{53ef}\u{80fd}\u{306a}\u{6700}\u{9069}\u{306a}\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{30e2}\u{30c7}\u{30eb}\u{3092}\u{81ea}\u{52d5}\u{9078}\u{629e}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{d604}\u{c7ac} \u{ad8c}\u{d55c}\u{c5d0}\u{c11c} \u{c0ac}\u{c6a9} \u{ac00}\u{b2a5}\u{d55c} \u{cd5c}\u{c801}\u{c758} \u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{baa8}\u{b378}\u{c744} \u{c790}\u{b3d9} \u{c120}\u{d0dd}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub fn cloud_virtual_models_title(count: usize, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Cloud Models ({count})"),
+        Locale::Zh => {
+            format!("\u{4e91}\u{7aef}\u{6a21}\u{578b}\u{ff08}{count}\u{ff09}")
+        }
+        Locale::Ja => format!(
+            "\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{30e2}\u{30c7}\u{30eb} ({count})"
+        ),
+        Locale::Ko => {
+            format!(
+                "\u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{baa8}\u{b378} ({count})"
+            )
+        }
+    }
+}
+
+pub const fn cloud_virtual_models_empty(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "No cached models yet. Click Fetch Models to load available cloud \
+         models.",
+        "\u{6682}\u{65e0}\u{7f13}\u{5b58}\u{6a21}\u{578b}\u{ff0c}\u{70b9}\u{51fb}\u{300c}\u{83b7}\u{53d6}\u{6a21}\u{578b}\u{5217}\u{8868}\u{300d}\u{5373}\u{53ef}\u{62c9}\u{53d6}\u{53ef}\u{7528}\u{4e91}\u{7aef}\u{6a21}\u{578b}\u{3002}",
+        "\u{30ad}\u{30e3}\u{30c3}\u{30b7}\u{30e5}\u{3055}\u{308c}\u{305f}\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{30e2}\u{30c7}\u{30eb}\u{304c}\u{3042}\u{308a}\u{307e}\u{305b}\u{3093}\u{3002}\u{300c}\u{30e2}\u{30c7}\u{30eb}\u{4e00}\u{89a7}\u{3092}\u{53d6}\u{5f97}\u{300d}\u{3092}\u{62bc}\u{3057}\u{3066}\u{8aad}\u{307f}\u{8fbc}\u{3093}\u{3067}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{ce90}\u{c2dc}\u{b41c} \u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{baa8}\u{b378}\u{c774} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \u{baa8}\u{b378} \u{baa9}\u{b85d} \u{ac00}\u{c838}\u{c624}\u{ae30}\u{b97c} \u{b20c}\u{b7ec} \u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{baa8}\u{b378}\u{c744} \u{bd88}\u{b7ec}\u{c624}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn cloud_model_locked_badge(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Pro Required",
+        "\u{9700}\u{5f00}\u{901a}\u{4f1a}\u{5458}",
+        "\u{4f1a}\u{54e1}\u{5fc5}\u{8981}",
+        "\u{d504}\u{b85c} \u{d544}\u{c694}",
+    )
+}
+
+pub const fn cloud_billing_modal_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Ruum Cloud Pro",
+        "\u{5f00}\u{901a} / \u{7eed}\u{8d39} Ruum \u{4e91}\u{7aef}\u{4f1a}\u{5458}",
+        "Ruum Cloud Pro",
+        "Ruum Cloud Pro",
+    )
+}
+
+pub const fn cloud_billing_modal_desc(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Select a Ruum Cloud Pro plan to continue to checkout.",
+        "\u{9009}\u{62e9} Ruum \u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{65b9}\u{6848}\u{540e}\u{70b9}\u{51fb}\u{786e}\u{5b9a}\u{8fdb}\u{5165}\u{652f}\u{4ed8}\u{3002}",
+        "Ruum Cloud Pro \u{30d7}\u{30e9}\u{30f3}\u{3092}\u{9078}\u{629e}\u{3057}\u{3066}\u{6c7a}\u{6e08}\u{3078}\u{9032}\u{307f}\u{307e}\u{3059}\u{3002}",
+        "Ruum Cloud Pro \u{c694}\u{ae08}\u{c81c}\u{b97c} \u{c120}\u{d0dd}\u{d558}\u{ace0} \u{acb0}\u{c81c}\u{b97c} \u{c9c4}\u{d589}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn cloud_billing_loading_plans(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Loading available Cloud Pro plans\u{2026}",
+        "\u{6b63}\u{5728}\u{52a0}\u{8f7d}\u{53ef}\u{9009}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{65b9}\u{6848}\u{2026}",
+        "\u{5229}\u{7528}\u{53ef}\u{80fd}\u{306a}\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{4f1a}\u{54e1}\u{30d7}\u{30e9}\u{30f3}\u{3092}\u{8aad}\u{307f}\u{8fbc}\u{307f}\u{4e2d}\u{2026}",
+        "\u{c774}\u{c6a9} \u{ac00}\u{b2a5}\u{d55c} \u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{d504}\u{b85c} \u{c694}\u{ae08}\u{c81c}\u{b97c} \u{bd88}\u{b7ec}\u{c624}\u{b294} \u{c911}\u{2026}",
+    )
+}
+
+pub const fn cloud_billing_unavailable_notice(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Online checkout is currently unavailable; you can use a redemption \
+         code in Settings.",
+        "\u{5728}\u{7ebf}\u{6536}\u{6b3e}\u{5c1a}\u{672a}\u{5f00}\u{542f}\u{ff0c}\u{53ef}\u{5728}\u{8bbe}\u{7f6e}\u{4e2d}\u{4f7f}\u{7528}\u{5151}\u{6362}\u{7801}",
+        "\u{30aa}\u{30f3}\u{30e9}\u{30a4}\u{30f3}\u{6c7a}\u{6e08}\u{306f}\u{73fe}\u{5728}\u{5229}\u{7528}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3002}\u{8a2d}\u{5b9a}\u{3067}\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}\u{3092}\u{3054}\u{5229}\u{7528}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{c628}\u{b77c}\u{c778} \u{acb0}\u{c81c}\u{b97c} \u{d604}\u{c7ac} \u{c0ac}\u{c6a9}\u{d560} \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4}. \u{c124}\u{c815}\u{c5d0}\u{c11c} \u{ad50}\u{d658} \u{cf54}\u{b4dc}\u{b97c} \u{c0ac}\u{c6a9}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn cloud_billing_confirm(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Confirm",
+        "\u{786e}\u{5b9a}",
+        "\u{78ba}\u{5b9a}",
+        "\u{d655}\u{c778}",
+    )
+}
+
+pub fn cloud_billing_usage_shared(
+    daily: u64,
+    monthly: u64,
+    soft_pct: u64,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "Usage limits: ~{daily}/day \u{00b7} ~{monthly}/month standard \
+             analyses (switches to light model at {soft_pct}%, resets 00:00 CST)"
+        ),
+        Locale::Zh => format!(
+            "\u{7528}\u{91cf}\u{9650}\u{5236}\u{ff1a}\u{6bcf}\u{65e5}\u{7ea6} {daily} \u{6b21} \u{00b7} \u{6bcf}\u{6708}\u{7ea6} {monthly} \u{6b21}\u{6807}\u{51c6}\u{5206}\u{6790}\u{ff08}\u{8fbe}\u{5230} {soft_pct}% \u{81ea}\u{52a8}\u{5207}\u{6362}\u{8f7b}\u{91cf}\u{6a21}\u{578b}\u{ff0c}\u{6bcf}\u{65e5} 00:00 \u{91cd}\u{7f6e}\u{ff09}"
+        ),
+        Locale::Ja => format!(
+            "\u{5229}\u{7528}\u{76ee}\u{5b89}\u{ff1a}1\u{65e5}\u{7d04} {daily} \u{56de} \u{00b7} \u{6708}\u{7d04} {monthly} \u{56de}\u{306e}\u{6a19}\u{6e96}\u{5206}\u{6790}\u{ff08}{soft_pct}% \u{5230}\u{9054}\u{3067}\u{8efd}\u{91cf}\u{30e2}\u{30c7}\u{30eb}\u{3078}\u{81ea}\u{52d5}\u{5207}\u{66ff}\u{3001}\u{6bce}\u{65e5} 00:00 \u{30ea}\u{30bb}\u{30c3}\u{30c8}\u{ff09}"
+        ),
+        Locale::Ko => format!(
+            "\u{c0ac}\u{c6a9} \u{d55c}\u{b3c4}: \u{c77c} \u{c57d} {daily}\u{d68c} \u{00b7} \u{c6d4} \u{c57d} {monthly}\u{d68c} \u{d45c}\u{c900} \u{bd84}\u{c11d}({soft_pct}% \u{b3c4}\u{b2ec} \u{c2dc} \u{acbd}\u{b7c9} \u{baa8}\u{b378} \u{c790}\u{b3d9} \u{c804}\u{d658}, \u{b9e4}\u{c77c} 00:00 \u{cd08}\u{ae30}\u{d654})"
+        ),
+    }
+}
+
+pub fn cloud_billing_usage_per_plan(
+    daily: u64,
+    monthly: u64,
+    soft_pct: u64,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "Plan limits: ~{daily}/day \u{00b7} ~{monthly}/month standard \
+             analyses ({soft_pct}% light-model fallback, resets 00:00 CST)"
+        ),
+        Locale::Zh => format!(
+            "\u{65b9}\u{6848}\u{7528}\u{91cf}\u{ff1a}\u{6bcf}\u{65e5}\u{7ea6} {daily} \u{6b21} \u{00b7} \u{6bcf}\u{6708}\u{7ea6} {monthly} \u{6b21}\u{6807}\u{51c6}\u{5206}\u{6790}\u{ff08}\u{8fbe}\u{5230} {soft_pct}% \u{81ea}\u{52a8}\u{5207}\u{6362}\u{8f7b}\u{91cf}\u{6a21}\u{578b}\u{ff0c}\u{6bcf}\u{65e5} 00:00 \u{91cd}\u{7f6e}\u{ff09}"
+        ),
+        Locale::Ja => format!(
+            "\u{30d7}\u{30e9}\u{30f3}\u{76ee}\u{5b89}\u{ff1a}1\u{65e5}\u{7d04} {daily} \u{56de} \u{00b7} \u{6708}\u{7d04} {monthly} \u{56de}\u{306e}\u{6a19}\u{6e96}\u{5206}\u{6790}\u{ff08}{soft_pct}% \u{3067}\u{8efd}\u{91cf}\u{30e2}\u{30c7}\u{30eb}\u{5207}\u{66ff}\u{3001}\u{6bce}\u{65e5} 00:00 \u{30ea}\u{30bb}\u{30c3}\u{30c8}\u{ff09}"
+        ),
+        Locale::Ko => format!(
+            "\u{c694}\u{ae08}\u{c81c} \u{d55c}\u{b3c4}: \u{c77c} \u{c57d} {daily}\u{d68c} \u{00b7} \u{c6d4} \u{c57d} {monthly}\u{d68c} \u{d45c}\u{c900} \u{bd84}\u{c11d}({soft_pct}% \u{acbd}\u{b7c9} \u{baa8}\u{b378} \u{c804}\u{d658}, \u{b9e4}\u{c77c} 00:00 \u{cd08}\u{ae30}\u{d654})"
+        ),
+    }
+}
+
+pub const fn cloud_billing_support_btn(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Support / Donate",
+        "\u{6253}\u{8d4f}\u{652f}\u{6301}",
+        "\u{652f}\u{63f4}\u{30fb}\u{5bc4}\u{4ed8}",
+        "\u{d6c4}\u{c6d0}\u{d558}\u{ae30}",
+    )
+}
+
+pub const fn cloud_billing_support_contact_hint(
+    locale: Locale,
+) -> &'static str {
+    pick(
+        locale,
+        "After donating, contact the author at lijunsong2@gmail.com to get a \
+         redemption code and redeem it in Settings.",
+        "\u{6253}\u{8d4f}\u{540e}\u{8bf7}\u{8054}\u{7cfb}\u{4f5c}\u{8005}\u{83b7}\u{53d6}\u{5151}\u{6362}\u{7801}\u{ff08}lijunsong2@gmail.com\u{ff09}\u{ff0c}\u{5e76}\u{5728}\u{8bbe}\u{7f6e}\u{4e2d}\u{5151}\u{6362}\u{3002}",
+        "\u{5bc4}\u{4ed8}\u{5f8c}\u{306f}\u{4f5c}\u{8005}\u{ff08}lijunsong2@gmail.com\u{ff09}\u{306b}\u{9023}\u{7d61}\u{3057}\u{3066}\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}\u{3092}\u{53d6}\u{5f97}\u{3057}\u{3001}\u{8a2d}\u{5b9a}\u{3067}\u{5f15}\u{304d}\u{63db}\u{3048}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{d6c4}\u{c6d0} \u{d6c4} \u{c791}\u{c131}\u{c790}(lijunsong2@gmail.com)\u{c5d0}\u{ac8c} \u{c5f0}\u{b77d}\u{d574} \u{ad50}\u{d658} \u{cf54}\u{b4dc}\u{b97c} \u{bc1b}\u{c544} \u{c124}\u{c815}\u{c5d0}\u{c11c} \u{ad50}\u{d658}\u{d558}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn cloud_billing_select_plan(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Choose a Cloud Pro plan",
+        "\u{9009}\u{62e9}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{65b9}\u{6848}",
+        "\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{4f1a}\u{54e1}\u{30d7}\u{30e9}\u{30f3}\u{3092}\u{9078}\u{629e}",
+        "\u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{d504}\u{b85c} \u{c694}\u{ae08}\u{c81c} \u{c120}\u{d0dd}",
+    )
+}
+
+pub const fn cloud_billing_creating_order(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Connecting to payment gateway to create Alipay QR (may take \
+         10\u{2013}30s cross-region)\u{2026}",
+        "\u{6b63}\u{5728}\u{8fde}\u{63a5}\u{652f}\u{4ed8}\u{7f51}\u{5173}\u{751f}\u{6210}\u{652f}\u{4ed8}\u{5b9d}\u{6536}\u{6b3e}\u{7801}\u{ff08}\u{8de8}\u{533a}\u{57df}\u{7f51}\u{7edc}\u{53ef}\u{80fd}\u{9700}\u{8981} 10\u{2013}30 \u{79d2}\u{ff09}\u{2026}",
+        "Alipay \u{6c7a}\u{6e08}\u{30b2}\u{30fc}\u{30c8}\u{30a6}\u{30a7}\u{30a4}\u{306b}\u{63a5}\u{7d9a}\u{3057}\u{3066} QR \u{30b3}\u{30fc}\u{30c9}\u{3092}\u{4f5c}\u{6210}\u{4e2d}\u{ff08}\u{5730}\u{57df}\u{9593}\u{901a}\u{4fe1}\u{306b} 10\u{2013}30 \u{79d2}\u{304b}\u{304b}\u{308b}\u{5834}\u{5408}\u{304c}\u{3042}\u{308a}\u{307e}\u{3059}\u{ff09}\u{2026}",
+        "Alipay \u{acb0}\u{c81c} \u{ac8c}\u{c774}\u{d2b8}\u{c6e8}\u{c774}\u{c5d0} \u{c5f0}\u{acb0}\u{d558}\u{c5ec} QR \u{cf54}\u{b4dc}\u{b97c} \u{c0dd}\u{c131}\u{d558}\u{b294} \u{c911}(\u{ad6d}\u{ac04} \u{b124}\u{d2b8}\u{c6cc}\u{d06c} \u{c0c1}\u{d669}\u{c5d0} \u{b530}\u{b77c} 10\u{2013}30\u{cd08} \u{c18c}\u{c694}\u{b420} \u{c218} \u{c788}\u{c74c})\u{2026}",
+    )
+}
+
+pub const fn cloud_billing_scan_qr_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Scan the QR code with Alipay on your phone",
+        "\u{8bf7}\u{4f7f}\u{7528}\u{624b}\u{673a}\u{652f}\u{4ed8}\u{5b9d}\u{626b}\u{7801}\u{652f}\u{4ed8}",
+        "\u{30b9}\u{30de}\u{30fc}\u{30c8}\u{30d5}\u{30a9}\u{30f3}\u{306e} Alipay \u{3067} QR \u{30b3}\u{30fc}\u{30c9}\u{3092}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
+        "\u{d734}\u{b300}\u{d3f0} Alipay\u{b85c} QR \u{cf54}\u{b4dc}\u{b97c} \u{c2a4}\u{ce94}\u{d558}\u{c138}\u{c694}",
+    )
+}
+
+pub fn cloud_billing_expiry_minutes(mins: u64, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Order expires in ~{mins} min"),
+        Locale::Zh => {
+            format!(
+                "\u{8ba2}\u{5355}\u{7ea6} {mins} \u{5206}\u{949f}\u{540e}\u{8fc7}\u{671f}"
+            )
+        }
+        Locale::Ja => format!(
+            "\u{6709}\u{52b9}\u{671f}\u{9650}: \u{7d04} {mins} \u{5206}"
+        ),
+        Locale::Ko => format!(
+            "\u{c8fc}\u{bb38} \u{b9cc}\u{b8cc}: \u{c57d} {mins}\u{bd84} \u{d6c4}"
+        ),
+    }
+}
+
+pub const fn cloud_billing_polling_status(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Waiting for payment confirmation (auto-checking every 3s)\u{2026}",
+        "\u{7b49}\u{5f85}\u{652f}\u{4ed8}\u{786e}\u{8ba4}\u{ff08}\u{6bcf} 3 \u{79d2}\u{81ea}\u{52a8}\u{6838}\u{9a8c}\u{ff09}\u{2026}",
+        "\u{6c7a}\u{6e08}\u{78ba}\u{8a8d}\u{5f85}\u{3061}\u{ff08}3\u{79d2}\u{3054}\u{3068}\u{306b}\u{81ea}\u{52d5}\u{78ba}\u{8a8d}\u{ff09}\u{2026}",
+        "\u{acb0}\u{c81c} \u{d655}\u{c778} \u{b300}\u{ae30} \u{c911} (3\u{cd08}\u{b9c8}\u{b2e4} \u{c790}\u{b3d9} \u{d655}\u{c778})\u{2026}",
+    )
+}
+
+pub const fn cloud_billing_poll_timed_out(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Auto-polling timed out after 5 minutes. If you already paid, \
+         click Refresh Now.",
+        "\u{81ea}\u{52a8}\u{8f6e}\u{8be2}\u{5df2}\u{8d85}\u{8fc7} 5 \u{5206}\u{949f}\u{3002}\u{82e5}\u{5df2}\u{5b8c}\u{6210}\u{652f}\u{4ed8}\u{ff0c}\u{8bf7}\u{70b9}\u{51fb}\u{300c}\u{5df2}\u{652f}\u{4ed8}\u{ff1f}\u{7acb}\u{5373}\u{5237}\u{65b0}\u{300d}\u{3002}",
+        "\u{81ea}\u{52d5}\u{78ba}\u{8a8d}\u{304c}5\u{5206}\u{3067}\u{30bf}\u{30a4}\u{30e0}\u{30a2}\u{30a6}\u{30c8}\u{3057}\u{307e}\u{3057}\u{305f}\u{3002}\u{652f}\u{6255}\u{3044}\u{6e08}\u{307f}\u{306e}\u{5834}\u{5408}\u{306f}\u{300c}\u{4eca}\u{3059}\u{3050}\u{66f4}\u{65b0}\u{300d}\u{3092}\u{62bc}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{c790}\u{b3d9} \u{d655}\u{c778} \u{c2dc}\u{ac04}(5\u{bd84})\u{c774} \u{cd08}\u{acfc}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}. \u{c774}\u{bbf8} \u{acb0}\u{c81c}\u{d558}\u{c168}\u{b2e4}\u{ba74} \u{c9c0}\u{ae08} \u{c0c8}\u{b85c}\u{ace0}\u{ce68}\u{c744} \u{b20c}\u{b7ec}\u{c8fc}\u{c138}\u{c694}.",
+    )
+}
+
+pub const fn cloud_billing_mobile_only_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "No HTTPS checkout page returned; please scan the QR code with \
+         Alipay.",
+        "\u{5f53}\u{524d}\u{8ba2}\u{5355}\u{4ec5}\u{652f}\u{6301}\u{624b}\u{673a}\u{626b}\u{7801}\u{ff0c}\u{8bf7}\u{4f7f}\u{7528}\u{652f}\u{4ed8}\u{5b9d}\u{626b}\u{63cf}\u{4e0a}\u{65b9}\u{4e8c}\u{7ef4}\u{7801}\u{3002}",
+        "HTTPS \u{306e}\u{6c7a}\u{6e08}\u{30da}\u{30fc}\u{30b8}\u{304c}\u{306a}\u{3044}\u{305f}\u{3081}\u{3001}\u{30b9}\u{30de}\u{30db}\u{306e} Alipay \u{3067} QR \u{30b3}\u{30fc}\u{30c9}\u{3092}\u{30b9}\u{30ad}\u{30e3}\u{30f3}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "HTTPS \u{acb0}\u{c81c} \u{b9c1}\u{d06c}\u{ac00} \u{c5c6}\u{c5b4} \u{baa8}\u{bc14}\u{c77c} Alipay\u{b85c} QR \u{cf54}\u{b4dc}\u{b97c} \u{c2a4}\u{ce94}\u{d574}\u{c57c} \u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn cloud_billing_open_browser(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Open in Browser",
+        "\u{5728}\u{6d4f}\u{89c8}\u{5668}\u{6253}\u{5f00}\u{652f}\u{4ed8}\u{9875}",
+        "\u{30d6}\u{30e9}\u{30a6}\u{30b6}\u{3067}\u{958b}\u{304f}",
+        "\u{be0c}\u{b77c}\u{c6b0}\u{c800}\u{c5d0}\u{c11c} \u{c5f4}\u{ae30}",
+    )
+}
+
+pub const fn cloud_billing_refresh_now(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Paid? Refresh Now",
+        "\u{5df2}\u{652f}\u{4ed8}\u{ff1f}\u{7acb}\u{5373}\u{5237}\u{65b0}",
+        "\u{652f}\u{6255}\u{3044}\u{6e08}\u{307f}\u{ff1f}\u{4eca}\u{3059}\u{3050}\u{66f4}\u{65b0}",
+        "\u{acb0}\u{c81c} \u{c644}\u{b8cc}? \u{c9c0}\u{ae08} \u{c0c8}\u{b85c}\u{ace0}\u{ce68}",
+    )
+}
+
+pub const fn cloud_billing_back_to_plans(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Change Plan",
+        "\u{66f4}\u{6362}\u{65b9}\u{6848}",
+        "\u{30d7}\u{30e9}\u{30f3}\u{3092}\u{5909}\u{66f4}",
+        "\u{c694}\u{ae08}\u{c81c} \u{bcc0}\u{acbd}",
+    )
+}
+
+pub const fn cloud_billing_retry(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Retry",
+        "\u{91cd}\u{8bd5}",
+        "\u{518d}\u{8a66}\u{884c}",
+        "\u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}",
+    )
+}
+
+pub fn cloud_billing_duration_label(period: &str, locale: Locale) -> String {
+    match period.trim().to_ascii_lowercase().as_str() {
+        "month" | "monthly" => pick(
+            locale,
+            "1 Month",
+            "\u{6708}\u{5361}",
+            "1\u{30f6}\u{6708}",
+            "1\u{ac1c}\u{c6d4}",
+        )
+        .to_owned(),
+        "quarter" | "quarterly" => pick(
+            locale,
+            "1 Quarter",
+            "\u{5b63}\u{5361}",
+            "3\u{30f6}\u{6708}",
+            "3\u{ac1c}\u{c6d4}",
+        )
+        .to_owned(),
+        "year" | "yearly" | "annual" => pick(
+            locale,
+            "1 Year",
+            "\u{5e74}\u{5361}",
+            "1\u{5e74}",
+            "1\u{b144}",
+        )
+        .to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+pub const CLOUD_REDEEM_PLACEHOLDER: &str = "RUUM-XXXX-XXXX-XXXX";
+
+pub const fn cloud_redeem_title(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Redemption Code",
+        "\u{5151}\u{6362}\u{7801}",
+        "\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}",
+        "\u{ad50}\u{d658} \u{cf54}\u{b4dc}",
+    )
+}
+
+pub const fn cloud_redeem_submit(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Redeem",
+        "\u{7acb}\u{5373}\u{5151}\u{6362}",
+        "\u{5f15}\u{304d}\u{63db}\u{3048}\u{308b}",
+        "\u{ad50}\u{d658}",
+    )
+}
+
+pub const fn cloud_redeem_empty_hint(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Enter a redemption code (e.g. RUUM-XXXX-XXXX-XXXX).",
+        "\u{8bf7}\u{8f93}\u{5165}\u{5151}\u{6362}\u{7801}\u{ff08}\u{683c}\u{5f0f}\u{793a}\u{4f8b}\u{ff1a}RUUM-XXXX-XXXX-XXXX\u{ff09}\u{3002}",
+        "\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}\u{ff08}\u{4f8b}: RUUM-XXXX-XXXX-XXXX\u{ff09}\u{3002}",
+        "\u{ad50}\u{d658} \u{cf54}\u{b4dc}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}(\u{c608}: RUUM-XXXX-XXXX-XXXX).",
+    )
+}
+
+pub fn cloud_redeem_succeeded(valid_until_ymd: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!(
+            "Code redeemed! Ruum Cloud Pro valid until {valid_until_ymd}."
+        ),
+        Locale::Zh => format!(
+            "\u{5151}\u{6362}\u{6210}\u{529f}\u{ff01}Ruum \u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{6709}\u{6548}\u{671f}\u{81f3} {valid_until_ymd}\u{3002}"
+        ),
+        Locale::Ja => format!(
+            "\u{5f15}\u{304d}\u{63db}\u{3048}\u{304c}\u{5b8c}\u{4e86}\u{3057}\u{307e}\u{3057}\u{305f}\u{ff01}Ruum Cloud Pro \u{306f} {valid_until_ymd} \u{307e}\u{3067}\u{6709}\u{52b9}\u{3067}\u{3059}\u{3002}"
+        ),
+        Locale::Ko => format!(
+            "\u{ad50}\u{d658} \u{c644}\u{b8cc}! Ruum Cloud Pro \u{c720}\u{d6a8} \u{ae30}\u{ac04}: {valid_until_ymd}."
+        ),
+    }
+}
+
+pub const fn cloud_redeem_succeeded_notif_title(
+    locale: Locale,
+) -> &'static str {
+    pick(
+        locale,
+        "Ruum Cloud Code Redeemed",
+        "Ruum \u{4e91}\u{7aef}\u{5151}\u{6362}\u{7801}\u{6838}\u{9500}\u{6210}\u{529f}",
+        "Ruum Cloud \u{30b3}\u{30fc}\u{30c9}\u{5f15}\u{304d}\u{63db}\u{3048}\u{5b8c}\u{4e86}",
+        "Ruum Cloud \u{cf54}\u{b4dc} \u{ad50}\u{d658} \u{c644}\u{b8cc}",
     )
 }

@@ -273,6 +273,62 @@ impl AdkDirectClient {
             .await
             .map_err(|_| AdkClientError::Timeout(config.timeout))?
     }
+
+    /// Runs a multi-turn agent loop against Ruum Cloud (`POST /v1/chat/completions`)
+    /// with per-request timeouts decoupled from an outer loop timeout, a single
+    /// fixed `X-Ruum-Session` UUID, strict 7-tool whitelisting, and
+    /// `max_iterations <= 8` (`fallback_without_tools_on_unsupported = false`).
+    pub async fn run_cloud_agent(
+        &self,
+        config: &crate::cloud_llm::RuumCloudConfig,
+        mut request: AdkAgentRequest,
+    ) -> Result<AdkAgentResponse, AdkClientError> {
+        adk_core::ensure_crypto_provider();
+        let session_id = config
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                ToOwned::to_owned,
+            );
+
+        let cloud_llm = Arc::new(crate::cloud_llm::RuumCloudLlm::new(
+            config.clone(),
+            session_id,
+        )?);
+        cloud_llm.clear_last_error();
+
+        request.max_iterations = request
+            .max_iterations
+            .clamp(1, crate::cloud_llm::MAX_CLOUD_ITERATIONS);
+        request.fallback_without_tools_on_unsupported = false;
+        request.tools.retain(|(def, _)| {
+            crate::cloud_llm::is_allowed_ruum_tool(&def.name)
+        });
+        request.toolsets.clear();
+
+        let has_tools = !request.tools.is_empty();
+        let llm_trait: Arc<dyn adk_core::Llm> = cloud_llm.clone();
+        match run_agent_once(llm_trait, &config.model, "", &request, has_tools)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(attempt) => {
+                if let Some(gw) = cloud_llm.take_last_error() {
+                    return Err(AdkClientError::CloudGateway {
+                        status: gw.status,
+                        code: gw.code,
+                        message: gw.message,
+                        trace_id: gw.trace_id,
+                        is_timeout: gw.is_timeout,
+                    });
+                }
+                Err(attempt.error)
+            }
+        }
+    }
 }
 
 struct AttemptFailure {

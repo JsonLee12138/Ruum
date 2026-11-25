@@ -730,6 +730,139 @@ mod tests {
             assert!(!pages::update_restart_warning_marks(2, locale).is_empty());
             assert!(!pages::update_restart_warning_scan(locale).is_empty());
             assert!(!messages::update_command_copied(locale).is_empty());
+            assert!(!messages::refreshing_cloud_entitlement(locale).is_empty());
+            assert!(!messages::cloud_entitlement_refreshed(locale).is_empty());
+            assert!(
+                !messages::cloud_no_available_models_blocked(locale).is_empty()
+            );
+            assert!(!messages::testing_cloud_connection(locale).is_empty());
+            assert!(!messages::cloud_payment_succeeded(locale).is_empty());
+            assert!(
+                !messages::cloud_payment_succeeded_notif_title(locale)
+                    .is_empty()
+            );
+            assert!(!messages::cloud_payment_still_pending(locale).is_empty());
+            assert!(!pages::ai_setup_choice_title(locale).is_empty());
+            assert!(!pages::ai_setup_choice_desc(locale).is_empty());
+            assert!(!pages::ai_setup_choice_recommended(locale).is_empty());
+            assert!(!pages::ai_setup_choice_cloud_title(locale).is_empty());
+            assert!(!pages::ai_setup_choice_cloud_desc(locale).is_empty());
+            assert!(!pages::ai_setup_choice_api_title(locale).is_empty());
+            assert!(!pages::ai_setup_choice_api_desc(locale).is_empty());
+            assert!(!pages::ai_setup_choice_cli_title(locale).is_empty());
+            assert!(!pages::ai_setup_choice_cli_desc(locale).is_empty());
+            assert!(!pages::cloud_card_title(locale).is_empty());
+            assert!(!pages::cloud_card_desc(locale).is_empty());
+            assert!(!pages::cloud_status_not_activated(locale).is_empty());
+            assert!(!pages::cloud_status_trial(2, locale).is_empty());
+            assert!(
+                !pages::cloud_status_paid_until("2026-12-31", "alipay", locale)
+                    .is_empty()
+            );
+            assert!(!pages::cloud_status_expired(locale).is_empty());
+            for zone in ["green", "yellow", "red"] {
+                let label = pages::cloud_fup_label(zone, locale);
+                assert!(!label.is_empty());
+                assert!(!label.to_ascii_lowercase().contains("fup"));
+            }
+            assert!(!pages::cloud_upgrade_pass(locale).is_empty());
+            assert!(!pages::cloud_refresh_entitlement(locale).is_empty());
+            assert!(!pages::cloud_test_connection(locale).is_empty());
+            assert!(!pages::cloud_fetch_models_btn(locale).is_empty());
+            assert!(!pages::cloud_model_auto_title(locale).is_empty());
+            assert!(!pages::cloud_model_auto_desc(locale).is_empty());
+            let models_title = pages::cloud_virtual_models_title(2, locale);
+            assert!(!models_title.is_empty());
+            assert!(!models_title.contains("Virtual Models"));
+            assert!(!models_title.contains("\u{865a}\u{62df}\u{6a21}\u{578b}"));
+            assert!(!pages::cloud_virtual_models_empty(locale).is_empty());
+            assert!(!pages::cloud_model_locked_badge(locale).is_empty());
+            assert!(!pages::cloud_billing_modal_title(locale).is_empty());
+            assert!(!pages::cloud_billing_modal_desc(locale).is_empty());
+            assert!(!pages::cloud_billing_loading_plans(locale).is_empty());
+            assert!(
+                !pages::cloud_billing_unavailable_notice(locale).is_empty()
+            );
+            assert!(!pages::cloud_billing_confirm(locale).is_empty());
+            let shared_usage =
+                pages::cloud_billing_usage_shared(25, 180, 70, locale);
+            assert!(shared_usage.contains("25"));
+            assert!(shared_usage.contains("180"));
+            assert!(shared_usage.contains("70"));
+            let plan_usage =
+                pages::cloud_billing_usage_per_plan(40, 300, 75, locale);
+            assert!(plan_usage.contains("40"));
+            assert!(plan_usage.contains("300"));
+            assert!(plan_usage.contains("75"));
+            assert!(!pages::cloud_billing_support_btn(locale).is_empty());
+            assert!(
+                pages::cloud_billing_support_contact_hint(locale)
+                    .contains("lijunsong2@gmail.com")
+            );
+            assert!(!pages::cloud_billing_select_plan(locale).is_empty());
+            let creating = pages::cloud_billing_creating_order(locale);
+            assert!(!creating.is_empty());
+            assert!(creating.contains("10"));
+            assert!(creating.contains("30"));
+            for membership_copy in [
+                pages::ai_setup_choice_cloud_desc(locale),
+                pages::cloud_source_label("other", locale),
+                pages::cloud_upgrade_pass(locale),
+                pages::cloud_model_locked_badge(locale),
+                pages::cloud_billing_modal_title(locale),
+                pages::cloud_billing_modal_desc(locale),
+                pages::cloud_billing_loading_plans(locale),
+                pages::cloud_billing_select_plan(locale),
+                messages::cloud_no_available_models_blocked(locale),
+                messages::cloud_payment_succeeded(locale),
+                messages::cloud_payment_succeeded_notif_title(locale),
+            ] {
+                assert!(!membership_copy.contains("\u{65f6}\u{957f}\u{5305}"));
+                assert!(
+                    !membership_copy
+                        .to_ascii_lowercase()
+                        .contains(concat!("duration ", "pass"))
+                );
+            }
+            assert!(
+                !pages::cloud_redeem_succeeded("2030-01-01", locale)
+                    .contains("\u{65f6}\u{957f}\u{5305}")
+            );
+            assert!(!pages::cloud_billing_scan_qr_hint(locale).is_empty());
+            assert!(
+                !pages::cloud_billing_expiry_minutes(15, locale).is_empty()
+            );
+            assert!(!pages::cloud_billing_polling_status(locale).is_empty());
+            assert!(!pages::cloud_billing_poll_timed_out(locale).is_empty());
+            assert!(!pages::cloud_billing_mobile_only_hint(locale).is_empty());
+            assert!(!pages::cloud_billing_open_browser(locale).is_empty());
+            assert!(!pages::cloud_billing_refresh_now(locale).is_empty());
+            assert!(!pages::cloud_billing_back_to_plans(locale).is_empty());
+            assert!(!pages::cloud_billing_retry(locale).is_empty());
+            assert!(
+                !pages::cloud_billing_duration_label("month", locale)
+                    .is_empty()
+            );
+            assert!(!pages::cloud_redeem_title(locale).is_empty());
+            for text in [
+                pages::cloud_redeem_title(locale),
+                pages::cloud_billing_unavailable_notice(locale),
+                pages::cloud_billing_modal_desc(locale),
+            ] {
+                assert!(
+                    !text.contains("\u{6253}\u{8d4f}\u{5151}\u{6362}\u{7801}")
+                );
+                assert!(!text.to_ascii_lowercase().contains("supporter"));
+            }
+            assert!(!pages::cloud_redeem_submit(locale).is_empty());
+            assert!(!pages::cloud_redeem_empty_hint(locale).is_empty());
+            assert!(
+                pages::cloud_redeem_succeeded("2030-01-01", locale)
+                    .contains("2030-01-01")
+            );
+            assert!(
+                !pages::cloud_redeem_succeeded_notif_title(locale).is_empty()
+            );
             assert!(!messages::title_cleanup_progress(locale).is_empty());
             assert!(
                 !messages::cleanup_cancelled_notif_title(locale).is_empty()
@@ -909,6 +1042,44 @@ mod tests {
                     assert_ne!(text, en);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cloud_and_settings_copy_avoids_fup_and_supporter_jargon() {
+        assert!(!pages::ai_assistant_cli_desc(Locale::Zh).contains("AI CLI"));
+        assert_eq!(
+            pages::ai_assistant_cli_desc(Locale::Zh),
+            "\u{9009}\u{62e9}\u{5f53}\u{53ef}\u{7528}\u{7a7a}\u{95f4}\u{4f4e}\u{4e8e}\u{9608}\u{503c}\u{65f6}\u{8c03}\u{7528}\u{7684} AI \u{5206}\u{6790}\u{3002}"
+        );
+        assert_eq!(
+            pages::cloud_card_desc(Locale::Zh),
+            "\u{5e73}\u{53f0}\u{81ea}\u{5e26}\u{4e91}\u{7aef}AI\u{7f51}\u{5173}"
+        );
+        assert_eq!(
+            pages::cloud_fup_label("green", Locale::Zh),
+            "\u{7528}\u{91cf}\u{6b63}\u{5e38}"
+        );
+        assert_eq!(
+            pages::cloud_fup_label("yellow", Locale::Zh),
+            "\u{7528}\u{91cf}\u{504f}\u{9ad8}\u{ff08}\u{8f7b}\u{91cf}\u{6a21}\u{5f0f}\u{ff09}"
+        );
+        assert_eq!(
+            pages::cloud_fup_label("red", Locale::Zh),
+            "\u{7528}\u{91cf}\u{5df2}\u{8fbe}\u{4e0a}\u{9650}"
+        );
+        for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+            assert!(!pages::ai_assistant_cli_desc(locale).contains("AI CLI"));
+            assert!(!pages::cloud_card_desc(locale).is_empty());
+            assert!(!pages::cloud_billing_confirm(locale).is_empty());
+            assert!(!pages::cloud_billing_support_btn(locale).is_empty());
+            assert!(
+                pages::cloud_billing_support_contact_hint(locale)
+                    .contains("lijunsong2@gmail.com")
+            );
+            assert!(!pages::cloud_fetch_models_btn(locale).is_empty());
+            assert!(!pages::cloud_model_auto_title(locale).is_empty());
+            assert!(!pages::cloud_model_auto_desc(locale).is_empty());
         }
     }
 }

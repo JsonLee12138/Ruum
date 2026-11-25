@@ -41,4 +41,5 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
 ] }
 url = { workspace = true }
+uuid = { workspace = true }
 zeroize = { workspace = true }

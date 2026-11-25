@@ -68,6 +68,15 @@ impl BlockingAdkClient {
         Self::block_on(self.inner.run_agent(config, request))
     }
 
+    /// Synchronously runs a multi-turn Ruum Cloud agent loop.
+    pub fn run_cloud_agent(
+        &self,
+        config: &crate::cloud_llm::RuumCloudConfig,
+        request: AdkAgentRequest,
+    ) -> Result<AdkAgentResponse, AdkClientError> {
+        Self::block_on(self.inner.run_cloud_agent(config, request))
+    }
+
     fn block_on<F, T>(fut: F) -> Result<T, AdkClientError>
     where
         F: Future<Output = Result<T, AdkClientError>> + Send,

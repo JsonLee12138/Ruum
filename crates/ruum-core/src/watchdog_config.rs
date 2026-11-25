@@ -34,6 +34,8 @@ pub const DEFAULT_COOLDOWN_SECS: u64 = 21_600;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AiCliProvider {
+    #[serde(rename = "ruum-cloud", alias = "ruum_cloud")]
+    RuumCloud,
     Pi,
     #[default]
     Agy,
@@ -44,13 +46,20 @@ pub enum AiCliProvider {
 
 impl AiCliProvider {
     /// All available providers for UI and iteration.
-    pub const ALL: [Self; 5] =
-        [Self::Agy, Self::Pi, Self::Codex, Self::Custom, Self::Api];
+    pub const ALL: [Self; 6] = [
+        Self::RuumCloud,
+        Self::Agy,
+        Self::Pi,
+        Self::Codex,
+        Self::Custom,
+        Self::Api,
+    ];
 
     /// Canonical short identifier.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::RuumCloud => "ruum-cloud",
             Self::Pi => "pi",
             Self::Agy => "agy",
             Self::Codex => "codex",
@@ -63,6 +72,7 @@ impl AiCliProvider {
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
         match id.trim().to_ascii_lowercase().as_str() {
+            "ruum-cloud" | "ruum_cloud" => Some(Self::RuumCloud),
             "pi" => Some(Self::Pi),
             "agy" => Some(Self::Agy),
             "codex" => Some(Self::Codex),
@@ -82,6 +92,10 @@ impl AiCliProvider {
     #[must_use]
     pub const fn label_in(self, locale: Locale) -> &'static str {
         match (self, locale) {
+            (Self::RuumCloud, Locale::En) => "Ruum Cloud AI (Built-in)",
+            (Self::RuumCloud, Locale::Zh) => "Ruum 云端 AI（内置）",
+            (Self::RuumCloud, Locale::Ja) => "Ruum クラウド AI（内蔵）",
+            (Self::RuumCloud, Locale::Ko) => "Ruum 클라우드 AI (내장)",
             (Self::Pi, _) => "Pi",
             (Self::Agy, _) => "Agy",
             (Self::Codex, _) => "Codex",
@@ -795,5 +809,32 @@ mod tests {
             assert_eq!(decoded, proto);
             assert!(!proto.label_in(Locale::En).is_empty());
         }
+    }
+
+    #[test]
+    fn ruum_cloud_provider_id_aliases_and_labels() {
+        assert_eq!(AiCliProvider::ALL.len(), 6);
+        assert!(AiCliProvider::ALL.contains(&AiCliProvider::RuumCloud));
+        assert_eq!(AiCliProvider::RuumCloud.id(), "ruum-cloud");
+        assert_eq!(
+            AiCliProvider::from_id("ruum-cloud"),
+            Some(AiCliProvider::RuumCloud)
+        );
+        assert_eq!(
+            AiCliProvider::from_id("RUUM_CLOUD"),
+            Some(AiCliProvider::RuumCloud)
+        );
+        assert_eq!(
+            serde_json::from_str::<AiCliProvider>("\"ruum_cloud\"").unwrap(),
+            AiCliProvider::RuumCloud
+        );
+        assert_eq!(
+            AiCliProvider::RuumCloud.label_in(Locale::En),
+            "Ruum Cloud AI (Built-in)"
+        );
+        assert_eq!(
+            AiCliProvider::RuumCloud.label_in(Locale::Zh),
+            "Ruum 云端 AI（内置）"
+        );
     }
 }

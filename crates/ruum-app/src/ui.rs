@@ -137,6 +137,14 @@ pub mod size {
     /// Fixed single-line height for the current-path lane in the cleanup
     /// progress window.
     pub const CLEANUP_PATH_LANE_H: Rems = Rems(1.25);
+    /// Width of the first-run AI setup 3-choice onboarding modal.
+    pub const AI_SETUP_MODAL: Rems = Rems(36.0);
+    /// Width of the Ruum Cloud billing / pass upgrade modal.
+    pub const CLOUD_BILLING_MODAL: Rems = Rems(34.0);
+    /// Square size of the Alipay QR checkout canvas inside `CloudBillingModal`.
+    pub const CLOUD_QR_CODE: Rems = Rems(12.5);
+    /// Maximum height of the scrollable model list in AI settings.
+    pub const CLOUD_MODELS_MAX_H: Rems = Rems(14.0);
 }
 
 /// Interface zoom steps, as a factor of the 16 px default rem.

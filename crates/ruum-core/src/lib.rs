@@ -16,6 +16,10 @@ pub mod classify;
 #[cfg(feature = "service")]
 pub mod cli_install;
 #[cfg(feature = "service")]
+pub mod cloud_client;
+#[cfg(feature = "service")]
+pub mod cloud_identity;
+#[cfg(feature = "service")]
 pub mod confirm;
 #[cfg(feature = "service")]
 pub mod credentials;

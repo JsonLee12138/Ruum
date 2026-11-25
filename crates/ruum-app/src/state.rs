@@ -26,6 +26,11 @@ use ruum_core::access::file_table_readable;
 use ruum_core::cli_install::{
     CliInstallEnv, CliInstallFactory, CliInstallStatus,
 };
+use ruum_core::cloud_client::{
+    BillingPlansSnapshot, ChargingOption, CloudApiError, CloudClient,
+    CloudVirtualModel, EntitlementSnapshot, PurchaseOrderSnapshot,
+    normalize_redemption_code_input,
+};
 use ruum_core::confirm::{
     CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
     DockerConfirmItem, RemoteConnectConfirmDecision,
@@ -50,8 +55,8 @@ use ruum_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use ruum_core::space::{SpaceInfo, device_for, space_info, volume_root_for};
 use ruum_core::ssh_session::SshSession;
 use ruum_core::storage::{
-    AiConfig, AppSettings, AuthMode, SshProfile, StorageDb, UpdateChannel,
-    UpdateSettings, WebhookConfig, WebhookEndpoint,
+    AiConfig, AppSettings, AuthMode, CloudState, SshProfile, StorageDb,
+    UpdateChannel, UpdateSettings, WebhookConfig, WebhookEndpoint,
 };
 use ruum_core::terminal_launcher::{TerminalEnv, TerminalFactory};
 #[cfg(test)]
@@ -1152,6 +1157,187 @@ impl UpdateUiState {
     }
 }
 
+/// Choice presented in the first-run AI setup modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiSetupChoice {
+    RuumCloud,
+    CustomApi,
+    LocalCli,
+}
+
+/// Deferred user action paused until first-run AI onboarding finishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingAiSetupAction {
+    LocalAnalysis,
+    SshAnalysis { profile_id: String },
+    EnableWatchdogAutoAnalyze,
+}
+
+/// State for the first-run 3-choice AI setup onboarding modal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiSetupChoiceModalState {
+    pub pending_action: PendingAiSetupAction,
+}
+
+/// Polling cadence and ceiling for Alipay QR checkout status verification.
+const BILLING_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const BILLING_POLL_MAX_DURATION: Duration = Duration::from_mins(5);
+const CLOUD_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Active step inside `CloudBillingModal`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BillingModalStep {
+    #[default]
+    SelectPlan,
+    Checkout,
+}
+
+/// State for the Ruum Cloud pass billing & Alipay QR checkout modal.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BillingModalState {
+    pub step: BillingModalStep,
+    pub plans: Option<BillingPlansSnapshot>,
+    pub loading_plans: bool,
+    pub plans_unavailable: bool,
+    pub selected_sku_id: Option<String>,
+    pub pending_out_request_no: Option<String>,
+    pub active_order: Option<PurchaseOrderSnapshot>,
+    pub active_sku: Option<ChargingOption>,
+    pub qr_matrix: Option<Arc<crate::qr::QrMatrix>>,
+    pub creating_order: bool,
+    pub refreshing_status: bool,
+    pub polling_timed_out: bool,
+    pub error: Option<String>,
+    pub poll_epoch: u64,
+}
+
+fn is_alipay_qr_wrapper_page(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    parsed
+        .host_str()
+        .is_some_and(|h| h.eq_ignore_ascii_case("mobilecodec.alipay.com"))
+        && parsed.path().contains("/show.htm")
+}
+
+/// Select the direct scannable QR payload from `[purchase_url, purchase_qr_code]`.
+///
+/// Prefers `purchase_url` when it uses `alipays://` (case-insensitive), when
+/// `purchase_qr_code` is empty, or when `purchase_qr_code` is Alipay's hosted
+/// `mobilecodec.alipay.com/show.htm` wrapper page (preventing nested QR scans).
+#[must_use]
+pub fn select_billing_qr_payload(
+    purchase_url: Option<&str>,
+    purchase_qr_code: Option<&str>,
+) -> Option<String> {
+    let url = purchase_url.map(str::trim).filter(|s| !s.is_empty());
+    let qr = purchase_qr_code.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(u) = url {
+        let is_alipays = u
+            .get(..10)
+            .is_some_and(|p| p.eq_ignore_ascii_case("alipays://"));
+        if is_alipays
+            || qr.is_none()
+            || qr.is_some_and(is_alipay_qr_wrapper_page)
+        {
+            return Some(u.to_owned());
+        }
+    }
+    if let Some(q) = qr {
+        return Some(q.to_owned());
+    }
+    url.map(ToOwned::to_owned)
+}
+
+/// Official Ruum support / donation anchor URL for `locale`.
+#[must_use]
+pub const fn ruum_support_url(locale: crate::i18n::Locale) -> &'static str {
+    match locale {
+        crate::i18n::Locale::En => "https://ruum.jsonlee12138.com/#support",
+        crate::i18n::Locale::Zh => "https://ruum.jsonlee12138.com/zh/#support",
+        crate::i18n::Locale::Ja => "https://ruum.jsonlee12138.com/ja/#support",
+        crate::i18n::Locale::Ko => "https://ruum.jsonlee12138.com/ko/#support",
+    }
+}
+
+/// Select the first safe browser URL from `[purchase_url, purchase_qr_code]`.
+///
+/// Only `https://` URLs with a host are accepted in production (skipping mobile
+/// deep links like `alipays://` or unsafe schemes such as `javascript:` /
+/// `file:`). Under `#[cfg(test)]`, loopback `http://` (`127.0.0.1`,
+/// `localhost`, `[::1]`) is also allowed for offline test stubs.
+#[must_use]
+pub fn select_safe_billing_browser_url(
+    purchase_url: Option<&str>,
+    purchase_qr_code: Option<&str>,
+) -> Option<String> {
+    for raw in [purchase_url, purchase_qr_code].into_iter().flatten() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = url::Url::parse(trimmed) else {
+            continue;
+        };
+        if parsed.scheme().eq_ignore_ascii_case("https") && parsed.has_host() {
+            return Some(parsed.into());
+        }
+        #[cfg(test)]
+        if parsed.scheme().eq_ignore_ascii_case("http")
+            && is_loopback_host(parsed.host().as_ref())
+        {
+            return Some(parsed.into());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+const fn is_loopback_host(host: Option<&url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// Format a UTC Unix timestamp in seconds as `YYYY-MM-DD`.
+#[must_use]
+pub fn format_unix_date_ymd(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    // Howard Hinnant's civil-from-days conversion (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
+/// Detect whether a formatted error indicates missing/exhausted cloud payment.
+#[must_use]
+pub fn is_cloud_payment_required_message(err: &str) -> bool {
+    err.contains("ENTITLEMENT_PAYMENT_REQUIRED")
+        || err.contains("INFERENCE_MODEL_NOT_ALLOWED")
+        || err.contains("Free trial exhausted or Cloud Pro expired")
+        || err.contains("Selected cloud model requires Cloud Pro")
+        || err.contains(
+            "\u{514d}\u{8d39}\u{4f53}\u{9a8c}\u{6b21}\u{6570}\u{5df2}\u{7528}\u{5b8c}\u{6216}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{5df2}\u{5230}\u{671f}",
+        )
+        || err.contains(
+            "\u{5f53}\u{524d}\u{6743}\u{76ca}\u{5c42}\u{7ea7}\u{65e0}\u{6743}\u{4f7f}\u{7528}\u{6240}\u{9009}\u{4e91}\u{7aef}\u{6a21}\u{578b}",
+        )
+}
+
 /// Unique key identifying a host tab in the Explore top bar.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum HostTabKey {
@@ -1596,6 +1782,42 @@ pub struct Ruum {
     pub ai_last_error: Option<String>,
     /// Unix seconds when `ai_last_error` was recorded.
     pub ai_last_error_at_secs: Option<u64>,
+    /// Cached Ruum Cloud registration, entitlement, and virtual model snapshot.
+    pub cloud_state: CloudState,
+    /// True while an explicit cloud entitlement/model refresh is in flight.
+    pub cloud_refreshing: bool,
+    /// Generation counter for discarding stale cloud entitlement refreshes.
+    pub cloud_refresh_epoch: u64,
+    /// True while an explicit Cloud virtual model list fetch is in flight.
+    pub cloud_fetching_models: bool,
+    /// Generation counter for discarding stale Cloud model fetch responses.
+    pub cloud_fetch_models_epoch: u64,
+    /// Shared mutex serializing `?refresh=1` calls against the 2s server debounce.
+    pub cloud_refresh_lock: Arc<Mutex<()>>,
+    /// Timestamp of the last `?refresh=1` request for 2s debounce coordination.
+    pub cloud_last_refresh_at: Arc<Mutex<Option<Instant>>>,
+    /// True after a 402 payment-required or 0-available-models condition.
+    pub cloud_payment_required: bool,
+    /// Active first-run 3-choice AI onboarding modal, if open.
+    pub ai_setup_choice_modal: Option<AiSetupChoiceModalState>,
+    /// Focus owner for `AiSetupChoiceModal`.
+    pub ai_setup_choice_focus: FocusHandle,
+    /// Active Ruum Cloud billing / pass upgrade modal, if open.
+    pub billing_modal: Option<BillingModalState>,
+    /// Epoch counter invalidating stale billing plan loads and poll loops.
+    pub billing_modal_epoch: u64,
+    /// Focus owner for `CloudBillingModal`.
+    pub billing_focus: FocusHandle,
+    /// Settings `RedeemCodeControl` text input.
+    pub cloud_redeem_input_settings: Option<Entity<InputState>>,
+    /// When true, `views::root` clears the redemption code input.
+    pub cloud_redeem_inputs_need_clear: bool,
+    /// True while `POST /v1/entitlement/redeem` is in flight (double-submit guard).
+    pub redeem_submitting: bool,
+    /// Epoch counter invalidating stale redemption responses.
+    pub redeem_epoch: u64,
+    /// Inline feedback `(message, is_error)` rendered inside `RedeemCodeControl`.
+    pub cloud_redeem_feedback: Option<(String, bool)>,
     /// Unsaved toggle/provider/model selections on the Settings page.
     pub watchdog_draft: WatchdogSettingsDraft,
     /// When true, `views::root` syncs Settings text inputs from committed DB state.
@@ -1695,6 +1917,8 @@ pub struct Ruum {
     pub terminal_os_override: Option<TerminalOs>,
     #[cfg(test)]
     pub terminal_launch_log: Vec<(String, TerminalLaunchPlan)>,
+    #[cfg(test)]
+    pub cloud_base_url_override: Option<String>,
 }
 
 fn open_db_for_window(this: &Ruum) -> Option<StorageDb> {
@@ -1920,6 +2144,15 @@ impl Ruum {
                 install_kind,
             )
         };
+        let cloud_state = if cfg!(test) {
+            CloudState::default()
+        } else {
+            db_path
+                .as_deref()
+                .and_then(|p| StorageDb::open(p).ok())
+                .and_then(|db| db.load_cloud_state().ok())
+                .unwrap_or_default()
+        };
         let ai_proposal = ai_state.parse_proposal().ok().flatten();
         let ai_last_error = ai_state.last_error;
         let ai_last_error_at_secs = ai_state.last_error_at_secs;
@@ -2096,6 +2329,24 @@ impl Ruum {
             ai_proposal,
             ai_last_error,
             ai_last_error_at_secs,
+            cloud_state,
+            cloud_refreshing: false,
+            cloud_refresh_epoch: 0,
+            cloud_fetching_models: false,
+            cloud_fetch_models_epoch: 0,
+            cloud_refresh_lock: Arc::new(Mutex::new(())),
+            cloud_last_refresh_at: Arc::new(Mutex::new(None)),
+            cloud_payment_required: false,
+            ai_setup_choice_modal: None,
+            ai_setup_choice_focus: cx.focus_handle(),
+            billing_modal: None,
+            billing_modal_epoch: 0,
+            billing_focus: cx.focus_handle(),
+            cloud_redeem_input_settings: None,
+            cloud_redeem_inputs_need_clear: false,
+            redeem_submitting: false,
+            redeem_epoch: 0,
+            cloud_redeem_feedback: None,
             watchdog_draft,
             watchdog_inputs_need_sync: false,
             setting_input_default_depth: None,
@@ -2151,8 +2402,13 @@ impl Ruum {
             terminal_os_override: None,
             #[cfg(test)]
             terminal_launch_log: Vec::new(),
+            #[cfg(test)]
+            cloud_base_url_override: None,
             locale: crate::i18n::Locale::current(),
         };
+        if tree.watchdog_draft.ai_provider == AiCliProvider::RuumCloud {
+            tree.sync_selected_cloud_model();
+        }
         if !cfg!(test) {
             Self::probe_system_statuses(cx);
             tree.local_docker_probing = true;
@@ -2678,6 +2934,7 @@ impl Ruum {
             &self.watchdog_input_model,
             &self.watchdog_input_api_base_url,
             &self.watchdog_input_api_key,
+            &self.cloud_redeem_input_settings,
         ];
         inputs
             .into_iter()
@@ -3011,6 +3268,12 @@ impl Ruum {
                 self.ai_proposal = ai_st.parse_proposal().ok().flatten();
                 self.ai_last_error = ai_st.last_error;
                 self.ai_last_error_at_secs = ai_st.last_error_at_secs;
+            }
+            if let Ok(cloud_st) = db.load_cloud_state() {
+                self.cloud_state = cloud_st;
+                if self.watchdog_draft.ai_provider == AiCliProvider::RuumCloud {
+                    self.sync_selected_cloud_model();
+                }
             }
         }
     }
@@ -3390,12 +3653,18 @@ impl Ruum {
             if let Ok(ai) = db.load_ai_config() {
                 self.ai_config = ai;
             }
+            if let Ok(cloud) = db.load_cloud_state() {
+                self.cloud_state = cloud;
+            }
         }
         self.watchdog_draft = WatchdogSettingsDraft::from_configs(
             &self.app_settings,
             &self.watchdog_config,
             &self.ai_config,
         );
+        if self.watchdog_draft.ai_provider == AiCliProvider::RuumCloud {
+            self.sync_selected_cloud_model();
+        }
         self.watchdog_inputs_need_sync = true;
     }
 
@@ -3613,6 +3882,51 @@ impl Ruum {
             });
             self.watchdog_input_api_key = Some(input);
         }
+        self.ensure_cloud_settings_redeem_input(window, cx);
+    }
+
+    fn create_redeem_input_entity(
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Entity<InputState> {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::pages::CLOUD_REDEEM_PLACEHOLDER)
+        });
+        cx.subscribe(&input, move |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit_redeem_code(cx);
+            }
+        })
+        .detach();
+        input
+    }
+
+    /// Initialize the Settings `RedeemCodeControl` input entity if absent.
+    pub fn ensure_cloud_settings_redeem_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.cloud_redeem_input_settings.is_none() {
+            self.cloud_redeem_input_settings =
+                Some(Self::create_redeem_input_entity(window, cx));
+        }
+    }
+
+    /// Clear the redemption code input after a successful redemption.
+    pub fn clear_cloud_redeem_inputs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(input) = &self.cloud_redeem_input_settings
+            && !input.read(cx).value().is_empty()
+        {
+            input.update(cx, |inp, cx| {
+                inp.set_value(String::new(), window, cx);
+            });
+        }
     }
 
     /// Read current AI settings including any unsaved draft/input values.
@@ -3632,7 +3946,9 @@ impl Ruum {
         if let Some(ref input) = self.watchdog_input_api_base_url {
             cfg.api_base_url = input.read(cx).value().trim().to_string();
         }
-        if let Some(ref input) = self.watchdog_input_model {
+        if cfg.provider != AiCliProvider::RuumCloud
+            && let Some(ref input) = self.watchdog_input_model
+        {
             let text = input.read(cx).value().trim().to_string();
             cfg.model = (!text.is_empty()).then_some(text);
         }
@@ -3646,6 +3962,16 @@ impl Ruum {
         cx: &App,
     ) -> ruum_core::ai_cli::AiExecutionContext {
         let mut ctx = ruum_core::ai_cli::AiExecutionContext::default();
+        if let Some(ref db_path) = self.db_path {
+            ctx = ctx.with_db_path(db_path.clone());
+        }
+        #[cfg(test)]
+        if let Some(ref base_url) = self.cloud_base_url_override {
+            ctx = ctx.with_cloud_base_url(base_url.clone());
+        }
+        if self.watchdog_draft.ai_provider == AiCliProvider::RuumCloud {
+            return self.attach_lazy_credential_store(ctx);
+        }
         if self.watchdog_draft.ai_provider != AiCliProvider::Api {
             return ctx;
         }
@@ -3655,6 +3981,27 @@ impl Ruum {
                 return ctx.with_api_key(key);
             }
         }
+        self.attach_lazy_credential_store(ctx)
+    }
+
+    fn snapshot_cloud_execution_context(
+        &self,
+    ) -> ruum_core::ai_cli::AiExecutionContext {
+        let mut ctx = ruum_core::ai_cli::AiExecutionContext::default();
+        if let Some(ref db_path) = self.db_path {
+            ctx = ctx.with_db_path(db_path.clone());
+        }
+        #[cfg(test)]
+        if let Some(ref base_url) = self.cloud_base_url_override {
+            ctx = ctx.with_cloud_base_url(base_url.clone());
+        }
+        self.attach_lazy_credential_store(ctx)
+    }
+
+    fn attach_lazy_credential_store(
+        &self,
+        mut ctx: ruum_core::ai_cli::AiExecutionContext,
+    ) -> ruum_core::ai_cli::AiExecutionContext {
         if let Some(ref store) = self.cred_store {
             ctx = ctx.with_credential_store(store.clone());
         } else if let Some(ref db_path) = self.db_path
@@ -3723,18 +4070,1141 @@ impl Ruum {
         provider: ruum_core::watchdog_config::AiCliProvider,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.watchdog_draft.ai_provider != provider {
+        let changed = self.watchdog_draft.ai_provider != provider;
+        if changed {
             self.watchdog_draft.ai_provider = provider;
             self.watchdog_test_epoch += 1;
             self.watchdog_fetch_epoch += 1;
             self.watchdog_benchmark_epoch += 1;
+            self.cloud_refresh_epoch += 1;
+            self.cloud_fetch_models_epoch += 1;
+            self.redeem_epoch = self.redeem_epoch.wrapping_add(1);
             self.watchdog_testing = false;
             self.watchdog_fetching_models = false;
+            self.cloud_refreshing = false;
+            self.cloud_fetching_models = false;
+            self.redeem_submitting = false;
+            self.cloud_redeem_feedback = None;
             self.watchdog_benchmarking_models.clear();
             self.watchdog_models.clear();
             self.watchdog_speed_results.clear();
+        }
+        if provider == AiCliProvider::RuumCloud {
+            if !self.ai_config.setup_completed {
+                self.ai_config.setup_completed = true;
+                if let Some(db) = open_db_for_window(self) {
+                    let mut persisted = db
+                        .load_ai_config()
+                        .unwrap_or_else(|_| self.ai_config.clone());
+                    persisted.setup_completed = true;
+                    persisted.updated_at_secs =
+                        u64::try_from(now_seconds()).unwrap_or(0);
+                    let _ = db.save_ai_config(&persisted);
+                }
+            }
+            self.reload_cloud_state();
+            self.sync_selected_cloud_model();
+        }
+        if changed || provider == AiCliProvider::RuumCloud {
             cx.notify();
         }
+    }
+
+    /// Parse cached Ruum Cloud entitlement from `cloud_state.entitlement_json`.
+    #[must_use]
+    pub fn cached_cloud_entitlement(&self) -> Option<EntitlementSnapshot> {
+        let raw = self.cloud_state.entitlement_json.as_deref()?;
+        serde_json::from_str::<EntitlementSnapshot>(raw).ok()
+    }
+
+    /// Parse cached Ruum Cloud billing plans from `cloud_state.plans_json`.
+    #[must_use]
+    pub fn cached_cloud_plans(&self) -> Option<BillingPlansSnapshot> {
+        let raw = self.cloud_state.plans_json.as_deref()?;
+        serde_json::from_str::<BillingPlansSnapshot>(raw).ok()
+    }
+
+    /// Parse cached Ruum Cloud virtual models from `cloud_state.models_json`.
+    #[must_use]
+    pub fn cached_cloud_models(&self) -> Vec<CloudVirtualModel> {
+        let Some(raw) = self.cloud_state.models_json.as_deref() else {
+            return Vec::new();
+        };
+        if let Ok(list) = serde_json::from_str::<Vec<CloudVirtualModel>>(raw) {
+            return list;
+        }
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|val| val.get("data").cloned())
+            .and_then(|data| {
+                serde_json::from_value::<Vec<CloudVirtualModel>>(data).ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reload cached `cloud_state` from `SQLite` without touching keychain/network.
+    pub fn reload_cloud_state(&mut self) {
+        if let Some(db) = self.open_existing_db()
+            && let Ok(cloud) = db.load_cloud_state()
+        {
+            self.cloud_state = cloud;
+        }
+    }
+
+    /// Validate cached Cloud model selection without overwriting `None` (`Auto`).
+    ///
+    /// Only clears a selected `Some(id)` back to `None` when `models` is
+    /// non-empty and no available model matches `id`.
+    pub fn sync_selected_cloud_model(&mut self) {
+        let models = self.cached_cloud_models();
+        if models.is_empty() {
+            return;
+        }
+        self.cloud_payment_required = models.iter().all(|m| !m.available);
+        let preferred = self
+            .watchdog_draft
+            .model
+            .as_deref()
+            .or(self.cloud_state.selected_model_id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let valid = preferred.and_then(|id| {
+            models
+                .iter()
+                .any(|m| m.id == id && m.available)
+                .then(|| id.to_owned())
+        });
+        self.cloud_state.selected_model_id.clone_from(&valid);
+        self.watchdog_draft.model = valid;
+    }
+
+    fn persist_cloud_model_selection(
+        &mut self,
+        chosen: Option<String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        self.watchdog_draft.model.clone_from(&chosen);
+        self.ai_config.model.clone_from(&chosen);
+        self.cloud_state.selected_model_id.clone_from(&chosen);
+        if let Some(db) = open_db_for_window(self) {
+            if let Ok(mut state) = db.load_cloud_state() {
+                state.selected_model_id.clone_from(&chosen);
+                state.updated_at_secs = now_secs;
+                let _ = db.save_cloud_state(&state);
+                self.cloud_state = state;
+            }
+            let mut ai_cfg = db
+                .load_ai_config()
+                .unwrap_or_else(|_| self.ai_config.clone());
+            ai_cfg.model = chosen;
+            ai_cfg.updated_at_secs = now_secs;
+            let _ = db.save_ai_config(&ai_cfg);
+            self.ai_config = ai_cfg;
+        }
+        cx.notify();
+    }
+
+    /// Select `Auto (Recommended)` (`None`) for Ruum Cloud and persist to
+    /// both `cloud_state.selected_model_id` and `ai_config.model`.
+    pub fn select_cloud_model_auto(&mut self, cx: &mut Context<'_, Self>) {
+        self.persist_cloud_model_selection(None, cx);
+    }
+
+    /// Select an available Ruum Cloud virtual model and persist to both
+    /// `cloud_state.selected_model_id` and `ai_config.model`.
+    pub fn select_cloud_model(
+        &mut self,
+        model_id: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let trimmed = model_id.trim();
+        let models = self.cached_cloud_models();
+        if !models.iter().any(|m| m.id == trimmed && m.available) {
+            return;
+        }
+        self.persist_cloud_model_selection(Some(trimmed.to_owned()), cx);
+    }
+
+    /// Fetch Ruum Cloud virtual models off the UI thread, reload `cloud_state`,
+    /// validate current selection (preserving `Auto`), and toast the outcome.
+    pub fn fetch_cloud_models(&mut self, cx: &mut Context<'_, Self>) {
+        if self.cloud_fetching_models {
+            return;
+        }
+        let ai_ctx = self.snapshot_cloud_execution_context();
+        let locale = self.locale;
+        let provider_label = AiCliProvider::RuumCloud.label_in(locale);
+        self.cloud_fetching_models = true;
+        self.cloud_fetch_models_epoch =
+            self.cloud_fetch_models_epoch.wrapping_add(1);
+        let epoch = self.cloud_fetch_models_epoch;
+        self.push_toast(
+            crate::i18n::messages::fetching_models(provider_label, locale),
+            Status::Neutral,
+            cx,
+        );
+
+        let task = cx.background_executor().spawn(async move {
+            let client = build_cloud_client(&ai_ctx)?;
+            client.fetch_virtual_models()
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.cloud_fetch_models_epoch != epoch {
+                    return;
+                }
+                this.cloud_fetching_models = false;
+                this.reload_cloud_state();
+                this.sync_selected_cloud_model();
+                let active_locale = this.locale;
+                let active_provider_label =
+                    AiCliProvider::RuumCloud.label_in(active_locale);
+                match res {
+                    Ok(models) => {
+                        let (msg, status) = if models.is_empty() {
+                            (
+                                crate::i18n::messages::no_models_discovered(
+                                    active_provider_label,
+                                    active_locale,
+                                ),
+                                Status::Warning,
+                            )
+                        } else {
+                            (
+                                crate::i18n::messages::loaded_models_for_provider(
+                                    models.len(),
+                                    active_provider_label,
+                                    active_locale,
+                                ),
+                                Status::Success,
+                            )
+                        };
+                        this.push_toast(msg, status, cx);
+                    }
+                    Err(err) => {
+                        this.push_toast(
+                            err.format_localized(active_locale),
+                            Status::Error,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Set Watchdog auto-analyze, gating first-run onboarding on `!setup_completed`.
+    pub fn set_watchdog_ai_auto_analyze(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if enabled && !self.ai_config.setup_completed {
+            self.ai_setup_choice_modal = Some(AiSetupChoiceModalState {
+                pending_action: PendingAiSetupAction::EnableWatchdogAutoAnalyze,
+            });
+            self.focus_request = Some(FocusTarget::AiSetupChoiceDialog);
+            cx.notify();
+            return;
+        }
+        if self.watchdog_draft.ai_auto_analyze != enabled {
+            self.watchdog_draft.ai_auto_analyze = enabled;
+            cx.notify();
+        }
+    }
+
+    /// Toggle Watchdog auto-analyze from the Settings checkbox.
+    pub fn toggle_watchdog_ai_auto_analyze(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let next = !self.watchdog_draft.ai_auto_analyze;
+        self.set_watchdog_ai_auto_analyze(next, cx);
+    }
+
+    /// Dismiss the first-run AI setup modal without marking `setup_completed`
+    /// or touching keychain/network.
+    pub fn cancel_ai_setup_choice(&mut self, cx: &mut Context<'_, Self>) {
+        if self.ai_setup_choice_modal.take().is_some() {
+            self.focus_request = Some(FocusTarget::Root);
+            cx.notify();
+        }
+    }
+
+    /// Confirm an onboarding backend choice, persist `setup_completed = true`,
+    /// and resume the deferred action.
+    pub fn confirm_ai_setup_choice(
+        &mut self,
+        choice: AiSetupChoice,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(modal) = self.ai_setup_choice_modal.take() else {
+            return;
+        };
+        let provider = match choice {
+            AiSetupChoice::RuumCloud => AiCliProvider::RuumCloud,
+            AiSetupChoice::CustomApi => AiCliProvider::Api,
+            AiSetupChoice::LocalCli => match self.ai_config.provider {
+                AiCliProvider::Pi
+                | AiCliProvider::Agy
+                | AiCliProvider::Codex
+                | AiCliProvider::Custom => self.ai_config.provider,
+                AiCliProvider::RuumCloud | AiCliProvider::Api => {
+                    AiCliProvider::Agy
+                }
+            },
+        };
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        self.ai_config.provider = provider;
+        self.ai_config.setup_completed = true;
+        self.ai_config.updated_at_secs = now_secs;
+        self.watchdog_draft.ai_provider = provider;
+        if matches!(
+            modal.pending_action,
+            PendingAiSetupAction::EnableWatchdogAutoAnalyze
+        ) {
+            self.watchdog_draft.ai_auto_analyze = true;
+            self.ai_config.auto_analyze_on_alert = true;
+        }
+        if let Some(db) = open_db_for_window(self) {
+            let _ = db.save_ai_config(&self.ai_config);
+        }
+        if provider == AiCliProvider::RuumCloud {
+            self.reload_cloud_state();
+            self.sync_selected_cloud_model();
+        }
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+
+        match (choice, modal.pending_action) {
+            (AiSetupChoice::RuumCloud, PendingAiSetupAction::LocalAnalysis) => {
+                self.run_ai_analysis_now(cx);
+            }
+            (
+                AiSetupChoice::RuumCloud,
+                PendingAiSetupAction::SshAnalysis { profile_id },
+            ) => {
+                self.analyze_ssh_profile(&profile_id, cx);
+            }
+            (
+                AiSetupChoice::CustomApi | AiSetupChoice::LocalCli,
+                PendingAiSetupAction::LocalAnalysis
+                | PendingAiSetupAction::SshAnalysis { .. },
+            ) => {
+                self.screen = Screen::Settings;
+                self.settings_category = SettingsCategory::Ai;
+                self.watchdog_inputs_need_sync = true;
+                cx.notify();
+            }
+            (_, PendingAiSetupAction::EnableWatchdogAutoAnalyze) => {}
+        }
+    }
+
+    /// Open the localized official support / donation section in the browser.
+    pub fn open_support_website(&self, cx: &App) {
+        cx.open_url(ruum_support_url(self.locale));
+    }
+
+    /// Open the Ruum Cloud pass billing modal, hydrating cached plans at 0ms
+    /// when available while silently refreshing plans in the background.
+    pub fn open_billing_modal(&mut self, cx: &mut Context<'_, Self>) {
+        let now_secs = current_unix_secs();
+        if let Some(ent) = self.cached_cloud_entitlement()
+            && ent.is_alipay_active_at(now_secs)
+        {
+            let date = ent
+                .alipay_valid_until_secs
+                .or(ent.valid_until_secs)
+                .map_or_else(|| "-".to_owned(), format_unix_date_ymd);
+            self.push_toast(
+                crate::i18n::pages::cloud_status_paid_until(
+                    &date,
+                    &ent.source,
+                    self.locale,
+                ),
+                Status::Neutral,
+                cx,
+            );
+            return;
+        }
+        self.crumb_menu = None;
+        self.power_menu = None;
+        self.show_help = false;
+        self.cloud_redeem_feedback = None;
+        self.billing_modal_epoch = self.billing_modal_epoch.wrapping_add(1);
+        let epoch = self.billing_modal_epoch;
+        let cached = self
+            .cached_cloud_plans()
+            .filter(BillingPlansSnapshot::is_available);
+        self.billing_modal = Some(match cached {
+            Some(plans) => {
+                let first_sku =
+                    plans.charging_options.first().map(|o| o.sku_id.clone());
+                BillingModalState {
+                    step: BillingModalStep::SelectPlan,
+                    loading_plans: false,
+                    plans: Some(plans),
+                    selected_sku_id: first_sku,
+                    poll_epoch: epoch,
+                    ..BillingModalState::default()
+                }
+            }
+            None => BillingModalState {
+                step: BillingModalStep::SelectPlan,
+                loading_plans: true,
+                poll_epoch: epoch,
+                ..BillingModalState::default()
+            },
+        });
+        self.focus_request = Some(FocusTarget::BillingDialog);
+        cx.notify();
+        self.load_billing_plans_for_epoch(epoch, cx);
+    }
+
+    /// Retry loading Ruum Cloud billing plans for the active modal.
+    pub fn retry_billing_plans(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(modal) = self.billing_modal.as_mut() else {
+            return;
+        };
+        if modal.loading_plans {
+            return;
+        }
+        modal.step = BillingModalStep::SelectPlan;
+        modal.loading_plans = true;
+        modal.plans_unavailable = false;
+        modal.error = None;
+        self.focus_request = Some(FocusTarget::BillingDialog);
+        let epoch = self.billing_modal_epoch;
+        cx.notify();
+        self.load_billing_plans_for_epoch(epoch, cx);
+    }
+
+    fn load_billing_plans_for_epoch(&self, epoch: u64, cx: &Context<'_, Self>) {
+        let ai_ctx = self.snapshot_cloud_execution_context();
+        let locale = self.locale;
+        let task = cx.background_executor().spawn(async move {
+            let client = build_cloud_client(&ai_ctx)?;
+            client.fetch_billing_plans()
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.billing_modal_epoch != epoch {
+                    return;
+                }
+                if res.is_ok() {
+                    this.reload_cloud_state();
+                }
+                let Some(modal) = this.billing_modal.as_mut() else {
+                    return;
+                };
+                modal.loading_plans = false;
+                match res {
+                    Ok(plans) => {
+                        if plans.is_available() {
+                            modal.plans_unavailable = false;
+                            let keep_existing = modal
+                                .selected_sku_id
+                                .as_deref()
+                                .is_some_and(|sel| {
+                                    plans
+                                        .charging_options
+                                        .iter()
+                                        .any(|o| o.sku_id == sel)
+                                });
+                            if !keep_existing {
+                                modal.selected_sku_id = plans
+                                    .charging_options
+                                    .first()
+                                    .map(|o| o.sku_id.clone());
+                            }
+                        } else {
+                            modal.plans_unavailable = true;
+                            modal.selected_sku_id = None;
+                        }
+                        modal.plans = Some(plans);
+                        modal.error = None;
+                    }
+                    Err(err) => {
+                        if modal.plans.is_some() {
+                            modal.plans_unavailable = false;
+                            modal.error = None;
+                        } else if err.is_billing_unavailable() {
+                            modal.plans_unavailable = true;
+                            modal.error = None;
+                        } else {
+                            modal.error = Some(err.format_localized(locale));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Close the Ruum Cloud billing modal and invalidate any active poll loop.
+    pub fn close_billing_modal(&mut self, cx: &mut Context<'_, Self>) {
+        self.billing_modal_epoch = self.billing_modal_epoch.wrapping_add(1);
+        if self.billing_modal.take().is_some() {
+            self.focus_request = Some(FocusTarget::Root);
+            cx.notify();
+        }
+    }
+
+    /// Select a SKU card in Step 1 (`SelectPlan`) without triggering any network call.
+    pub fn select_billing_sku(
+        &mut self,
+        sku_id: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(modal) = self.billing_modal.as_mut() else {
+            return;
+        };
+        if modal.creating_order || modal.step != BillingModalStep::SelectPlan {
+            return;
+        }
+        if modal.selected_sku_id.as_deref() != Some(sku_id.as_str()) {
+            modal.selected_sku_id = Some(sku_id);
+            modal.pending_out_request_no = None;
+            cx.notify();
+        }
+    }
+
+    /// Confirm the selected SKU in Step 1 (`SelectPlan`) and advance to Step 2
+    /// (`Checkout`), creating the purchase order.
+    pub fn confirm_billing_plan(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(sku_id) = self
+            .billing_modal
+            .as_ref()
+            .filter(|m| {
+                m.step == BillingModalStep::SelectPlan
+                    && !m.creating_order
+                    && !m.loading_plans
+                    && !m.plans_unavailable
+            })
+            .and_then(|m| m.selected_sku_id.clone())
+        else {
+            return;
+        };
+        self.focus_request = Some(FocusTarget::BillingDialog);
+        self.purchase_billing_sku(sku_id, cx);
+    }
+
+    /// Return from QR checkout view (`Checkout`) to SKU plan selection (`SelectPlan`).
+    pub fn back_to_billing_plans(&mut self, cx: &mut Context<'_, Self>) {
+        self.billing_modal_epoch = self.billing_modal_epoch.wrapping_add(1);
+        let epoch = self.billing_modal_epoch;
+        if let Some(modal) = self.billing_modal.as_mut() {
+            modal.step = BillingModalStep::SelectPlan;
+            modal.active_order = None;
+            modal.active_sku = None;
+            modal.qr_matrix = None;
+            modal.creating_order = false;
+            modal.refreshing_status = false;
+            modal.polling_timed_out = false;
+            modal.error = None;
+            modal.pending_out_request_no = None;
+            modal.poll_epoch = epoch;
+            self.focus_request = Some(FocusTarget::BillingDialog);
+            cx.notify();
+        }
+    }
+
+    /// Create a purchase order for `sku_id`, either unlocking immediately on
+    /// `ALLOW` or entering QR checkout + 3s non-blocking polling.
+    pub fn purchase_billing_sku(
+        &mut self,
+        sku_id: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(modal) = self.billing_modal.as_mut() else {
+            return;
+        };
+        if modal.creating_order {
+            return;
+        }
+        if modal.selected_sku_id.as_deref() != Some(sku_id.as_str()) {
+            modal.pending_out_request_no = None;
+        }
+        let out_request_no = modal
+            .pending_out_request_no
+            .get_or_insert_with(
+                ruum_core::cloud_client::generate_purchase_request_no,
+            )
+            .clone();
+        modal.step = BillingModalStep::Checkout;
+        modal.creating_order = true;
+        modal.selected_sku_id = Some(sku_id.clone());
+        modal.error = None;
+        let active_sku = modal.plans.as_ref().and_then(|plans| {
+            plans
+                .charging_options
+                .iter()
+                .find(|opt| opt.sku_id == sku_id)
+                .cloned()
+        });
+        modal.active_sku.clone_from(&active_sku);
+        self.focus_request = Some(FocusTarget::BillingDialog);
+        let epoch = self.billing_modal_epoch;
+        let ai_ctx = self.snapshot_cloud_execution_context();
+        let lock = Arc::clone(&self.cloud_refresh_lock);
+        let last_refresh_at = Arc::clone(&self.cloud_last_refresh_at);
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let client = build_cloud_client(&ai_ctx)?;
+            let order = client
+                .create_purchase_with_request_no(&sku_id, &out_request_no)?;
+            if order.decision.eq_ignore_ascii_case("ALLOW") {
+                let _ = sync_entitlement_and_models_after_allow(
+                    &client,
+                    &lock,
+                    &last_refresh_at,
+                )?;
+                return Ok::<_, CloudApiError>(PurchaseOutcome::Allowed);
+            }
+            let qr_payload = select_billing_qr_payload(
+                order.purchase_url.as_deref(),
+                order.purchase_qr_code.as_deref(),
+            );
+            let qr_matrix = qr_payload
+                .as_deref()
+                .map(crate::qr::QrMatrix::encode)
+                .transpose()
+                .map_err(|e| {
+                    CloudApiError::new(None, Some("CLOUD_QR_ERROR"), e, None)
+                })?
+                .map(Arc::new);
+            Ok::<_, CloudApiError>(PurchaseOutcome::PendingQr {
+                order,
+                qr_matrix,
+            })
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.billing_modal_epoch != epoch {
+                    return;
+                }
+                match res {
+                    Ok(PurchaseOutcome::Allowed) => {
+                        let _ = this.mark_cloud_paid_unlocked(cx);
+                    }
+                    Ok(PurchaseOutcome::PendingQr { order, qr_matrix }) => {
+                        let matched_sku = active_sku.or_else(|| {
+                            order.charging_options.first().cloned()
+                        });
+                        if let Some(modal) = this.billing_modal.as_mut() {
+                            modal.creating_order = false;
+                            modal.active_order = Some(order);
+                            modal.active_sku = matched_sku;
+                            modal.qr_matrix = qr_matrix;
+                            modal.polling_timed_out = false;
+                            modal.error = None;
+                            modal.poll_epoch = epoch;
+                        }
+                        cx.notify();
+                        Self::start_billing_poll_loop(epoch, cx);
+                    }
+                    Err(err) => {
+                        let active_locale = this.locale;
+                        if let Some(modal) = this.billing_modal.as_mut() {
+                            modal.creating_order = false;
+                            modal.error =
+                                Some(err.format_localized(active_locale));
+                        }
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Open the validated HTTPS billing checkout URL in the system browser.
+    pub fn open_billing_browser_url(&self, cx: &App) {
+        let Some(order) = self
+            .billing_modal
+            .as_ref()
+            .and_then(|m| m.active_order.as_ref())
+        else {
+            return;
+        };
+        if let Some(url) = select_safe_billing_browser_url(
+            order.purchase_url.as_deref(),
+            order.purchase_qr_code.as_deref(),
+        ) {
+            cx.open_url(&url);
+        }
+    }
+
+    /// Manually check `?refresh=1` from the QR checkout view using the shared
+    /// refresh lock so it does not collide with automatic 3s polling.
+    pub fn refresh_billing_order_status(&mut self, cx: &mut Context<'_, Self>) {
+        if self.cloud_refreshing {
+            return;
+        }
+        let Some(modal) = self.billing_modal.as_mut() else {
+            return;
+        };
+        if modal.refreshing_status || modal.active_order.is_none() {
+            return;
+        }
+        modal.refreshing_status = true;
+        modal.error = None;
+        self.cloud_refreshing = true;
+        let epoch = self.billing_modal_epoch;
+        let ai_ctx = self.snapshot_cloud_execution_context();
+        let lock = Arc::clone(&self.cloud_refresh_lock);
+        let last_refresh_at = Arc::clone(&self.cloud_last_refresh_at);
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            poll_billing_entitlement_once(&ai_ctx, &lock, &last_refresh_at)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            cx.update(|cx| {
+                let mut paid_notif: Option<(crate::i18n::Locale, String)> = None;
+                let _ = this.update(cx, |this, cx| {
+                    this.cloud_refreshing = false;
+                    if this.billing_modal_epoch != epoch {
+                        return;
+                    }
+                    this.reload_cloud_state();
+                    this.sync_selected_cloud_model();
+                    let active_locale = this.locale;
+                    match res {
+                        Ok(ent) if ent.is_paid => {
+                            let msg = this.mark_cloud_paid_unlocked(cx);
+                            paid_notif = Some((active_locale, msg));
+                        }
+                        Ok(_) => {
+                            if let Some(modal) = this.billing_modal.as_mut() {
+                                modal.refreshing_status = false;
+                            }
+                            this.push_toast(
+                                crate::i18n::messages::cloud_payment_still_pending(
+                                    active_locale,
+                                ),
+                                Status::Neutral,
+                                cx,
+                            );
+                        }
+                        Err(err) => {
+                            if let Some(modal) = this.billing_modal.as_mut() {
+                                modal.refreshing_status = false;
+                                modal.error =
+                                    Some(err.format_localized(active_locale));
+                            }
+                            cx.notify();
+                        }
+                    }
+                });
+                if let Some((notif_locale, msg)) = paid_notif {
+                    crate::post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                        crate::i18n::messages::cloud_payment_succeeded_notif_title(
+                            notif_locale,
+                        ),
+                        &msg,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_billing_poll_loop(epoch: u64, cx: &Context<'_, Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut elapsed = Duration::ZERO;
+            loop {
+                cx.background_executor().timer(BILLING_POLL_INTERVAL).await;
+                elapsed += BILLING_POLL_INTERVAL;
+
+                let action = this
+                    .update(cx, |this, cx| {
+                        if this.billing_modal_epoch != epoch {
+                            return BillingPollStep::Stop;
+                        }
+                        let Some(modal) = this.billing_modal.as_mut() else {
+                            return BillingPollStep::Stop;
+                        };
+                        if modal.active_order.is_none()
+                            || modal.poll_epoch != epoch
+                        {
+                            return BillingPollStep::Stop;
+                        }
+                        if elapsed > BILLING_POLL_MAX_DURATION {
+                            modal.polling_timed_out = true;
+                            cx.notify();
+                            return BillingPollStep::Stop;
+                        }
+                        if this.cloud_refreshing || modal.refreshing_status {
+                            return BillingPollStep::Skip;
+                        }
+                        if !cfg!(test)
+                            && let Some(last) = *this
+                                .cloud_last_refresh_at
+                                .lock()
+                                .unwrap_or_else(
+                                    std::sync::PoisonError::into_inner,
+                                )
+                            && last.elapsed() < CLOUD_REFRESH_DEBOUNCE
+                        {
+                            return BillingPollStep::Skip;
+                        }
+                        this.cloud_refreshing = true;
+                        modal.refreshing_status = true;
+                        cx.notify();
+                        BillingPollStep::Poll {
+                            ai_ctx: this.snapshot_cloud_execution_context(),
+                            lock: Arc::clone(&this.cloud_refresh_lock),
+                            last_refresh_at: Arc::clone(
+                                &this.cloud_last_refresh_at,
+                            ),
+                        }
+                    })
+                    .unwrap_or(BillingPollStep::Stop);
+
+                let (ai_ctx, lock, last_refresh_at) = match action {
+                    BillingPollStep::Stop => break,
+                    BillingPollStep::Skip => continue,
+                    BillingPollStep::Poll {
+                        ai_ctx,
+                        lock,
+                        last_refresh_at,
+                    } => (ai_ctx, lock, last_refresh_at),
+                };
+
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        poll_billing_entitlement_once(
+                            &ai_ctx,
+                            &lock,
+                            &last_refresh_at,
+                        )
+                    })
+                    .await;
+
+                let aftermath = cx.update(|cx| {
+                    let mut paid_notif: Option<(crate::i18n::Locale, String)> =
+                        None;
+                    let step = this
+                        .update(cx, |this, cx| {
+                            this.cloud_refreshing = false;
+                            if this.billing_modal_epoch != epoch {
+                                return BillingPollAftermath::Stop;
+                            }
+                            this.reload_cloud_state();
+                            this.sync_selected_cloud_model();
+                            let active_locale = this.locale;
+                            match res {
+                                Ok(ent) if ent.is_paid => {
+                                    let msg = this.mark_cloud_paid_unlocked(cx);
+                                    paid_notif = Some((active_locale, msg));
+                                    BillingPollAftermath::Stop
+                                }
+                                Ok(_) => {
+                                    if let Some(modal) =
+                                        this.billing_modal.as_mut()
+                                    {
+                                        modal.refreshing_status = false;
+                                    }
+                                    cx.notify();
+                                    BillingPollAftermath::Continue
+                                }
+                                Err(err) => {
+                                    if let Some(modal) =
+                                        this.billing_modal.as_mut()
+                                    {
+                                        modal.refreshing_status = false;
+                                        modal.error = Some(
+                                            err.format_localized(active_locale),
+                                        );
+                                    }
+                                    cx.notify();
+                                    BillingPollAftermath::Continue
+                                }
+                            }
+                        })
+                        .unwrap_or(BillingPollAftermath::Stop);
+
+                    if let Some((notif_locale, msg)) = paid_notif {
+                        crate::post_app_notification(
+                            ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                            crate::i18n::messages::cloud_payment_succeeded_notif_title(
+                                notif_locale,
+                            ),
+                            &msg,
+                            cx,
+                        );
+                    }
+                    step
+                });
+
+                if aftermath == BillingPollAftermath::Stop {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn mark_cloud_paid_unlocked(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> String {
+        let done_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        self.reload_cloud_state();
+        self.sync_selected_cloud_model();
+        self.cloud_payment_required = false;
+        self.ai_last_error = None;
+        self.ai_last_error_at_secs = None;
+        if let Some(db) = open_db_for_window(self) {
+            let _ = db.clear_ai_error(done_secs);
+        }
+        self.close_billing_modal(cx);
+        let msg = crate::i18n::messages::cloud_payment_succeeded(self.locale)
+            .to_owned();
+        self.push_toast(msg.clone(), Status::Success, cx);
+        msg
+    }
+
+    /// Submit a redemption code from AI Settings, guarding against empty
+    /// submissions and concurrent double-submits, then refreshing `/v1/models`
+    /// and syncing `cloud_state` on success.
+    pub fn submit_redeem_code(&mut self, cx: &mut Context<'_, Self>) {
+        if self.redeem_submitting {
+            return;
+        }
+        let raw = self
+            .cloud_redeem_input_settings
+            .as_ref()
+            .map_or_else(String::new, |inp| inp.read(cx).value().to_string());
+
+        let clean_code = normalize_redemption_code_input(&raw);
+        if clean_code.is_empty() {
+            let hint = crate::i18n::pages::cloud_redeem_empty_hint(self.locale)
+                .to_owned();
+            self.cloud_redeem_feedback = Some((hint.clone(), false));
+            self.push_toast(hint, Status::Neutral, cx);
+            cx.notify();
+            return;
+        }
+
+        self.redeem_submitting = true;
+        self.redeem_epoch = self.redeem_epoch.wrapping_add(1);
+        let epoch = self.redeem_epoch;
+        self.cloud_redeem_feedback = None;
+        if let Some(modal) = self.billing_modal.as_mut() {
+            modal.error = None;
+        }
+
+        let ai_ctx = self.snapshot_cloud_execution_context();
+        let lock = Arc::clone(&self.cloud_refresh_lock);
+        let last_refresh_at = Arc::clone(&self.cloud_last_refresh_at);
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let client = build_cloud_client(&ai_ctx)?;
+            let res = client.redeem_code(&clean_code)?;
+            {
+                let _guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *last_refresh_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Instant::now());
+                let _ = client.fetch_virtual_models();
+            }
+            Ok::<_, CloudApiError>(res)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let done_secs = u64::try_from(now_seconds()).unwrap_or(0);
+            cx.update(|cx| {
+                let mut success_notif: Option<(crate::i18n::Locale, String)> =
+                    None;
+                let _ = this.update(cx, |this, cx| {
+                    if this.redeem_epoch != epoch {
+                        return;
+                    }
+                    this.redeem_submitting = false;
+                    let active_locale = this.locale;
+                    match res {
+                        Ok(redeemed) => {
+                            this.reload_cloud_state();
+                            this.sync_selected_cloud_model();
+                            this.cloud_payment_required = false;
+                            this.ai_last_error = None;
+                            this.ai_last_error_at_secs = None;
+                            this.cloud_redeem_feedback = None;
+                            this.cloud_redeem_inputs_need_clear = true;
+                            if let Some(db) = open_db_for_window(this) {
+                                let _ = db.clear_ai_error(done_secs);
+                            }
+                            this.close_billing_modal(cx);
+                            let valid_until_secs = redeemed
+                                .entitlement
+                                .valid_until_secs
+                                .unwrap_or(redeemed.new_valid_until_secs);
+                            let date_ymd =
+                                format_unix_date_ymd(valid_until_secs);
+                            let msg =
+                                crate::i18n::pages::cloud_redeem_succeeded(
+                                    &date_ymd,
+                                    active_locale,
+                                );
+                            this.push_toast(msg.clone(), Status::Success, cx);
+                            success_notif = Some((active_locale, msg));
+                        }
+                        Err(err) => {
+                            let msg = err.format_localized(active_locale);
+                            this.cloud_redeem_feedback =
+                                Some((msg.clone(), true));
+                            this.push_toast(msg, Status::Error, cx);
+                            cx.notify();
+                        }
+                    }
+                });
+                if let Some((notif_locale, msg)) = success_notif {
+                    crate::post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                        crate::i18n::pages::cloud_redeem_succeeded_notif_title(
+                            notif_locale,
+                        ),
+                        &msg,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Refresh Ruum Cloud entitlement (`?refresh=1`) and virtual models off the
+    /// UI thread using an epoch guard and shared mutex lock.
+    pub fn refresh_cloud_entitlement(&mut self, cx: &mut Context<'_, Self>) {
+        if self.cloud_refreshing {
+            return;
+        }
+        let ai_ctx = self.snapshot_cloud_execution_context();
+        let db_path = self.db_path.clone();
+        let locale = self.locale;
+        let lock = Arc::clone(&self.cloud_refresh_lock);
+        let last_refresh_at = Arc::clone(&self.cloud_last_refresh_at);
+        self.cloud_refreshing = true;
+        self.cloud_refresh_epoch += 1;
+        let epoch = self.cloud_refresh_epoch;
+        self.push_toast(
+            crate::i18n::messages::refreshing_cloud_entitlement(locale),
+            Status::Neutral,
+            cx,
+        );
+
+        let task = cx.background_executor().spawn(async move {
+            let client = build_cloud_client(&ai_ctx)
+                .map_err(|e| e.format_localized(locale))?;
+            refresh_entitlement_and_models_with_client(
+                &client,
+                &lock,
+                &last_refresh_at,
+            )
+            .map_err(|e| e.format_localized(locale))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let done_secs = u64::try_from(now_seconds()).unwrap_or(0);
+            cx.update(|cx| {
+                let mut notif: Option<(
+                    ruum_core::watchdog::AiFailureKind,
+                    crate::i18n::Locale,
+                    String,
+                )> = None;
+                let updated = this.update(cx, |this, cx| {
+                    if epoch != this.cloud_refresh_epoch {
+                        return;
+                    }
+                    this.cloud_refreshing = false;
+                    this.reload_cloud_state();
+                    this.sync_selected_cloud_model();
+                    let active_locale = this.locale;
+                    match res {
+                        Ok((ent, models)) => {
+                            let all_locked = !models.is_empty()
+                                && models.iter().all(|m| !m.available);
+                            this.cloud_payment_required = all_locked
+                                || (!ent.is_paid && ent.trial_remaining == 0);
+                            if !this.cloud_payment_required {
+                                this.ai_last_error = None;
+                                this.ai_last_error_at_secs = None;
+                                if let Some(db) = open_db_for_window(this) {
+                                    let _ = db.clear_ai_error(done_secs);
+                                }
+                            }
+                            this.push_toast(
+                                crate::i18n::messages::cloud_entitlement_refreshed(
+                                    active_locale,
+                                ),
+                                Status::Success,
+                                cx,
+                            );
+                        }
+                        Err(err) => {
+                            let kind =
+                                ruum_core::watchdog::classify_ai_failure(&err);
+                            let summary =
+                                crate::i18n::messages::ai_analysis_error(
+                                    &err,
+                                    active_locale,
+                                );
+                            this.ai_last_error = Some(summary.clone());
+                            this.ai_last_error_at_secs = Some(done_secs);
+                            this.cloud_payment_required =
+                                is_cloud_payment_required_message(&summary)
+                                    || is_cloud_payment_required_message(&err);
+                            if let Some(db) = open_db_for_window(this) {
+                                let _ = db.record_ai_error(&summary, done_secs);
+                            }
+                            this.push_toast(summary.clone(), Status::Error, cx);
+                            notif = Some((kind, active_locale, summary));
+                        }
+                    }
+                    cx.notify();
+                });
+
+                if let Some((kind, notif_locale, summary)) = notif {
+                    crate::post_app_notification(
+                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+                        crate::i18n::messages::ai_analysis_failure_notif_title(
+                            kind,
+                            notif_locale,
+                        ),
+                        &summary,
+                        cx,
+                    );
+                } else if updated.is_err()
+                    && let Some(db) = open_db_for_background(db_path.as_deref())
+                {
+                    let _ = db.load_cloud_state();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Switch the direct API wire protocol and update uncustomized default URLs
@@ -3967,13 +5437,18 @@ impl Ruum {
             .as_ref()
             .map(|input| input.read(cx).value().trim().to_string())
             .filter(|val| !val.is_empty());
-        let model = self.watchdog_input_model.as_ref().map_or_else(
-            || self.watchdog_draft.model.clone(),
-            |input| {
-                let text = input.read(cx).value().trim().to_string();
-                (!text.is_empty()).then_some(text)
-            },
-        );
+        let model =
+            if self.watchdog_draft.ai_provider == AiCliProvider::RuumCloud {
+                self.watchdog_draft.model.clone()
+            } else {
+                self.watchdog_input_model.as_ref().map_or_else(
+                    || self.watchdog_draft.model.clone(),
+                    |input| {
+                        let text = input.read(cx).value().trim().to_string();
+                        (!text.is_empty()).then_some(text)
+                    },
+                )
+            };
 
         let next_app = AppSettings {
             power_preset: self.watchdog_draft.power_preset.key().to_owned(),
@@ -4013,6 +5488,7 @@ impl Ruum {
             model,
             api_protocol: self.watchdog_draft.api_protocol,
             api_base_url,
+            setup_completed: self.ai_config.setup_completed,
             updated_at_secs: now_secs,
         }
         .normalized();
@@ -4828,19 +6304,25 @@ impl Ruum {
         self.watchdog_testing = true;
         self.watchdog_test_epoch += 1;
         let epoch = self.watchdog_test_epoch;
-        let toast_msg = if temp_cfg.provider == AiCliProvider::Api {
-            crate::i18n::messages::testing_api_connection(
-                temp_cfg.api_protocol.label_in(self.locale),
-                self.locale,
-            )
-        } else {
-            crate::i18n::messages::testing_cli_connection(
+        let toast_msg = match temp_cfg.provider {
+            AiCliProvider::Api => {
+                crate::i18n::messages::testing_api_connection(
+                    temp_cfg.api_protocol.label_in(self.locale),
+                    self.locale,
+                )
+            }
+            AiCliProvider::RuumCloud => {
+                crate::i18n::messages::testing_cloud_connection(self.locale)
+                    .to_owned()
+            }
+            _ => crate::i18n::messages::testing_cli_connection(
                 provider_label,
                 self.locale,
-            )
+            ),
         };
         self.push_toast(toast_msg, Status::Neutral, cx);
 
+        let is_cloud = temp_cfg.provider == AiCliProvider::RuumCloud;
         let task = cx.background_executor().spawn(async move {
             let runner = ruum_core::ai_cli::TimedCommandRunner::new(
                 Duration::from_secs(
@@ -4859,11 +6341,25 @@ impl Ruum {
                     return;
                 }
                 this.watchdog_testing = false;
+                if is_cloud {
+                    this.reload_cloud_state();
+                    this.sync_selected_cloud_model();
+                }
                 match res {
                     Ok(version_msg) => {
+                        if is_cloud {
+                            this.cloud_payment_required = this
+                                .cached_cloud_models()
+                                .iter()
+                                .all(|m| !m.available)
+                                && !this.cached_cloud_models().is_empty();
+                        }
                         this.push_toast(version_msg, Status::Success, cx);
                     }
                     Err(err) => {
+                        if is_cloud && is_cloud_payment_required_message(&err) {
+                            this.cloud_payment_required = true;
+                        }
                         this.push_toast(err, Status::Error, cx);
                     }
                 }
@@ -4880,6 +6376,7 @@ impl Ruum {
         let temp_cfg = self.snapshot_ai_config(cx);
         let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = temp_cfg.provider.label_in(self.locale);
+        let is_cloud = temp_cfg.provider == AiCliProvider::RuumCloud;
         self.watchdog_fetching_models = true;
         self.watchdog_fetch_epoch += 1;
         let epoch = self.watchdog_fetch_epoch;
@@ -4907,6 +6404,10 @@ impl Ruum {
                     return;
                 }
                 this.watchdog_fetching_models = false;
+                if is_cloud {
+                    this.reload_cloud_state();
+                    this.sync_selected_cloud_model();
+                }
                 let locale = this.locale;
                 match res {
                     Ok((models, note)) => {
@@ -5148,9 +6649,64 @@ impl Ruum {
         }
     }
 
+    /// Block Ruum Cloud analysis before network when cached virtual models
+    /// exist and every model has `available == false`.
+    fn abort_if_cloud_models_locked(
+        &mut self,
+        ai_cfg: &AiConfig,
+        ssh_alias: Option<&str>,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if ai_cfg.provider != AiCliProvider::RuumCloud {
+            return false;
+        }
+        let cached = self.cached_cloud_models();
+        if cached.is_empty() || cached.iter().any(|m| m.available) {
+            return false;
+        }
+        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        let raw = crate::i18n::messages::cloud_no_available_models_blocked(
+            self.locale,
+        );
+        let summary = match ssh_alias {
+            Some(alias) => crate::i18n::messages::ssh_ai_analyze_failed(
+                alias,
+                raw,
+                self.locale,
+            ),
+            None => crate::i18n::messages::ai_analysis_error(raw, self.locale),
+        };
+        self.cloud_payment_required = true;
+        self.ai_last_error = Some(summary.clone());
+        self.ai_last_error_at_secs = Some(now_secs);
+        if let Some(db) = open_db_for_window(self) {
+            let _ = db.record_ai_error(&summary, now_secs);
+        }
+        self.push_toast(summary.clone(), Status::Error, cx);
+        crate::post_app_notification(
+            ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
+            crate::i18n::messages::ai_analysis_failure_notif_title(
+                ruum_core::watchdog::AiFailureKind::Failed,
+                self.locale,
+            ),
+            &summary,
+            cx,
+        );
+        cx.notify();
+        true
+    }
+
     /// Trigger manual AI analysis off the UI thread and open confirmation modal.
     pub fn run_ai_analysis_now(&mut self, cx: &mut Context<'_, Self>) {
         if self.watchdog_analyzing {
+            return;
+        }
+        if !self.ai_config.setup_completed {
+            self.ai_setup_choice_modal = Some(AiSetupChoiceModalState {
+                pending_action: PendingAiSetupAction::LocalAnalysis,
+            });
+            self.focus_request = Some(FocusTarget::AiSetupChoiceDialog);
+            cx.notify();
             return;
         }
         let Some(home) = std::env::home_dir() else {
@@ -5162,6 +6718,10 @@ impl Ruum {
             return;
         };
         let ai_cfg = self.snapshot_ai_config(cx);
+        if self.abort_if_cloud_models_locked(&ai_cfg, None, cx) {
+            return;
+        }
+        let is_cloud = ai_cfg.provider == AiCliProvider::RuumCloud;
         let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = ai_cfg.provider.label_in(self.locale);
         let cli_exe = crate::resolve_cli_exe();
@@ -5228,12 +6788,19 @@ impl Ruum {
                         return false;
                     }
                     this.watchdog_analyzing = false;
+                    if is_cloud {
+                        this.reload_cloud_state();
+                        this.sync_selected_cloud_model();
+                    }
                     let active_locale = this.locale;
                     match res {
                         Ok(proposal) => {
                             this.ai_proposal = Some(proposal.clone());
                             this.ai_last_error = None;
                             this.ai_last_error_at_secs = None;
+                            if is_cloud {
+                                this.cloud_payment_required = false;
+                            }
                             let ai_state =
                                 ruum_core::storage::AiState::from_proposal(
                                     &proposal, done_secs,
@@ -5297,6 +6864,12 @@ impl Ruum {
                                 );
                             this.ai_last_error = Some(summary.clone());
                             this.ai_last_error_at_secs = Some(done_secs);
+                            if is_cloud
+                                && (is_cloud_payment_required_message(&summary)
+                                    || is_cloud_payment_required_message(&err))
+                            {
+                                this.cloud_payment_required = true;
+                            }
                             if let Some(db) = open_db_for_window(this) {
                                 let _ = db.record_ai_error(&summary, done_secs);
                             }
@@ -6512,6 +8085,22 @@ impl Ruum {
         else {
             return;
         };
+        if !self.ai_config.setup_completed {
+            self.ai_setup_choice_modal = Some(AiSetupChoiceModalState {
+                pending_action: PendingAiSetupAction::SshAnalysis {
+                    profile_id: profile.id,
+                },
+            });
+            self.focus_request = Some(FocusTarget::AiSetupChoiceDialog);
+            cx.notify();
+            return;
+        }
+        let ai_cfg = self.snapshot_ai_config(cx);
+        if self.abort_if_cloud_models_locked(&ai_cfg, Some(&profile.alias), cx)
+        {
+            return;
+        }
+        let is_cloud = ai_cfg.provider == AiCliProvider::RuumCloud;
         let store = match self.ensure_cred_store() {
             Ok(store) => store,
             Err(err) => {
@@ -6543,7 +8132,6 @@ impl Ruum {
 
         let existing_session = self.find_live_ssh_session(id);
         let duration_minutes = self.app_settings.ssh_session_duration_minutes;
-        let ai_cfg = self.snapshot_ai_config(cx);
         let ai_ctx = self.snapshot_ai_execution_context(cx);
         let provider_label = ai_cfg.provider.label_in(self.locale);
         let options = self.options.clone();
@@ -6608,12 +8196,19 @@ impl Ruum {
                 )> = None;
                 let updated = this.update(cx, |this, cx| {
                     this.ssh_analyzing_profiles.remove(&profile_id);
+                    if is_cloud {
+                        this.reload_cloud_state();
+                        this.sync_selected_cloud_model();
+                    }
                     let active_locale = this.locale;
                     match res {
                         Ok((session, header, proposal)) => {
                             this.store_live_ssh_session(&profile_id, &session);
                             this.ai_last_error = None;
                             this.ai_last_error_at_secs = None;
+                            if is_cloud {
+                                this.cloud_payment_required = false;
+                            }
                             if let Some(db) = open_db_for_window(this) {
                                 let _ = db.clear_ai_error(done_secs);
                                 if let Some(info) = header.space {
@@ -6683,6 +8278,12 @@ impl Ruum {
                                 );
                             this.ai_last_error = Some(summary.clone());
                             this.ai_last_error_at_secs = Some(done_secs);
+                            if is_cloud
+                                && (is_cloud_payment_required_message(&summary)
+                                    || is_cloud_payment_required_message(&err))
+                            {
+                                this.cloud_payment_required = true;
+                            }
                             if let Some(db) = open_db_for_window(this) {
                                 let _ = db.record_ai_error(&summary, done_secs);
                             }
@@ -8546,6 +10147,12 @@ impl Ruum {
             Some(FocusTarget::UpdateDialog) => {
                 window.focus(&self.update_focus, cx);
             }
+            Some(FocusTarget::AiSetupChoiceDialog) => {
+                window.focus(&self.ai_setup_choice_focus, cx);
+            }
+            Some(FocusTarget::BillingDialog) => {
+                window.focus(&self.billing_focus, cx);
+            }
             None => {}
         }
     }
@@ -9830,6 +11437,18 @@ impl Ruum {
             }
             return;
         }
+        if self.ai_setup_choice_modal.is_some() {
+            if key == "escape" {
+                self.cancel_ai_setup_choice(cx);
+            }
+            return;
+        }
+        if self.billing_modal.is_some() {
+            if key == "escape" {
+                self.close_billing_modal(cx);
+            }
+            return;
+        }
 
         // The volume picker modal owns its keys while open: arrows move, Enter
         // picks, Escape closes, and nothing behind acts.
@@ -10444,13 +12063,16 @@ pub fn restart_args(root: &Path) -> Vec<std::ffi::OsString> {
     vec![root.as_os_str().to_owned()]
 }
 
-/// Now, in Unix seconds.
-pub fn now_seconds() -> i64 {
+/// Now, in unsigned Unix seconds.
+pub fn current_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Now, in Unix seconds.
+pub fn now_seconds() -> i64 {
+    i64::try_from(current_unix_secs()).unwrap_or(i64::MAX)
 }
 
 /// Let go of a tree off the UI thread: freeing a disk's millions of nodes
@@ -10489,6 +12111,10 @@ pub enum FocusTarget {
     RemoteConnectDialog,
     /// The centered software update card modal.
     UpdateDialog,
+    /// The first-run 3-choice AI onboarding modal.
+    AiSetupChoiceDialog,
+    /// The Ruum Cloud pass billing modal.
+    BillingDialog,
 }
 
 impl Render for Ruum {
@@ -10640,6 +12266,125 @@ pub fn apply_update_check_to_runtime(
         }
     });
     crate::refresh_tray_update_status(cx);
+}
+
+enum PurchaseOutcome {
+    Allowed,
+    PendingQr {
+        order: PurchaseOrderSnapshot,
+        qr_matrix: Option<Arc<crate::qr::QrMatrix>>,
+    },
+}
+
+enum BillingPollStep {
+    Stop,
+    Skip,
+    Poll {
+        ai_ctx: ruum_core::ai_cli::AiExecutionContext,
+        lock: Arc<Mutex<()>>,
+        last_refresh_at: Arc<Mutex<Option<Instant>>>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BillingPollAftermath {
+    Continue,
+    Stop,
+}
+
+fn build_cloud_client(
+    ai_ctx: &ruum_core::ai_cli::AiExecutionContext,
+) -> Result<CloudClient, CloudApiError> {
+    let db = match ai_ctx.db_path.as_deref() {
+        Some(path) => StorageDb::open(path),
+        None => StorageDb::open_default(),
+    }
+    .map_err(|e| {
+        CloudApiError::new(
+            None,
+            Some("CLOUD_DB_ERROR"),
+            format!("failed to open Ruum database: {e}"),
+            None,
+        )
+    })?;
+    let store = if let Some(ref s) = ai_ctx.credential_store {
+        s.clone()
+    } else if let Some(dir) = db.db_path().parent()
+        && !dir.as_os_str().is_empty()
+    {
+        LazyCredentialStore::platform(dir)
+    } else {
+        LazyCredentialStore::open_default().map_err(|e| {
+            CloudApiError::new(None, Some("CLOUD_KEYCHAIN_ERROR"), e, None)
+        })?
+    };
+    let mut client = CloudClient::new(Arc::new(db), store);
+    if let Some(ref base_url) = ai_ctx.cloud_base_url {
+        client = client.with_base_url(base_url)?;
+    }
+    Ok(client)
+}
+
+fn sync_entitlement_and_models_inner(
+    client: &CloudClient,
+    lock: &Mutex<()>,
+    last_refresh_at: &Mutex<Option<Instant>>,
+    force_refresh: bool,
+) -> Result<(EntitlementSnapshot, Vec<CloudVirtualModel>), CloudApiError> {
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *last_refresh_at
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(Instant::now());
+    let ent = client.fetch_entitlement(force_refresh)?;
+    let models = client.fetch_virtual_models()?;
+    Ok((ent, models))
+}
+
+fn sync_entitlement_and_models_after_allow(
+    client: &CloudClient,
+    lock: &Mutex<()>,
+    last_refresh_at: &Mutex<Option<Instant>>,
+) -> Result<(EntitlementSnapshot, Vec<CloudVirtualModel>), CloudApiError> {
+    sync_entitlement_and_models_inner(client, lock, last_refresh_at, false)
+}
+
+fn refresh_entitlement_and_models_with_client(
+    client: &CloudClient,
+    lock: &Mutex<()>,
+    last_refresh_at: &Mutex<Option<Instant>>,
+) -> Result<(EntitlementSnapshot, Vec<CloudVirtualModel>), CloudApiError> {
+    let (ent, models) =
+        sync_entitlement_and_models_inner(client, lock, last_refresh_at, true)?;
+    let now_secs = current_unix_secs();
+    if !ent.is_alipay_active_at(now_secs)
+        && client.cached_plans_need_refresh(now_secs, 3600)
+    {
+        let _ = client.fetch_billing_plans();
+    }
+    Ok((ent, models))
+}
+
+fn poll_billing_entitlement_once(
+    ai_ctx: &ruum_core::ai_cli::AiExecutionContext,
+    lock: &Mutex<()>,
+    last_refresh_at: &Mutex<Option<Instant>>,
+) -> Result<EntitlementSnapshot, CloudApiError> {
+    let client = build_cloud_client(ai_ctx)?;
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *last_refresh_at
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(Instant::now());
+    let ent = client.fetch_entitlement(true)?;
+    if ent.is_paid {
+        let _ = client.fetch_virtual_models();
+    }
+    Ok(ent)
 }
 
 enum DownloadTransition {
@@ -10963,6 +12708,29 @@ mod tests {
             Direction::Right
                 .offset(&from, &Rect::new(200.0, 160.0, 20.0, 20.0))
                 > 0.0
+        );
+    }
+
+    #[test]
+    fn live_alipay_pair_selects_alipays_for_qr_and_https_for_browser() {
+        let purchase_url = "alipays://platformapi/startapp?\
+            appId=2021006180624128&page=pages/order/index?\
+            purchaseLinkId=abc";
+        let purchase_qr_code = "https://mobilecodec.alipay.com/show.htm?code=6w711231jgnqlyjvhbr7v58";
+
+        assert_eq!(
+            select_billing_qr_payload(
+                Some(purchase_url),
+                Some(purchase_qr_code),
+            ),
+            Some(purchase_url.to_owned()),
+        );
+        assert_eq!(
+            select_safe_billing_browser_url(
+                Some(purchase_url),
+                Some(purchase_qr_code),
+            ),
+            Some(purchase_qr_code.to_owned()),
         );
     }
 }

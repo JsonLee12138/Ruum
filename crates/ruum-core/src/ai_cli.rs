@@ -20,18 +20,22 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::classify::Category;
+use crate::cloud_client::{
+    CloudApiError, CloudClient, select_best_available_model,
+};
 use crate::credentials::LazyCredentialStore;
 use crate::docker_adapter::{
     DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
     validate_targets_against_summary,
 };
+use crate::i18n::{Locale, format_cloud_error_message};
 use crate::identity::HostIdentity;
 use crate::insights::{self, Finding};
 use crate::mcp::{McpServer, local_read_only_tool_definitions};
 use crate::remote::Header;
 use crate::removal::RemovalMode;
 use crate::size::human_bytes;
-use crate::storage::AiConfig;
+use crate::storage::{AiConfig, StorageDb};
 use crate::trash_adapter::TrashOs;
 use crate::tree::{Node, NodeKind, path_of};
 use crate::watchdog_config::{
@@ -40,6 +44,9 @@ use crate::watchdog_config::{
 
 /// Environment variable checked as a headless fallback for direct API keys.
 pub const ENV_AI_API_KEY: &str = "RUUM_AI_API_KEY";
+
+/// Sentinel model identifier sent to Ruum Cloud when Auto routing is active.
+pub const CLOUD_AUTO_MODEL_ID: &str = "auto";
 
 /// Returns `true` when `RUUM_AI_API_KEY` is present and non-empty.
 #[must_use]
@@ -834,6 +841,13 @@ pub fn build_invocation_for_config(
                         .to_string(),
                 );
             }
+            AiCliProvider::RuumCloud => {
+                return Err(
+                    "Ruum Cloud provider does not use an external CLI \
+                     executable"
+                        .to_string(),
+                );
+            }
         }
     };
 
@@ -887,6 +901,10 @@ pub fn build_invocation_for_config(
             return Err("direct API provider does not build CLI invocations"
                 .to_string());
         }
+        AiCliProvider::RuumCloud => {
+            return Err("Ruum Cloud provider does not build CLI invocations"
+                .to_string());
+        }
     }
 
     if !config.extra_args.trim().is_empty() {
@@ -927,6 +945,12 @@ pub fn probe_cli(
         AiCliProvider::Api => {
             return Err(
                 "direct API provider does not use an external CLI executable"
+                    .to_string(),
+            );
+        }
+        AiCliProvider::RuumCloud => {
+            return Err(
+                "Ruum Cloud provider does not use an external CLI executable"
                     .to_string(),
             );
         }
@@ -1469,6 +1493,9 @@ fn cli_discover_models(
         )),
         AiCliProvider::Api => {
             Err("direct API provider must use DirectApiAiAdapter".to_string())
+        }
+        AiCliProvider::RuumCloud => {
+            Err("Ruum Cloud provider must use RuumCloudAiAdapter".to_string())
         }
     }
 }
@@ -2853,6 +2880,7 @@ pub fn run_analysis(
 pub enum AiBackendKind {
     Cli,
     DirectApi,
+    RuumCloud,
 }
 
 /// Execution-time credential and HTTP overrides for AI operations.
@@ -2861,6 +2889,8 @@ pub struct AiExecutionContext {
     pub api_key: Option<Zeroizing<String>>,
     pub credential_store: Option<LazyCredentialStore>,
     pub allow_insecure_http: bool,
+    pub db_path: Option<PathBuf>,
+    pub cloud_base_url: Option<String>,
 }
 
 impl AiExecutionContext {
@@ -2888,6 +2918,22 @@ impl AiExecutionContext {
         self.allow_insecure_http = allow;
         self
     }
+
+    /// Inject an explicit `SQLite` database path for `RuumCloud` state access.
+    #[must_use]
+    pub fn with_db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.db_path = Some(path.into());
+        self
+    }
+
+    /// Override the Ruum Cloud gateway base URL (primarily for offline tests).
+    #[must_use]
+    pub fn with_cloud_base_url(mut self, url: impl Into<String>) -> Self {
+        let raw = url.into();
+        let trimmed = raw.trim();
+        self.cloud_base_url = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        self
+    }
 }
 
 impl fmt::Debug for AiExecutionContext {
@@ -2896,6 +2942,8 @@ impl fmt::Debug for AiExecutionContext {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("has_credential_store", &self.credential_store.is_some())
             .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("db_path", &self.db_path)
+            .field("cloud_base_url", &self.cloud_base_url)
             .finish()
     }
 }
@@ -3040,6 +3088,576 @@ impl AiExecutionAdapter for CliAiAdapter {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectApiAiAdapter;
 
+/// Adapter routing [`AiCliProvider::RuumCloud`] through [`CloudClient`] and
+/// [`ruum_adk::RuumCloudLlm`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuumCloudAiAdapter;
+
+fn format_cloud_api_err(err: &CloudApiError) -> String {
+    err.format_localized(Locale::current())
+}
+
+fn format_cloud_adk_err(err: &ruum_adk::AdkClientError) -> String {
+    match err {
+        ruum_adk::AdkClientError::CloudGateway {
+            status,
+            code,
+            message,
+            trace_id,
+            is_timeout,
+        } => format_cloud_error_message(
+            code.as_deref(),
+            *status,
+            message,
+            trace_id.as_deref(),
+            *is_timeout,
+            Locale::current(),
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn build_cloud_client_from_context(
+    ctx: &AiExecutionContext,
+) -> Result<CloudClient, String> {
+    let db = match ctx.db_path {
+        Some(ref path) => Arc::new(
+            StorageDb::open(path)
+                .map_err(|e| format!("failed to open Ruum database: {e}"))?,
+        ),
+        None => Arc::new(
+            StorageDb::open_default()
+                .map_err(|e| format!("failed to open Ruum database: {e}"))?,
+        ),
+    };
+    let cred_store = if let Some(ref store) = ctx.credential_store {
+        store.clone()
+    } else if let Some(ref db_path) = ctx.db_path
+        && let Some(dir) = db_path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        LazyCredentialStore::platform(dir)
+    } else {
+        LazyCredentialStore::open_default()?
+    };
+
+    let mut client = CloudClient::new(db, cred_store);
+    if let Some(ref base_url) = ctx.cloud_base_url {
+        client = client
+            .with_base_url(base_url)
+            .map_err(|e| format_cloud_api_err(&e))?;
+    }
+    Ok(client)
+}
+
+fn resolve_cloud_preferred_model<'a>(
+    model_override: Option<&'a str>,
+    config: &'a AiConfig,
+    cached_selected: Option<&'a str>,
+) -> Option<&'a str> {
+    model_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            config
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| cached_selected.map(str::trim).filter(|s| !s.is_empty()))
+}
+
+fn prepare_cloud_inference_model(
+    client: &CloudClient,
+    config: &AiConfig,
+    model_override: Option<&str>,
+) -> Result<(String, String), String> {
+    let ent = client
+        .fetch_entitlement(false)
+        .map_err(|e| format_cloud_api_err(&e))?;
+    if ent.decision.eq_ignore_ascii_case("DENY")
+        || (!ent.is_paid && ent.trial_remaining == 0)
+    {
+        return Err(CloudApiError::new(
+            Some(402),
+            Some("ENTITLEMENT_PAYMENT_REQUIRED"),
+            "Free trial exhausted or plan expired",
+            None,
+        )
+        .format_localized(Locale::current()));
+    }
+
+    let models = client
+        .fetch_virtual_models()
+        .map_err(|e| format_cloud_api_err(&e))?;
+    if !models.iter().any(|m| m.available) {
+        return Err(CloudApiError::new(
+            Some(403),
+            Some("INFERENCE_MODEL_NOT_ALLOWED"),
+            "No Ruum Cloud models are currently available for this account",
+            None,
+        )
+        .format_localized(Locale::current()));
+    }
+    let cached_selected = client.cached_selected_model_id();
+    let preferred = resolve_cloud_preferred_model(
+        model_override,
+        config,
+        cached_selected.as_deref(),
+    );
+    let chosen_id = if let Some(pref) = preferred
+        && models.iter().any(|m| m.id == pref && m.available)
+    {
+        pref.to_owned()
+    } else {
+        CLOUD_AUTO_MODEL_ID.to_owned()
+    };
+    let base_url = client
+        .resolved_base_url()
+        .map_err(|e| format_cloud_api_err(&e))?;
+    Ok((base_url, chosen_id))
+}
+
+fn map_cloud_api_to_gateway_error(
+    err: CloudApiError,
+) -> ruum_adk::CloudGatewayError {
+    ruum_adk::CloudGatewayError {
+        status: err.http_status,
+        code: err.code,
+        message: err.message,
+        trace_id: err.trace_id,
+        retry_after_secs: err.retry_after_secs,
+        is_timeout: err.is_timeout,
+    }
+}
+
+struct CoreCloudTokenProvider {
+    client: Arc<CloudClient>,
+}
+
+impl ruum_adk::CloudTokenProvider for CoreCloudTokenProvider {
+    fn current_token<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<String, ruum_adk::CloudGatewayError>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let client = Arc::clone(&self.client);
+        spawn_blocking_thread(
+            "ruum-cloud-jwt",
+            || {
+                Err(ruum_adk::CloudGatewayError {
+                    status: None,
+                    code: Some("CLOUD_INTERNAL_ERROR".to_owned()),
+                    message: "cloud token future mutex poisoned".to_owned(),
+                    trace_id: None,
+                    retry_after_secs: None,
+                    is_timeout: false,
+                })
+            },
+            |err| {
+                Err(ruum_adk::CloudGatewayError {
+                    status: None,
+                    code: Some("CLOUD_INTERNAL_ERROR".to_owned()),
+                    message: format!(
+                        "failed to spawn cloud token worker: {err}"
+                    ),
+                    trace_id: None,
+                    retry_after_secs: None,
+                    is_timeout: false,
+                })
+            },
+            move || {
+                client
+                    .ensure_valid_jwt()
+                    .map_err(map_cloud_api_to_gateway_error)
+            },
+        )
+    }
+
+    fn refresh_token<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<String, ruum_adk::CloudGatewayError>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let client = Arc::clone(&self.client);
+        spawn_blocking_thread(
+            "ruum-cloud-refresh",
+            || {
+                Err(ruum_adk::CloudGatewayError {
+                    status: None,
+                    code: Some("CLOUD_INTERNAL_ERROR".to_owned()),
+                    message: "cloud refresh future mutex poisoned".to_owned(),
+                    trace_id: None,
+                    retry_after_secs: None,
+                    is_timeout: false,
+                })
+            },
+            |err| {
+                Err(ruum_adk::CloudGatewayError {
+                    status: None,
+                    code: Some("CLOUD_INTERNAL_ERROR".to_owned()),
+                    message: format!(
+                        "failed to spawn cloud refresh worker: {err}"
+                    ),
+                    trace_id: None,
+                    retry_after_secs: None,
+                    is_timeout: false,
+                })
+            },
+            move || {
+                let state = client
+                    .refresh_access_token()
+                    .map_err(map_cloud_api_to_gateway_error)?;
+                state
+                    .access_token
+                    .ok_or_else(|| ruum_adk::CloudGatewayError {
+                        status: None,
+                        code: Some("AUTH_TOKEN_MISSING".to_owned()),
+                        message: "cloud token refresh returned no access token"
+                            .to_owned(),
+                        trace_id: None,
+                        retry_after_secs: None,
+                        is_timeout: false,
+                    })
+            },
+        )
+    }
+}
+
+impl AiExecutionAdapter for RuumCloudAiAdapter {
+    fn kind(&self) -> AiBackendKind {
+        AiBackendKind::RuumCloud
+    }
+
+    fn test_connection(
+        &self,
+        _config: &AiConfig,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<String, String> {
+        let client = build_cloud_client_from_context(ctx)?;
+        let ent = client
+            .fetch_entitlement(false)
+            .map_err(|e| format_cloud_api_err(&e))?;
+        let models = client
+            .fetch_virtual_models()
+            .map_err(|e| format_cloud_api_err(&e))?;
+        let avail = models.iter().filter(|m| m.available).count();
+        let status_label = if ent.is_paid {
+            "paid plan active".to_owned()
+        } else {
+            format!("trial remaining: {}", ent.trial_remaining)
+        };
+        Ok(format!(
+            "Ruum Cloud ready ({status_label}, {avail}/{} model(s) available)",
+            models.len()
+        ))
+    }
+
+    fn discover_models(
+        &self,
+        _config: &AiConfig,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+        let client = build_cloud_client_from_context(ctx)?;
+        let models = client
+            .fetch_virtual_models()
+            .map_err(|e| format_cloud_api_err(&e))?;
+        let any_available = models.iter().any(|m| m.available);
+        let mapped = models
+            .into_iter()
+            .map(|m| {
+                let title = m
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&m.id);
+                let tier_tag = if m.tier.trim().is_empty() {
+                    "cloud"
+                } else {
+                    m.tier.trim()
+                };
+                let label = if m.available {
+                    format!("{title} ({tier_tag})")
+                } else {
+                    format!("{title} ({tier_tag}, locked)")
+                };
+                DiscoveredModel {
+                    id: m.id,
+                    label,
+                    provider: Some("ruum-cloud".to_owned()),
+                }
+            })
+            .collect();
+        let note = (!any_available).then(|| {
+            "No Ruum Cloud models are currently available; purchase a plan or \
+             redeem a code to unlock."
+                .to_owned()
+        });
+        Ok((mapped, note))
+    }
+
+    fn benchmark_model(
+        &self,
+        config: &AiConfig,
+        model_override: Option<&str>,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> ModelSpeedResult {
+        let requested_model = model_override
+            .or(config.model.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(auto)")
+            .to_owned();
+        let client = match build_cloud_client_from_context(ctx) {
+            Ok(c) => Arc::new(c),
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: requested_model,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: err,
+                };
+            }
+        };
+        let ent = match client.fetch_entitlement(false) {
+            Ok(e) => e,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: requested_model,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: format_cloud_api_err(&err),
+                };
+            }
+        };
+        if !ent.is_paid {
+            return ModelSpeedResult {
+                model: requested_model,
+                elapsed_ms: 0,
+                ok: false,
+                detail: "Model speed test is disabled during free trial to \
+                         preserve trial quota."
+                    .to_owned(),
+            };
+        }
+
+        let models = match client.fetch_virtual_models() {
+            Ok(m) => m,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: requested_model,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: format_cloud_api_err(&err),
+                };
+            }
+        };
+        let cached_selected = client.cached_selected_model_id();
+        let preferred = resolve_cloud_preferred_model(
+            model_override,
+            config,
+            cached_selected.as_deref(),
+        );
+        let Some(chosen) = select_best_available_model(&models, preferred)
+        else {
+            return ModelSpeedResult {
+                model: requested_model,
+                elapsed_ms: 0,
+                ok: false,
+                detail: "No available Ruum Cloud models for benchmark."
+                    .to_owned(),
+            };
+        };
+        let base_url = match client.resolved_base_url() {
+            Ok(u) => u,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: chosen.id.clone(),
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: format_cloud_api_err(&err),
+                };
+            }
+        };
+        let adk = match ruum_adk::BlockingAdkClient::new() {
+            Ok(c) => c,
+            Err(err) => {
+                return ModelSpeedResult {
+                    model: chosen.id.clone(),
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: err.to_string(),
+                };
+            }
+        };
+        let token_provider: Arc<dyn ruum_adk::CloudTokenProvider> =
+            Arc::new(CoreCloudTokenProvider { client });
+        let cloud_cfg = ruum_adk::RuumCloudConfig::new(
+            base_url,
+            chosen.id.clone(),
+            ruum_adk::RuumTask::LocalAnalysis,
+            token_provider,
+        )
+        .with_client_version(env!("CARGO_PKG_VERSION"));
+        let mut req = ruum_adk::AdkAgentRequest::new(
+            "Reply concisely.",
+            "Reply with only OK.",
+        );
+        req.max_iterations = 1;
+        req.fallback_without_tools_on_unsupported = false;
+
+        let start = Instant::now();
+        let res = adk.run_cloud_agent(&cloud_cfg, req);
+        let elapsed_ms =
+            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match res {
+            Ok(resp) => {
+                let reply = first_line_snippet(&resp.text, 60);
+                ModelSpeedResult {
+                    model: resp.model,
+                    elapsed_ms,
+                    ok: true,
+                    detail: if reply.is_empty() {
+                        "OK".to_owned()
+                    } else {
+                        reply
+                    },
+                }
+            }
+            Err(err) => ModelSpeedResult {
+                model: chosen.id.clone(),
+                elapsed_ms,
+                ok: false,
+                detail: format_cloud_adk_err(&err),
+            },
+        }
+    }
+
+    fn run_analysis_with_tree(
+        &self,
+        config: &AiConfig,
+        home_dir: &Path,
+        _current_exe: &Path,
+        now_secs: u64,
+        existing_tree: Option<&Node>,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String> {
+        let client = Arc::new(build_cloud_client_from_context(ctx)?);
+        let (base_url, model_id) =
+            prepare_cloud_inference_model(&client, config, None)?;
+        let adk = ruum_adk::BlockingAdkClient::new()
+            .map_err(|err| format_cloud_adk_err(&err))?;
+
+        let candidates =
+            collect_reclaimable_candidates(home_dir, existing_tree, now_secs);
+        let (instruction, prompt) =
+            build_direct_api_analysis_prompt(home_dir, &candidates);
+
+        let mut mcp = McpServer::default().with_read_only(true);
+        if let Some(tree) = existing_tree {
+            mcp.seed_local_tree_cache(
+                home_dir,
+                tree.clone(),
+                Some(home_dir.to_path_buf()),
+            );
+        }
+        let shared_mcp = Arc::new(Mutex::new(mcp));
+
+        let mut req = ruum_adk::AdkAgentRequest::new(instruction, prompt);
+        req.tools = build_local_mcp_adk_tools(&shared_mcp);
+        req.max_iterations = ruum_adk::MAX_CLOUD_ITERATIONS;
+        req.fallback_without_tools_on_unsupported = false;
+
+        let token_provider: Arc<dyn ruum_adk::CloudTokenProvider> =
+            Arc::new(CoreCloudTokenProvider { client });
+        let cloud_cfg = ruum_adk::RuumCloudConfig::new(
+            base_url,
+            model_id,
+            ruum_adk::RuumTask::LocalAnalysis,
+            token_provider,
+        )
+        .with_client_version(env!("CARGO_PKG_VERSION"));
+
+        let resp = adk
+            .run_cloud_agent(&cloud_cfg, req)
+            .map_err(|err| format_cloud_adk_err(&err))?;
+        parse_and_validate_proposal(&resp.text, home_dir, now_secs)
+    }
+
+    fn run_tree_analysis(
+        &self,
+        config: &AiConfig,
+        root_path: &Path,
+        home_path: Option<&Path>,
+        tree: &Node,
+        docker: &DockerProbeStatus,
+        target_os: TrashOs,
+        now_secs: u64,
+        _runner: &dyn CommandRunner,
+        ctx: &AiExecutionContext,
+    ) -> Result<CleanupProposal, String> {
+        let client = Arc::new(build_cloud_client_from_context(ctx)?);
+        let (base_url, model_id) =
+            prepare_cloud_inference_model(&client, config, None)?;
+        let adk = ruum_adk::BlockingAdkClient::new()
+            .map_err(|err| format_cloud_adk_err(&err))?;
+
+        let candidates = collect_tree_candidates(root_path, tree, docker);
+        let prompt =
+            build_tree_analysis_prompt(root_path, target_os, &candidates);
+
+        // Remote / in-memory analysis runs single-turn inference with zero
+        // local disk or SSH tools mounted.
+        let mut req = ruum_adk::AdkAgentRequest::new(
+            "You are an automated disk cleanup advisor for Ruum. Analyze \
+             only the provided in-memory snapshot and output strictly valid \
+             JSON.",
+            prompt,
+        );
+        req.max_iterations = 1;
+        req.fallback_without_tools_on_unsupported = false;
+
+        let token_provider: Arc<dyn ruum_adk::CloudTokenProvider> =
+            Arc::new(CoreCloudTokenProvider { client });
+        let cloud_cfg = ruum_adk::RuumCloudConfig::new(
+            base_url,
+            model_id,
+            ruum_adk::RuumTask::TreeAnalysis,
+            token_provider,
+        )
+        .with_client_version(env!("CARGO_PKG_VERSION"));
+
+        let resp = adk
+            .run_cloud_agent(&cloud_cfg, req)
+            .map_err(|err| format_cloud_adk_err(&err))?;
+        validate_proposal_against_tree(
+            &resp.text, root_path, home_path, tree, docker, target_os, now_secs,
+        )
+    }
+}
+
 /// Factory selecting the [`AiExecutionAdapter`] for a configured provider.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AiBackendFactory;
@@ -3054,6 +3672,7 @@ impl AiBackendFactory {
             | AiCliProvider::Codex
             | AiCliProvider::Custom => AiBackendKind::Cli,
             AiCliProvider::Api => AiBackendKind::DirectApi,
+            AiCliProvider::RuumCloud => AiBackendKind::RuumCloud,
         }
     }
 
@@ -3063,6 +3682,7 @@ impl AiBackendFactory {
         match Self::kind_for(provider) {
             AiBackendKind::Cli => Box::new(CliAiAdapter),
             AiBackendKind::DirectApi => Box::new(DirectApiAiAdapter),
+            AiBackendKind::RuumCloud => Box::new(RuumCloudAiAdapter),
         }
     }
 }
@@ -3151,23 +3771,22 @@ fn sanitize_adk_error(err: &ruum_adk::AdkClientError, api_key: &str) -> String {
     ruum_adk::sanitize_error_message(&err.to_string(), api_key)
 }
 
-struct ToolSlot {
-    result: Option<Result<serde_json::Value, String>>,
+struct BlockingSlot<T> {
+    result: Option<T>,
     waker: Option<Waker>,
 }
 
-struct BlockingToolFuture {
-    slot: Arc<Mutex<ToolSlot>>,
+struct BlockingThreadFuture<T> {
+    slot: Arc<Mutex<BlockingSlot<T>>>,
+    on_poison: fn() -> T,
 }
 
-impl Future for BlockingToolFuture {
-    type Output = Result<serde_json::Value, String>;
+impl<T> Future for BlockingThreadFuture<T> {
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Ok(mut guard) = self.slot.lock() else {
-            return Poll::Ready(Err(
-                "local MCP tool result mutex poisoned".to_owned()
-            ));
+            return Poll::Ready((self.on_poison)());
         };
         if let Some(res) = guard.result.take() {
             return Poll::Ready(res);
@@ -3175,6 +3794,38 @@ impl Future for BlockingToolFuture {
         guard.waker = Some(cx.waker().clone());
         Poll::Pending
     }
+}
+
+fn spawn_blocking_thread<T: Send + 'static>(
+    thread_name: &str,
+    on_poison: fn() -> T,
+    on_spawn_err: fn(io::Error) -> T,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Pin<Box<dyn Future<Output = T> + Send>> {
+    let slot = Arc::new(Mutex::new(BlockingSlot {
+        result: None,
+        waker: None,
+    }));
+    let worker_slot = Arc::clone(&slot);
+    let spawn_res = std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            let outcome = work();
+            if let Ok(mut guard) = worker_slot.lock() {
+                guard.result = Some(outcome);
+                let waker = guard.waker.take();
+                drop(guard);
+                if let Some(w) = waker {
+                    w.wake();
+                }
+            }
+        });
+    if let Err(err) = spawn_res
+        && let Ok(mut guard) = slot.lock()
+    {
+        guard.result = Some(on_spawn_err(err));
+    }
+    Box::pin(BlockingThreadFuture { slot, on_poison })
 }
 
 struct LocalMcpToolExecutor {
@@ -3199,38 +3850,21 @@ impl ruum_adk::AdkToolExecutor for LocalMcpToolExecutor {
     {
         let tool_name = self.tool_name.clone();
         let server = Arc::clone(&self.server);
-        let slot = Arc::new(Mutex::new(ToolSlot {
-            result: None,
-            waker: None,
-        }));
-        let worker_slot = Arc::clone(&slot);
-        let spawn_res = std::thread::Builder::new()
-            .name("ruum-mcp-tool".to_owned())
-            .spawn(move || {
+        spawn_blocking_thread(
+            "ruum-mcp-tool",
+            || Err("local MCP tool result mutex poisoned".to_owned()),
+            |err| Err(format!("failed to spawn local MCP worker: {err}")),
+            move || {
                 // Execute synchronous disk/git tools off the Tokio runtime so
                 // concurrent or timed-out tool calls never stall async workers.
-                let outcome = match server.lock() {
+                match server.lock() {
                     Ok(mut guard) => {
                         guard.dispatch_local_read_only_tool(&tool_name, &args)
                     }
                     Err(_) => Err("local MCP server mutex poisoned".to_owned()),
-                };
-                if let Ok(mut guard) = worker_slot.lock() {
-                    guard.result = Some(outcome);
-                    let waker = guard.waker.take();
-                    drop(guard);
-                    if let Some(w) = waker {
-                        w.wake();
-                    }
                 }
-            });
-        if let Err(err) = spawn_res
-            && let Ok(mut guard) = slot.lock()
-        {
-            guard.result =
-                Some(Err(format!("failed to spawn local MCP worker: {err}")));
-        }
-        Box::pin(BlockingToolFuture { slot })
+            },
+        )
     }
 }
 
@@ -5231,5 +5865,889 @@ mod tests {
         assert_eq!(prop.docker_targets, vec![DockerCleanTarget::BuildCache]);
 
         server.join().unwrap();
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedCloudReq {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: serde_json::Value,
+    }
+
+    impl RecordedCloudReq {
+        fn header(&self, name: &str) -> Option<&str> {
+            let target = name.to_ascii_lowercase();
+            self.headers
+                .iter()
+                .find(|(k, _)| k == &target)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    struct CloudStubServer {
+        base_url: String,
+        recorded: Arc<Mutex<Vec<RecordedCloudReq>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CloudStubServer {
+        fn stop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedCloudReq> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for CloudStubServer {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    type StubReply = (u16, Vec<(&'static str, &'static str)>, String);
+
+    fn spawn_cloud_stub(replies: Vec<StubReply>) -> CloudStubServer {
+        use std::collections::VecDeque;
+        use std::fmt::Write as _;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_bg = Arc::clone(&recorded);
+        let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        let handle = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut tmp = [0_u8; 4096];
+                let mut hend = None;
+                while let Ok(n) = stream.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) =
+                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        hend = Some(pos + 4);
+                        break;
+                    }
+                }
+                let Some(header_end) = hend else { continue };
+                let head = String::from_utf8_lossy(&buf[..header_end]);
+                let mut lines = head.split("\r\n");
+                let req_line = lines.next().unwrap_or("");
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_owned();
+                let path = parts.next().unwrap_or("").to_owned();
+                let mut headers = Vec::new();
+                let mut clen = 0_usize;
+                for line in lines {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        let kl = k.trim().to_ascii_lowercase();
+                        let val = v.trim().to_owned();
+                        if kl == "content-length" {
+                            clen = val.parse::<usize>().unwrap_or(0);
+                        }
+                        headers.push((kl, val));
+                    }
+                }
+                while buf.len() < header_end + clen {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let raw_body =
+                    &buf[header_end..(header_end + clen).min(buf.len())];
+                let body_val = serde_json::from_slice(raw_body)
+                    .unwrap_or(serde_json::Value::Null);
+                recorded_bg.lock().unwrap().push(RecordedCloudReq {
+                    method,
+                    path,
+                    headers,
+                    body: body_val,
+                });
+
+                let (status, extra_headers, body) = queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| (500, Vec::new(), "{}".to_owned()));
+                let mut resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (k, v) in extra_headers {
+                    let _ = write!(resp, "{k}: {v}\r\n");
+                }
+                resp.push_str("\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        CloudStubServer {
+            base_url: format!("http://{addr}"),
+            recorded,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn seed_registered_cloud_ctx(
+        dir: &Path,
+        base_url: &str,
+    ) -> (AiExecutionContext, Arc<crate::storage::StorageDb>) {
+        use crate::credentials::CREDENTIALS_FILE_NAME;
+        use crate::credentials::test_helpers::MemoryRootSecretStore;
+        use crate::storage::{CloudState, StorageDb};
+
+        let db = Arc::new(StorageDb::open(dir.join("ruum.db")).unwrap());
+        let root = Arc::new(MemoryRootSecretStore::new([42_u8; 32]));
+        let creds =
+            LazyCredentialStore::new(dir.join(CREDENTIALS_FILE_NAME), root);
+        let sk = creds.load_or_create_cloud_signing_key().unwrap();
+        let dev_id = crate::cloud_identity::derive_device_id(
+            &crate::cloud_identity::signing_key_public_b64(&sk),
+        )
+        .unwrap();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        db.save_cloud_state(&CloudState {
+            gateway_base_url: base_url.to_owned(),
+            device_id: Some(dev_id),
+            subject_id: Some("sub_test".to_owned()),
+            access_token: Some("jwt-test".to_owned()),
+            token_expires_at_secs: exp,
+            ..CloudState::default()
+        })
+        .unwrap();
+        let ctx = AiExecutionContext::default()
+            .with_credential_store(creds)
+            .with_db_path(db.db_path().to_path_buf())
+            .with_cloud_base_url(base_url);
+        (ctx, db)
+    }
+
+    #[test]
+    fn ruum_cloud_test_connection_never_calls_completions_and_benchmark_blocked_on_trial()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        let ent_json = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": false,
+                "source": "trial",
+                "decision": "ALLOW",
+                "trialRemaining": 3,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-ent-1"
+        })
+        .to_string();
+        let models_json = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-mod-1",
+            "data": [{
+                "id": "ruum-fast",
+                "display_name": "Ruum Fast",
+                "tier": "trial",
+                "available": true
+            }]
+        })
+        .to_string();
+
+        let mut server = spawn_cloud_stub(vec![
+            (200, vec![], ent_json.clone()),
+            (200, vec![], models_json),
+            (200, vec![], ent_json),
+        ]);
+        let (ctx, _db) =
+            seed_registered_cloud_ctx(temp.path(), &server.base_url);
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+
+        let conn_res = test_connection_for_config_with_context(
+            &cfg,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("RuumCloud test_connection should succeed");
+        assert!(conn_res.contains("Ruum Cloud"));
+
+        let bench = benchmark_model_for_config_with_context(
+            &cfg,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        );
+        assert!(!bench.ok, "benchmark must be blocked on free trial");
+
+        server.stop();
+        let paths: Vec<String> =
+            server.recorded().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/v1/entitlement/status",
+                "/v1/models",
+                "/v1/entitlement/status"
+            ]
+        );
+        assert!(!paths.iter().any(|p| p.contains("completions")));
+    }
+
+    #[test]
+    fn ruum_cloud_blocks_completions_when_zero_models_available_and_runs_when_available()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("artifact.bin"), b"123456").unwrap();
+
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+
+        // Case 1: 0 available models -> blocked client-side before /v1/chat/completions
+        let ent_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": false,
+                "source": "trial",
+                "decision": "ALLOW",
+                "trialRemaining": 2,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-e1"
+        })
+        .to_string();
+        let no_avail_models = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-m0",
+            "data": [{
+                "id": "ruum-pro",
+                "display_name": "Ruum Pro",
+                "tier": "paid",
+                "available": false
+            }]
+        })
+        .to_string();
+        let mut srv_0 = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], no_avail_models),
+        ]);
+        let (ctx_0, _db_0) =
+            seed_registered_cloud_ctx(temp.path(), &srv_0.base_url);
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+        let err = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_000_999,
+            None,
+            &MockCommandRunner::default(),
+            &ctx_0,
+        )
+        .unwrap_err();
+        srv_0.stop();
+        assert!(!err.is_empty());
+        assert!(
+            !srv_0
+                .recorded()
+                .iter()
+                .any(|r| r.path.contains("completions")),
+            "must block /v1/chat/completions when 0 models available"
+        );
+
+        // Case 2: available model -> succeeds via RuumCloudLlm
+        let avail_models = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-m1",
+            "data": [{
+                "id": "ruum-fast",
+                "display_name": "Ruum Fast",
+                "tier": "trial",
+                "available": true
+            }]
+        })
+        .to_string();
+        let chat_ok = serde_json::json!({
+            "id": "chatcmpl-cloud-1",
+            "object": "chat.completion",
+            "model": "ruum-fast",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::json!({
+                        "summary": "Cloud cleanup",
+                        "items": [{
+                            "path": target.to_string_lossy(),
+                            "mode": "permanent",
+                            "reason": "build artifact"
+                        }]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let temp2 = tempfile::tempdir().unwrap();
+        let mut srv_1 = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok),
+            (200, vec![], avail_models),
+            (200, vec![], chat_ok),
+        ]);
+        let (ctx_1, _db_1) =
+            seed_registered_cloud_ctx(temp2.path(), &srv_1.base_url);
+        let prop = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_001_000,
+            None,
+            &MockCommandRunner::default(),
+            &ctx_1,
+        )
+        .expect("RuumCloud analysis should succeed");
+        srv_1.stop();
+        assert_eq!(prop.summary, "Cloud cleanup");
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.items[0].path, crate::removal::normalize(&target));
+        assert!(
+            srv_1
+                .recorded()
+                .iter()
+                .any(|r| r.path == "/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn ruum_cloud_end_to_end_401_token_refresh_replay_and_tree_analysis() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("node_modules");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("bundle.js"), b"0123456789").unwrap();
+
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+
+        let ent_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": true,
+                "source": "alipay",
+                "decision": "ALLOW",
+                "trialRemaining": 0,
+                "validUntilSecs": exp + 86400,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-ent"
+        })
+        .to_string();
+        let models_ok = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-mod",
+            "data": [{
+                "id": "ruum-pro",
+                "display_name": "Ruum Pro",
+                "tier": "paid",
+                "available": true
+            }]
+        })
+        .to_string();
+        let err_401 = serde_json::json!({
+            "code": "AUTH_TOKEN_EXPIRED",
+            "message": "jwt expired",
+            "traceId": "tr-401-exp",
+            "error": {
+                "code": "AUTH_TOKEN_EXPIRED",
+                "message": "jwt expired",
+                "type": "ruum_gateway_error",
+                "traceId": "tr-401-exp"
+            }
+        })
+        .to_string();
+        let token_refresh_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "accessToken": "jwt-refreshed-2",
+                "expiresAtSecs": exp + 900,
+                "deviceId": "dev_test",
+                "subjectId": "sub_test"
+            },
+            "traceId": "tr-tok-2"
+        })
+        .to_string();
+        let chat_tool_turn = serde_json::json!({
+            "id": "chatcmpl-tool",
+            "object": "chat.completion",
+            "model": "ruum-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_scan_1",
+                        "type": "function",
+                        "function": {
+                            "name": "list_volumes",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+        let chat_final = serde_json::json!({
+            "id": "chatcmpl-final",
+            "object": "chat.completion",
+            "model": "ruum-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::json!({
+                        "summary": "Cloud local cleanup",
+                        "items": [{
+                            "path": target.to_string_lossy(),
+                            "mode": "permanent",
+                            "reason": "rebuildable dependencies"
+                        }]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+
+        let mut srv = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (401, vec![("X-Trace-ID", "tr-401-exp")], err_401),
+            (200, vec![], token_refresh_ok),
+            (200, vec![], chat_tool_turn),
+            (200, vec![], chat_final),
+        ]);
+        let (ctx, _db) = seed_registered_cloud_ctx(temp.path(), &srv.base_url);
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+
+        let prop = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_002_000,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("401 refresh + replay should succeed");
+        srv.stop();
+
+        assert_eq!(prop.summary, "Cloud local cleanup");
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.items[0].path, crate::removal::normalize(&target));
+
+        let reqs = srv.recorded();
+        assert_eq!(reqs.len(), 6);
+        assert_eq!(reqs[2].method, "POST");
+        assert_eq!(reqs[2].path, "/v1/chat/completions");
+        assert_eq!(reqs[3].path, "/v1/auth/token");
+        assert_eq!(
+            reqs[3].header("x-ruum-client-version"),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(reqs[3].header("x-ruum-sig").is_some());
+
+        let s2 = reqs[2].header("x-ruum-session").unwrap();
+        let s4 = reqs[4].header("x-ruum-session").unwrap();
+        let s5 = reqs[5].header("x-ruum-session").unwrap();
+        assert_eq!(s2, s4);
+        assert_eq!(s4, s5);
+        assert_eq!(reqs[4].header("x-ruum-task"), Some("local_analysis"));
+        assert_eq!(reqs[4].body["stream"], serde_json::json!(false));
+        let sent_tools: Vec<&str> = reqs[4].body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| {
+                t.pointer("/function/name").and_then(|v| v.as_str())
+            })
+            .collect();
+        assert!(!sent_tools.is_empty());
+        for t in sent_tools {
+            assert!(ruum_adk::is_allowed_ruum_tool(t), "unexpected tool {t}");
+        }
+
+        // Also test run_tree_analysis via RuumCloudAiAdapter (tree_analysis, 0 tools).
+        let tree_file = temp.path().join("cache.tmp");
+        fs::write(&tree_file, b"abcd").unwrap();
+        let mut tree_node = Node::directory(
+            temp.path().file_name().unwrap().to_string_lossy().as_ref(),
+        );
+        let mut child = Node::entry("cache.tmp", NodeKind::File, 4);
+        child.category = Category::Cache;
+        tree_node.children.push(child);
+        crate::tree::aggregate(&mut tree_node, crate::tree::Metric::Bytes);
+
+        let tree_reply = serde_json::json!({
+            "id": "chatcmpl-tree",
+            "object": "chat.completion",
+            "model": "ruum-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::json!({
+                        "summary": "Remote tree cleanup",
+                        "items": [{
+                            "path": tree_file.to_string_lossy(),
+                            "mode": "permanent",
+                            "reason": "cache"
+                        }]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let temp_tree = tempfile::tempdir().unwrap();
+        let mut srv_tree = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok),
+            (200, vec![], models_ok),
+            (200, vec![], tree_reply),
+        ]);
+        let (ctx_tree, _db_tree) =
+            seed_registered_cloud_ctx(temp_tree.path(), &srv_tree.base_url);
+        let tree_prop = run_tree_analysis_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Some(temp.path()),
+            &tree_node,
+            &DockerProbeStatus::NotInstalled,
+            TrashOs::MacOs,
+            1_700_002_100,
+            &MockCommandRunner::default(),
+            &ctx_tree,
+        )
+        .expect("RuumCloud tree analysis should succeed");
+        srv_tree.stop();
+        assert_eq!(tree_prop.summary, "Remote tree cleanup");
+        assert_eq!(tree_prop.items.len(), 1);
+        let tree_reqs = srv_tree.recorded();
+        assert_eq!(tree_reqs[2].header("x-ruum-task"), Some("tree_analysis"));
+        assert!(tree_reqs[2].body.get("tools").is_none());
+        assert_eq!(tree_reqs[2].body["stream"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn ruum_cloud_preserves_trace_id_on_402_429_and_discovers_virtual_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        let ent_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": false,
+                "source": "trial",
+                "decision": "ALLOW",
+                "trialRemaining": 1,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-e"
+        })
+        .to_string();
+        let models_ok = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-m",
+            "data": [{
+                "id": "ruum-fast",
+                "display_name": "Ruum Fast",
+                "tier": "trial",
+                "available": true
+            }]
+        })
+        .to_string();
+        let err_402 = serde_json::json!({
+            "code": "ENTITLEMENT_PAYMENT_REQUIRED",
+            "message": "trial exhausted",
+            "traceId": "tr-402-pay",
+            "error": {
+                "code": "ENTITLEMENT_PAYMENT_REQUIRED",
+                "message": "trial exhausted",
+                "type": "ruum_gateway_error",
+                "traceId": "tr-402-pay"
+            }
+        })
+        .to_string();
+        let err_429 = serde_json::json!({
+            "code": "INFERENCE_FUP_LIMIT_EXCEEDED",
+            "message": "fup reached",
+            "traceId": "tr-429-fup",
+            "error": {
+                "code": "INFERENCE_FUP_LIMIT_EXCEEDED",
+                "message": "fup reached",
+                "type": "ruum_gateway_error",
+                "traceId": "tr-429-fup"
+            }
+        })
+        .to_string();
+
+        let mut srv = spawn_cloud_stub(vec![
+            (200, vec![], models_ok.clone()),
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (402, vec![("X-Trace-ID", "tr-402-pay")], err_402),
+            (200, vec![], ent_ok),
+            (200, vec![], models_ok),
+            (429, vec![("X-Trace-ID", "tr-429-fup")], err_429),
+        ]);
+        let (ctx, _db) = seed_registered_cloud_ctx(temp.path(), &srv.base_url);
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+
+        let (models, note) = discover_models_for_config_with_context(
+            &cfg,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "ruum-fast");
+        assert_eq!(models[0].provider.as_deref(), Some("ruum-cloud"));
+        assert!(note.is_none());
+
+        let err1 = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_003_000,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err1.contains("[Trace: tr-402-pay]"), "err1={err1}");
+
+        let err2 = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_003_001,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err2.contains("[Trace: tr-429-fup]"), "err2={err2}");
+
+        srv.stop();
+    }
+
+    #[test]
+    fn prepare_cloud_inference_model_precedence_and_auto() {
+        let temp = tempfile::tempdir().unwrap();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        let ent_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": true,
+                "source": "alipay",
+                "decision": "ALLOW",
+                "trialRemaining": 0,
+                "validUntilSecs": exp + 86400,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-ent-pref"
+        })
+        .to_string();
+        let models_ok = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-mod-pref",
+            "data": [
+                {
+                    "id": "ruum-fast",
+                    "display_name": "Ruum Fast",
+                    "tier": "trial",
+                    "available": true
+                },
+                {
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "tier": "paid",
+                    "available": true
+                },
+                {
+                    "id": "ruum-locked",
+                    "display_name": "Ruum Locked",
+                    "tier": "paid",
+                    "available": false
+                }
+            ]
+        })
+        .to_string();
+
+        let mut srv = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (200, vec![], ent_ok.clone()),
+            (200, vec![], models_ok.clone()),
+            (200, vec![], ent_ok),
+            (200, vec![], models_ok),
+        ]);
+        let (ctx, db) = seed_registered_cloud_ctx(temp.path(), &srv.base_url);
+        let client = build_cloud_client_from_context(&ctx).unwrap();
+
+        // 1. Auto (None everywhere) resolves to "auto" when models exist.
+        let auto_cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            model: None,
+            ..AiConfig::default()
+        };
+        let (_, chosen_auto) =
+            prepare_cloud_inference_model(&client, &auto_cfg, None).unwrap();
+        assert_eq!(chosen_auto, CLOUD_AUTO_MODEL_ID);
+        assert_eq!(chosen_auto, "auto");
+        assert_eq!(db.load_cloud_state().unwrap().selected_model_id, None);
+
+        // 2. Fallback to cloud_state.selected_model_id when config.model is None.
+        let mut st = db.load_cloud_state().unwrap();
+        st.selected_model_id = Some("ruum-pro".to_owned());
+        db.save_cloud_state(&st).unwrap();
+        let (_, chosen_cached) =
+            prepare_cloud_inference_model(&client, &auto_cfg, None).unwrap();
+        assert_eq!(chosen_cached, "ruum-pro");
+
+        // 3. config.model takes precedence over cloud_state.selected_model_id.
+        let explicit_cfg = AiConfig {
+            model: Some("ruum-fast".to_owned()),
+            ..auto_cfg
+        };
+        let (_, chosen_cfg) =
+            prepare_cloud_inference_model(&client, &explicit_cfg, None)
+                .unwrap();
+        assert_eq!(chosen_cfg, "ruum-fast");
+
+        // 4. model_override takes precedence over config.model and cloud_state.
+        let (_, chosen_override) = prepare_cloud_inference_model(
+            &client,
+            &explicit_cfg,
+            Some("ruum-pro"),
+        )
+        .unwrap();
+        assert_eq!(chosen_override, "ruum-pro");
+
+        // 5. Stale/unknown model preference falls back to "auto".
+        let (_, chosen_stale) = prepare_cloud_inference_model(
+            &client,
+            &explicit_cfg,
+            Some("stale-removed-model"),
+        )
+        .unwrap();
+        assert_eq!(chosen_stale, CLOUD_AUTO_MODEL_ID);
+
+        // 6. Unavailable model preference falls back to "auto".
+        let (_, chosen_unavailable) = prepare_cloud_inference_model(
+            &client,
+            &explicit_cfg,
+            Some("ruum-locked"),
+        )
+        .unwrap();
+        assert_eq!(chosen_unavailable, CLOUD_AUTO_MODEL_ID);
+
+        srv.stop();
     }
 }

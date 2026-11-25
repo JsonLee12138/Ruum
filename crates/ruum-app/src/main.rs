@@ -20,6 +20,7 @@ mod marks;
 mod notifications;
 mod palette;
 mod power;
+mod qr;
 mod rail_pages;
 mod state;
 #[cfg(test)]
@@ -3092,7 +3093,8 @@ pub(crate) fn trigger_background_ai_analysis_with(
         let ai_cfg = db.load_ai_config().unwrap_or_default();
         let now_secs = now_unix_secs();
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
-        let mut ai_ctx = ruum_core::ai_cli::AiExecutionContext::default();
+        let mut ai_ctx = ruum_core::ai_cli::AiExecutionContext::default()
+            .with_db_path(db.db_path().to_path_buf());
         if let Some(store) = shared_cred_store {
             ai_ctx = ai_ctx.with_credential_store(store);
         }

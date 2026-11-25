@@ -52,6 +52,12 @@ pub const AI_CREDENTIAL_SERVICE: &str = "ruum.ai";
 /// Account identifier for the stored direct AI API key.
 pub const AI_DIRECT_API_KEY_ACCOUNT: &str = "direct-api-key";
 
+/// Credential namespace used for Ruum Cloud device signing keys.
+pub const CLOUD_CREDENTIAL_SERVICE: &str = "ruum.cloud";
+
+/// Account identifier for the stored Ed25519 device signing key seed.
+pub const CLOUD_SIGNING_KEY_ACCOUNT: &str = "device-signing-key-v1";
+
 const MAGIC: &[u8; 4] = b"RMDC";
 const VERSION_EMPTY_AAD: u8 = 1;
 const VERSION_BOUND_AAD: u8 = 2;
@@ -1005,6 +1011,78 @@ impl LazyCredentialStore {
     pub fn has_ai_api_key(&self) -> Result<bool, String> {
         Ok(self.get_ai_api_key()?.is_some())
     }
+
+    /// Load the Ruum Cloud Ed25519 signing key on demand (zero keychain calls
+    /// when `device-credentials.enc` does not exist yet).
+    pub fn get_cloud_signing_key(
+        &self,
+    ) -> Result<Option<ed25519_dalek::SigningKey>, String> {
+        let Some(raw) =
+            self.get(CLOUD_CREDENTIAL_SERVICE, CLOUD_SIGNING_KEY_ACCOUNT)?
+        else {
+            return Ok(None);
+        };
+        let seed = decode_ed25519_seed(&raw)?;
+        Ok(Some(ed25519_dalek::SigningKey::from_bytes(&seed)))
+    }
+
+    /// Load or lazily create and persist a 32-byte Ed25519 device signing key
+    /// inside `ruum.cloud`.
+    pub fn load_or_create_cloud_signing_key(
+        &self,
+    ) -> Result<ed25519_dalek::SigningKey, String> {
+        if let Some(existing) = self.get_cloud_signing_key()? {
+            return Ok(existing);
+        }
+        let mut seed = Zeroizing::new([0_u8; 32]);
+        OsRng.fill_bytes(seed.as_mut());
+        let encoded = Zeroizing::new(STANDARD.encode(seed.as_ref()));
+        self.set(
+            CLOUD_CREDENTIAL_SERVICE,
+            CLOUD_SIGNING_KEY_ACCOUNT,
+            encoded.as_bytes(),
+        )?;
+        Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+    }
+
+    /// Remove the stored Ruum Cloud Ed25519 device signing key if present.
+    pub fn delete_cloud_signing_key(&self) -> Result<(), String> {
+        self.delete(CLOUD_CREDENTIAL_SERVICE, CLOUD_SIGNING_KEY_ACCOUNT)
+    }
+
+    /// Return whether a Ruum Cloud Ed25519 device signing key is stored.
+    pub fn has_cloud_signing_key(&self) -> Result<bool, String> {
+        Ok(self.get_cloud_signing_key()?.is_some())
+    }
+}
+
+fn decode_ed25519_seed(raw: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+    if raw.len() == 32 {
+        let mut seed = Zeroizing::new([0_u8; 32]);
+        seed.copy_from_slice(raw);
+        return Ok(seed);
+    }
+    let text = std::str::from_utf8(raw)
+        .map_err(|e| format!("解码云端设备密钥失败: {e}"))?
+        .trim();
+    if let Ok(decoded) = STANDARD.decode(text).map(Zeroizing::new)
+        && decoded.len() == 32
+    {
+        let mut seed = Zeroizing::new([0_u8; 32]);
+        seed.copy_from_slice(&decoded);
+        return Ok(seed);
+    }
+    if text.len() == 64 {
+        let mut seed = Zeroizing::new([0_u8; 32]);
+        for (idx, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(chunk)
+                .map_err(|_| "无效的云端设备密钥编码".to_owned())?;
+            seed[idx] = u8::from_str_radix(pair, 16)
+                .map_err(|_| "无效的云端设备十六进制密钥".to_owned())?;
+        }
+        return Ok(seed);
+    }
+    Err("云端设备密钥长度无效".to_owned())
 }
 
 /// Namespaced view into a [`LazyCredentialStore`].
@@ -1678,5 +1756,51 @@ mod tests {
         store.delete_ai_api_key().unwrap();
         assert!(!store.has_ai_api_key().unwrap());
         assert!(store.get_ai_api_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn cloud_signing_key_lazy_crud_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join(CREDENTIALS_FILE_NAME);
+        let root_store = Arc::new(MemoryRootSecretStore::new([77_u8; 32]));
+        let store =
+            LazyCredentialStore::new(file_path.clone(), root_store.clone());
+
+        assert_eq!(CLOUD_CREDENTIAL_SERVICE, "ruum.cloud");
+
+        // Construction and missing-file reads trigger zero keychain calls.
+        assert!(!store.has_cloud_signing_key().unwrap());
+        assert!(store.get_cloud_signing_key().unwrap().is_none());
+        store.delete_cloud_signing_key().unwrap();
+        assert_eq!(root_store.call_count(), 0);
+        assert!(!file_path.exists());
+
+        // Creating lazily hits the keychain once and persists the 32-byte seed.
+        let key1 = store.load_or_create_cloud_signing_key().unwrap();
+        assert_eq!(root_store.call_count(), 1);
+        assert!(file_path.exists());
+        assert!(store.has_cloud_signing_key().unwrap());
+
+        // Subsequent reads reuse the cached state without extra keychain calls.
+        let key2 = store.load_or_create_cloud_signing_key().unwrap();
+        assert_eq!(key1.to_bytes(), key2.to_bytes());
+        assert_eq!(
+            store.get_cloud_signing_key().unwrap().unwrap().to_bytes(),
+            key1.to_bytes()
+        );
+        assert_eq!(root_store.call_count(), 1);
+
+        // Fresh store instance reloads the exact same key from disk.
+        let root_store_reopen =
+            Arc::new(MemoryRootSecretStore::new([77_u8; 32]));
+        let reopened =
+            LazyCredentialStore::new(file_path, root_store_reopen.clone());
+        assert_eq!(root_store_reopen.call_count(), 0);
+        let key3 = reopened.load_or_create_cloud_signing_key().unwrap();
+        assert_eq!(key3.to_bytes(), key1.to_bytes());
+        assert_eq!(root_store_reopen.call_count(), 1);
+
+        reopened.delete_cloud_signing_key().unwrap();
+        assert!(!reopened.has_cloud_signing_key().unwrap());
     }
 }

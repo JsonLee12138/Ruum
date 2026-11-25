@@ -229,12 +229,51 @@ pub enum AdkClientError {
     /// Operation exceeded its configured timeout.
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
+    /// Cloud gateway returned an API error or network failure.
+    #[error(
+        "cloud gateway error{}: {message}",
+        format_cloud_error_meta(*status, code.as_deref(), trace_id.as_deref())
+    )]
+    CloudGateway {
+        /// Optional HTTP status code.
+        status: Option<u16>,
+        /// Optional gateway error code (e.g. `ENTITLEMENT_PAYMENT_REQUIRED`).
+        code: Option<String>,
+        /// Sanitized error message.
+        message: String,
+        /// Optional `X-Trace-ID` returned by the gateway.
+        trace_id: Option<String>,
+        /// Whether the failure was caused by a timeout.
+        is_timeout: bool,
+    },
     /// Agent exceeded `max_iterations` without completing.
     #[error("agent exceeded max iterations ({0}) without a final response")]
     MaxIterationsExceeded(u32),
     /// Model or runtime failure.
     #[error("model error: {0}")]
     Model(String),
+}
+
+fn format_cloud_error_meta(
+    status: Option<u16>,
+    code: Option<&str>,
+    trace_id: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(st) = status {
+        parts.push(format!("HTTP {st}"));
+    }
+    if let Some(c) = code.filter(|s| !s.is_empty()) {
+        parts.push(c.to_owned());
+    }
+    if let Some(tid) = trace_id.filter(|s| !s.is_empty()) {
+        parts.push(format!("Trace: {tid}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 fn format_status(status: Option<u16>) -> String {

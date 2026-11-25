@@ -3367,6 +3367,7 @@ esac
     update(&view, cx, |app, cx| {
         app.screen = Screen::Settings;
         app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.ai_config.setup_completed = true;
         app.ai_config.provider = AiCliProvider::Agy;
         app.watchdog_draft.ai_provider = AiCliProvider::Agy;
         app.ai_config.custom_command = fake_cli.to_string_lossy().to_string();
@@ -4091,6 +4092,19 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
     assert_eq!(
         fresh_val(fresh_cx, |a| &a.watchdog_input_model),
         "gpt-5-codex"
+    );
+
+    // Saving settings must preserve an existing `setup_completed = true` flag.
+    fresh_cx.update(|window, cx| {
+        fresh_view.update(cx, |app, cx| {
+            app.ai_config.setup_completed = true;
+            app.save_watchdog_settings(window, cx);
+        });
+    });
+    assert!(
+        db.load_ai_config()
+            .expect("reloaded ai cfg")
+            .setup_completed
     );
 }
 
@@ -6198,6 +6212,7 @@ fn slice3_remote_snapshot_ai_analysis_and_platform_script_selection(
     };
     update(&view, cx, |app, cx| {
         app.cred_store = Some(counter.store_for(&enc_path));
+        app.ai_config.setup_completed = true;
         app.ssh_profiles = vec![profile];
         app.analyze_ssh_profile("srv-ai-err", cx);
     });
@@ -8932,6 +8947,7 @@ fn local_ai_analysis_failure_notifies_and_persists_open_and_closed(
         app.db_path = Some(db_path.clone());
         app.cred_store = Some(store.clone());
         app.set_locale(Locale::Zh);
+        app.ai_config.setup_completed = true;
         app.ai_config.provider = AiCliProvider::Api;
         app.watchdog_draft.ai_provider = AiCliProvider::Api;
         app.ai_config.api_base_url = format!("http://{addr_fail}/v1");
@@ -9059,6 +9075,7 @@ fn local_ai_analysis_failure_notifies_and_persists_open_and_closed(
         app.db_path = Some(db_for_win.clone());
         app.cred_store = Some(store_for_win.clone());
         app.set_locale(Locale::En);
+        app.ai_config.setup_completed = true;
         app.ai_config.provider = AiCliProvider::Api;
         app.watchdog_draft.ai_provider = AiCliProvider::Api;
         app.ai_config.api_base_url = format!("http://{addr2}/v1");
@@ -9140,6 +9157,7 @@ fn remote_ssh_ai_analysis_failure_notifies_and_persists_open_and_closed(
     update(&view, win_cx, |app, cx| {
         app.db_path = Some(db_path.clone());
         app.cred_store = Some(counter.store_for(&enc_path));
+        app.ai_config.setup_completed = true;
         app.ssh_profiles = vec![profile.clone()];
         app.analyze_ssh_profile("srv-ai-err", cx);
     });
@@ -9192,6 +9210,7 @@ fn remote_ssh_ai_analysis_failure_notifies_and_persists_open_and_closed(
         let mut app = Ruum::with_tree(root2.clone(), tree2, options(), 3, cx);
         app.db_path = Some(db_for_win.clone());
         app.cred_store = Some(store2.clone());
+        app.ai_config.setup_completed = true;
         app.ssh_profiles = vec![profile];
         app
     });
@@ -10984,6 +11003,7 @@ fn explore_ai_button_local_click_dispatches_and_guards_reentry(
         app.db_path = Some(db_path);
         app.cred_store = Some(store);
         app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
         app.ai_config.provider = AiCliProvider::Api;
         app.watchdog_draft.ai_provider = AiCliProvider::Api;
         app.ai_config.api_base_url = format!("http://{addr}/v1");
@@ -11104,6 +11124,7 @@ fn explore_ai_button_ssh_tab_dispatches_and_respects_state(
     update(&view, win_cx, |app, cx| {
         app.db_path = Some(db_path);
         app.cred_store = Some(counter.store_for(&enc_path));
+        app.ai_config.setup_completed = true;
         app.ssh_profiles = vec![profile.clone()];
         app.host_tabs.push(ExploreHostTab {
             key: HostTabKey::Ssh(profile.id.clone()),
@@ -11182,4 +11203,4657 @@ fn explore_ai_button_ssh_tab_dispatches_and_respects_state(
         assert_eq!(*status, gpui_omarchy::Status::Error);
         assert!(msg.contains("prod-ai"), "unexpected notice: {msg}");
     });
+}
+
+#[derive(Clone, Debug)]
+struct StubCloudRequest {
+    method: String,
+    path: String,
+    headers: String,
+    body: String,
+}
+
+#[derive(Clone, Debug)]
+struct StubCloudReply {
+    status: String,
+    trace_id: Option<String>,
+    body: String,
+}
+
+struct TestCloudStubServer {
+    addr: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<StubCloudRequest>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestCloudStubServer {
+    fn start<F>(handler: F) -> Self
+    where
+        F: Fn(&StubCloudRequest) -> StubCloudReply + Send + Sync + 'static,
+    {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind stub cloud server");
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking stub listener");
+        let addr = listener.local_addr().expect("stub local_addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let req_srv = Arc::clone(&requests);
+
+        let thread = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream
+                            .set_read_timeout(Some(Duration::from_secs(5)));
+                        let (headers, body) =
+                            read_test_http_request(&mut stream);
+                        let first_line =
+                            headers.lines().next().unwrap_or_default();
+                        let mut parts = first_line.split_whitespace();
+                        let method = parts.next().unwrap_or("GET").to_owned();
+                        let path = parts.next().unwrap_or("/").to_owned();
+                        let rec = StubCloudRequest {
+                            method,
+                            path,
+                            headers,
+                            body,
+                        };
+                        let reply = handler(&rec);
+                        req_srv.lock().expect("lock requests").push(rec);
+                        let trace_hdr = reply
+                            .trace_id
+                            .as_deref()
+                            .map_or_else(String::new, |tid| {
+                                format!("X-Trace-ID: {tid}\r\n")
+                            });
+                        let resp = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\n\
+                             {trace_hdr}Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{}",
+                            reply.status,
+                            reply.body.len(),
+                            reply.body,
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            stop,
+            requests,
+            thread: Some(thread),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn recorded_requests(&self) -> Vec<StubCloudRequest> {
+        self.requests.lock().expect("lock requests").clone()
+    }
+}
+
+impl Drop for TestCloudStubServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn stub_cloud_models_json(models: &serde_json::Value) -> String {
+    serde_json::json!({
+        "object": "list",
+        "data": models,
+    })
+    .to_string()
+}
+
+fn stub_cloud_entitlement_json(
+    is_paid: bool,
+    source: &str,
+    decision: &str,
+    trial_remaining: u64,
+    valid_until_secs: Option<u64>,
+    fup_zone: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "subjectId": "sub-test-1",
+        "deviceId": "dev-test-1",
+        "isPaid": is_paid,
+        "source": source,
+        "decision": decision,
+        "trialRemaining": trial_remaining,
+        "validUntilSecs": valid_until_secs,
+        "fupZone": fup_zone,
+        "syncedAtSecs": 1_700_000_000_u64,
+    })
+}
+
+fn seed_cloud_auth_and_state(
+    db_path: &Path,
+    store: &ruum_core::credentials::LazyCredentialStore,
+    base_url: &str,
+    entitlement_json: Option<String>,
+    models_json: Option<String>,
+    selected_model_id: Option<String>,
+) {
+    use ruum_core::storage::{CloudState, StorageDb};
+
+    let _ = store.load_or_create_cloud_signing_key().expect("seed key");
+    let db = StorageDb::open(db_path).expect("open db");
+    db.save_cloud_state(&CloudState {
+        gateway_base_url: base_url.to_owned(),
+        device_id: Some("dev-test-1".into()),
+        subject_id: Some("sub-test-1".into()),
+        access_token: Some("jwt-test-token-value".into()),
+        token_expires_at_secs: 4_102_444_800,
+        entitlement_json,
+        models_json,
+        selected_model_id,
+        plans_json: None,
+        plans_cached_at_secs: 0,
+        install_salt: None,
+        last_synced_at_secs: 1_700_000_000,
+        updated_at_secs: 1_700_000_000,
+    })
+    .expect("save cloud_state");
+}
+
+#[gpui_kit::test]
+fn cloud_cold_startup_and_settings_render_zero_keychain_zero_network(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-cold.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x31; 32]);
+
+    let server = TestCloudStubServer::start(|_| {
+        StubCloudReply {
+        status: "200 OK".into(),
+        trace_id: Some("tr-unexpected".into()),
+        body: r#"{"code":"OK","message":"ok","data":{},"traceId":"tr-unexpected"}"#
+            .into(),
+    }
+    });
+
+    // Ensure empty DB exists with default `setup_completed = false`.
+    {
+        let db = StorageDb::open(&db_path).expect("open fresh db");
+        assert!(!db.load_ai_config().expect("load ai").setup_completed);
+    }
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(900.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.cloud_base_url_override = Some(server.base_url());
+        app.reload_watchdog_config_and_prepare_settings();
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(win_cx);
+
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+    read(&view, win_cx, |app| {
+        assert!(!app.ai_config.setup_completed);
+    });
+
+    // Even when `cloud_state` has cached entitlement + models and provider is
+    // RuumCloud, rendering Settings reads purely from SQLite cache (0 keychain,
+    // 0 network).
+    let cached_ent = stub_cloud_entitlement_json(
+        true,
+        "alipay",
+        "ALLOW",
+        0,
+        Some(1_893_456_000),
+        "green",
+    )
+    .to_string();
+    let cached_models = stub_cloud_models_json(&serde_json::json!([
+        {
+            "id": "ruum-fast",
+            "display_name": "Ruum Fast",
+            "description": "Quick cloud model",
+            "tier": "trial",
+            "available": true,
+            "owned_by": "secret-upstream-channel-do-not-render"
+        }
+    ]));
+    {
+        use ruum_core::storage::CloudState;
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.save_cloud_state(&CloudState {
+            gateway_base_url: server.base_url(),
+            entitlement_json: Some(cached_ent),
+            models_json: Some(cached_models),
+            selected_model_id: Some("ruum-fast".into()),
+            ..CloudState::default()
+        })
+        .expect("save cached cloud_state");
+    }
+
+    update(&view, win_cx, |app, cx| {
+        app.reload_watchdog_config_and_prepare_settings();
+        app.set_watchdog_provider(AiCliProvider::RuumCloud, cx);
+    });
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-settings-card").is_some());
+    assert!(win_cx.debug_bounds("cloud-entitlement-badge").is_some());
+    assert!(win_cx.debug_bounds("cloud-fup-pill").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-0").is_some());
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+}
+
+#[gpui_kit::test]
+fn ai_setup_choice_modal_triggers_across_all_three_entries_and_persists(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-setup.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x32; 32]);
+
+    let server = TestCloudStubServer::start(|req| {
+        match req.path.as_str() {
+        "/v1/entitlement/status" | "/v1/entitlement/status?refresh=1" => {
+            StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-ent".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": stub_cloud_entitlement_json(false, "trial", "ALLOW", 3, None, "green"),
+                    "traceId": "tr-ent",
+                })
+                .to_string(),
+            }
+        }
+        "/v1/models" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-models".into()),
+            body: stub_cloud_models_json(&serde_json::json!([{
+                "id": "ruum-fast",
+                "display_name": "Ruum Fast",
+                "description": "Trial model",
+                "tier": "trial",
+                "available": true
+            }])),
+        },
+        "/v1/chat/completions" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-chat".into()),
+            body: serde_json::json!({
+                "id": "chat-1",
+                "object": "chat.completion",
+                "model": "ruum-fast",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": r#"{"summary":"All clean","items":[]}"#
+                    },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        },
+        other => panic!("unexpected path: {other}"),
+    }
+    });
+
+    let profile = SshProfile {
+        id: "srv-setup".into(),
+        alias: "setup-box".into(),
+        host: "127.0.0.1".into(),
+        port: 22,
+        username: "deploy".into(),
+        auth_mode: AuthMode::Password,
+        default_path: Some("~".into()),
+        created_at_secs: 1,
+        updated_at_secs: 1,
+        last_total_bytes: None,
+        last_available_bytes: None,
+        last_scanned_secs: None,
+        pending_script_path: None,
+        pending_script_items: None,
+        pending_reclaim_bytes: None,
+        pending_created_secs: None,
+    };
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(900.)));
+    update(&view, win_cx, |app, _| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(counter.store_for(&enc_path));
+        app.cloud_base_url_override = Some(server.base_url());
+        app.ssh_profiles = vec![profile];
+        app.ai_config.setup_completed = false;
+        app.watchdog_draft.ai_auto_analyze = false;
+    });
+
+    // Entry 1: `run_ai_analysis_now` opens `AiSetupChoiceModal`; cancelling via
+    // Escape keeps `setup_completed = false` with 0 keychain/network calls.
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("ai-setup-choice-modal").is_some());
+    assert!(win_cx.debug_bounds("ai-setup-choice-cloud").is_some());
+    assert!(win_cx.debug_bounds("ai-setup-choice-api").is_some());
+    assert!(win_cx.debug_bounds("ai-setup-choice-cli").is_some());
+    press(win_cx, "escape");
+    read(&view, win_cx, |app| {
+        assert!(app.ai_setup_choice_modal.is_none());
+        assert!(!app.ai_config.setup_completed);
+        assert!(!app.watchdog_analyzing);
+    });
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+
+    // Entry 2: `analyze_ssh_profile` opens `AiSetupChoiceModal`; Cancel button
+    // dismisses without setting `setup_completed` or calling keychain/network.
+    update(&view, win_cx, |app, cx| {
+        app.analyze_ssh_profile("srv-setup", cx);
+    });
+    draw(win_cx);
+    let cancel_bounds = win_cx
+        .debug_bounds("ai-setup-choice-cancel")
+        .expect("ai-setup-choice-cancel");
+    win_cx.simulate_click(cancel_bounds.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(app.ai_setup_choice_modal.is_none());
+        assert!(!app.ai_config.setup_completed);
+        assert!(app.ssh_analyzing_profiles.is_empty());
+    });
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+
+    // Entry 3: Enabling Watchdog auto-analyze while `!setup_completed` opens
+    // `AiSetupChoiceModal` and leaves `ai_auto_analyze == false` on cancel.
+    update(&view, win_cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.watchdog_draft.ai_auto_analyze = false;
+        app.set_watchdog_ai_auto_analyze(true, cx);
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("ai-setup-choice-modal").is_some());
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_draft.ai_auto_analyze);
+    });
+    update(&view, win_cx, Ruum::cancel_ai_setup_choice);
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(app.ai_setup_choice_modal.is_none());
+        assert!(!app.ai_config.setup_completed);
+        assert!(!app.watchdog_draft.ai_auto_analyze);
+    });
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+
+    // Confirming Watchdog toggle with `RuumCloud` persists `setup_completed = true`
+    // and `provider = RuumCloud` and completes enabling `ai_auto_analyze`.
+    update(&view, win_cx, |app, cx| {
+        app.set_watchdog_ai_auto_analyze(true, cx);
+    });
+    draw(win_cx);
+    let cloud_card = win_cx
+        .debug_bounds("ai-setup-choice-cloud")
+        .expect("ai-setup-choice-cloud");
+    win_cx.simulate_click(cloud_card.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(app.ai_setup_choice_modal.is_none());
+        assert!(app.ai_config.setup_completed);
+        assert_eq!(app.ai_config.provider, AiCliProvider::RuumCloud);
+        assert_eq!(app.watchdog_draft.ai_provider, AiCliProvider::RuumCloud);
+        assert!(app.watchdog_draft.ai_auto_analyze);
+        assert!(app.ai_config.auto_analyze_on_alert);
+    });
+    let saved_ai = StorageDb::open(&db_path)
+        .expect("open db")
+        .load_ai_config()
+        .expect("load ai");
+    assert!(saved_ai.setup_completed);
+    assert_eq!(saved_ai.provider, AiCliProvider::RuumCloud);
+    assert!(saved_ai.auto_analyze_on_alert);
+
+    // Reset `setup_completed = false`, seed cloud auth, trigger `run_ai_analysis_now`,
+    // and choose `RuumCloud`: verifies onboarding executes the cloud analysis!
+    let store = counter.store_for(&enc_path);
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        None,
+        None,
+        None,
+    );
+    update(&view, win_cx, |app, cx| {
+        app.ai_config.setup_completed = false;
+        app.ai_config.provider = AiCliProvider::Agy;
+        app.watchdog_draft.ai_provider = AiCliProvider::Agy;
+        app.run_ai_analysis_now(cx);
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("ai-setup-choice-modal").is_some());
+    update(&view, win_cx, |app, cx| {
+        app.confirm_ai_setup_choice(crate::state::AiSetupChoice::RuumCloud, cx);
+    });
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        assert!(app.ai_config.setup_completed);
+        assert_eq!(app.ai_config.provider, AiCliProvider::RuumCloud);
+        assert!(!app.watchdog_analyzing);
+        assert_eq!(app.ai_last_error, None);
+    });
+    assert!(server.recorded_requests().iter().any(|r| {
+        r.method == "POST"
+            && r.path == "/v1/chat/completions"
+            && r.headers.to_ascii_lowercase().contains("authorization")
+            && !r.body.is_empty()
+    }));
+}
+
+#[gpui_kit::test]
+fn ruum_cloud_settings_virtual_models_auto_select_locked_notice_and_hidden_inputs(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-models.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x33; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let all_locked = Arc::new(AtomicBool::new(false));
+    let all_locked_srv = Arc::clone(&all_locked);
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/entitlement/status" | "/v1/entitlement/status?refresh=1" => {
+                let locked = all_locked_srv.load(Ordering::Acquire);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-ent".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            false,
+                            "trial",
+                            if locked { "DENY" } else { "ALLOW" },
+                            if locked { 0 } else { 2 },
+                            None,
+                            "green",
+                        ),
+                        "traceId": "tr-ent",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => {
+                let locked = all_locked_srv.load(Ordering::Acquire);
+                let models = if locked {
+                    serde_json::json!([
+                        {
+                            "id": "ruum-pro",
+                            "display_name": "Ruum Pro",
+                            "description": "High-reasoning paid tier model",
+                            "tier": "paid",
+                            "available": false,
+                            "owned_by": "secret-upstream-volcengine"
+                        }
+                    ])
+                } else {
+                    serde_json::json!([
+                        {
+                            "id": "ruum-pro",
+                            "display_name": "Ruum Pro",
+                            "description": "High-reasoning paid tier model",
+                            "tier": "paid",
+                            "available": false,
+                            "owned_by": "secret-upstream-volcengine"
+                        },
+                        {
+                            "id": "ruum-fast",
+                            "display_name": "Ruum Fast",
+                            "description": "Fast trial model",
+                            "tier": "trial",
+                            "available": true,
+                            "owned_by": "secret-upstream-xiaomi"
+                        }
+                    ])
+                };
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-models".into()),
+                    body: stub_cloud_models_json(&models),
+                }
+            }
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-plans".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "DISABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": []
+                    },
+                    "traceId": "tr-plans",
+                })
+                .to_string(),
+            },
+            "/v1/chat/completions" => {
+                panic!("test must NOT hit /v1/chat/completions")
+            }
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        None,
+        None,
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.set_watchdog_provider(AiCliProvider::RuumCloud, cx);
+    });
+    draw(win_cx);
+
+    // Switching to RuumCloud in Settings marks `setup_completed = true` and
+    // hides irrelevant BYOK/CLI inputs.
+    read(&view, win_cx, |app| {
+        assert!(app.ai_config.setup_completed);
+    });
+    assert!(win_cx.debug_bounds("cloud-settings-card").is_some());
+    assert!(win_cx.debug_bounds("setting-custom-cmd-input").is_none());
+    assert!(win_cx.debug_bounds("setting-extra-args-input").is_none());
+    assert!(win_cx.debug_bounds("setting-api-base-url-input").is_none());
+    assert!(win_cx.debug_bounds("setting-api-key-input").is_none());
+    assert!(win_cx.debug_bounds("setting-api-protocol-openai").is_none());
+    assert!(win_cx.debug_bounds("setting-model-input").is_none());
+
+    // `Test Connection` hits only `/v1/entitlement/status` & `/v1/models`,
+    // preserves `None` (`Auto (Recommended)`), and hides benchmark controls
+    // while `!is_paid`.
+    update(&view, win_cx, Ruum::test_watchdog_ai_cli);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+        let models = app.cached_cloud_models();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].tier, "paid");
+        assert!(!models[0].available);
+        assert_eq!(models[1].tier, "trial");
+        assert!(models[1].available);
+    });
+    assert!(win_cx.debug_bounds("cloud-fetch-models-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-virtual-models-list").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-auto").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-0").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-1").is_some());
+    assert!(win_cx.debug_bounds("cloud-models-locked-notice").is_none());
+    assert!(win_cx.debug_bounds("setting-speed-all-btn").is_none());
+    assert!(win_cx.debug_bounds("setting-model-speed-0").is_none());
+    assert!(
+        server
+            .recorded_requests()
+            .iter()
+            .all(|r| r.path != "/v1/chat/completions")
+    );
+
+    // Selecting `ruum-fast` persists it; clicking `Auto` restores `None`.
+    let fast_row = win_cx
+        .debug_bounds("cloud-model-row-1")
+        .expect("cloud-model-row-1");
+    win_cx.simulate_click(fast_row.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model.as_deref(), Some("ruum-fast"));
+        assert_eq!(
+            app.cloud_state.selected_model_id.as_deref(),
+            Some("ruum-fast")
+        );
+    });
+    let auto_row = win_cx
+        .debug_bounds("cloud-model-row-auto")
+        .expect("cloud-model-row-auto");
+    win_cx.simulate_click(auto_row.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+    });
+
+    // Refresh when server returns 0 available models (`available == false` for all).
+    all_locked.store(true, Ordering::Release);
+    update(&view, win_cx, Ruum::refresh_cloud_entitlement);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+        assert!(app.cached_cloud_models().iter().all(|m| !m.available));
+    });
+    assert!(win_cx.debug_bounds("cloud-models-locked-notice").is_none());
+    assert!(win_cx.debug_bounds("cloud-locked-upgrade-btn").is_none());
+    assert!(win_cx.debug_bounds("cloud-locked-switch-api-btn").is_none());
+    assert!(win_cx.debug_bounds("cloud-locked-switch-cli-btn").is_none());
+
+    // Client-side guard blocks `run_ai_analysis_now` before
+    // `/v1/chat/completions`, and the redundant locked-notice card stays
+    // absent even when payment is required.
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert!(matches!(app.notice, Some((_, gpui_omarchy::Status::Error))));
+        assert!(app.ai_last_error.is_some());
+        assert!(app.cloud_payment_required);
+    });
+    assert!(win_cx.debug_bounds("cloud-models-locked-notice").is_none());
+    assert!(win_cx.debug_bounds("cloud-locked-upgrade-btn").is_none());
+    assert!(win_cx.debug_bounds("cloud-locked-switch-api-btn").is_none());
+    assert!(win_cx.debug_bounds("cloud-locked-switch-cli-btn").is_none());
+    assert!(
+        server
+            .recorded_requests()
+            .iter()
+            .all(|r| r.path != "/v1/chat/completions")
+    );
+
+    // Clicking the primary `cloud-upgrade-btn` opens the billing modal shell;
+    // Esc closes it.
+    let upg = win_cx
+        .debug_bounds("cloud-upgrade-btn")
+        .expect("cloud-upgrade-btn");
+    win_cx.simulate_click(upg.center(), Modifiers::none());
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-modal").is_some());
+    press(win_cx, "escape");
+    assert!(win_cx.debug_bounds("cloud-billing-modal").is_none());
+
+    // Persisted DB also retained `setup_completed = true`.
+    assert!(
+        StorageDb::open(&db_path)
+            .expect("open db")
+            .load_ai_config()
+            .expect("load ai")
+            .setup_completed
+    );
+}
+
+#[gpui_kit::test]
+fn ruum_cloud_errors_surface_toast_last_error_with_trace_and_keep_local_ops_intact(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-err.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x34; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let mode = Arc::new(AtomicUsize::new(0));
+    let mode_srv = Arc::clone(&mode);
+    let server = TestCloudStubServer::start(move |req| {
+        match req.path.as_str() {
+        "/v1/entitlement/status" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-ent".into()),
+            body: serde_json::json!({
+                "code": "OK",
+                "message": "ok",
+                "data": stub_cloud_entitlement_json(false, "trial", "ALLOW", 1, None, "green"),
+                "traceId": "tr-ent",
+            })
+            .to_string(),
+        },
+        "/v1/models" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-models".into()),
+            body: stub_cloud_models_json(&serde_json::json!([{
+                "id": "ruum-fast",
+                "display_name": "Ruum Fast",
+                "description": "Fast trial model",
+                "tier": "trial",
+                "available": true
+            }])),
+        },
+        "/v1/chat/completions" => match mode_srv.load(Ordering::Acquire) {
+            0 => StubCloudReply {
+                status: "402 Payment Required".into(),
+                trace_id: Some("tr-402-abc".into()),
+                body: serde_json::json!({
+                    "code": "ENTITLEMENT_PAYMENT_REQUIRED",
+                    "message": "trial exhausted",
+                    "traceId": "tr-402-abc",
+                })
+                .to_string(),
+            },
+            1 => StubCloudReply {
+                status: "429 Too Many Requests".into(),
+                trace_id: Some("tr-429-xyz".into()),
+                body: serde_json::json!({
+                    "code": "INFERENCE_FUP_LIMIT_EXCEEDED",
+                    "message": "daily budget exceeded",
+                    "traceId": "tr-429-xyz",
+                })
+                .to_string(),
+            },
+            _ => StubCloudReply {
+                status: "503 Service Unavailable".into(),
+                trace_id: Some("tr-503-qrs".into()),
+                body: serde_json::json!({
+                    "code": "COMMON_UPSTREAM_UNAVAILABLE",
+                    "message": "upstream temporarily unavailable",
+                    "traceId": "tr-503-qrs",
+                })
+                .to_string(),
+            },
+        },
+        other => panic!("unexpected path: {other}"),
+    }
+    });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        None,
+        None,
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        cx.notify();
+    });
+
+    for (idx, expected_trace) in [
+        (0_usize, "tr-402-abc"),
+        (1_usize, "tr-429-xyz"),
+        (2_usize, "tr-503-qrs"),
+    ] {
+        mode.store(idx, Ordering::Release);
+        update(&view, win_cx, Ruum::run_ai_analysis_now);
+        win_cx.run_until_parked();
+        read(&view, win_cx, |app| {
+            assert!(!app.watchdog_analyzing);
+            let (msg, status) = app.notice.as_ref().expect("error toast");
+            assert_eq!(*status, gpui_omarchy::Status::Error);
+            assert!(
+                msg.contains(expected_trace),
+                "toast missing trace {expected_trace}: {msg}"
+            );
+            assert!(!msg.contains("jwt-test-token-value"));
+            let last_err = app.ai_last_error.as_deref().unwrap_or("");
+            assert!(
+                last_err.contains(expected_trace),
+                "last_error missing trace {expected_trace}: {last_err}"
+            );
+            if idx == 0 {
+                assert!(app.cloud_payment_required);
+            }
+        });
+        let db_err = StorageDb::open(&db_path)
+            .expect("open db")
+            .load_ai_state()
+            .expect("load ai state")
+            .last_error
+            .unwrap_or_default();
+        assert!(db_err.contains(expected_trace), "db_err={db_err}");
+    }
+
+    let notifs = win_cx.shown_system_notifications();
+    assert_eq!(notifs.len(), 3);
+    assert!(
+        notifs
+            .iter()
+            .all(|n| n.tag.as_ref() == NOTIF_TAG_AI_ANALYSIS)
+    );
+
+    // Local feature immunity: local marking, Review, and Permanent removal work
+    // 100% normally immediately after cloud errors.
+    let junk_dir = temp.path().join("junk");
+    let keep_file = temp.path().join("keep/notes.txt");
+    assert!(junk_dir.is_dir());
+    assert!(keep_file.is_file());
+
+    update(&view, win_cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        app.marks.toggle(ruum_core::removal::Target {
+            path: junk_dir.clone(),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.open_review();
+        cx.notify();
+    });
+    draw(win_cx);
+    press(win_cx, "enter");
+    assert!(read(&view, win_cx, |app| app.confirm_open));
+    press(win_cx, "enter");
+    assert_eq!(read(&view, win_cx, |app| app.screen), Screen::Running);
+
+    let epoch = read(&view, win_cx, |app| app.run_epoch);
+    let mut finished = false;
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        finished = update(&view, win_cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "local removal finished after cloud errors");
+    assert!(!junk_dir.exists(), "marked junk dir must be removed");
+    assert!(keep_file.is_file(), "unmarked keep file must remain intact");
+}
+
+#[test]
+fn cloud_billing_qr_matrix_encodes_long_alipay_url_with_quiet_zone() {
+    use crate::qr::{QUIET_MODULES, QrMatrix};
+
+    assert_eq!(QUIET_MODULES, 4);
+    assert!(QrMatrix::encode("").is_err());
+    assert!(QrMatrix::encode("   ").is_err());
+
+    let alipay_url = "https://mobilecodec.alipay.com/show.htm?\
+        code=bax0123456789abcdefghijklmnopqrstuvwxyz0123456789\
+        &scene=ruum_pass_year";
+    let matrix = QrMatrix::encode(alipay_url).expect("encode alipay QR");
+    assert!(matrix.width() >= 29, "width={}", matrix.width());
+    assert_eq!(matrix.total_modules(), matrix.width() + 2 * QUIET_MODULES);
+
+    let total = matrix.total_modules();
+    let mut dark_count = 0usize;
+    let mut light_count = 0usize;
+    for y in 0..total {
+        for x in 0..total {
+            let in_quiet = x < QUIET_MODULES
+                || y < QUIET_MODULES
+                || x >= total - QUIET_MODULES
+                || y >= total - QUIET_MODULES;
+            let dark = matrix.is_dark_with_quiet_zone(x, y);
+            if in_quiet {
+                assert!(
+                    !dark,
+                    "quiet zone ({x},{y}) must stay light for Alipay scan"
+                );
+            } else if dark {
+                dark_count += 1;
+            } else {
+                light_count += 1;
+            }
+        }
+    }
+    assert!(dark_count > 0 && light_count > 0);
+    // Finder patterns occupy top-left, top-right, bottom-left corners.
+    assert!(matrix.is_dark(0, 0));
+    assert!(matrix.is_dark(matrix.width() - 1, 0));
+    assert!(matrix.is_dark(0, matrix.width() - 1));
+}
+
+#[test]
+fn cloud_billing_select_safe_browser_url_filters_schemes_and_falls_back() {
+    use crate::state::select_safe_billing_browser_url;
+
+    // Real Alipay returns `alipays://` in `purchaseUrl` and `https://` in
+    // `purchaseQrCode`; desktop browser launcher must safely fall back to HTTPS.
+    assert_eq!(
+        select_safe_billing_browser_url(
+            Some("alipays://platformapi/startapp?appId=20000067"),
+            Some("https://mobilecodec.alipay.com/show.htm?code=abc123"),
+        ),
+        Some("https://mobilecodec.alipay.com/show.htm?code=abc123".to_owned()),
+    );
+
+    // Direct HTTPS `purchaseUrl` takes precedence when present.
+    assert_eq!(
+        select_safe_billing_browser_url(
+            Some("https://checkout.alipay.com/pay?id=42"),
+            Some("https://mobilecodec.alipay.com/show.htm?code=abc123"),
+        ),
+        Some("https://checkout.alipay.com/pay?id=42".to_owned()),
+    );
+
+    // Dangerous and non-loopback plain HTTP schemes must be rejected.
+    assert_eq!(
+        select_safe_billing_browser_url(
+            Some("javascript:alert(1)"),
+            Some("file:///etc/passwd"),
+        ),
+        None,
+    );
+    assert_eq!(
+        select_safe_billing_browser_url(
+            Some("http://evil.example.com/pay"),
+            Some("data:text/html,<script>1</script>"),
+        ),
+        None,
+    );
+
+    // Under `#[cfg(test)]`, loopback HTTP is allowed for local test stubs.
+    assert_eq!(
+        select_safe_billing_browser_url(
+            Some("alipays://app"),
+            Some("http://127.0.0.1:8080/pay"),
+        ),
+        Some("http://127.0.0.1:8080/pay".to_owned()),
+    );
+    assert_eq!(
+        select_safe_billing_browser_url(
+            None,
+            Some("http://localhost:8787/pay"),
+        ),
+        Some("http://localhost:8787/pay".to_owned()),
+    );
+    assert_eq!(
+        select_safe_billing_browser_url(None, Some("http://[::1]:8787/pay"),),
+        Some("http://[::1]:8787/pay".to_owned()),
+    );
+}
+
+#[gpui_kit::test]
+fn cloud_billing_modal_sku_qr_polling_unlocks_and_stops_on_paid_or_close(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-billing-poll.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x41; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let paid = Arc::new(AtomicBool::new(false));
+    let mobile_only_qr = Arc::new(AtomicBool::new(false));
+    let refresh_hits = Arc::new(AtomicUsize::new(0));
+    let paid_srv = Arc::clone(&paid);
+    let mobile_srv = Arc::clone(&mobile_only_qr);
+    let hits_srv = Arc::clone(&refresh_hits);
+
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-plans".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": [
+                            {
+                                "skuId": "pass_month",
+                                "displayName": "Monthly Pass",
+                                "price": "¥2.9",
+                                "durationPeriod": "month"
+                            },
+                            {
+                                "skuId": "pass_year",
+                                "displayName": "Annual Pass",
+                                "price": "¥24.9",
+                                "durationPeriod": "year"
+                            }
+                        ]
+                    },
+                    "traceId": "tr-plans",
+                })
+                .to_string(),
+            },
+            "/v1/billing/purchase" => {
+                let qr = if mobile_srv.load(Ordering::Acquire) {
+                    "alipays://platformapi/startapp?appId=20000067&qr=only"
+                } else {
+                    "https://mobilecodec.alipay.com/show.htm?\
+                 code=bax0987654321abcdefghijklmnopqrstuvwxyz"
+                };
+                StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-purchase".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "decision": "PAY_REQUIRED",
+                        "outRequestNo": "ord-qr-1",
+                        "purchaseUrl": "alipays://platformapi/startapp?appId=1",
+                        "purchaseQrCode": qr,
+                        "expireAtSecs": 4_102_445_400_u64,
+                    },
+                    "traceId": "tr-purchase",
+                })
+                .to_string(),
+            }
+            }
+            "/v1/entitlement/status?refresh=1" => {
+                hits_srv.fetch_add(1, Ordering::AcqRel);
+                let is_paid = paid_srv.load(Ordering::Acquire);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-poll".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            is_paid,
+                            if is_paid { "alipay" } else { "trial" },
+                            if is_paid { "ALLOW" } else { "DENY" },
+                            0,
+                            is_paid.then_some(1_893_456_000),
+                            "green",
+                        ),
+                        "traceId": "tr-poll",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => {
+                let is_paid = paid_srv.load(Ordering::Acquire);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-models".into()),
+                    body: stub_cloud_models_json(&serde_json::json!([
+                        {
+                            "id": "ruum-pro",
+                            "display_name": "Ruum Pro",
+                            "description": "Flagship cloud model",
+                            "tier": "paid",
+                            "available": is_paid,
+                        }
+                    ])),
+                }
+            }
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    {
+        use ruum_core::storage::{AiConfig, StorageDb};
+        let db = StorageDb::open(&db_path).expect("open db");
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+        db.save_ai_config(&cfg).expect("save ai_config");
+    }
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.reload_watchdog_config_and_prepare_settings();
+        app.reload_cloud_state();
+        app.sync_selected_cloud_model();
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // Plans fetched & rendered dynamically as SKU cards, with no redeem input
+    // inside the billing modal and Confirm button present.
+    assert!(win_cx.debug_bounds("cloud-billing-modal").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-redeem-control")
+            .is_none()
+    );
+    assert!(win_cx.debug_bounds("cloud-billing-sku-0").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-1").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-confirm-btn").is_some());
+
+    // Clicking SKU only switches selection (zero purchase request); clicking
+    // Confirm transitions into Step 2 QR checkout mode.
+    let sku0 = win_cx
+        .debug_bounds("cloud-billing-sku-0")
+        .expect("cloud-billing-sku-0");
+    win_cx.simulate_click(sku0.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("billing modal open");
+        assert_eq!(modal.step, crate::state::BillingModalStep::SelectPlan);
+        assert!(modal.active_order.is_none());
+    });
+
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-open-browser").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-hint").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-refresh-btn").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-mobile-only-hint")
+            .is_none()
+    );
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("billing modal open");
+        assert_eq!(modal.step, crate::state::BillingModalStep::Checkout);
+        assert!(modal.active_order.is_some());
+        assert!(modal.qr_matrix.is_some());
+    });
+
+    // First 3s poll sees `isPaid == false`, keeps modal open.
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(3));
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert_eq!(refresh_hits.load(Ordering::Acquire), 1);
+    assert!(win_cx.debug_bounds("cloud-billing-modal").is_some());
+
+    // Second 3s poll sees `isPaid == true` -> unlocks, refreshes models,
+    // closes modal, emits toast & OS notification, and stops polling!
+    paid.store(true, Ordering::Release);
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(3));
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert_eq!(refresh_hits.load(Ordering::Acquire), 2);
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(!app.cloud_payment_required);
+        assert!(app.cached_cloud_entitlement().is_some_and(|e| e.is_paid));
+        assert_eq!(app.watchdog_draft.model, None);
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Success))
+        ));
+    });
+    assert!(!win_cx.shown_system_notifications().is_empty());
+
+    // Advancing clock further must NOT trigger additional polling requests.
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(9));
+    win_cx.run_until_parked();
+    assert_eq!(refresh_hits.load(Ordering::Acquire), 2);
+
+    // Re-open with mobile-only (`alipays://`) QR & URL -> `Open in Browser`
+    // disabled + mobile guidance shown; closing modal stops polling too.
+    paid.store(false, Ordering::Release);
+    mobile_only_qr.store(true, Ordering::Release);
+    {
+        use ruum_core::storage::StorageDb;
+        let db = StorageDb::open(&db_path).expect("open db");
+        let mut st = db.load_cloud_state().expect("load cloud_state");
+        st.entitlement_json = None;
+        db.save_cloud_state(&st).expect("clear entitlement cache");
+    }
+    update(&view, win_cx, |app, cx| {
+        app.reload_cloud_state();
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-open-browser").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-mobile-only-hint")
+            .is_some()
+    );
+    // Clicking the disabled Open in Browser button must do nothing harmful.
+    let open_btn = win_cx
+        .debug_bounds("cloud-billing-open-browser")
+        .expect("open browser btn");
+    win_cx.simulate_click(open_btn.center(), Modifiers::none());
+
+    // Close modal via Escape -> invalidates epoch and stops polling forever.
+    press(win_cx, "escape");
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+    });
+    let hits_at_close = refresh_hits.load(Ordering::Acquire);
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(9));
+    win_cx.run_until_parked();
+    assert_eq!(refresh_hits.load(Ordering::Acquire), hits_at_close);
+}
+
+#[gpui_kit::test]
+fn cloud_billing_modal_unavailable_plans_and_instant_allow_decision(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-billing-modes.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x42; 32]);
+    let store = counter.store_for(&enc_path);
+
+    // mode 0 => HTTP 200 DISABLED / empty chargingOptions
+    // mode 1 => HTTP 503 BILLING_PRODUCT_DISABLED
+    // mode 2 => HTTP 200 ENABLED + purchase returns decision == "ALLOW"
+    let mode = Arc::new(AtomicUsize::new(0));
+    let mode_srv = Arc::clone(&mode);
+
+    let server = TestCloudStubServer::start(move |req| {
+        let cur_mode = mode_srv.load(Ordering::Acquire);
+        match req.path.as_str() {
+            "/v1/billing/plans" => match cur_mode {
+                0 => StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-disabled-200".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": {
+                            "capabilityStatus": "DISABLED",
+                            "productName": "Ruum Cloud Pass",
+                            "billingMode": "TIME_BASED",
+                            "chargingOptions": []
+                        },
+                        "traceId": "tr-disabled-200",
+                    })
+                    .to_string(),
+                },
+                1 => StubCloudReply {
+                    status: "503 Service Unavailable".into(),
+                    trace_id: Some("tr-disabled-503".into()),
+                    body: serde_json::json!({
+                        "code": "BILLING_PRODUCT_DISABLED",
+                        "message": "product disabled",
+                        "traceId": "tr-disabled-503",
+                    })
+                    .to_string(),
+                },
+                _ => StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-enabled".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": {
+                            "capabilityStatus": "ENABLED",
+                            "productName": "Ruum Cloud Pass",
+                            "billingMode": "TIME_BASED",
+                            "chargingOptions": [{
+                                "skuId": "pass_month",
+                                "displayName": "Monthly Pass",
+                                "price": "¥2.9",
+                                "durationPeriod": "month"
+                            }]
+                        },
+                        "traceId": "tr-enabled",
+                    })
+                    .to_string(),
+                },
+            },
+            "/v1/billing/purchase" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-allow".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "decision": "ALLOW",
+                        "outRequestNo": "ord-allow-1",
+                        "validUntilSecs": 1_893_456_000_u64,
+                    },
+                    "traceId": "tr-allow",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/status" | "/v1/entitlement/status?refresh=1" => {
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-ent".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            true,
+                            "alipay",
+                            "ALLOW",
+                            0,
+                            Some(1_893_456_000),
+                            "green",
+                        ),
+                        "traceId": "tr-ent",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([{
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "tier": "paid",
+                    "available": true
+                }])),
+            },
+            other => panic!("unexpected path: {other}"),
+        }
+    });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        app.cloud_payment_required = true;
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // Case A: HTTP 200 with capabilityStatus != ENABLED shows friendly notice.
+    assert!(win_cx.debug_bounds("cloud-billing-unavailable").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-0").is_none());
+    press(win_cx, "escape");
+
+    // Case B: HTTP 503 BILLING_PRODUCT_DISABLED shows the same friendly notice.
+    mode.store(1, Ordering::Release);
+    update(&view, win_cx, Ruum::open_billing_modal);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-unavailable").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-0").is_none());
+    press(win_cx, "escape");
+
+    // Case C: `decision == "ALLOW"` unlocks immediately without QR wait.
+    mode.store(2, Ordering::Release);
+    update(&view, win_cx, Ruum::open_billing_modal);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(!app.cloud_payment_required);
+        assert!(app.cached_cloud_entitlement().is_some_and(|e| e.is_paid));
+        assert_eq!(app.watchdog_draft.model, None);
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Success))
+        ));
+    });
+    let reqs = server.recorded_requests();
+    assert!(reqs.iter().any(|r| r.path == "/v1/entitlement/status"));
+    assert!(
+        reqs.iter()
+            .all(|r| r.path != "/v1/entitlement/status?refresh=1")
+    );
+}
+
+#[gpui_kit::test]
+fn cloud_billing_manual_refresh_back_to_plans_and_five_min_timeout(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-billing-timeout.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x43; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let paid = Arc::new(AtomicBool::new(false));
+    let refresh_hits = Arc::new(AtomicUsize::new(0));
+    let paid_srv = Arc::clone(&paid);
+    let hits_srv = Arc::clone(&refresh_hits);
+
+    let server = TestCloudStubServer::start(move |req| {
+        match req.path.as_str() {
+        "/v1/billing/plans" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-plans".into()),
+            body: serde_json::json!({
+                "code": "OK",
+                "message": "ok",
+                "data": {
+                    "capabilityStatus": "ENABLED",
+                    "productName": "Ruum Cloud Pass",
+                    "billingMode": "TIME_BASED",
+                    "chargingOptions": [{
+                        "skuId": "pass_quarter",
+                        "displayName": "Quarterly Pass",
+                        "price": "¥7.9",
+                        "durationPeriod": "quarter"
+                    }]
+                },
+                "traceId": "tr-plans",
+            })
+            .to_string(),
+        },
+        "/v1/billing/purchase" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-purchase".into()),
+            body: serde_json::json!({
+                "code": "OK",
+                "message": "ok",
+                "data": {
+                    "decision": "PAY_REQUIRED",
+                    "outRequestNo": "ord-timeout-1",
+                    "purchaseUrl": "alipays://platformapi/startapp?appId=1",
+                    "purchaseQrCode": "https://mobilecodec.alipay.com/show.htm?code=timeout",
+                    "expireAtSecs": 4_102_445_400_u64,
+                },
+                "traceId": "tr-purchase",
+            })
+            .to_string(),
+        },
+        "/v1/entitlement/status?refresh=1" => {
+            hits_srv.fetch_add(1, Ordering::AcqRel);
+            let is_paid = paid_srv.load(Ordering::Acquire);
+            StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-refresh".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": stub_cloud_entitlement_json(
+                        is_paid,
+                        if is_paid { "alipay" } else { "trial" },
+                        if is_paid { "ALLOW" } else { "DENY" },
+                        0,
+                        is_paid.then_some(1_893_456_000),
+                        "green",
+                    ),
+                    "traceId": "tr-refresh",
+                })
+                .to_string(),
+            }
+        }
+        "/v1/models" => StubCloudReply {
+            status: "200 OK".into(),
+            trace_id: Some("tr-models".into()),
+            body: stub_cloud_models_json(&serde_json::json!([{
+                "id": "ruum-pro",
+                "display_name": "Ruum Pro",
+                "tier": "paid",
+                "available": paid_srv.load(Ordering::Acquire),
+            }])),
+        },
+        other => panic!("unexpected path: {other}"),
+    }
+    });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        app.cloud_payment_required = true;
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // Enter QR mode via Confirm, then test `Change Plan` stops the poll loop.
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    let back_btn = win_cx
+        .debug_bounds("cloud-billing-back-plans")
+        .expect("back to plans");
+    win_cx.simulate_click(back_btn.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.step, crate::state::BillingModalStep::SelectPlan);
+        assert!(modal.active_order.is_none());
+    });
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(6));
+    win_cx.run_until_parked();
+    assert_eq!(refresh_hits.load(Ordering::Acquire), 0);
+
+    // Re-enter QR mode via Confirm and advance past the 5-minute (300s) ceiling.
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    for _ in 0..101 {
+        win_cx
+            .background_executor
+            .advance_clock(Duration::from_secs(3));
+        win_cx.run_until_parked();
+    }
+    draw(win_cx);
+
+    let hits_at_timeout = refresh_hits.load(Ordering::Acquire);
+    assert_eq!(hits_at_timeout, 100);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal still open");
+        assert!(modal.polling_timed_out);
+    });
+
+    // After timeout, advancing clock does not poll, but manual "Refresh Now"
+    // stays interactive and unlocks when paid!
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(9));
+    win_cx.run_until_parked();
+    assert_eq!(refresh_hits.load(Ordering::Acquire), hits_at_timeout);
+
+    // First click while still unpaid -> neutral pending toast.
+    let refresh_btn = win_cx
+        .debug_bounds("cloud-billing-refresh-btn")
+        .expect("refresh now btn");
+    win_cx.simulate_click(refresh_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_some());
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Neutral))
+        ));
+    });
+
+    // Second click after payment settles -> unlocks & closes modal.
+    paid.store(true, Ordering::Release);
+    draw(win_cx);
+    let refresh_btn = win_cx
+        .debug_bounds("cloud-billing-refresh-btn")
+        .expect("refresh now btn");
+    win_cx.simulate_click(refresh_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(!app.cloud_payment_required);
+        assert!(app.cached_cloud_entitlement().is_some_and(|e| e.is_paid));
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Success))
+        ));
+    });
+}
+
+#[gpui_kit::test]
+fn cloud_settings_redeem_code_unlocks_models_updates_expiry_and_guards_double_submit(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-redeem-settings.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x51; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let redeemed = Arc::new(AtomicBool::new(false));
+    let redeem_hits = Arc::new(AtomicUsize::new(0));
+
+    let redeemed_srv = Arc::clone(&redeemed);
+    let hits_srv = Arc::clone(&redeem_hits);
+    let valid_until_2030 = 1_893_456_000_u64; // 2030-01-01
+
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/entitlement/redeem" => {
+                hits_srv.fetch_add(1, Ordering::AcqRel);
+                redeemed_srv.store(true, Ordering::Release);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-redeem-settings".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": {
+                            "redeemedDurationPeriod": "YEAR",
+                            "previousValidUntilSecs": null,
+                            "newValidUntilSecs": valid_until_2030,
+                            "entitlement": stub_cloud_entitlement_json(
+                                true,
+                                "redemption",
+                                "ALLOW",
+                                0,
+                                Some(valid_until_2030),
+                                "green",
+                            ),
+                            "accessToken": "jwt-redeemed-settings",
+                            "expiresAtSecs": 4_102_445_900_u64,
+                        },
+                        "traceId": "tr-redeem-settings",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => {
+                let is_paid = redeemed_srv.load(Ordering::Acquire);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-models".into()),
+                    body: stub_cloud_models_json(&serde_json::json!([
+                        {
+                            "id": "ruum-pro",
+                            "display_name": "Ruum Pro",
+                            "description": "Flagship cloud model",
+                            "tier": "paid",
+                            "available": is_paid,
+                        }
+                    ])),
+                }
+            }
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.set_watchdog_provider(AiCliProvider::RuumCloud, cx);
+    });
+    draw(win_cx);
+
+    // Control + placeholder RUUM-XXXX-XXXX-XXXX present in AI Settings.
+    assert!(
+        win_cx
+            .debug_bounds("cloud-settings-redeem-control")
+            .is_some()
+    );
+    assert!(win_cx.debug_bounds("cloud-settings-redeem-input").is_some());
+    assert!(win_cx.debug_bounds("cloud-settings-redeem-btn").is_some());
+
+    let settings_input = read(&view, win_cx, |app| {
+        app.cloud_redeem_input_settings
+            .clone()
+            .expect("settings redeem input")
+    });
+    win_cx.update(|_, cx| {
+        assert_eq!(
+            settings_input
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .as_str(),
+            "RUUM-XXXX-XXXX-XXXX"
+        );
+    });
+
+    // Empty / whitespace button click gives gentle feedback without calling
+    // server (also exercises real button click wiring).
+    let btn = win_cx
+        .debug_bounds("cloud-settings-redeem-btn")
+        .expect("redeem btn");
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value("   ", window, cx);
+        });
+    });
+    win_cx.simulate_click(btn.center(), Modifiers::none());
+    draw(win_cx);
+    assert_eq!(redeem_hits.load(Ordering::Acquire), 0);
+    assert!(
+        win_cx
+            .debug_bounds("cloud-settings-redeem-feedback")
+            .is_some()
+    );
+    read(&view, win_cx, |app| {
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Neutral))
+        ));
+    });
+
+    // Type trimmed/lowercase code, submit once, verify `redeem_submitting` is
+    // armed and a duplicate submission while in flight is dropped cleanly.
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value("  ruum-gift-1234-5678  ", window, cx);
+        });
+    });
+    update(&view, win_cx, |app, cx| {
+        app.submit_redeem_code(cx);
+        assert!(app.redeem_submitting);
+        app.submit_redeem_code(cx);
+    });
+    // Rendering while `redeem_submitting == true` must succeed without panic.
+    draw(win_cx);
+
+    // Let background task and UI continuation complete.
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert_eq!(redeem_hits.load(Ordering::Acquire), 1);
+    let reqs = server.recorded_requests();
+    let redeem_req = reqs
+        .iter()
+        .find(|r| r.path == "/v1/entitlement/redeem")
+        .expect("redeem request recorded");
+    let body_val: serde_json::Value =
+        serde_json::from_str(&redeem_req.body).expect("json body");
+    assert_eq!(body_val["code"].as_str(), Some("RUUM-GIFT-1234-5678"));
+    assert!(reqs.iter().any(|r| r.path == "/v1/models"));
+
+    read(&view, win_cx, |app| {
+        assert!(!app.redeem_submitting);
+        assert!(!app.cloud_payment_required);
+        assert_eq!(
+            app.cloud_state.access_token.as_deref(),
+            Some("jwt-redeemed-settings")
+        );
+        assert_eq!(app.watchdog_draft.model, None);
+        let ent = app.cached_cloud_entitlement().expect("entitlement cached");
+        assert!(ent.is_paid);
+        assert_eq!(ent.valid_until_secs, Some(valid_until_2030));
+        assert!(
+            matches!(
+                &app.notice,
+                Some((msg, gpui_omarchy::Status::Success))
+                    if msg.contains("2030-01-01")
+            ),
+            "expected success toast with 2030-01-01, got {:?}",
+            app.notice
+        );
+    });
+    win_cx.update(|_, cx| {
+        assert_eq!(settings_input.read(cx).value().as_str(), "");
+    });
+    assert!(!win_cx.shown_system_notifications().is_empty());
+}
+
+#[gpui_kit::test]
+fn cloud_billing_modal_redeem_code_unlocks_closes_modal_and_stops_polling(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-redeem-modal.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x52; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let redeemed = Arc::new(AtomicBool::new(false));
+    let poll_hits = Arc::new(AtomicUsize::new(0));
+    let redeemed_srv = Arc::clone(&redeemed);
+    let poll_srv = Arc::clone(&poll_hits);
+    let valid_until = 1_924_992_000_u64; // 2031-01-01
+
+    let server = TestCloudStubServer::start(move |req| {
+        match req.path.as_str() {
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-plans".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": [{
+                            "skuId": "pass_month",
+                            "displayName": "Monthly Pass",
+                            "price": "¥2.9",
+                            "durationPeriod": "month"
+                        }]
+                    },
+                    "traceId": "tr-plans",
+                })
+                .to_string(),
+            },
+            "/v1/billing/purchase" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-purchase".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "decision": "PAY_REQUIRED",
+                        "outRequestNo": "ord-redeem-poll",
+                        "purchaseUrl": "alipays://platformapi/startapp?appId=1",
+                        "purchaseQrCode": "https://mobilecodec.alipay.com/show.htm?code=redeem",
+                        "expireAtSecs": 4_102_445_400_u64,
+                    },
+                    "traceId": "tr-purchase",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/status?refresh=1" => {
+                poll_srv.fetch_add(1, Ordering::AcqRel);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-poll".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            false, "trial", "DENY", 0, None, "green",
+                        ),
+                        "traceId": "tr-poll",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/entitlement/redeem" => {
+                redeemed_srv.store(true, Ordering::Release);
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-redeem-modal".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": {
+                            "redeemedDurationPeriod": "YEAR",
+                            "previousValidUntilSecs": null,
+                            "newValidUntilSecs": valid_until,
+                            "entitlement": stub_cloud_entitlement_json(
+                                true,
+                                "redemption",
+                                "ALLOW",
+                                0,
+                                Some(valid_until),
+                                "green",
+                            ),
+                            "accessToken": "jwt-redeemed-modal",
+                            "expiresAtSecs": 4_102_446_000_u64,
+                        },
+                        "traceId": "tr-redeem-modal",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([{
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "tier": "paid",
+                    "available": redeemed_srv.load(Ordering::Acquire),
+                }])),
+            },
+            other => panic!("unexpected path: {other}"),
+        }
+    });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        app.cloud_payment_required = true;
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(win_cx);
+    let settings_input = read(&view, win_cx, |app| {
+        app.cloud_redeem_input_settings
+            .clone()
+            .expect("settings redeem input")
+    });
+    update(&view, win_cx, Ruum::open_billing_modal);
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // Billing modal must NOT expose any redeem control; confirm enters Step 2
+    // Checkout and starts the 3s poll loop.
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-redeem-control")
+            .is_none()
+    );
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-hint").is_some());
+
+    // Redeeming via AI Settings while modal poll is active closes modal & stops
+    // polling cleanly.
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value("RUUM-MODL-2031-CODE", window, cx);
+        });
+    });
+    update(&view, win_cx, Ruum::submit_redeem_code);
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    let hits_on_close = poll_hits.load(Ordering::Acquire);
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(!app.cloud_payment_required);
+        assert_eq!(
+            app.cloud_state.access_token.as_deref(),
+            Some("jwt-redeemed-modal")
+        );
+        let ent = app.cached_cloud_entitlement().expect("entitlement");
+        assert!(ent.is_paid);
+        assert_eq!(ent.valid_until_secs, Some(valid_until));
+        assert!(
+            matches!(
+                &app.notice,
+                Some((msg, gpui_omarchy::Status::Success))
+                    if msg.contains("2031-01-01")
+            ),
+            "expected success toast with 2031-01-01, got {:?}",
+            app.notice
+        );
+    });
+    win_cx.update(|_, cx| {
+        assert_eq!(settings_input.read(cx).value().as_str(), "");
+    });
+
+    // Active 3s poll loop must stop immediately once modal closes on redeem.
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(9));
+    win_cx.run_until_parked();
+    assert_eq!(poll_hits.load(Ordering::Acquire), hits_on_close);
+}
+
+#[gpui_kit::test]
+fn cloud_redeem_rejected_code_surfaces_localized_error_with_trace_and_allows_retry(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-redeem-error.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x53; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let attempt = Arc::new(AtomicUsize::new(0));
+    let attempt_srv = Arc::clone(&attempt);
+    let leaked_input = "RUUM-USED-9999-LEAK";
+
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-disabled".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "DISABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": []
+                    },
+                    "traceId": "tr-disabled",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/redeem" => {
+                let cur = attempt_srv.fetch_add(1, Ordering::AcqRel);
+                if cur == 0 {
+                    StubCloudReply {
+                        status: "409 Conflict".into(),
+                        trace_id: Some("tr-used-99".into()),
+                        body: serde_json::json!({
+                            "code": "REDEMPTION_CODE_ALREADY_USED",
+                            "message": format!("already used {leaked_input}"),
+                            "data": null,
+                            "traceId": "tr-used-99",
+                        })
+                        .to_string(),
+                    }
+                } else {
+                    StubCloudReply {
+                        status: "404 Not Found".into(),
+                        trace_id: Some("tr-inv-77".into()),
+                        body: serde_json::json!({
+                            "code": "REDEMPTION_CODE_INVALID",
+                            "message": "invalid code",
+                            "data": null,
+                            "traceId": "tr-inv-77",
+                        })
+                        .to_string(),
+                    }
+                }
+            }
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.set_watchdog_provider(AiCliProvider::RuumCloud, cx);
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // When billing is DISABLED, billing modal shows unavailable notice with
+    // zero redeem control; redeeming in Settings shows inline error + Trace ID.
+    assert!(win_cx.debug_bounds("cloud-billing-unavailable").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-redeem-control")
+            .is_none()
+    );
+    press(win_cx, "escape");
+    draw(win_cx);
+
+    let settings_input = read(&view, win_cx, |app| {
+        app.cloud_redeem_input_settings
+            .clone()
+            .expect("settings redeem input")
+    });
+    let redeem_btn = win_cx
+        .debug_bounds("cloud-settings-redeem-btn")
+        .expect("settings redeem btn");
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value(leaked_input, window, cx);
+        });
+    });
+    win_cx.simulate_click(redeem_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(
+        win_cx
+            .debug_bounds("cloud-settings-redeem-feedback")
+            .is_some()
+    );
+    read(&view, win_cx, |app| {
+        assert!(!app.redeem_submitting);
+        assert!(app.billing_modal.is_none());
+        let (fb, is_err) = app
+            .cloud_redeem_feedback
+            .as_ref()
+            .expect("inline feedback set");
+        assert!(*is_err);
+        assert!(fb.contains("[Trace: tr-used-99]"));
+        assert!(fb.to_ascii_lowercase().contains("one-time"));
+        assert!(!fb.contains(leaked_input));
+        assert!(matches!(
+            &app.notice,
+            Some((msg, gpui_omarchy::Status::Error))
+                if msg.contains("[Trace: tr-used-99]")
+                    && !msg.contains(leaked_input)
+        ));
+    });
+
+    // Retry remains interactive: submitting another code triggers attempt #2.
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value("RUUM-BAD-0000-CODE", window, cx);
+        });
+    });
+    let redeem_btn = win_cx
+        .debug_bounds("cloud-settings-redeem-btn")
+        .expect("settings redeem btn");
+    win_cx.simulate_click(redeem_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert_eq!(attempt.load(Ordering::Acquire), 2);
+    read(&view, win_cx, |app| {
+        assert!(!app.redeem_submitting);
+        let (fb, is_err) = app
+            .cloud_redeem_feedback
+            .as_ref()
+            .expect("second feedback set");
+        assert!(*is_err);
+        assert!(fb.contains("[Trace: tr-inv-77]"));
+    });
+}
+
+fn assert_valid_cloud_register_request(
+    req: &StubCloudRequest,
+    difficulty_bits: u8,
+) {
+    let headers_lower = req.headers.to_ascii_lowercase();
+    for required in [
+        "x-ruum-device-id:",
+        "x-ruum-ts:",
+        "x-ruum-nonce:",
+        "x-ruum-sig:",
+    ] {
+        assert!(
+            headers_lower.contains(required),
+            "register request missing header {required}: {}",
+            req.headers
+        );
+    }
+
+    let body: serde_json::Value =
+        serde_json::from_str(&req.body).expect("register JSON body");
+    assert!(
+        matches!(body["os"].as_str(), Some("macos" | "windows" | "linux")),
+        "register body missing valid os field: {body}"
+    );
+    assert!(
+        body.get("platform").is_none(),
+        "register body must not contain legacy platform key: {body}"
+    );
+    let pubkey_b64 = body["pubkeyB64"].as_str().expect("pubkeyB64");
+    let derived_dev_id =
+        ruum_core::cloud_identity::derive_device_id(pubkey_b64)
+            .expect("derive_device_id");
+    assert!(
+        headers_lower.contains(&derived_dev_id.to_ascii_lowercase()),
+        "header X-Ruum-Device-Id should match derived id {derived_dev_id}"
+    );
+
+    let hw_hash = body["hwAnchorHash"].as_str().expect("hwAnchorHash");
+    let os_hash = body["osAnchorHash"].as_str().expect("osAnchorHash");
+    assert_eq!(hw_hash.len(), 64);
+    assert_eq!(os_hash.len(), 64);
+    assert!(hw_hash.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(os_hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+    let chal_nonce = body["challengeNonce"].as_str().expect("challengeNonce");
+    let pow_sol = body["powSolution"].as_str().expect("powSolution");
+    assert!(
+        ruum_core::cloud_identity::verify_pow_solution(
+            chal_nonce,
+            pow_sol,
+            difficulty_bits,
+        ),
+        "PoW solution did not satisfy difficulty {difficulty_bits}"
+    );
+}
+
+fn assert_valid_cloud_chat_request(
+    req: &StubCloudRequest,
+    expected_model: &str,
+    expected_bearer: &str,
+) {
+    let headers_lower = req.headers.to_ascii_lowercase();
+    assert!(
+        headers_lower.contains(
+            &format!("authorization: bearer {expected_bearer}")
+                .to_ascii_lowercase()
+        ),
+        "missing expected bearer token in headers: {}",
+        req.headers
+    );
+    assert!(headers_lower.contains("x-ruum-session:"));
+    assert!(headers_lower.contains("x-ruum-task: local_analysis"));
+    assert!(headers_lower.contains("x-ruum-client-version:"));
+
+    let body: serde_json::Value =
+        serde_json::from_str(&req.body).expect("chat JSON body");
+    assert_eq!(body["model"].as_str(), Some(expected_model));
+    assert_eq!(body["stream"].as_bool(), Some(false));
+}
+
+#[gpui_kit::test]
+fn e2e_cloud_full_lifecycle_onboarding_trial_402_alipay_qr_unlock_and_pro_analysis(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-e2e-full.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x61; 32]);
+    let store = counter.store_for(&enc_path);
+
+    // Ensure fresh DB starts with `setup_completed = false` & empty `cloud_state`.
+    {
+        let db = StorageDb::open(&db_path).expect("open fresh db");
+        assert!(!db.load_ai_config().expect("load ai").setup_completed);
+        let cs = db.load_cloud_state().expect("load cloud_state");
+        assert!(cs.device_id.is_none());
+        assert!(cs.subject_id.is_none());
+        assert!(cs.access_token.is_none());
+    }
+
+    // phase 0: trial active (ruum-fast available, ruum-pro locked)
+    // phase 1: gateway returns 402 ENTITLEMENT_PAYMENT_REQUIRED on inference
+    // phase 2: Alipay payment settled (isPaid = true, ruum-pro unlocked)
+    let phase = Arc::new(AtomicUsize::new(0));
+    let phase_srv = Arc::clone(&phase);
+    let valid_until_2030 = 1_893_456_000_u64;
+
+    let server = TestCloudStubServer::start(move |req| {
+        let cur_phase = phase_srv.load(Ordering::Acquire);
+        match req.path.as_str() {
+            "/v1/devices/challenge" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-e2e-chal".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "nonce": "chal-e2e-1",
+                        "difficultyBits": 6,
+                        "expiresAtSecs": 4_102_444_800_u64,
+                    },
+                    "traceId": "tr-e2e-chal",
+                })
+                .to_string(),
+            },
+            "/v1/devices/register" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-e2e-reg".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "deviceId": "dev-e2e-1",
+                        "subjectId": "sub-e2e-1",
+                        "accessToken": "jwt-e2e-trial",
+                        "expiresAtSecs": 4_102_444_800_u64,
+                        "trialRemaining": 1,
+                        "isNewSubject": true,
+                    },
+                    "traceId": "tr-e2e-reg",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/status" => {
+                let is_paid = cur_phase >= 2;
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-e2e-ent".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            is_paid,
+                            if is_paid { "alipay" } else { "trial" },
+                            "ALLOW",
+                            u64::from(!is_paid),
+                            is_paid.then_some(valid_until_2030),
+                            "green",
+                        ),
+                        "traceId": "tr-e2e-ent",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/entitlement/status?refresh=1" => {
+                let is_paid = cur_phase >= 2;
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-e2e-poll".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            is_paid,
+                            if is_paid { "alipay" } else { "trial" },
+                            if is_paid { "ALLOW" } else { "DENY" },
+                            0,
+                            is_paid.then_some(valid_until_2030),
+                            "green",
+                        ),
+                        "traceId": "tr-e2e-poll",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => {
+                let is_paid = cur_phase >= 2;
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-e2e-models".into()),
+                    body: stub_cloud_models_json(&serde_json::json!([
+                        {
+                            "id": "ruum-pro",
+                            "display_name": "Ruum Pro",
+                            "description": "Paid flagship reasoning model",
+                            "tier": "paid",
+                            "available": is_paid,
+                        },
+                        {
+                            "id": "ruum-fast",
+                            "display_name": "Ruum Fast",
+                            "description": "Trial analysis model",
+                            "tier": "trial",
+                            "available": true,
+                        }
+                    ])),
+                }
+            }
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-e2e-plans".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": [
+                            {
+                                "skuId": "pass_month",
+                                "displayName": "Monthly Pass",
+                                "price": "¥2.9",
+                                "durationPeriod": "month"
+                            },
+                            {
+                                "skuId": "pass_year",
+                                "displayName": "Annual Pass",
+                                "price": "¥24.9",
+                                "durationPeriod": "year"
+                            }
+                        ]
+                    },
+                    "traceId": "tr-e2e-plans",
+                })
+                .to_string(),
+            },
+            "/v1/billing/purchase" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-e2e-purchase".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "decision": "PAY_REQUIRED",
+                        "outRequestNo": "ord-e2e-1",
+                        "purchaseUrl":
+                            "alipays://platformapi/startapp?appId=20000067",
+                        "purchaseQrCode":
+                            "https://mobilecodec.alipay.com/show.htm?code=e2e1",
+                        "expireAtSecs": 4_102_445_400_u64,
+                    },
+                    "traceId": "tr-e2e-purchase",
+                })
+                .to_string(),
+            },
+            "/v1/chat/completions" => match cur_phase {
+                0 => StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-e2e-chat-trial".into()),
+                    body: serde_json::json!({
+                        "id": "chat-trial-1",
+                        "object": "chat.completion",
+                        "model": "ruum-fast",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": r#"{"summary":"Trial ok","items":[]}"#
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string(),
+                },
+                1 => StubCloudReply {
+                    status: "402 Payment Required".into(),
+                    trace_id: Some("tr-e2e-402".into()),
+                    body: serde_json::json!({
+                        "code": "ENTITLEMENT_PAYMENT_REQUIRED",
+                        "message": "free trial exhausted",
+                        "traceId": "tr-e2e-402",
+                    })
+                    .to_string(),
+                },
+                _ => StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-e2e-chat-pro".into()),
+                    body: serde_json::json!({
+                        "id": "chat-pro-1",
+                        "object": "chat.completion",
+                        "model": "ruum-pro",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": r#"{"summary":"Pro ok","items":[]}"#
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string(),
+                },
+            },
+            other => panic!("unexpected E2E path: {other}"),
+        }
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, _| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store.clone());
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.reload_watchdog_config_and_prepare_settings();
+    });
+    draw(win_cx);
+
+    // 1. Cold start: 0 keychain calls, 0 network requests, `setup_completed == false`.
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+    read(&view, win_cx, |app| {
+        assert!(!app.ai_config.setup_completed);
+    });
+
+    // 2. Click AI analysis -> opens `AiSetupChoiceModal` -> choose Built-in Ruum Cloud.
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    draw(win_cx);
+    let cloud_choice = win_cx
+        .debug_bounds("ai-setup-choice-cloud")
+        .expect("ai-setup-choice-cloud");
+    win_cx.simulate_click(cloud_choice.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(counter.load_count() >= 1);
+    read(&view, win_cx, |app| {
+        assert!(app.ai_setup_choice_modal.is_none());
+        assert!(app.ai_config.setup_completed);
+        assert_eq!(app.ai_config.provider, AiCliProvider::RuumCloud);
+        assert!(!app.watchdog_analyzing);
+        assert_eq!(app.ai_last_error, None);
+        assert!(!app.cloud_payment_required);
+        assert_eq!(app.watchdog_draft.model, None);
+        let models = app.cached_cloud_models();
+        assert!(models.iter().any(|m| m.id == "ruum-fast" && m.available));
+        assert!(models.iter().any(|m| m.id == "ruum-pro" && !m.available));
+    });
+    let reqs = server.recorded_requests();
+    assert!(reqs.iter().any(|r| r.path == "/v1/devices/challenge"));
+    let reg_req = reqs
+        .iter()
+        .find(|r| r.path == "/v1/devices/register")
+        .expect("device register request");
+    assert_valid_cloud_register_request(reg_req, 6);
+    let chat_trial_req = reqs
+        .iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .expect("trial chat completion request");
+    assert_valid_cloud_chat_request(
+        chat_trial_req,
+        ruum_core::ai_cli::CLOUD_AUTO_MODEL_ID,
+        "jwt-e2e-trial",
+    );
+
+    // 3. Exhaust trials -> 402 ENTITLEMENT_PAYMENT_REQUIRED with X-Trace-ID.
+    phase.store(1, Ordering::Release);
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert!(app.cloud_payment_required);
+        let (msg, status) = app.notice.as_ref().expect("402 error toast");
+        assert_eq!(*status, gpui_omarchy::Status::Error);
+        assert!(msg.contains("[Trace: tr-e2e-402]"), "toast={msg}");
+        let err = app.ai_last_error.as_deref().unwrap_or("");
+        assert!(err.contains("[Trace: tr-e2e-402]"), "last_error={err}");
+    });
+
+    // 4. Local-first immunity while `cloud_payment_required == true`:
+    //    local rescan, treemap rendering, and marking operate 100% normally.
+    let extra_file = temp.path().join("extra/cache.bin");
+    std::fs::create_dir_all(extra_file.parent().expect("extra parent"))
+        .expect("mkdir extra");
+    std::fs::write(&extra_file, vec![b'z'; 400_000]).expect("write extra");
+
+    update(&view, win_cx, Ruum::start_scan);
+    finish_scan(&view, win_cx);
+    draw(win_cx);
+    let junk_dir = temp.path().join("junk");
+    update(&view, win_cx, |app, _| {
+        assert!(app.tree().is_some());
+        assert!(app.treemap_size.get().width > px(0.));
+        assert!(app.layout().map(<[Tile]>::len).unwrap_or_default() >= 4);
+    });
+    update(&view, win_cx, |app, cx| {
+        app.marks.toggle(ruum_core::removal::Target {
+            path: junk_dir.clone(),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.open_review();
+        cx.notify();
+    });
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.marks.len(), 1);
+    });
+    press(win_cx, "escape");
+    read(&view, win_cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+    });
+
+    // 5. Unlock via CloudBillingModal (SKU -> QR Canvas -> 3s poll -> paid).
+    update(&view, win_cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(win_cx);
+    let upgrade_btn = win_cx
+        .debug_bounds("cloud-upgrade-btn")
+        .expect("cloud-upgrade-btn");
+    win_cx.simulate_click(upgrade_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-billing-modal").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-redeem-control")
+            .is_none()
+    );
+    let sku0 = win_cx
+        .debug_bounds("cloud-billing-sku-0")
+        .expect("cloud-billing-sku-0");
+    win_cx.simulate_click(sku0.center(), Modifiers::none());
+    draw(win_cx);
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-open-browser").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-hint").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-mobile-only-hint")
+            .is_none()
+    );
+
+    phase.store(2, Ordering::Release);
+    win_cx
+        .background_executor
+        .advance_clock(Duration::from_secs(3));
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(!app.cloud_payment_required);
+        assert!(app.cached_cloud_entitlement().is_some_and(|e| e.is_paid));
+        assert!(
+            app.cached_cloud_models()
+                .iter()
+                .any(|m| m.id == "ruum-pro" && m.available)
+        );
+    });
+
+    // Select unlocked `ruum-pro` in Settings and run paid AI analysis.
+    let pro_row = win_cx
+        .debug_bounds("cloud-model-row-0")
+        .expect("cloud-model-row-0 (ruum-pro)");
+    win_cx.simulate_click(pro_row.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model.as_deref(), Some("ruum-pro"));
+        assert_eq!(
+            app.cloud_state.selected_model_id.as_deref(),
+            Some("ruum-pro")
+        );
+    });
+
+    let chat_count_before = server
+        .recorded_requests()
+        .iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .count();
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert_eq!(app.ai_last_error, None);
+        assert!(!app.cloud_payment_required);
+    });
+    let reqs_after = server.recorded_requests();
+    let pro_chats: Vec<_> = reqs_after
+        .iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .collect();
+    assert_eq!(pro_chats.len(), chat_count_before + 1);
+    assert_valid_cloud_chat_request(
+        pro_chats.last().expect("pro chat req"),
+        "ruum-pro",
+        "jwt-e2e-trial",
+    );
+}
+
+#[gpui_kit::test]
+fn e2e_cloud_redemption_code_unlock_leads_to_paid_pro_analysis(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-e2e-redeem.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x62; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let redeemed = Arc::new(AtomicBool::new(false));
+    let redeemed_srv = Arc::clone(&redeemed);
+    let valid_until_2031 = 1_924_992_000_u64;
+
+    let server = TestCloudStubServer::start(move |req| {
+        let is_paid = redeemed_srv.load(Ordering::Acquire);
+        match req.path.as_str() {
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-plans".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "DISABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": []
+                    },
+                    "traceId": "tr-plans",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/redeem" => {
+                let first = !redeemed_srv.swap(true, Ordering::AcqRel);
+                if first {
+                    StubCloudReply {
+                        status: "200 OK".into(),
+                        trace_id: Some("tr-redeem-e2e".into()),
+                        body: serde_json::json!({
+                            "code": "OK",
+                            "message": "ok",
+                            "data": {
+                                "redeemedDurationPeriod": "YEAR",
+                                "previousValidUntilSecs": null,
+                                "newValidUntilSecs": valid_until_2031,
+                                "entitlement": stub_cloud_entitlement_json(
+                                    true,
+                                    "redemption",
+                                    "ALLOW",
+                                    0,
+                                    Some(valid_until_2031),
+                                    "green",
+                                ),
+                                "accessToken": "jwt-redeemed-e2e",
+                                "expiresAtSecs": 4_102_446_000_u64,
+                            },
+                            "traceId": "tr-redeem-e2e",
+                        })
+                        .to_string(),
+                    }
+                } else {
+                    StubCloudReply {
+                        status: "409 Conflict".into(),
+                        trace_id: Some("tr-redeem-used".into()),
+                        body: serde_json::json!({
+                            "code": "REDEMPTION_CODE_ALREADY_USED",
+                            "message": "code already used",
+                            "data": null,
+                            "traceId": "tr-redeem-used",
+                        })
+                        .to_string(),
+                    }
+                }
+            }
+            "/v1/entitlement/status" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-ent".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": stub_cloud_entitlement_json(
+                        is_paid,
+                        if is_paid { "redemption" } else { "trial" },
+                        if is_paid { "ALLOW" } else { "DENY" },
+                        0,
+                        is_paid.then_some(valid_until_2031),
+                        "green",
+                    ),
+                    "traceId": "tr-ent",
+                })
+                .to_string(),
+            },
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([{
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "tier": "paid",
+                    "available": is_paid,
+                }])),
+            },
+            "/v1/chat/completions" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-chat-pro".into()),
+                body: serde_json::json!({
+                    "id": "chat-redeem-pro-1",
+                    "object": "chat.completion",
+                    "model": "ruum-pro",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": r#"{"summary":"Redeem Pro ok","items":[]}"#
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            },
+            other => panic!("unexpected path: {other}"),
+        }
+    });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false,
+        }]))),
+        None,
+    );
+
+    {
+        use ruum_core::storage::{AiConfig, StorageDb};
+        let db = StorageDb::open(&db_path).expect("open db");
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+        db.save_ai_config(&cfg).expect("save ai_config");
+    }
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.reload_watchdog_config_and_prepare_settings();
+        app.reload_cloud_state();
+        app.sync_selected_cloud_model();
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // Billing modal no longer contains redeem controls; close it and redeem in
+    // Settings -> AI instead.
+    read(&view, win_cx, |app| {
+        assert!(app.cloud_payment_required);
+    });
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-redeem-control")
+            .is_none()
+    );
+    press(win_cx, "escape");
+    update(&view, win_cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(win_cx);
+    let settings_input = read(&view, win_cx, |app| {
+        app.cloud_redeem_input_settings
+            .clone()
+            .expect("settings redeem input")
+    });
+    let redeem_btn = win_cx
+        .debug_bounds("cloud-settings-redeem-btn")
+        .expect("settings redeem btn");
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value("  ruum-vip1-2031-code  ", window, cx);
+        });
+    });
+    win_cx.simulate_click(redeem_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(!app.cloud_payment_required);
+        assert_eq!(app.watchdog_draft.model, None);
+        assert!(
+            app.cached_cloud_entitlement()
+                .is_some_and(|e| e.is_paid && e.source == "redemption")
+        );
+    });
+
+    // Next AI analysis runs in Auto mode with the freshly synced JWT!
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert_eq!(app.ai_last_error, None);
+    });
+    let reqs = server.recorded_requests();
+    let chat_req = reqs
+        .iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .expect("pro chat req after redeem");
+    assert_valid_cloud_chat_request(
+        chat_req,
+        ruum_core::ai_cli::CLOUD_AUTO_MODEL_ID,
+        "jwt-redeemed-e2e",
+    );
+
+    // Re-submitting the same one-time code in Settings fails with
+    // REDEMPTION_CODE_ALREADY_USED + Trace ID (no master codes).
+    let settings_btn = win_cx
+        .debug_bounds("cloud-settings-redeem-btn")
+        .expect("settings redeem btn");
+    win_cx.update(|window, cx| {
+        settings_input.update(cx, |inp, cx| {
+            inp.set_value("RUUM-VIP1-2031-CODE", window, cx);
+        });
+    });
+    win_cx.simulate_click(settings_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    read(&view, win_cx, |app| {
+        let (fb, is_err) = app
+            .cloud_redeem_feedback
+            .as_ref()
+            .expect("reuse error feedback");
+        assert!(*is_err);
+        assert!(fb.contains("[Trace: tr-redeem-used]"));
+    });
+}
+
+#[gpui_kit::test]
+fn e2e_cloud_reinstall_recovery_restores_paid_entitlement_and_models(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-reinstall.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x63; 32]);
+    let store = counter.store_for(&enc_path);
+
+    // Fresh DB + wiped `ruum.cloud` identity key.
+    {
+        let db = StorageDb::open(&db_path).expect("open fresh db");
+        assert!(!db.load_ai_config().expect("load ai").setup_completed);
+        assert!(
+            db.load_cloud_state()
+                .expect("load cloud")
+                .device_id
+                .is_none()
+        );
+        assert!(!store.has_cloud_signing_key().expect("check key"));
+    }
+
+    let valid_until_2030 = 1_893_456_000_u64;
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/devices/challenge" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-reinst-chal".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "nonce": "chal-reinst-1",
+                        "difficultyBits": 6,
+                        "expiresAtSecs": 4_102_444_800_u64,
+                    },
+                    "traceId": "tr-reinst-chal",
+                })
+                .to_string(),
+            },
+            "/v1/devices/register" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-reinst-reg".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "deviceId": "dev-reinstalled-2",
+                        "subjectId": "sub-restored-paid",
+                        "accessToken": "jwt-reinstalled-paid",
+                        "expiresAtSecs": 4_102_444_800_u64,
+                        "trialRemaining": 0,
+                        "isNewSubject": false,
+                    },
+                    "traceId": "tr-reinst-reg",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/status" => {
+                let mut ent = stub_cloud_entitlement_json(
+                    true,
+                    "alipay",
+                    "ALLOW",
+                    0,
+                    Some(valid_until_2030),
+                    "green",
+                );
+                ent["subjectId"] = serde_json::json!("sub-restored-paid");
+                ent["deviceId"] = serde_json::json!("dev-reinstalled-2");
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-reinst-ent".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": ent,
+                        "traceId": "tr-reinst-ent",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-reinst-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([{
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "description": "Paid flagship reasoning model",
+                    "tier": "paid",
+                    "available": true,
+                }])),
+            },
+            "/v1/chat/completions" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-reinst-chat".into()),
+                body: serde_json::json!({
+                    "id": "chat-reinst-1",
+                    "object": "chat.completion",
+                    "model": "ruum-pro",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": r#"{"summary":"Restored ok","items":[]}"#
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            },
+            other => panic!("unexpected reinstall path: {other}"),
+        });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, _| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store.clone());
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.reload_watchdog_config_and_prepare_settings();
+    });
+    draw(win_cx);
+
+    assert_eq!(counter.load_count(), 0);
+    assert!(server.recorded_requests().is_empty());
+
+    // Choosing RuumCloud after reinstall registers a new keypair, receives
+    // `isNewSubject: false`, syncs `/v1/entitlement/status` & `/v1/models`,
+    // and restores paid `ruum-pro` access seamlessly.
+    update(&view, win_cx, Ruum::run_ai_analysis_now);
+    draw(win_cx);
+    let cloud_choice = win_cx
+        .debug_bounds("ai-setup-choice-cloud")
+        .expect("ai-setup-choice-cloud");
+    win_cx.simulate_click(cloud_choice.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(counter.load_count() >= 1);
+    assert!(store.has_cloud_signing_key().expect("key created"));
+    let reqs = server.recorded_requests();
+    let reg_req = reqs
+        .iter()
+        .find(|r| r.path == "/v1/devices/register")
+        .expect("reinstall register request");
+    assert_valid_cloud_register_request(reg_req, 6);
+    assert!(reqs.iter().any(|r| r.path == "/v1/entitlement/status"));
+    assert!(reqs.iter().any(|r| r.path == "/v1/models"));
+    let chat_req = reqs
+        .iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .expect("restored pro chat req");
+    assert_valid_cloud_chat_request(
+        chat_req,
+        ruum_core::ai_cli::CLOUD_AUTO_MODEL_ID,
+        "jwt-reinstalled-paid",
+    );
+
+    read(&view, win_cx, |app| {
+        assert!(app.ai_config.setup_completed);
+        assert_eq!(app.ai_config.provider, AiCliProvider::RuumCloud);
+        assert!(!app.cloud_payment_required);
+        assert_eq!(app.ai_last_error, None);
+        assert_eq!(
+            app.cloud_state.subject_id.as_deref(),
+            Some("sub-restored-paid")
+        );
+        assert_eq!(app.watchdog_draft.model, None);
+        let ent = app
+            .cached_cloud_entitlement()
+            .expect("restored entitlement");
+        assert!(ent.is_paid);
+        assert_eq!(ent.source, "alipay");
+        assert_eq!(ent.valid_until_secs, Some(valid_until_2030));
+    });
+
+    // Settings renders restored paid badge and unlocked `ruum-pro` row cleanly.
+    update(&view, win_cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-settings-card").is_some());
+    assert!(win_cx.debug_bounds("cloud-entitlement-badge").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-0").is_some());
+}
+
+#[test]
+fn cloud_billing_qr_payload_and_support_url_selection() {
+    use crate::i18n::Locale;
+    use crate::state::{ruum_support_url, select_billing_qr_payload};
+
+    // Live Alipay Vibe Pay returns `alipays://` in `purchaseUrl` and a
+    // `mobilecodec.alipay.com/show.htm` wrapper page in `purchaseQrCode`;
+    // QR encoder must pick `alipays://` directly to eliminate nested QR scans.
+    assert_eq!(
+        select_billing_qr_payload(
+            Some("alipays://platformapi/startapp?appId=20000067&url=x"),
+            Some("https://mobilecodec.alipay.com/show.htm?code=abc123"),
+        ),
+        Some("alipays://platformapi/startapp?appId=20000067&url=x".to_owned()),
+    );
+    assert_eq!(
+        select_billing_qr_payload(
+            Some("ALIPAYS://platformapi/startapp?appId=1"),
+            Some("https://qr.example.com/direct"),
+        ),
+        Some("ALIPAYS://platformapi/startapp?appId=1".to_owned()),
+    );
+    assert_eq!(
+        select_billing_qr_payload(
+            Some("https://qr.alipay.com/bax099"),
+            Some("https://MOBILECODEC.ALIPAY.COM/show.htm?code=wrapper"),
+        ),
+        Some("https://qr.alipay.com/bax099".to_owned()),
+    );
+    assert_eq!(
+        select_billing_qr_payload(
+            Some("https://checkout.example.com/pay"),
+            Some("https://checkout.example.com/qr-direct"),
+        ),
+        Some("https://checkout.example.com/qr-direct".to_owned()),
+    );
+    assert_eq!(
+        select_billing_qr_payload(
+            Some("https://checkout.example.com/pay"),
+            Some("   "),
+        ),
+        Some("https://checkout.example.com/pay".to_owned()),
+    );
+    assert_eq!(
+        select_billing_qr_payload(None, Some("alipays://only")),
+        Some("alipays://only".to_owned()),
+    );
+    assert_eq!(select_billing_qr_payload(None, Some("  ")), None);
+
+    assert_eq!(
+        ruum_support_url(Locale::En),
+        "https://ruum.jsonlee12138.com/#support"
+    );
+    assert_eq!(
+        ruum_support_url(Locale::Zh),
+        "https://ruum.jsonlee12138.com/zh/#support"
+    );
+    assert_eq!(
+        ruum_support_url(Locale::Ja),
+        "https://ruum.jsonlee12138.com/ja/#support"
+    );
+    assert_eq!(
+        ruum_support_url(Locale::Ko),
+        "https://ruum.jsonlee12138.com/ko/#support"
+    );
+}
+
+#[gpui_kit::test]
+fn cloud_billing_usage_policy_shared_vs_per_sku_and_two_step_checkout(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-usage-policy.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x71; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let per_sku_mode = Arc::new(AtomicBool::new(false));
+    let per_sku_srv = Arc::clone(&per_sku_mode);
+
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/billing/plans" => {
+                let data = if per_sku_srv.load(Ordering::Acquire) {
+                    serde_json::json!({
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "usagePolicy": {
+                            "dailyBudgetMicroCny": 250_000,
+                            "monthlyBudgetMicroCny": 1_800_000,
+                            "estimatedDailyAnalyses": 25,
+                            "estimatedMonthlyAnalyses": 180,
+                            "softFallbackPercent": 70,
+                            "resetTimezone": "Asia/Shanghai",
+                        },
+                        "chargingOptions": [
+                            {
+                                "skuId": "pass_month",
+                                "displayName": "Monthly Pass",
+                                "price": "¥2.9",
+                                "durationPeriod": "month",
+                                "usagePolicy": {
+                                    "dailyBudgetMicroCny": 250_000,
+                                    "monthlyBudgetMicroCny": 1_800_000,
+                                    "estimatedDailyAnalyses": 25,
+                                    "estimatedMonthlyAnalyses": 180,
+                                    "softFallbackPercent": 70,
+                                    "resetTimezone": "Asia/Shanghai",
+                                }
+                            },
+                            {
+                                "skuId": "pass_year",
+                                "displayName": "Annual Pass",
+                                "price": "¥24.9",
+                                "durationPeriod": "year",
+                                "usagePolicy": {
+                                    "dailyBudgetMicroCny": 500_000,
+                                    "monthlyBudgetMicroCny": 3_600_000,
+                                    "estimatedDailyAnalyses": 50,
+                                    "estimatedMonthlyAnalyses": 360,
+                                    "softFallbackPercent": 70,
+                                    "resetTimezone": "Asia/Shanghai",
+                                }
+                            }
+                        ]
+                    })
+                } else {
+                    serde_json::json!({
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pass",
+                        "billingMode": "TIME_BASED",
+                        "usagePolicy": {
+                            "dailyBudgetMicroCny": 250_000,
+                            "monthlyBudgetMicroCny": 1_800_000,
+                            "estimatedDailyAnalyses": 25,
+                            "estimatedMonthlyAnalyses": 180,
+                            "softFallbackPercent": 70,
+                            "resetTimezone": "Asia/Shanghai",
+                        },
+                        "chargingOptions": [
+                            {
+                                "skuId": "pass_month",
+                                "displayName": "Monthly Pass",
+                                "price": "¥2.9",
+                                "durationPeriod": "month"
+                            },
+                            {
+                                "skuId": "pass_year",
+                                "displayName": "Annual Pass",
+                                "price": "¥24.9",
+                                "durationPeriod": "year"
+                            }
+                        ]
+                    })
+                };
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-plans-policy".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": data,
+                        "traceId": "tr-plans-policy",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/billing/purchase" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-purchase-policy".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "decision": "PAY_REQUIRED",
+                        "outRequestNo": "ord-policy-1",
+                        "purchaseUrl":
+                            "alipays://platformapi/startapp?appId=20000067",
+                        "purchaseQrCode":
+                            "https://mobilecodec.alipay.com/show.htm?code=p1",
+                        "expireAtSecs": 4_102_445_400_u64,
+                    },
+                    "traceId": "tr-purchase-policy",
+                })
+                .to_string(),
+            },
+            "/v1/entitlement/status?refresh=1" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-poll".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": stub_cloud_entitlement_json(
+                        false, "trial", "DENY", 0, None, "green",
+                    ),
+                    "traceId": "tr-poll",
+                })
+                .to_string(),
+            },
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        None,
+        None,
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // Part A: uniform usagePolicy -> shared banner above SKU list, no per-SKU
+    // limits, first SKU pre-selected, clicking SKU 1 switches selection only.
+    assert!(win_cx.debug_bounds("cloud-billing-usage-banner").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-limit-0").is_none());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-limit-1").is_none());
+    let sku1 = win_cx
+        .debug_bounds("cloud-billing-sku-1")
+        .expect("cloud-billing-sku-1");
+    win_cx.simulate_click(sku1.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.step, crate::state::BillingModalStep::SelectPlan);
+        assert_eq!(modal.selected_sku_id.as_deref(), Some("pass_year"));
+        assert!(modal.active_order.is_none());
+    });
+    assert!(
+        server
+            .recorded_requests()
+            .iter()
+            .all(|r| r.path != "/v1/billing/purchase")
+    );
+    press(win_cx, "escape");
+
+    // Part B: per-SKU differing policies -> no shared banner, first SKU
+    // expanded by default, clicking SKU 1 expands SKU 1 with 0 purchase calls,
+    // then clicking Confirm creates purchase for `pass_year`.
+    per_sku_mode.store(true, Ordering::Release);
+    update(&view, win_cx, Ruum::open_billing_modal);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-usage-banner").is_none());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-limit-0").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-limit-1").is_none());
+
+    let sku1 = win_cx
+        .debug_bounds("cloud-billing-sku-1")
+        .expect("cloud-billing-sku-1");
+    win_cx.simulate_click(sku1.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-sku-limit-0").is_none());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-limit-1").is_some());
+    assert!(
+        server
+            .recorded_requests()
+            .iter()
+            .all(|r| r.path != "/v1/billing/purchase")
+    );
+
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    let purchase_req = server
+        .recorded_requests()
+        .into_iter()
+        .find(|r| r.path == "/v1/billing/purchase")
+        .expect("purchase request sent after Confirm");
+    let body: serde_json::Value =
+        serde_json::from_str(&purchase_req.body).expect("purchase json");
+    assert_eq!(body["skuId"].as_str(), Some("pass_year"));
+    assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-support-hint").is_some());
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-redeem-control")
+            .is_none()
+    );
+    press(win_cx, "escape");
+}
+
+#[gpui_kit::test]
+fn cloud_billing_instant_cached_plans_and_silent_background_refresh(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::storage::{CloudState, StorageDb};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-cached-plans.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x72; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let fail_refresh = Arc::new(AtomicBool::new(true));
+    let fail_srv = Arc::clone(&fail_refresh);
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/billing/plans" => {
+                if fail_srv.load(Ordering::Acquire) {
+                    StubCloudReply {
+                        status: "502 Bad Gateway".into(),
+                        trace_id: Some("tr-bg-err".into()),
+                        body: serde_json::json!({
+                            "code": "COMMON_UPSTREAM_UNAVAILABLE",
+                            "message": "temporary upstream error",
+                            "traceId": "tr-bg-err",
+                        })
+                        .to_string(),
+                    }
+                } else {
+                    StubCloudReply {
+                        status: "200 OK".into(),
+                        trace_id: Some("tr-bg-ok".into()),
+                        body: serde_json::json!({
+                            "code": "OK",
+                            "message": "ok",
+                            "data": {
+                                "capabilityStatus": "ENABLED",
+                                "productName": "Ruum Cloud Pass",
+                                "billingMode": "TIME_BASED",
+                                "chargingOptions": [
+                                    {
+                                        "skuId": "pass_month",
+                                        "displayName": "Monthly Pass",
+                                        "price": "¥2.9",
+                                        "durationPeriod": "month"
+                                    },
+                                    {
+                                        "skuId": "pass_year",
+                                        "displayName": "Annual Pass",
+                                        "price": "¥19.9",
+                                        "durationPeriod": "year"
+                                    }
+                                ]
+                            },
+                            "traceId": "tr-bg-ok",
+                        })
+                        .to_string(),
+                    }
+                }
+            }
+            other => panic!("unexpected path: {other}"),
+        });
+
+    let cached_plans_json = serde_json::json!({
+        "capabilityStatus": "ENABLED",
+        "productName": "Ruum Cloud Pass",
+        "billingMode": "TIME_BASED",
+        "chargingOptions": [
+            {
+                "skuId": "pass_month",
+                "displayName": "Monthly Pass",
+                "price": "¥2.9",
+                "durationPeriod": "month"
+            }
+        ]
+    })
+    .to_string();
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.save_cloud_state(&CloudState {
+            gateway_base_url: server.base_url(),
+            plans_json: Some(cached_plans_json),
+            plans_cached_at_secs: 1_700_000_000,
+            ..CloudState::default()
+        })
+        .expect("seed cached plans");
+    }
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.reload_watchdog_config_and_prepare_settings();
+        app.open_billing_modal(cx);
+    });
+    // Draw IMMEDIATELY before background refresh completes -> 0ms cached SKU!
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert!(!modal.loading_plans);
+        assert_eq!(modal.selected_sku_id.as_deref(), Some("pass_month"));
+    });
+    assert!(win_cx.debug_bounds("cloud-billing-loading").is_none());
+    assert!(win_cx.debug_bounds("cloud-billing-sku-0").is_some());
+
+    // Background refresh failure keeps cached plans cleanly without error card.
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-sku-0").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-error").is_none());
+
+    // Re-open with healthy background refresh -> silently updates to 2 SKUs
+    // while preserving user's selected `pass_month`.
+    fail_refresh.store(false, Ordering::Release);
+    press(win_cx, "escape");
+    update(&view, win_cx, Ruum::open_billing_modal);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-sku-1").is_some());
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.selected_sku_id.as_deref(), Some("pass_month"));
+        assert_eq!(
+            app.cached_cloud_plans().map(|p| p.charging_options.len()),
+            Some(2)
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn cloud_settings_fetch_models_auto_and_sqlite_persistence_across_reload(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-fetch-models.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x73; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-fetch-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([
+                    {
+                        "id": "ruum-pro",
+                        "display_name": "Ruum Pro",
+                        "tier": "paid",
+                        "available": true
+                    },
+                    {
+                        "id": "ruum-fast",
+                        "display_name": "Ruum Fast",
+                        "tier": "trial",
+                        "available": true
+                    }
+                ])),
+            },
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                true,
+                "alipay",
+                "ALLOW",
+                0,
+                Some(1_893_456_000),
+                "green",
+            )
+            .to_string(),
+        ),
+        None,
+        None,
+    );
+    {
+        use ruum_core::storage::AiConfig;
+        let db = StorageDb::open(&db_path).expect("open db");
+        db.save_ai_config(&AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        })
+        .expect("save ai_config");
+    }
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.reload_watchdog_config_and_prepare_settings();
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+    });
+    draw(win_cx);
+
+    // Even with 0 cached models, Auto (Recommended) row is rendered & selected.
+    assert!(win_cx.debug_bounds("cloud-fetch-models-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-virtual-models-list").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-auto").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-0").is_none());
+
+    // Clicking Fetch Models loads models and preserves Auto (`None`).
+    let fetch_btn = win_cx
+        .debug_bounds("cloud-fetch-models-btn")
+        .expect("cloud-fetch-models-btn");
+    win_cx.simulate_click(fetch_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-model-row-0").is_some());
+    assert!(win_cx.debug_bounds("cloud-model-row-1").is_some());
+    read(&view, win_cx, |app| {
+        assert!(!app.cloud_fetching_models);
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+        assert_eq!(app.ai_config.model, None);
+    });
+
+    // Click `ruum-pro` -> persists to BOTH `cloud_state.selected_model_id`
+    // and `ai_config.model` across SQLite reload.
+    let pro_row = win_cx
+        .debug_bounds("cloud-model-row-0")
+        .expect("cloud-model-row-0");
+    win_cx.simulate_click(pro_row.center(), Modifiers::none());
+    draw(win_cx);
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        assert_eq!(
+            db.load_cloud_state()
+                .expect("load cloud")
+                .selected_model_id
+                .as_deref(),
+            Some("ruum-pro")
+        );
+        assert_eq!(
+            db.load_ai_config().expect("load ai").model.as_deref(),
+            Some("ruum-pro")
+        );
+    }
+    update(&view, win_cx, |app, _| {
+        app.reload_watchdog_config_and_prepare_settings();
+    });
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model.as_deref(), Some("ruum-pro"));
+        assert_eq!(
+            app.cloud_state.selected_model_id.as_deref(),
+            Some("ruum-pro")
+        );
+        assert_eq!(app.ai_config.model.as_deref(), Some("ruum-pro"));
+    });
+
+    // Click `Auto (Recommended)` -> persists `None` to BOTH tables across reload.
+    let auto_row = win_cx
+        .debug_bounds("cloud-model-row-auto")
+        .expect("cloud-model-row-auto");
+    win_cx.simulate_click(auto_row.center(), Modifiers::none());
+    draw(win_cx);
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        assert_eq!(
+            db.load_cloud_state().expect("load cloud").selected_model_id,
+            None
+        );
+        assert_eq!(db.load_ai_config().expect("load ai").model, None);
+    }
+    update(&view, win_cx, |app, _| {
+        app.reload_watchdog_config_and_prepare_settings();
+    });
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+        assert_eq!(app.ai_config.model, None);
+    });
+}
+
+#[test]
+fn cloud_payment_required_message_matches_cloud_pro_copy() {
+    use crate::state::is_cloud_payment_required_message;
+
+    for msg in [
+        "Free trial exhausted or Cloud Pro expired. \
+         Upgrade to Cloud Pro or redeem a code.",
+        "Selected cloud model requires Cloud Pro. \
+         Upgrade or choose an available model.",
+        "\u{514d}\u{8d39}\u{4f53}\u{9a8c}\u{6b21}\u{6570}\u{5df2}\u{7528}\u{5b8c}\u{6216}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{5df2}\u{5230}\u{671f}\u{ff0c}\u{8bf7}\u{5f00}\u{901a}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{6216}\u{4f7f}\u{7528}\u{5151}\u{6362}\u{7801}\u{3002}",
+        "\u{5f53}\u{524d}\u{6743}\u{76ca}\u{5c42}\u{7ea7}\u{65e0}\u{6743}\u{4f7f}\u{7528}\u{6240}\u{9009}\u{4e91}\u{7aef}\u{6a21}\u{578b}\u{ff0c}\u{8bf7}\u{5f00}\u{901a}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{6216}\u{5207}\u{6362}\u{53ef}\u{7528}\u{6a21}\u{578b}\u{3002}",
+        "ENTITLEMENT_PAYMENT_REQUIRED",
+        "INFERENCE_MODEL_NOT_ALLOWED",
+    ] {
+        assert!(
+            is_cloud_payment_required_message(msg),
+            "expected payment required match for: {msg}"
+        );
+    }
+    assert!(!is_cloud_payment_required_message(
+        "INFERENCE_FUP_LIMIT_EXCEEDED"
+    ));
+}
+
+#[gpui_kit::test]
+fn billing_modal_preserves_out_request_no_on_retry_and_resets_sku(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-billing-idempotency.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x79; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let purchase_attempt = Arc::new(AtomicUsize::new(0));
+    let purchase_srv = Arc::clone(&purchase_attempt);
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-plans".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pro",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": [
+                            {
+                                "skuId": "pro_month",
+                                "displayName": "Monthly Pro",
+                                "price": "\u{00a5}2.9",
+                                "durationPeriod": "month"
+                            },
+                            {
+                                "skuId": "pro_year",
+                                "displayName": "Annual Pro",
+                                "price": "\u{00a5}24.9",
+                                "durationPeriod": "year"
+                            }
+                        ]
+                    },
+                    "traceId": "tr-plans",
+                })
+                .to_string(),
+            },
+            "/v1/billing/purchase" => {
+                let n = purchase_srv.fetch_add(1, Ordering::AcqRel);
+                if n == 0 {
+                    // Non-5xx failure leaves modal in Checkout error state so
+                    // manual retry for the same SKU can reuse `outRequestNo`.
+                    StubCloudReply {
+                        status: "400 Bad Request".into(),
+                        trace_id: Some("tr-purch-fail".into()),
+                        body: serde_json::json!({
+                            "code": "BILLING_TEMP_REJECTED",
+                            "message": "gateway busy",
+                            "traceId": "tr-purch-fail",
+                        })
+                        .to_string(),
+                    }
+                } else {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&req.body).expect("purchase json");
+                    let req_no = parsed["outRequestNo"]
+                        .as_str()
+                        .unwrap_or("ord-fallback");
+                    let qr = "alipays://platformapi/startapp?appId=1";
+                    StubCloudReply {
+                        status: "200 OK".into(),
+                        trace_id: Some("tr-purch-ok".into()),
+                        body: serde_json::json!({
+                            "code": "OK",
+                            "message": "ok",
+                            "data": {
+                                "decision": "PAY_REQUIRED",
+                                "outRequestNo": req_no,
+                                "purchaseUrl": qr,
+                                "purchaseQrCode": qr,
+                                "expireAtSecs": 4_102_445_400_u64,
+                            },
+                            "traceId": "tr-purch-ok",
+                        })
+                        .to_string(),
+                    }
+                }
+            }
+            "/v1/entitlement/status?refresh=1" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-ent".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": stub_cloud_entitlement_json(
+                        false, "trial", "DENY", 0, None, "green",
+                    ),
+                    "traceId": "tr-ent",
+                })
+                .to_string(),
+            },
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([{
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "tier": "paid",
+                    "available": false,
+                }])),
+            },
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        Some(stub_cloud_models_json(&serde_json::json!([{
+            "id": "ruum-pro",
+            "display_name": "Ruum Pro",
+            "tier": "paid",
+            "available": false
+        }]))),
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        app.open_billing_modal(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // 1. Confirm first SKU -> fails, `pending_out_request_no` stays set.
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    let first_req_no = read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert!(modal.error.is_some());
+        modal
+            .pending_out_request_no
+            .clone()
+            .expect("pending_out_request_no set")
+    });
+    assert!(first_req_no.starts_with("req_"));
+
+    // 2. Retry same SKU via UI button -> reuses `pending_out_request_no`.
+    let retry_btn = win_cx
+        .debug_bounds("cloud-billing-retry-order-btn")
+        .expect("cloud-billing-retry-order-btn");
+    win_cx.simulate_click(retry_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(
+            modal.pending_out_request_no.as_deref(),
+            Some(first_req_no.as_str())
+        );
+        assert_eq!(
+            modal.active_order.as_ref().map(|o| o.purchase_id.as_str()),
+            Some(first_req_no.as_str())
+        );
+    });
+
+    // 3. `back_to_billing_plans` clears `pending_out_request_no`.
+    let back_btn = win_cx
+        .debug_bounds("cloud-billing-back-plans")
+        .expect("cloud-billing-back-plans");
+    win_cx.simulate_click(back_btn.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.pending_out_request_no, None);
+    });
+
+    // 4. `select_billing_sku` clears any pending request key on SKU switch.
+    update(&view, win_cx, |app, _| {
+        if let Some(modal) = app.billing_modal.as_mut() {
+            modal.pending_out_request_no = Some("req_stale".into());
+        }
+    });
+    let sku1 = win_cx
+        .debug_bounds("cloud-billing-sku-1")
+        .expect("cloud-billing-sku-1");
+    win_cx.simulate_click(sku1.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.selected_sku_id.as_deref(), Some("pro_year"));
+        assert_eq!(modal.pending_out_request_no, None);
+    });
+
+    // Confirming new SKU generates a fresh `outRequestNo` != `first_req_no`.
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    let second_req_no = read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        modal
+            .pending_out_request_no
+            .clone()
+            .expect("new pending_out_request_no")
+    });
+    assert_ne!(second_req_no, first_req_no);
+
+    let purchase_reqs: Vec<serde_json::Value> = server
+        .recorded_requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/billing/purchase")
+        .map(|r| serde_json::from_str(&r.body).expect("json body"))
+        .collect();
+    assert_eq!(purchase_reqs.len(), 3);
+    assert_eq!(purchase_reqs[0]["outRequestNo"], first_req_no);
+    assert_eq!(purchase_reqs[1]["outRequestNo"], first_req_no);
+    assert_eq!(purchase_reqs[2]["outRequestNo"], second_req_no);
+    assert_eq!(purchase_reqs[2]["skuId"], "pro_year");
+}
+
+#[gpui_kit::test]
+fn cloud_paid_state_ux_precisely_distinguishes_alipay_redemption_and_expired(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::AiCliProvider;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-paid-ux.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x7a; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let server = TestCloudStubServer::start(|req| {
+        panic!("passive/guarded UX must issue 0 requests, got {}", req.path);
+    });
+
+    let now = crate::state::current_unix_secs();
+    let future_ts = now + 86_400 * 30;
+    let past_ts = now.saturating_sub(600);
+
+    // (a) Active Alipay paid user: badge + hint shown, upgrade hidden,
+    //     open_billing_modal is a 0-request no-op with Neutral toast.
+    let mut alipay_active = stub_cloud_entitlement_json(
+        true,
+        "alipay",
+        "ALLOW",
+        0,
+        Some(future_ts),
+        "green",
+    );
+    alipay_active["alipayValidUntilSecs"] = serde_json::json!(future_ts);
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(alipay_active.to_string()),
+        None,
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store.clone());
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.navigate_rail(Screen::Settings, cx);
+        app.set_settings_category(crate::state::SettingsCategory::Ai, cx);
+        app.ai_config.setup_completed = true;
+        app.set_watchdog_provider(AiCliProvider::RuumCloud, cx);
+        app.reload_cloud_state();
+    });
+    draw(win_cx);
+
+    assert!(win_cx.debug_bounds("cloud-entitlement-badge").is_some());
+    assert!(win_cx.debug_bounds("cloud-alipay-active-hint").is_some());
+    assert!(win_cx.debug_bounds("cloud-upgrade-btn").is_none());
+
+    update(&view, win_cx, Ruum::open_billing_modal);
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert!(app.billing_modal.is_none());
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Neutral))
+        ));
+    });
+    assert!(server.recorded_requests().is_empty());
+
+    // (b) Pure redemption user (`source: "redemption"`,
+    //     `grantValidUntilSecs` in future, `alipayValidUntilSecs: null`):
+    //     `cloud-upgrade-btn` IS rendered and hint is NOT rendered.
+    let mut pure_redeem = stub_cloud_entitlement_json(
+        true,
+        "redemption",
+        "ALLOW",
+        0,
+        Some(future_ts),
+        "green",
+    );
+    pure_redeem["alipayValidUntilSecs"] = serde_json::Value::Null;
+    pure_redeem["grantValidUntilSecs"] = serde_json::json!(future_ts);
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(pure_redeem.to_string()),
+        None,
+        None,
+    );
+    update(&view, win_cx, |app, cx| {
+        app.reload_cloud_state();
+        cx.notify();
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-upgrade-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-alipay-active-hint").is_none());
+
+    // (c) Locally expired Alipay user (stale `isPaid: true`, past
+    //     `alipayValidUntilSecs`): flips to Expired + Renew Cloud Pro at 0ms.
+    let mut expired_alipay = stub_cloud_entitlement_json(
+        true,
+        "alipay",
+        "ALLOW",
+        0,
+        Some(past_ts),
+        "green",
+    );
+    expired_alipay["alipayValidUntilSecs"] = serde_json::json!(past_ts);
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(expired_alipay.to_string()),
+        None,
+        None,
+    );
+    update(&view, win_cx, |app, cx| {
+        app.reload_cloud_state();
+        cx.notify();
+    });
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-upgrade-btn").is_some());
+    assert!(win_cx.debug_bounds("cloud-alipay-active-hint").is_none());
+    read(&view, win_cx, |app| {
+        let ent = app.cached_cloud_entitlement();
+        assert_eq!(
+            crate::rail_pages::cloud_upgrade_action_label(
+                ent.as_ref(),
+                crate::i18n::Locale::En,
+                now,
+            ),
+            crate::i18n::pages::cloud_renew_pass(crate::i18n::Locale::En),
+        );
+        assert_eq!(
+            crate::rail_pages::cloud_entitlement_badge_label(
+                ent.as_ref(),
+                crate::i18n::Locale::En,
+                now,
+            ),
+            crate::i18n::pages::cloud_status_expired(crate::i18n::Locale::En),
+        );
+    });
+    assert!(server.recorded_requests().is_empty());
+}
+
+#[gpui_kit::test]
+fn cloud_plan_prewarming_back_during_creating_and_503_no_auto_retry(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+    use ruum_core::storage::StorageDb;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-prewarm-retry.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x7b; 32]);
+    let store = counter.store_for(&enc_path);
+
+    let delay_purchase = Arc::new(AtomicBool::new(true));
+    let delay_srv = Arc::clone(&delay_purchase);
+    let return_503 = Arc::new(AtomicBool::new(true));
+    let return_503_srv = Arc::clone(&return_503);
+
+    let server =
+        TestCloudStubServer::start(move |req| match req.path.as_str() {
+            "/v1/entitlement/status" | "/v1/entitlement/status?refresh=1" => {
+                StubCloudReply {
+                    status: "200 OK".into(),
+                    trace_id: Some("tr-ent".into()),
+                    body: serde_json::json!({
+                        "code": "OK",
+                        "message": "ok",
+                        "data": stub_cloud_entitlement_json(
+                            false, "trial", "DENY", 0, None, "green",
+                        ),
+                        "traceId": "tr-ent",
+                    })
+                    .to_string(),
+                }
+            }
+            "/v1/models" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-models".into()),
+                body: stub_cloud_models_json(&serde_json::json!([{
+                    "id": "ruum-pro",
+                    "display_name": "Ruum Pro",
+                    "tier": "paid",
+                    "available": false,
+                }])),
+            },
+            "/v1/billing/plans" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-plans-prewarm".into()),
+                body: serde_json::json!({
+                    "code": "OK",
+                    "message": "ok",
+                    "data": {
+                        "capabilityStatus": "ENABLED",
+                        "productName": "Ruum Cloud Pro",
+                        "billingMode": "TIME_BASED",
+                        "chargingOptions": [{
+                            "skuId": "pro_month",
+                            "displayName": "Monthly Pro",
+                            "price": "\u{00a5}2.9",
+                            "durationPeriod": "month"
+                        }]
+                    },
+                    "traceId": "tr-plans-prewarm",
+                })
+                .to_string(),
+            },
+            "/v1/billing/purchase" => {
+                if delay_srv.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(120));
+                }
+                if return_503_srv.load(Ordering::Acquire) {
+                    StubCloudReply {
+                        status: "503 Service Unavailable".into(),
+                        trace_id: Some("tr-503-once".into()),
+                        body: serde_json::json!({
+                            "code": "BILLING_UNAVAILABLE",
+                            "message": "temporary upstream error",
+                            "traceId": "tr-503-once",
+                        })
+                        .to_string(),
+                    }
+                } else {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&req.body).expect("purchase json");
+                    let req_no = parsed["outRequestNo"]
+                        .as_str()
+                        .unwrap_or("ord-fallback");
+                    let qr = "alipays://platformapi/startapp?appId=1";
+                    StubCloudReply {
+                        status: "200 OK".into(),
+                        trace_id: Some("tr-purch-ok".into()),
+                        body: serde_json::json!({
+                            "code": "OK",
+                            "message": "ok",
+                            "data": {
+                                "decision": "PAY_REQUIRED",
+                                "outRequestNo": req_no,
+                                "purchaseUrl": qr,
+                                "purchaseQrCode": qr,
+                                "expireAtSecs": 4_102_445_400_u64,
+                            },
+                            "traceId": "tr-purch-ok",
+                        })
+                        .to_string(),
+                    }
+                }
+            }
+            other => panic!("unexpected path: {other}"),
+        });
+
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        Some(
+            stub_cloud_entitlement_json(
+                false, "trial", "DENY", 0, None, "green",
+            )
+            .to_string(),
+        ),
+        None,
+        None,
+    );
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.simulate_resize(gpui_kit::size(px(1100.), px(950.)));
+    update(&view, win_cx, |app, _| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::RuumCloud;
+        app.watchdog_draft.ai_provider = AiCliProvider::RuumCloud;
+        app.reload_cloud_state();
+    });
+
+    // (d) Manual `refresh_cloud_entitlement` when unpaid pre-warms `plans_json`
+    //     so `open_billing_modal` renders `cloud-billing-sku-0` at 0ms.
+    update(&view, win_cx, Ruum::refresh_cloud_entitlement);
+    win_cx.run_until_parked();
+    let saved = StorageDb::open(&db_path)
+        .expect("open db")
+        .load_cloud_state()
+        .expect("load cloud_state");
+    assert!(saved.plans_json.is_some());
+
+    update(&view, win_cx, Ruum::open_billing_modal);
+    draw(win_cx);
+    assert!(win_cx.debug_bounds("cloud-billing-sku-0").is_some());
+    assert!(win_cx.debug_bounds("cloud-billing-loading").is_none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    // (e) Confirm starts `creating_order` while server delays 120ms:
+    //     1) `back_to_billing_plans` cancels and discards the stale 503 via
+    //        `billing_modal_epoch`;
+    //     2) footer `cloud-billing-back-plans` click returns to SelectPlan.
+    assert!(win_cx.debug_bounds("cloud-billing-confirm-btn").is_some());
+    update(&view, win_cx, Ruum::confirm_billing_plan);
+    draw(win_cx);
+    assert!(
+        win_cx
+            .debug_bounds("cloud-billing-creating-order")
+            .is_some()
+    );
+    assert!(win_cx.debug_bounds("cloud-billing-back-plans").is_some());
+    update(&view, win_cx, Ruum::back_to_billing_plans);
+    win_cx.run_until_parked();
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.step, crate::state::BillingModalStep::SelectPlan);
+        assert!(!modal.creating_order);
+        assert!(modal.error.is_none());
+    });
+
+    update(&view, win_cx, |app, cx| {
+        if let Some(m) = app.billing_modal.as_mut() {
+            m.step = crate::state::BillingModalStep::Checkout;
+            m.creating_order = true;
+            m.active_order = None;
+        }
+        cx.notify();
+    });
+    draw(win_cx);
+    let back_btn = win_cx
+        .debug_bounds("cloud-billing-back-plans")
+        .expect("cloud-billing-back-plans");
+    win_cx.simulate_click(back_btn.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        let modal = app.billing_modal.as_ref().expect("modal open");
+        assert_eq!(modal.step, crate::state::BillingModalStep::SelectPlan);
+        assert!(!modal.creating_order);
+    });
+
+    // (f) 503 purchase fails after exactly 1 new `/v1/billing/purchase`
+    //     request (no auto-retry), and Retry sends a 2nd request with the
+    //     exact same `outRequestNo`.
+    delay_purchase.store(false, Ordering::Release);
+    let count_before_f = server
+        .recorded_requests()
+        .iter()
+        .filter(|r| r.path == "/v1/billing/purchase")
+        .count();
+    let confirm_btn = win_cx
+        .debug_bounds("cloud-billing-confirm-btn")
+        .expect("cloud-billing-confirm-btn");
+    win_cx.simulate_click(confirm_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    let after_503_count = server
+        .recorded_requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/billing/purchase")
+        .skip(count_before_f)
+        .count();
+    assert_eq!(after_503_count, 1, "must not auto-retry 503");
+
+    let retry_btn = win_cx
+        .debug_bounds("cloud-billing-retry-order-btn")
+        .expect("cloud-billing-retry-order-btn");
+    return_503.store(false, Ordering::Release);
+    win_cx.simulate_click(retry_btn.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    let after_retry_reqs: Vec<serde_json::Value> = server
+        .recorded_requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/billing/purchase")
+        .skip(count_before_f)
+        .map(|r| serde_json::from_str(&r.body).expect("json"))
+        .collect();
+    assert_eq!(after_retry_reqs.len(), 2);
+    assert_eq!(
+        after_retry_reqs[0]["outRequestNo"],
+        after_retry_reqs[1]["outRequestNo"]
+    );
+    assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
 }

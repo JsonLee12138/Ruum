@@ -142,7 +142,7 @@ usage:
   ruum config webhook set [--enabled BOOL] [--url URL]
                           [--headers-json JSON] [--timeout-secs N] [--json]
   ruum config ai get [--json]
-  ruum config ai set [--auto-analyze BOOL] [--provider agy|pi|codex|custom|api]
+  ruum config ai set [--auto-analyze BOOL] [--provider ruum-cloud|agy|pi|codex|custom|api]
                      [--custom-command CMD] [--extra-args ARGS]
                      [--model M | --clear-model]
                      [--api-protocol openai|anthropic]
@@ -1546,6 +1546,7 @@ fn ai_config_json(
         "api_protocol": cfg.api_protocol.id(),
         "api_base_url": cfg.api_base_url,
         "api_key_configured": api_key_configured,
+        "setup_completed": cfg.setup_completed,
         "updated_at_secs": cfg.updated_at_secs,
     })
 }
@@ -1586,6 +1587,7 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                 println!("api_protocol = {}", cfg.api_protocol.id());
                 println!("api_base_url = {}", cfg.api_base_url);
                 println!("api_key_configured = {api_key_configured}");
+                println!("setup_completed = {}", cfg.setup_completed);
             }
             Ok(())
         }
@@ -1609,7 +1611,7 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                             .with_context(|| {
                                 format!(
                                     "unknown AI provider `{raw}`; expected \
-                                     agy, pi, codex, custom, or api"
+                                     ruum-cloud, agy, pi, codex, custom, or api"
                                 )
                             })?;
                     }
@@ -1679,6 +1681,7 @@ fn cmd_config_ai(args: &[OsString]) -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             }
 
+            cfg.setup_completed = true;
             cfg.updated_at_secs = now_unix_secs();
             db.save_ai_config(&cfg)?;
             let saved = db.load_ai_config()?;

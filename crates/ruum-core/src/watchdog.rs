@@ -132,7 +132,8 @@ impl<'a> CoreWatchdogEventHandler<'a> {
             notifier,
             locale: Locale::current(),
             ipc_notify_target: resolve_ipc_target_and_token(),
-            ai_context: AiExecutionContext::default(),
+            ai_context: AiExecutionContext::default()
+                .with_db_path(db.db_path().to_path_buf()),
         }
     }
 
@@ -215,7 +216,7 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
         }
 
         let ai_cfg = self.db.load_ai_config()?;
-        if !ai_cfg.auto_analyze_on_alert {
+        if !ai_cfg.setup_completed || !ai_cfg.auto_analyze_on_alert {
             self.send_ipc_watchdog_update();
             return Ok(());
         }
@@ -2403,6 +2404,7 @@ mod tests {
         fs::write(&fake_ai, b"").unwrap();
 
         db.save_ai_config(&AiConfig {
+            setup_completed: true,
             auto_analyze_on_alert: true,
             provider: AiCliProvider::Custom,
             custom_command: fake_ai.to_string_lossy().into_owned(),
@@ -2477,6 +2479,7 @@ mod tests {
             })
             .unwrap();
         db.save_ai_config(&AiConfig {
+            setup_completed: true,
             auto_analyze_on_alert: true,
             provider: AiCliProvider::Custom,
             custom_command: fake_ai.to_string_lossy().into_owned(),
@@ -2588,6 +2591,7 @@ mod tests {
         ))
         .unwrap();
         db.save_ai_config(&AiConfig {
+            setup_completed: true,
             auto_analyze_on_alert: true,
             provider: AiCliProvider::Custom,
             custom_command: fake_ai.to_string_lossy().into_owned(),
@@ -2741,6 +2745,7 @@ mod tests {
         });
 
         db.save_ai_config(&AiConfig {
+            setup_completed: true,
             auto_analyze_on_alert: true,
             provider: AiCliProvider::Api,
             api_protocol: ApiProtocol::OpenAi,
@@ -2839,6 +2844,7 @@ mod tests {
         db.save_ai_state(&prior_state).unwrap();
 
         db.save_ai_config(&AiConfig {
+            setup_completed: true,
             auto_analyze_on_alert: true,
             provider: AiCliProvider::Custom,
             custom_command: fake_ai.to_string_lossy().into_owned(),
@@ -2985,5 +2991,96 @@ mod tests {
             assert!(tagged[1].2.chars().count() <= 160);
             assert!(!tagged[1].2.contains('\n'));
         }
+    }
+
+    #[test]
+    fn watchdog_skips_ai_analysis_and_keychain_when_setup_not_completed() {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::credentials::test_helpers::MemoryRootSecretStore;
+        use crate::credentials::{CREDENTIALS_FILE_NAME, LazyCredentialStore};
+        use crate::storage::AiConfig;
+        use crate::watchdog_config::AiCliProvider;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net_hits = Arc::new(AtomicUsize::new(0));
+        let net_hits_bg = Arc::clone(&net_hits);
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::SeqCst) {
+                if let Ok((_stream, _)) = listener.accept() {
+                    net_hits_bg.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        let root_store = Arc::new(MemoryRootSecretStore::new([42_u8; 32]));
+        let root_trait: Arc<dyn crate::credentials::RootSecretStore> =
+            root_store.clone();
+        let cred_store = LazyCredentialStore::new(
+            home.join(CREDENTIALS_FILE_NAME),
+            root_trait,
+        );
+
+        // Even with auto_analyze_on_alert = true and RuumCloud selected,
+        // setup_completed = false MUST skip AI analysis with 0 keychain/network hits.
+        db.save_ai_config(&AiConfig {
+            setup_completed: false,
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let ai_runner = MockRunner::default();
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db,
+            PathBuf::from("/bin/ruum"),
+            &ai_runner,
+            &confirm,
+            &notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None)
+        .with_ai_context(
+            AiExecutionContext::default()
+                .with_credential_store(cred_store)
+                .with_db_path(db.db_path().to_path_buf())
+                .with_cloud_base_url(format!("http://{addr}")),
+        );
+
+        let event = WatchdogEvent::LowDiskSpace {
+            timestamp_secs: 1_794_895_400,
+            mount_path: home.to_path_buf(),
+            available_bytes: 512,
+            total_bytes: 1024,
+            threshold_bytes: 1024 * 1024 * 1024,
+        };
+        handler.on_event(&event).unwrap();
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+
+        assert_eq!(root_store.call_count(), 0, "zero keychain calls");
+        assert_eq!(net_hits.load(Ordering::SeqCst), 0, "zero cloud requests");
+        assert!(ai_runner.runs.lock().unwrap().is_empty());
+        assert_eq!(db.load_ai_state().unwrap().last_proposal_json, None);
+        assert_eq!(db.load_ai_state().unwrap().last_error, None);
+        assert_eq!(notifier.tagged.lock().unwrap().len(), 1);
+        assert_eq!(notifier.tagged.lock().unwrap()[0].0, NOTIF_TAG_LOW_SPACE);
     }
 }

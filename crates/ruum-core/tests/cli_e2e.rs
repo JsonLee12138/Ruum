@@ -2769,6 +2769,7 @@ fn config_ai_api_flags_redact_secret_and_preserve_lazy_keychain() {
         serde_json::from_str(&stdout_str(&ai_get_cli)).unwrap();
     assert_eq!(cli_json["provider"], "agy");
     assert_eq!(cli_json["api_key_configured"], false);
+    assert_eq!(cli_json["setup_completed"], false);
 
     // Configure direct API with --api-key-stdin and verify secret redaction.
     let mut set_cmd = sb.cmd_with_test_keychain();
@@ -2832,6 +2833,17 @@ fn config_ai_api_flags_redact_secret_and_preserve_lazy_keychain() {
         serde_json::from_str(&stdout_str(&cleared)).unwrap();
     assert_eq!(cleared_json["api_base_url"], "");
     assert_eq!(cleared_json["api_key_configured"], false);
+    assert_eq!(cleared_json["setup_completed"], true);
+
+    // Selecting `ruum-cloud` via CLI marks setup_completed = true without
+    // touching the keychain.
+    let cloud_set =
+        sb.run(&["config", "ai", "set", "--provider", "ruum-cloud", "--json"]);
+    assert!(cloud_set.status.success(), "{}", stderr_str(&cloud_set));
+    let cloud_json: Value =
+        serde_json::from_str(&stdout_str(&cloud_set)).unwrap();
+    assert_eq!(cloud_json["provider"], "ruum-cloud");
+    assert_eq!(cloud_json["setup_completed"], true);
 }
 
 #[test]

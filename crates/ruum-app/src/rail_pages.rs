@@ -36,7 +36,7 @@ use crate::palette;
 use crate::power::PowerEfficiency;
 use crate::state::{
     CleanupConfirmModal, DockerGroupKind, RemoteConnectConfirmModal, Ruum,
-    Screen, SettingsCategory, UpdateUiState,
+    Screen, SettingsCategory, UpdateUiState, format_unix_date_ymd,
 };
 use crate::ui::{icon, size, space, text};
 
@@ -131,7 +131,7 @@ fn circle_icon(color: Hsla) -> Svg {
         .text_color(color)
 }
 
-fn action_button_with_spinner(
+pub fn action_button_with_spinner(
     id: impl Into<ElementId>,
     spin_id: impl Into<SharedString>,
     label: &'static str,
@@ -1482,6 +1482,47 @@ pub fn watchdog_page(
                             .text_size(text::BODY)
                             .text_color(theme.danger)
                             .child(err_summary.clone()),
+                    )
+                    .when(
+                        app.cloud_payment_required
+                            && app.ai_config.provider
+                                == AiCliProvider::RuumCloud
+                            && !app.cached_cloud_entitlement().is_some_and(
+                                |e| {
+                                    e.is_alipay_active_at(
+                                        crate::state::current_unix_secs(),
+                                    )
+                                },
+                            ),
+                        |card| {
+                            let now_secs = crate::state::current_unix_secs();
+                            let cached_ent = app.cached_cloud_entitlement();
+                            let upgrade_label = cloud_upgrade_action_label(
+                                cached_ent.as_ref(),
+                                locale,
+                                now_secs,
+                            );
+                            card.child(
+                                div()
+                                    .pt(space::XS)
+                                    .debug_selector(|| {
+                                        "watchdog-cloud-upgrade-btn".into()
+                                    })
+                                    .child(
+                                        button(
+                                            "watchdog-cloud-upgrade-btn",
+                                            upgrade_label,
+                                            ButtonVariant::Primary,
+                                            cx,
+                                        )
+                                        .on_click(cx.listener(
+                                            |this, _, _, cx| {
+                                                this.open_billing_modal(cx);
+                                            },
+                                        )),
+                                    ),
+                            )
+                        },
                     ),
             )
     });
@@ -2509,6 +2550,7 @@ fn ai_settings_section(
     let current_provider = app.watchdog_draft.ai_provider;
     let current_protocol = app.watchdog_draft.api_protocol;
     let is_api = current_provider == AiCliProvider::Api;
+    let is_ruum_cloud = current_provider == AiCliProvider::RuumCloud;
     let entity_auto_analyze = cx.entity().downgrade();
 
     let mut provider_buttons =
@@ -2516,6 +2558,7 @@ fn ai_settings_section(
     for provider in AiCliProvider::ALL {
         let is_selected = provider == current_provider;
         let id = match provider {
+            AiCliProvider::RuumCloud => "provider-ruum-cloud",
             AiCliProvider::Agy => "provider-agy",
             AiCliProvider::Pi => "provider-pi",
             AiCliProvider::Codex => "provider-codex",
@@ -2570,9 +2613,7 @@ fn ai_settings_section(
                     .tab_stop(false)
                     .on_change(move |_, _, _, cx| {
                         let _ = entity_auto_analyze.update(cx, |this, cx| {
-                            this.watchdog_draft.ai_auto_analyze =
-                                !this.watchdog_draft.ai_auto_analyze;
-                            cx.notify();
+                            this.toggle_watchdog_ai_auto_analyze(cx);
                         });
                     }),
                 ),
@@ -2580,6 +2621,7 @@ fn ai_settings_section(
         .child(provider_buttons);
 
     let show_custom_cmd = !is_api
+        && !is_ruum_cloud
         && (current_provider == AiCliProvider::Custom
             || !app.ai_config.custom_command.is_empty()
             || !input_custom_cmd.read(cx).value().trim().is_empty());
@@ -2592,6 +2634,12 @@ fn ai_settings_section(
             window,
             cx,
         ));
+    }
+
+    if is_ruum_cloud {
+        ai_section =
+            ai_section.child(ruum_cloud_settings_card(app, window, cx));
+        return ai_section.into_any_element();
     }
 
     if is_api {
@@ -2787,7 +2835,7 @@ fn ai_settings_section(
             .flex()
             .flex_col()
             .gap(space::XS)
-            .max_h(Rems(14.0))
+            .max_h(size::CLOUD_MODELS_MAX_H)
             .overflow_y_scroll()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
 
@@ -3027,6 +3075,719 @@ fn ai_settings_section(
     }
 
     ai_section.into_any_element()
+}
+
+pub fn cloud_upgrade_action_label(
+    entitlement: Option<&ruum_core::cloud_client::EntitlementSnapshot>,
+    locale: crate::i18n::Locale,
+    now_secs: u64,
+) -> &'static str {
+    if entitlement.is_some_and(|e| e.has_expired_alipay_history_at(now_secs)) {
+        crate::i18n::pages::cloud_renew_pass(locale)
+    } else {
+        crate::i18n::pages::cloud_upgrade_pass(locale)
+    }
+}
+
+pub fn cloud_entitlement_badge_label(
+    entitlement: Option<&ruum_core::cloud_client::EntitlementSnapshot>,
+    locale: crate::i18n::Locale,
+    now_secs: u64,
+) -> String {
+    match entitlement {
+        None => {
+            crate::i18n::pages::cloud_status_not_activated(locale).to_owned()
+        }
+        Some(ent) if ent.is_effectively_paid_at(now_secs) => {
+            let until = if ent.is_alipay_active_at(now_secs) {
+                ent.alipay_valid_until_secs.or(ent.valid_until_secs)
+            } else {
+                ent.grant_valid_until_secs
+                    .filter(|&u| u > now_secs)
+                    .or(ent.valid_until_secs)
+            };
+            let date =
+                until.map_or_else(|| "-".to_owned(), format_unix_date_ymd);
+            crate::i18n::pages::cloud_status_paid_until(
+                &date,
+                &ent.source,
+                locale,
+            )
+        }
+        Some(ent)
+            if ent.trial_remaining > 0
+                && !ent.decision.eq_ignore_ascii_case("DENY") =>
+        {
+            crate::i18n::pages::cloud_status_trial(ent.trial_remaining, locale)
+        }
+        Some(_) => crate::i18n::pages::cloud_status_expired(locale).to_owned(),
+    }
+}
+
+fn cloud_entitlement_status_row(
+    entitlement: Option<&ruum_core::cloud_client::EntitlementSnapshot>,
+    locale: crate::i18n::Locale,
+    theme: &gpui_omarchy::Theme,
+    now_secs: u64,
+) -> Div {
+    let badge_text =
+        cloud_entitlement_badge_label(entitlement, locale, now_secs);
+    let badge_color = match entitlement {
+        None => theme.secondary,
+        Some(ent) if ent.is_effectively_paid_at(now_secs) => theme.success,
+        Some(ent)
+            if ent.trial_remaining > 0
+                && !ent.decision.eq_ignore_ascii_case("DENY") =>
+        {
+            theme.accent
+        }
+        Some(_) => theme.danger,
+    };
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(space::SM)
+        .child(
+            div()
+                .id("cloud-entitlement-badge")
+                .debug_selector(|| "cloud-entitlement-badge".into())
+                .px(space::SM)
+                .py(space::XS)
+                .rounded(space::XS)
+                .border_1()
+                .border_color(badge_color.opacity(0.45))
+                .bg(badge_color.opacity(0.14))
+                .text_size(text::CAPTION)
+                .text_color(badge_color)
+                .child(badge_text),
+        );
+
+    if let Some(ent) = entitlement {
+        let fup_zone = ent.fup_zone.trim();
+        let fup_color = match fup_zone.to_ascii_lowercase().as_str() {
+            "yellow" => theme.warning,
+            "red" => theme.danger,
+            _ => theme.success,
+        };
+        let fup_label = crate::i18n::pages::cloud_fup_label(fup_zone, locale);
+        row = row.child(
+            div()
+                .id("cloud-fup-pill")
+                .debug_selector(|| "cloud-fup-pill".into())
+                .px(space::SM)
+                .py(space::XS)
+                .rounded(space::XS)
+                .border_1()
+                .border_color(fup_color.opacity(0.45))
+                .bg(fup_color.opacity(0.14))
+                .text_size(text::CAPTION)
+                .text_color(fup_color)
+                .child(fup_label),
+        );
+        if ent.is_alipay_active_at(now_secs) {
+            row = row.child(
+                div()
+                    .id("cloud-alipay-active-hint")
+                    .debug_selector(|| "cloud-alipay-active-hint".into())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(crate::i18n::pages::cloud_alipay_active_renew_hint(
+                        locale,
+                    )),
+            );
+        }
+    }
+
+    row
+}
+
+fn cloud_virtual_model_row(
+    app: &Ruum,
+    index: usize,
+    model: &ruum_core::cloud_client::CloudVirtualModel,
+    is_paid: bool,
+    cx: &Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let is_selected = app.watchdog_draft.model.as_deref()
+        == Some(model.id.as_str())
+        && model.available;
+    let title = model
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&model.id)
+        .to_owned();
+    let tier_label = if model.tier.trim().is_empty() {
+        "cloud".to_owned()
+    } else {
+        model.tier.trim().to_owned()
+    };
+    let desc = model
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let model_id_pick = model.id.clone();
+    let model_id_bench = model.id.clone();
+    let is_benchmarking = app.watchdog_benchmarking_models.contains(&model.id);
+    let speed_opt = app
+        .watchdog_speed_results
+        .iter()
+        .find(|r| r.model == model.id);
+
+    let mut info_col = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(space::XXS)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .text_color(if is_selected {
+                            theme.accent
+                        } else if model.available {
+                            theme.bright
+                        } else {
+                            theme.secondary
+                        })
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .px(space::XS)
+                        .py(space::XXS)
+                        .rounded(space::XXS)
+                        .bg(theme.normal_fill())
+                        .border_1()
+                        .border_color(theme.divider())
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(tier_label),
+                ),
+        );
+
+    if let Some(description) = desc {
+        info_col = info_col.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(description),
+        );
+    }
+
+    let mut right_col = div().flex().flex_row().items_center().gap(space::SM);
+
+    if is_paid && model.available {
+        let speed_btn = div()
+            .id(ElementId::Name(
+                format!("setting-model-speed-{index}").into(),
+            ))
+            .debug_selector(move || format!("setting-model-speed-{index}"))
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .px(space::SM)
+            .py(space::XS)
+            .rounded(space::XS)
+            .border_1()
+            .border_color(theme.control_border())
+            .bg(theme.normal_fill())
+            .hover(|style| style.bg(theme.hover_fill()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.benchmark_watchdog_model(Some(model_id_bench.clone()), cx);
+            }))
+            .child(if is_benchmarking {
+                spinning_loader(
+                    format!("setting-model-spin-{index}"),
+                    theme.accent,
+                )
+                .into_any_element()
+            } else if let Some(res) = speed_opt {
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(if res.ok {
+                        theme.success
+                    } else {
+                        theme.danger
+                    })
+                    .child(if res.ok {
+                        format!("{} ms", res.elapsed_ms)
+                    } else {
+                        crate::i18n::pages::speed_retry(
+                            u128::from(res.elapsed_ms),
+                            locale,
+                        )
+                    })
+                    .into_any_element()
+            } else {
+                zap_icon(theme.accent).into_any_element()
+            });
+        right_col = right_col.child(speed_btn);
+    }
+
+    if model.available {
+        let select_id = model.id.clone();
+        right_col = right_col.child(
+            div()
+                .debug_selector(move || format!("cloud-model-select-{index}"))
+                .child(
+                    button(
+                        ElementId::Name(
+                            format!("cloud-model-select-{index}").into(),
+                        ),
+                        "",
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .accessibility_label(if is_selected {
+                        crate::i18n::pages::selected(locale)
+                    } else {
+                        crate::i18n::pages::select(locale)
+                    })
+                    .p(space::XS)
+                    .justify_center()
+                    .when(is_selected, |b| b.bg(theme.accent.opacity(0.18)))
+                    .child(if is_selected {
+                        gpui_omarchy::icon(IconName::CircleCheck)
+                            .size(icon::MD)
+                            .text_color(theme.accent)
+                            .into_any_element()
+                    } else {
+                        circle_icon(theme.secondary).into_any_element()
+                    })
+                    .on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.select_cloud_model(&select_id, cx);
+                        },
+                    )),
+                ),
+        );
+    } else {
+        right_col = right_col.child(
+            div()
+                .px(space::XS)
+                .py(space::XXS)
+                .rounded(space::XXS)
+                .border_1()
+                .border_color(theme.warning.opacity(0.45))
+                .bg(theme.warning.opacity(0.12))
+                .text_size(text::CAPTION)
+                .text_color(theme.warning)
+                .child(crate::i18n::pages::cloud_model_locked_badge(locale)),
+        );
+    }
+
+    let mut row = div()
+        .id(ElementId::Name(format!("cloud-model-row-{index}").into()))
+        .debug_selector(move || format!("cloud-model-row-{index}"))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::SM)
+        .p(space::SM)
+        .rounded(space::XS)
+        .bg(if is_selected {
+            theme.accent.opacity(0.12)
+        } else {
+            theme.normal_fill()
+        })
+        .border_1()
+        .border_color(if is_selected {
+            theme.accent.opacity(0.45)
+        } else {
+            theme.divider()
+        })
+        .child(info_col)
+        .child(right_col);
+
+    if model.available {
+        row = row.cursor_pointer().on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.select_cloud_model(&model_id_pick, cx);
+            },
+        ));
+    }
+    row
+}
+
+fn cloud_auto_model_row(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let is_selected = app.watchdog_draft.model.is_none();
+
+    let info_col = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(space::XXS)
+        .child(
+            div()
+                .text_color(if is_selected {
+                    theme.accent
+                } else {
+                    theme.bright
+                })
+                .child(crate::i18n::pages::cloud_model_auto_title(locale)),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_model_auto_desc(locale)),
+        );
+
+    let select_btn = div()
+        .debug_selector(|| "cloud-model-select-auto".into())
+        .child(
+            button("cloud-model-select-auto", "", ButtonVariant::Secondary, cx)
+                .accessibility_label(if is_selected {
+                    crate::i18n::pages::selected(locale)
+                } else {
+                    crate::i18n::pages::select(locale)
+                })
+                .p(space::XS)
+                .justify_center()
+                .when(is_selected, |b| b.bg(theme.accent.opacity(0.18)))
+                .child(if is_selected {
+                    gpui_omarchy::icon(IconName::CircleCheck)
+                        .size(icon::MD)
+                        .text_color(theme.accent)
+                        .into_any_element()
+                } else {
+                    circle_icon(theme.secondary).into_any_element()
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.select_cloud_model_auto(cx);
+                })),
+        );
+
+    div()
+        .id("cloud-model-row-auto")
+        .debug_selector(|| "cloud-model-row-auto".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::SM)
+        .p(space::SM)
+        .rounded(space::XS)
+        .bg(if is_selected {
+            theme.accent.opacity(0.12)
+        } else {
+            theme.normal_fill()
+        })
+        .border_1()
+        .border_color(if is_selected {
+            theme.accent.opacity(0.45)
+        } else {
+            theme.divider()
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.select_cloud_model_auto(cx);
+        }))
+        .child(info_col)
+        .child(select_btn)
+}
+
+pub struct RedeemControlIds {
+    pub control: &'static str,
+    pub input: &'static str,
+    pub submit: &'static str,
+    pub spinner: &'static str,
+    pub feedback: &'static str,
+}
+
+pub const SETTINGS_REDEEM_IDS: RedeemControlIds = RedeemControlIds {
+    control: "cloud-settings-redeem-control",
+    input: "cloud-settings-redeem-input",
+    submit: "cloud-settings-redeem-btn",
+    spinner: "cloud-settings-redeem-spin",
+    feedback: "cloud-settings-redeem-feedback",
+};
+
+pub fn redeem_code_control(
+    ids: &'static RedeemControlIds,
+    app: &Ruum,
+    input: &Entity<InputState>,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let submitting = app.redeem_submitting;
+    let submit_btn = action_button_with_spinner(
+        ids.submit,
+        ids.spinner,
+        crate::i18n::pages::cloud_redeem_submit(locale),
+        submitting,
+        ButtonVariant::Secondary,
+        cx,
+    )
+    .disabled(submitting)
+    .when(!submitting, |btn| {
+        btn.on_click(cx.listener(move |this, _, _, cx| {
+            this.submit_redeem_code(cx);
+        }))
+    });
+
+    div()
+        .id(ids.control)
+        .debug_selector(move || ids.control.into())
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_redeem_title(locale)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    div().flex_1().min_w_0().child(
+                        gpui_omarchy::input(ids.input, input, window, cx)
+                            .debug_selector(move || ids.input.into()),
+                    ),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || ids.submit.into())
+                        .child(submit_btn),
+                ),
+        )
+        .when_some(app.cloud_redeem_feedback.as_ref(), |col, (msg, is_err)| {
+            col.child(
+                div()
+                    .id(ids.feedback)
+                    .debug_selector(move || ids.feedback.into())
+                    .text_size(text::CAPTION)
+                    .text_color(if *is_err {
+                        theme.danger
+                    } else {
+                        theme.secondary
+                    })
+                    .child(msg.clone()),
+            )
+        })
+}
+
+fn ruum_cloud_settings_card(
+    app: &Ruum,
+    window: &Window,
+    cx: &mut Context<'_, Ruum>,
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let locale = app.locale;
+    let now_secs = crate::state::current_unix_secs();
+    let entitlement = app.cached_cloud_entitlement();
+    let models = app.cached_cloud_models();
+    let is_paid = entitlement
+        .as_ref()
+        .is_some_and(|e| e.is_effectively_paid_at(now_secs));
+    let alipay_active = entitlement
+        .as_ref()
+        .is_some_and(|e| e.is_alipay_active_at(now_secs));
+    let upgrade_label =
+        cloud_upgrade_action_label(entitlement.as_ref(), locale, now_secs);
+    let redeem_input = app
+        .cloud_redeem_input_settings
+        .as_ref()
+        .expect("settings redeem input initialized");
+
+    let mut card = div()
+        .id("cloud-settings-card")
+        .debug_selector(|| "cloud-settings-card".into())
+        .flex()
+        .flex_col()
+        .gap(space::MD)
+        .p(space::MD)
+        .rounded(space::XS)
+        .border_1()
+        .border_color(theme.divider())
+        .bg(theme.normal_fill())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XXS)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .text_color(theme.bright)
+                        .child(crate::i18n::pages::cloud_card_title(locale)),
+                )
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(crate::i18n::pages::cloud_card_desc(locale)),
+                ),
+        )
+        .child(cloud_entitlement_status_row(
+            entitlement.as_ref(),
+            locale,
+            &theme,
+            now_secs,
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(space::SM)
+                .when(!alipay_active, |row| {
+                    row.child(
+                        div()
+                            .debug_selector(|| "cloud-upgrade-btn".into())
+                            .child(
+                                button(
+                                    "cloud-upgrade-btn",
+                                    upgrade_label,
+                                    ButtonVariant::Primary,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.open_billing_modal(cx);
+                                    }),
+                                ),
+                            ),
+                    )
+                })
+                .child(
+                    div()
+                        .debug_selector(|| {
+                            "cloud-refresh-entitlement-btn".into()
+                        })
+                        .child(
+                            action_button_with_spinner(
+                                "cloud-refresh-entitlement-btn",
+                                "cloud-refresh-entitlement-spin",
+                                crate::i18n::pages::cloud_refresh_entitlement(
+                                    locale,
+                                ),
+                                app.cloud_refreshing,
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.refresh_cloud_entitlement(cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div().debug_selector(|| "setting-test-cli".into()).child(
+                        action_button_with_spinner(
+                            "setting-test-cli",
+                            "setting-test-cli-spin",
+                            crate::i18n::pages::cloud_test_connection(locale),
+                            app.watchdog_testing,
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.test_watchdog_ai_cli(cx);
+                            },
+                        )),
+                    ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "cloud-fetch-models-btn".into())
+                        .child(
+                            action_button_with_spinner(
+                                "cloud-fetch-models-btn",
+                                "cloud-fetch-models-spin",
+                                crate::i18n::pages::cloud_fetch_models_btn(
+                                    locale,
+                                ),
+                                app.cloud_fetching_models,
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .disabled(app.cloud_fetching_models)
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.fetch_cloud_models(cx);
+                                },
+                            )),
+                        ),
+                ),
+        );
+
+    card = card.child(redeem_code_control(
+        &SETTINGS_REDEEM_IDS,
+        app,
+        redeem_input,
+        window,
+        cx,
+    ));
+
+    let mut list = div()
+        .id("cloud-virtual-models-list")
+        .debug_selector(|| "cloud-virtual-models-list".into())
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .max_h(size::CLOUD_MODELS_MAX_H)
+        .overflow_y_scroll()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(cloud_auto_model_row(app, cx));
+    for (index, model) in models.iter().enumerate() {
+        list =
+            list.child(cloud_virtual_model_row(app, index, model, is_paid, cx));
+    }
+
+    if !models.is_empty() {
+        card = card.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_virtual_models_title(
+                    models.len(),
+                    locale,
+                )),
+        );
+    }
+    card = card.child(list);
+    if models.is_empty() {
+        card = card.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(crate::i18n::pages::cloud_virtual_models_empty(locale)),
+        );
+    }
+
+    card
 }
 
 fn cli_settings_section(app: &Ruum, cx: &Context<'_, Ruum>) -> AnyElement {

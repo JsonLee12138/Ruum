@@ -1,7 +1,8 @@
 //! Localized toast notices and status feedback strings for `state.rs`.
 
 use ruum_core::i18n::{
-    MAX_AI_FAILURE_SUMMARY_CHARS, clean_ai_failure_reason, truncate_single_line,
+    MAX_AI_FAILURE_SUMMARY_CHARS, clean_ai_failure_reason,
+    truncate_preserving_trace,
 };
 use ruum_core::watchdog::{
     AiFailureKind, classify_ai_failure, format_ai_failure_summary,
@@ -788,7 +789,7 @@ pub fn ssh_ai_analyze_failed(alias: &str, err: &str, locale: Locale) -> String {
             ),
         }
     };
-    truncate_single_line(&msg, MAX_AI_FAILURE_SUMMARY_CHARS)
+    truncate_preserving_trace(&msg, MAX_AI_FAILURE_SUMMARY_CHARS)
 }
 
 pub fn webhook_saved(name: &str, locale: Locale) -> String {
@@ -952,5 +953,77 @@ pub const fn update_command_copied(locale: Locale) -> &'static str {
         "\u{5347}\u{7ea7}\u{547d}\u{4ee4}\u{5df2}\u{590d}\u{5236}\u{5230}\u{526a}\u{8d34}\u{677f}",
         "\u{30a2}\u{30c3}\u{30d7}\u{30b0}\u{30ec}\u{30fc}\u{30c9}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{30b3}\u{30d4}\u{30fc}\u{3057}\u{307e}\u{3057}\u{305f}",
         "\u{c5c5}\u{adf8}\u{b808}\u{c774}\u{b4dc} \u{ba85}\u{b839}\u{c744} \u{d074}\u{b9bd}\u{bcf4}\u{b4dc}\u{c5d0} \u{bcf5}\u{c0ac}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}",
+    )
+}
+
+pub const fn refreshing_cloud_entitlement(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Refreshing Ruum Cloud entitlement\u{2026}",
+        "\u{6b63}\u{5728}\u{5237}\u{65b0} Ruum \u{4e91}\u{7aef}\u{6743}\u{76ca}\u{2026}",
+        "Ruum Cloud \u{306e}\u{5229}\u{7528}\u{6a29}\u{9650}\u{3092}\u{66f4}\u{65b0}\u{4e2d}\u{2026}",
+        "Ruum Cloud \u{ad8c}\u{d55c} \u{c0c1}\u{d0dc}\u{b97c} \u{c0c8}\u{b85c} \u{ace0}\u{ce58}\u{b294} \u{c911}\u{2026}",
+    )
+}
+
+pub const fn cloud_entitlement_refreshed(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Ruum Cloud entitlement and models updated",
+        "\u{5df2}\u{5237}\u{65b0} Ruum \u{4e91}\u{7aef}\u{6743}\u{76ca}\u{4e0e}\u{53ef}\u{7528}\u{6a21}\u{578b}",
+        "Ruum Cloud \u{306e}\u{5229}\u{7528}\u{6a29}\u{9650}\u{3068}\u{30e2}\u{30c7}\u{30eb}\u{3092}\u{66f4}\u{65b0}\u{3057}\u{307e}\u{3057}\u{305f}",
+        "Ruum Cloud \u{ad8c}\u{d55c} \u{bc0f} \u{baa8}\u{b378} \u{baa9}\u{b85d}\u{c744} \u{c5c5}\u{b370}\u{c774}\u{d2b8}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}",
+    )
+}
+
+pub const fn cloud_no_available_models_blocked(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Current models require Cloud Pro or a redemption code.",
+        "\u{5f53}\u{524d}\u{6a21}\u{578b}\u{9700}\u{5f00}\u{901a}\u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{6216}\u{4f7f}\u{7528}\u{5151}\u{6362}\u{7801}\u{89e3}\u{9501}\u{3002}",
+        "\u{73fe}\u{5728}\u{306e}\u{30e2}\u{30c7}\u{30eb}\u{3092}\u{5229}\u{7528}\u{3059}\u{308b}\u{306b}\u{306f}\u{30af}\u{30e9}\u{30a6}\u{30c9}\u{4f1a}\u{54e1}\u{307e}\u{305f}\u{306f}\u{5f15}\u{63db}\u{30b3}\u{30fc}\u{30c9}\u{304c}\u{5fc5}\u{8981}\u{3067}\u{3059}\u{3002}",
+        "\u{d604}\u{c7ac} \u{baa8}\u{b378}\u{c744} \u{c0ac}\u{c6a9}\u{d558}\u{b824}\u{ba74} \u{d074}\u{b77c}\u{c6b0}\u{b4dc} \u{d504}\u{b85c} \u{b610}\u{b294} \u{ad50}\u{d658} \u{cf54}\u{b4dc}\u{ac00} \u{d544}\u{c694}\u{d569}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn testing_cloud_connection(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Checking Ruum Cloud entitlement and models\u{2026}",
+        "\u{6b63}\u{5728}\u{68c0}\u{67e5} Ruum \u{4e91}\u{7aef}\u{6743}\u{76ca}\u{4e0e}\u{6a21}\u{578b}\u{2026}",
+        "Ruum Cloud \u{306e}\u{63a5}\u{7d9a}\u{3068}\u{30e2}\u{30c7}\u{30eb}\u{3092}\u{78ba}\u{8a8d}\u{4e2d}\u{2026}",
+        "Ruum Cloud \u{c5f0}\u{acb0} \u{bc0f} \u{baa8}\u{b378} \u{d655}\u{c778} \u{c911}\u{2026}",
+    )
+}
+
+pub const fn cloud_payment_succeeded(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Ruum Cloud Pro activated! Available models refreshed.",
+        "Ruum \u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{5df2}\u{5f00}\u{901a}\u{ff01}\u{5df2}\u{5237}\u{65b0}\u{53ef}\u{7528}\u{6a21}\u{578b}\u{3002}",
+        "Ruum Cloud Pro \u{304c}\u{6709}\u{52b9}\u{5316}\u{3055}\u{308c}\u{307e}\u{3057}\u{305f}\u{ff01}\u{5229}\u{7528}\u{53ef}\u{80fd}\u{306a}\u{30e2}\u{30c7}\u{30eb}\u{3092}\u{66f4}\u{65b0}\u{3057}\u{307e}\u{3057}\u{305f}\u{3002}",
+        "Ruum Cloud Pro\u{ac00} \u{d65c}\u{c131}\u{d654}\u{b418}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}! \u{c0ac}\u{c6a9} \u{ac00}\u{b2a5}\u{d55c} \u{baa8}\u{b378}\u{c744} \u{c0c8}\u{b85c}\u{ace0}\u{ce68}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}.",
+    )
+}
+
+pub const fn cloud_payment_succeeded_notif_title(
+    locale: Locale,
+) -> &'static str {
+    pick(
+        locale,
+        "Ruum Cloud Pro Activated",
+        "Ruum \u{4e91}\u{7aef}\u{4f1a}\u{5458}\u{5df2}\u{5f00}\u{901a}",
+        "Ruum Cloud Pro \u{6709}\u{52b9}\u{5316}\u{5b8c}\u{4e86}",
+        "Ruum Cloud Pro \u{d65c}\u{c131}\u{d654}\u{b428}",
+    )
+}
+
+pub const fn cloud_payment_still_pending(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Payment not confirmed yet. Complete payment and try again.",
+        "\u{6682}\u{672a}\u{68c0}\u{6d4b}\u{5230}\u{652f}\u{4ed8}\u{5230}\u{8d26}\u{ff0c}\u{8bf7}\u{5b8c}\u{6210}\u{652f}\u{4ed8}\u{540e}\u{518d}\u{8bd5}\u{3002}",
+        "\u{6c7a}\u{6e08}\u{304c}\u{307e}\u{3060}\u{78ba}\u{8a8d}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093}\u{3002}\u{652f}\u{6255}\u{3044}\u{5b8c}\u{4e86}\u{5f8c}\u{306b}\u{518d}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "\u{c544}\u{c9c1} \u{acb0}\u{c81c}\u{ac00} \u{d655}\u{c778}\u{b418}\u{c9c0} \u{c54a}\u{c558}\u{c2b5}\u{b2c8}\u{b2e4}. \u{acb0}\u{c81c}\u{b97c} \u{c644}\u{b8cc}\u{d55c} \u{d6c4} \u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\u{c138}\u{c694}.",
     )
 }

@@ -191,6 +191,7 @@ pub fn classify_ai_failure(err: &str) -> AiFailureKind {
         || lower.contains("time-out")
         || lower.contains("timeout")
         || lower.contains("deadline has elapsed")
+        || lower.contains("请求超时")
         || contains_http_timeout_status(&lower)
     {
         AiFailureKind::TimedOut
@@ -321,6 +322,32 @@ pub fn truncate_single_line(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Normalize whitespace to a single line and cap at `max_chars` while
+/// preserving a trailing `[Trace: <id>]` suffix when it fits.
+#[must_use]
+pub fn truncate_preserving_trace(text: &str, max_chars: usize) -> String {
+    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= max_chars {
+        return single;
+    }
+    if let Some(pos) = single.rfind("[Trace:") {
+        let trace_suffix = &single[pos..];
+        let trace_chars = trace_suffix.chars().count();
+        if trace_suffix.ends_with(']')
+            && trace_chars.saturating_add(2) <= max_chars
+        {
+            let prefix = single[..pos].trim_end();
+            let avail = max_chars - trace_chars - 2;
+            let mut out: String = prefix.chars().take(avail).collect();
+            out.push('\u{2026}');
+            out.push(' ');
+            out.push_str(trace_suffix);
+            return out;
+        }
+    }
+    truncate_single_line(&single, max_chars)
+}
+
 /// Core notification title for a general AI analysis failure.
 #[must_use]
 pub const fn ai_analysis_failed_title(locale: Locale) -> &'static str {
@@ -412,7 +439,231 @@ pub fn format_ai_failure_summary(err: &str, locale: Locale) -> String {
             }
         }
     };
-    truncate_single_line(&msg, MAX_AI_FAILURE_SUMMARY_CHARS)
+    truncate_preserving_trace(&msg, MAX_AI_FAILURE_SUMMARY_CHARS)
+}
+
+/// Format a Ruum Cloud gateway or network error into a localized message with a
+/// trailing `[Trace: <trace_id>]` tag when available.
+#[must_use]
+pub fn format_cloud_error_message(
+    code: Option<&str>,
+    http_status: Option<u16>,
+    fallback_message: &str,
+    trace_id: Option<&str>,
+    is_timeout: bool,
+    locale: Locale,
+) -> String {
+    let norm_code = code.map(str::trim).filter(|s| !s.is_empty());
+    let zh = matches!(locale, Locale::Zh);
+    let base: String = if is_timeout
+        || matches!(norm_code, Some("COMMON_UPSTREAM_TIMEOUT"))
+        || matches!(http_status, Some(408 | 504))
+    {
+        if zh {
+            "云端 AI 请求超时，请稍后重试或切换本地 CLI / 自带 API Key。"
+        } else {
+            "Cloud AI request timed out. Retry later or switch to Local CLI / Custom API."
+        }
+        .to_owned()
+    } else {
+        match norm_code {
+            Some("ENTITLEMENT_PAYMENT_REQUIRED") => {
+                if zh {
+                    "免费体验次数已用完或云端会员已到期，请开通云端会员或使用兑换码。"
+                } else {
+                    "Free trial exhausted or Cloud Pro expired. Upgrade to Cloud Pro or redeem a code."
+                }
+                .to_owned()
+            }
+            Some("ENTITLEMENT_DENIED") => {
+                if zh {
+                    "当前设备主体权益被拒绝访问。"
+                } else {
+                    "Cloud AI access was denied for this device."
+                }
+                .to_owned()
+            }
+            Some("INFERENCE_MODEL_NOT_ALLOWED") => {
+                if zh {
+                    "当前权益层级无权使用所选云端模型，请开通云端会员或切换可用模型。"
+                } else {
+                    "Selected cloud model requires Cloud Pro. Upgrade or choose an available model."
+                }
+                .to_owned()
+            }
+            Some("INFERENCE_FUP_LIMIT_EXCEEDED") => match locale {
+                Locale::En => {
+                    "Daily or monthly usage limit reached. Retry tomorrow or switch to Local CLI / Custom API."
+                }
+                Locale::Zh => {
+                    "已达到今日或本月用量上限，请次日重试或切换本地 CLI / 自带 API Key。"
+                }
+                Locale::Ja => {
+                    "本日または今月の利用上限に達しました。翌日再試行するか、ローカル CLI / カスタム API に切り替えてください。"
+                }
+                Locale::Ko => {
+                    "일일 또는 월간 사용 한도에 도달했습니다. 내일 다시 시도하거나 로컬 CLI / 사용자 API로 전환하세요."
+                }
+            }
+            .to_owned(),
+            Some("INFERENCE_CONCURRENCY_LIMITED") => {
+                if zh {
+                    "当前设备已有云端分析任务正在执行，请等待完成后重试。"
+                } else {
+                    "Another cloud analysis is already running on this device. Wait and retry."
+                }
+                .to_owned()
+            }
+            Some("INFERENCE_SESSION_LIMIT_EXCEEDED") => {
+                if zh {
+                    "单次云端分析轮数已达上限。"
+                } else {
+                    "Cloud analysis session turn limit exceeded."
+                }
+                .to_owned()
+            }
+            Some("COMMON_RATE_LIMITED" | "INFERENCE_RATE_LIMITED") => {
+                if zh {
+                    "请求过于频繁，请稍后重试。"
+                } else {
+                    "Too many requests. Please try again shortly."
+                }
+                .to_owned()
+            }
+            Some("AUTH_DEVICE_REVOKED") => {
+                if zh {
+                    "当前设备已被吊销云端访问权限。"
+                } else {
+                    "This device's cloud access has been revoked."
+                }
+                .to_owned()
+            }
+            Some("BILLING_UNAVAILABLE") => match locale {
+                Locale::En => {
+                    "Online payment is unavailable. You can use a redemption code."
+                }
+                Locale::Zh => "在线收款尚未开启或暂不可用，可使用兑换码。",
+                Locale::Ja => {
+                    "オンライン決済は現在利用できません。引換コードをご利用いただけます。"
+                }
+                Locale::Ko => {
+                    "온라인 결제를 현재 사용할 수 없습니다. 교환 코드를 사용할 수 있습니다."
+                }
+            }
+            .to_owned(),
+            Some("BILLING_PRODUCT_DISABLED") => match locale {
+                Locale::En => {
+                    "Billing product is currently disabled. You can use a redemption code."
+                }
+                Locale::Zh => "当前收款商品暂未开启购买，可使用兑换码。",
+                Locale::Ja => {
+                    "現在このプランの購入は無効です。引換コードをご利用いただけます。"
+                }
+                Locale::Ko => {
+                    "현재 결제 상품 구매가 비활성화되어 있습니다. 교환 코드를 사용할 수 있습니다."
+                }
+            }
+            .to_owned(),
+            Some("REDEMPTION_CODE_INVALID") => match locale {
+                Locale::En => "Redemption code is invalid or does not exist.",
+                Locale::Zh => "兑换码不存在或格式无效。",
+                Locale::Ja => "引換コードが無効か、存在しません。",
+                Locale::Ko => "교환 코드가 잘못되었거나 존재하지 않습니다.",
+            }
+            .to_owned(),
+            Some("REDEMPTION_CODE_ALREADY_USED") => match locale {
+                Locale::En => {
+                    "This one-time redemption code has already been used and is permanently invalidated."
+                }
+                Locale::Zh => {
+                    "该兑换码已被使用并永久失效（仅限一次性核销，不可重复使用）。"
+                }
+                Locale::Ja => {
+                    "この使い切り引換コードはすでに使用され、永久に無効化されています。"
+                }
+                Locale::Ko => {
+                    "이 일회용 교환 코드는 이미 사용되어 영구적으로 무효화되었습니다."
+                }
+            }
+            .to_owned(),
+            Some("REDEMPTION_CODE_EXPIRED") => match locale {
+                Locale::En => "This redemption code has expired.",
+                Locale::Zh => "该兑换码已过期。",
+                Locale::Ja => "この引換コードは有効期限が切れています。",
+                Locale::Ko => "이 교환 코드는 만료되었습니다.",
+            }
+            .to_owned(),
+            Some("REDEMPTION_CODE_REVOKED") => match locale {
+                Locale::En => "This redemption code has been revoked.",
+                Locale::Zh => "该兑换码已作废。",
+                Locale::Ja => "この引換コードは取り消されています。",
+                Locale::Ko => "이 교환 코드는 폐기되었습니다.",
+            }
+            .to_owned(),
+            Some("REDEMPTION_RATE_LIMITED") => match locale {
+                Locale::En => {
+                    "Too many redemption attempts. Please try again later."
+                }
+                Locale::Zh => "兑换尝试过于频繁，请稍后再试。",
+                Locale::Ja => {
+                    "引換の試行回数が多すぎます。しばらくしてからもう一度お試しください。"
+                }
+                Locale::Ko => {
+                    "교환 시도가 너무 많습니다. 잠시 후 다시 시도하세요."
+                }
+            }
+            .to_owned(),
+            Some(
+                "INFERENCE_GLOBAL_BUDGET_EXCEEDED"
+                | "INFERENCE_NO_AVAILABLE_UPSTREAM"
+                | "COMMON_SERVICE_UNAVAILABLE"
+                | "COMMON_UPSTREAM_PROTOCOL_ERROR"
+                | "COMMON_INTERNAL_ERROR",
+            ) => {
+                if zh {
+                    "云端 AI 服务暂不可用，请稍后重试或切换本地 CLI / 自带 API Key。"
+                } else {
+                    "Cloud AI service is temporarily unavailable. Retry later or switch to Local CLI / Custom API."
+                }
+                .to_owned()
+            }
+            _ if http_status == Some(402) => {
+                if zh {
+                    "免费体验次数已用完或云端会员已到期，请开通云端会员或使用兑换码。"
+                } else {
+                    "Free trial exhausted or Cloud Pro expired. Upgrade to Cloud Pro or redeem a code."
+                }
+                .to_owned()
+            }
+            _ if http_status.is_some_and(|s| s >= 500) => {
+                if zh {
+                    "云端 AI 服务暂不可用，请稍后重试或切换本地 CLI / 自带 API Key。"
+                } else {
+                    "Cloud AI service is temporarily unavailable. Retry later or switch to Local CLI / Custom API."
+                }
+                .to_owned()
+            }
+            _ => {
+                let cleaned = clean_ai_failure_reason(fallback_message);
+                if cleaned.is_empty() {
+                    if zh {
+                        "云端 AI 请求失败，请稍后重试。"
+                    } else {
+                        "Cloud AI request failed. Please try again later."
+                    }
+                    .to_owned()
+                } else {
+                    cleaned
+                }
+            }
+        }
+    };
+
+    let clean_trace = trace_id.map(str::trim).filter(|s| !s.is_empty());
+    match clean_trace {
+        Some(tid) => format!("{base} [Trace: {tid}]"),
+        None => base,
+    }
 }
 
 #[cfg(test)]
@@ -683,6 +934,232 @@ mod tests {
         for i in 1..locales.len() {
             assert_ne!(timed_out_titles[i], timed_out_titles[0]);
             assert_ne!(failed_titles[i], failed_titles[0]);
+        }
+    }
+
+    #[test]
+    fn cloud_error_messages_localize_all_codes_and_preserve_trace_id() {
+        let codes = [
+            "ENTITLEMENT_PAYMENT_REQUIRED",
+            "INFERENCE_FUP_LIMIT_EXCEEDED",
+            "INFERENCE_CONCURRENCY_LIMITED",
+            "COMMON_RATE_LIMITED",
+            "AUTH_DEVICE_REVOKED",
+            "BILLING_UNAVAILABLE",
+            "BILLING_PRODUCT_DISABLED",
+            "REDEMPTION_CODE_INVALID",
+            "REDEMPTION_CODE_ALREADY_USED",
+            "REDEMPTION_CODE_EXPIRED",
+            "REDEMPTION_CODE_REVOKED",
+            "REDEMPTION_RATE_LIMITED",
+        ];
+        for code in codes {
+            let en = format_cloud_error_message(
+                Some(code),
+                None,
+                "raw",
+                Some("tr-123"),
+                false,
+                Locale::En,
+            );
+            let zh = format_cloud_error_message(
+                Some(code),
+                None,
+                "raw",
+                Some("tr-123"),
+                false,
+                Locale::Zh,
+            );
+            assert!(en.ends_with("[Trace: tr-123]"), "code={code} en={en}");
+            assert!(zh.ends_with("[Trace: tr-123]"), "code={code} zh={zh}");
+            assert_ne!(en, zh, "code={code}");
+        }
+
+        let timeout_zh = format_cloud_error_message(
+            None,
+            None,
+            "timed out",
+            Some("tr-to"),
+            true,
+            Locale::Zh,
+        );
+        assert!(timeout_zh.contains("超时"));
+        assert!(timeout_zh.ends_with("[Trace: tr-to]"));
+        assert_eq!(classify_ai_failure(&timeout_zh), AiFailureKind::TimedOut);
+
+        let err_503 = format_cloud_error_message(
+            None,
+            Some(503),
+            "unavailable",
+            Some("tr-503"),
+            false,
+            Locale::En,
+        );
+        assert!(err_503.contains("unavailable"));
+        assert!(err_503.ends_with("[Trace: tr-503]"));
+    }
+
+    #[test]
+    fn format_ai_failure_summary_preserves_trace_id_under_cap() {
+        let long_raw = "Cloud gateway returned a very verbose diagnostic \
+             message describing an upstream model failure that exceeds one \
+             hundred and sixty chars by a wide margin \
+             [Trace: trace-503-9f8e7d6c]";
+        let summary = format_ai_failure_summary(long_raw, Locale::En);
+        assert!(
+            summary.chars().count() <= MAX_AI_FAILURE_SUMMARY_CHARS,
+            "summary too long: {}",
+            summary.chars().count()
+        );
+        assert!(
+            summary.ends_with("[Trace: trace-503-9f8e7d6c]"),
+            "trace id lost in summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn redemption_error_codes_localize_distinctly_across_all_locales_with_trace()
+     {
+        let codes = [
+            "REDEMPTION_CODE_INVALID",
+            "REDEMPTION_CODE_ALREADY_USED",
+            "REDEMPTION_CODE_EXPIRED",
+            "REDEMPTION_CODE_REVOKED",
+            "REDEMPTION_RATE_LIMITED",
+        ];
+        let locales = [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko];
+        for locale in locales {
+            let mut seen = std::collections::BTreeSet::new();
+            for code in codes {
+                let msg = format_cloud_error_message(
+                    Some(code),
+                    None,
+                    "raw fallback",
+                    Some("tr-red-1"),
+                    false,
+                    locale,
+                );
+                assert!(msg.ends_with("[Trace: tr-red-1]"), "{code}: {msg}");
+                assert!(
+                    seen.insert(msg),
+                    "duplicate msg for {code} in {locale:?}"
+                );
+            }
+        }
+
+        let used_en = format_cloud_error_message(
+            Some("REDEMPTION_CODE_ALREADY_USED"),
+            Some(409),
+            "used",
+            Some("tr-used"),
+            false,
+            Locale::En,
+        );
+        assert!(used_en.to_ascii_lowercase().contains("one-time"));
+        assert!(used_en.to_ascii_lowercase().contains("permanently"));
+
+        let used_zh = format_cloud_error_message(
+            Some("REDEMPTION_CODE_ALREADY_USED"),
+            Some(409),
+            "used",
+            Some("tr-used"),
+            false,
+            Locale::Zh,
+        );
+        assert!(used_zh.contains("永久失效"));
+        assert!(used_zh.contains("一次"));
+    }
+
+    #[test]
+    fn cloud_usage_limit_and_billing_errors_no_fup_or_supporter() {
+        let locales = [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko];
+
+        let mut fup_msgs = std::collections::BTreeSet::new();
+        for locale in locales {
+            let msg = format_cloud_error_message(
+                Some("INFERENCE_FUP_LIMIT_EXCEEDED"),
+                Some(429),
+                "raw",
+                Some("tr-limit"),
+                false,
+                locale,
+            );
+            let lower = msg.to_ascii_lowercase();
+            assert!(!lower.contains("fup"), "locale={locale:?} msg={msg}");
+            assert!(!lower.contains("fair-use"), "locale={locale:?} msg={msg}");
+            assert!(!msg.contains("公平使用"), "locale={locale:?} msg={msg}");
+            assert!(msg.ends_with("[Trace: tr-limit]"));
+            assert!(fup_msgs.insert(msg));
+        }
+
+        let expected_redeem_terms = [
+            (Locale::En, "redemption code"),
+            (Locale::Zh, "兑换码"),
+            (Locale::Ja, "引換コード"),
+            (Locale::Ko, "교환 코드"),
+        ];
+        for code in ["BILLING_UNAVAILABLE", "BILLING_PRODUCT_DISABLED"] {
+            let mut seen = std::collections::BTreeSet::new();
+            for (locale, expected_term) in expected_redeem_terms {
+                let msg = format_cloud_error_message(
+                    Some(code),
+                    Some(503),
+                    "raw",
+                    Some("tr-bill"),
+                    false,
+                    locale,
+                );
+                let lower = msg.to_ascii_lowercase();
+                assert!(
+                    !lower.contains("supporter"),
+                    "code={code} locale={locale:?} msg={msg}"
+                );
+                assert!(
+                    !msg.contains("打赏兑换码"),
+                    "code={code} locale={locale:?} msg={msg}"
+                );
+                assert!(
+                    msg.contains(expected_term),
+                    "code={code} locale={locale:?} msg={msg}"
+                );
+                assert!(msg.ends_with("[Trace: tr-bill]"));
+                assert!(seen.insert(msg));
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_membership_errors_use_cloud_pro_terminology() {
+        for (code, status) in [
+            (Some("ENTITLEMENT_PAYMENT_REQUIRED"), Some(402)),
+            (Some("INFERENCE_MODEL_NOT_ALLOWED"), Some(403)),
+            (None, Some(402)),
+        ] {
+            let zh = format_cloud_error_message(
+                code,
+                status,
+                "raw",
+                Some("tr-pro"),
+                false,
+                Locale::Zh,
+            );
+            assert!(zh.contains("云端会员"), "code={code:?} zh={zh}");
+            assert!(
+                !zh.contains("\u{65f6}\u{957f}\u{5305}"),
+                "code={code:?} zh={zh}"
+            );
+            assert!(zh.ends_with("[Trace: tr-pro]"));
+
+            let en = format_cloud_error_message(
+                code,
+                status,
+                "raw",
+                Some("tr-pro"),
+                false,
+                Locale::En,
+            );
+            assert!(en.contains("Cloud Pro"), "code={code:?} en={en}");
+            assert!(en.ends_with("[Trace: tr-pro]"));
         }
     }
 }

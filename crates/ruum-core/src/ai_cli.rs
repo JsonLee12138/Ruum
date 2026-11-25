@@ -6493,7 +6493,7 @@ mod tests {
             Some(temp.path()),
             &tree_node,
             &DockerProbeStatus::NotInstalled,
-            TrashOs::MacOs,
+            crate::trash_adapter::TrashAdapterFactory::current_os(),
             1_700_002_100,
             &MockCommandRunner::default(),
             &ctx_tree,

@@ -75,3 +75,36 @@ pub mod watchdog_service;
 pub mod webhook;
 #[cfg(windows)]
 mod windows;
+
+/// Pure-sync AI execution stage shared across scan coordinators, Ruum Cloud
+/// SSE streams, Watchdog, and desktop UI without async dependencies.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiProgressStage {
+    Scanning = 1,
+    Queued = 2,
+    Connecting = 3,
+    Thinking = 4,
+    Generating = 5,
+}
+
+impl AiProgressStage {
+    /// Encode as a non-zero `u8` for lock-free atomic stage slots (`0` = unset).
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from an atomic `u8` stage slot (`0` or invalid -> `None`).
+    #[must_use]
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Scanning),
+            2 => Some(Self::Queued),
+            3 => Some(Self::Connecting),
+            4 => Some(Self::Thinking),
+            5 => Some(Self::Generating),
+            _ => None,
+        }
+    }
+}

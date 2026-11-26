@@ -14,13 +14,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use ruum_core::ai_cli::{
-    DefaultCommandRunner, env_api_key_present, run_analysis_for_config,
+    AiExecutionContext, DefaultCommandRunner, env_api_key_present,
+    run_analysis_with_tree_for_config_with_context,
 };
 use ruum_core::credentials::{
     LazyCredentialStore, SshCredentialSecret,
     delete_ssh_profile_with_credentials,
 };
 use ruum_core::desktop_launch::{DesktopLaunchEnv, DesktopLaunchFactory};
+use ruum_core::docker_adapter::{DockerEnv, DockerFactory};
+use ruum_core::i18n::Locale;
 use ruum_core::notify::notify_gui_watchdog_update;
 use ruum_core::payload::Archive;
 use ruum_core::remote::{
@@ -2011,17 +2014,30 @@ fn cmd_analyze(args: &[OsString]) -> Result<()> {
     }
 
     let root = resolve_local_root(path_arg.as_deref(), false)?;
+    ruum_core::removal::prime_mount_points();
     let db = StorageDb::open_default()?;
     let ai_cfg = db.load_ai_config()?;
     let current_exe = std::env::current_exe()?;
     let now = now_unix_secs();
+    let docker = DockerFactory::create().probe(&DockerEnv::current());
+    let mut ai_ctx = AiExecutionContext::default()
+        .with_locale(Locale::current())
+        .with_local_docker(docker);
+    if let Some(home) = std::env::home_dir() {
+        ai_ctx = ai_ctx.with_user_home(home);
+    }
+    if let Ok(sp) = space_info(&root) {
+        ai_ctx = ai_ctx.with_volume_space(sp);
+    }
 
-    let proposal = run_analysis_for_config(
+    let proposal = run_analysis_with_tree_for_config_with_context(
         &ai_cfg,
         &root,
         &current_exe,
         now,
+        None,
         &DefaultCommandRunner,
+        &ai_ctx,
     )
     .map_err(anyhow::Error::msg)?;
 
@@ -2032,7 +2048,11 @@ fn cmd_analyze(args: &[OsString]) -> Result<()> {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&proposal)?);
     } else {
-        println!("{} ({} items)", proposal.summary, proposal.items.len());
+        println!(
+            "{} ({} items)",
+            proposal.summary,
+            proposal.items.len() + proposal.docker_targets.len()
+        );
         for item in &proposal.items {
             println!(
                 "  {}  {}  [{}]",
@@ -2040,6 +2060,9 @@ fn cmd_analyze(args: &[OsString]) -> Result<()> {
                 human_bytes(item.bytes),
                 item.mode.label()
             );
+        }
+        for target in &proposal.docker_targets {
+            println!("  [docker] {target:?}");
         }
     }
     Ok(())

@@ -173,10 +173,18 @@ impl ServiceAdapter for MacOsServiceAdapter {
         let plist_path = Self::plist_path_in(env).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no LaunchAgents dir")
         })?;
-        let path_str = plist_path.to_string_lossy();
-        let _ =
-            runner.run(Path::new("launchctl"), &["unload", "-w", &path_str]);
+        if let Ok(id_out) = runner.run(Path::new("id"), &["-u"])
+            && id_out.success()
+            && let Ok(uid) = id_out.stdout.trim().parse::<u32>()
+        {
+            let target = format!("gui/{uid}/{MACOS_LABEL}");
+            let _ = runner.run(Path::new("launchctl"), &["bootout", &target]);
+        }
+        let _ = runner.run(Path::new("launchctl"), &["remove", MACOS_LABEL]);
         if plist_path.exists() {
+            let path_str = plist_path.to_string_lossy();
+            let _ = runner
+                .run(Path::new("launchctl"), &["unload", "-w", &path_str]);
             fs::remove_file(&plist_path)?;
         }
         Ok(())
@@ -281,6 +289,10 @@ impl ServiceAdapter for LinuxServiceAdapter {
         }
         let _ =
             runner.run(Path::new("systemctl"), &["--user", "daemon-reload"]);
+        let _ = runner.run(
+            Path::new("systemctl"),
+            &["--user", "reset-failed", LINUX_UNIT_NAME],
+        );
         Ok(())
     }
 
@@ -449,34 +461,49 @@ impl ServiceAdapter for WindowsServiceAdapter {
             && let Some(pid) = Self::live_pid(runner, path)
         {
             let pid_str = pid.to_string();
-            let _ =
-                runner.run(Path::new("taskkill"), &["/PID", &pid_str, "/F"]);
-            let _ = fs::remove_file(path);
-            return Ok(());
+            if runner
+                .run(Path::new("taskkill"), &["/PID", &pid_str, "/T", "/F"])
+                .is_ok_and(|out| out.success())
+            {
+                let _ = fs::remove_file(path);
+                return Ok(());
+            }
         }
 
+        // Fast `tasklist` check (~40ms) avoids PowerShell cold-start when no
+        // `ruum.exe` process exists; when present, filter strictly by the
+        // `watchdog` subcommand so manual CLI sessions / `ruum mcp` survive.
+        let has_ruum_proc = runner
+            .run(
+                Path::new("tasklist"),
+                &["/FI", "IMAGENAME eq ruum.exe", "/FO", "CSV", "/NH"],
+            )
+            .is_ok_and(|out| {
+                out.success()
+                    && out.stdout.to_ascii_lowercase().contains("ruum")
+            });
+        if has_ruum_proc {
+            let ps_cmd = "Get-CimInstance Win32_Process \
+                          -Filter \"Name = 'ruum.exe'\" \
+                          | Where-Object { \
+                              $_.CommandLine -match '(^|\\s)watchdog(\\s|$)' \
+                          } \
+                          | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
+            let _ = runner.run(
+                Path::new("powershell.exe"),
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    ps_cmd,
+                ],
+            );
+        }
         if let Some(ref path) = pid_path {
             let _ = fs::remove_file(path);
         }
-        // Fallback when PID file is missing or stale: stop only `ruum.exe`
-        // processes launched with the `watchdog` subcommand.
-        let ps_cmd = "Get-CimInstance Win32_Process \
-                      -Filter \"Name = 'ruum.exe'\" \
-                      | Where-Object { \
-                          $_.CommandLine -match '(^|\\s)watchdog(\\s|$)' \
-                      } \
-                      | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
-        let _ = runner.run(
-            Path::new("powershell.exe"),
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                ps_cmd,
-            ],
-        );
         Ok(())
     }
 
@@ -701,6 +728,38 @@ pub fn has_service_residue(runner: &dyn ServiceRunner) -> bool {
     )
 }
 
+/// One-shot check that cleans up service residue and orphaned OS services.
+///
+/// Sweeps configless active `launchd` / `systemd --user` services without
+/// blindly touching manual `ruum.exe` CLI sessions on Windows.
+pub fn reap_orphaned_service_in(
+    os: ServiceOs,
+    env: &ServiceEnv,
+    runner: &dyn ServiceRunner,
+) -> io::Result<bool> {
+    if has_service_residue_in(os, env, runner) {
+        ServiceAdapterFactory::create_for(os).uninstall(runner, env)?;
+        return Ok(true);
+    }
+    let orphaned_active = match os {
+        ServiceOs::MacOs => runner
+            .run(Path::new("launchctl"), &["list", MACOS_LABEL])
+            .is_ok_and(|out| out.success()),
+        ServiceOs::Linux => runner
+            .run(
+                Path::new("systemctl"),
+                &["--user", "is-active", LINUX_UNIT_NAME],
+            )
+            .is_ok_and(|out| out.success() && out.stdout.trim() == "active"),
+        ServiceOs::Windows => false,
+    };
+    if !orphaned_active {
+        return Ok(false);
+    }
+    ServiceAdapterFactory::create_for(os).uninstall(runner, env)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,9 +916,13 @@ mod tests {
             ServiceStatus::Inactive
         );
 
-        let runner_un = ScriptedRunner::with_default(ok_out(""));
+        let runner_un = ScriptedRunner::with_default(ok_out("501\n"));
         adapter.uninstall(&runner_un, &env).unwrap();
         assert!(!plist.exists());
+        let un_calls = runner_un.calls();
+        assert_eq!(un_calls[0].0, PathBuf::from("id"));
+        assert_eq!(un_calls[1].1, vec!["bootout", "gui/501/com.ruum.watchdog"]);
+        assert_eq!(un_calls[2].1, vec!["remove", "com.ruum.watchdog"]);
     }
 
     #[test]
@@ -918,9 +981,15 @@ mod tests {
         let runner_un = ScriptedRunner::with_default(ok_out(""));
         adapter.uninstall(&runner_un, &env).unwrap();
         assert!(!unit.exists());
+        let un_calls = runner_un.calls();
+        assert!(
+            un_calls
+                .iter()
+                .any(|c| c.1 == vec!["--user", "daemon-reload"])
+        );
         assert_eq!(
-            runner_un.calls().last().unwrap().1,
-            vec!["--user", "daemon-reload"]
+            un_calls.last().unwrap().1,
+            vec!["--user", "reset-failed", "ruum-watchdog.service"]
         );
     }
 
@@ -1007,12 +1076,26 @@ mod tests {
         adapter.uninstall(&runner_un_pid, &env).unwrap();
         assert!(!pid_path.exists());
         assert_eq!(runner_un_pid.calls()[2].0, PathBuf::from("taskkill"));
+        assert!(runner_un_pid.calls()[2].1.contains(&"/T".to_string()));
 
-        let runner_un_fallback = ScriptedRunner::with_default(ok_out(""));
+        let runner_un_none = ScriptedRunner::with_sequence(vec![
+            err_out(1, "no reg"),
+            ok_out(""),
+        ]);
+        adapter.uninstall(&runner_un_none, &env).unwrap();
+        assert_eq!(runner_un_none.calls().len(), 2);
+        assert_eq!(runner_un_none.calls()[1].0, PathBuf::from("tasklist"));
+
+        let runner_un_fallback = ScriptedRunner::with_sequence(vec![
+            ok_out("reg deleted"),
+            ok_out("\"ruum.exe\",\"777\",\"Console\",\"1\",\"12,000 K\"\n"),
+            ok_out("stopped"),
+        ]);
         adapter.uninstall(&runner_un_fallback, &env).unwrap();
         let fb_calls = runner_un_fallback.calls();
-        assert_eq!(fb_calls[1].0, PathBuf::from("powershell.exe"));
-        assert!(fb_calls[1].1.iter().any(|a| a.contains("Win32_Process")));
+        assert_eq!(fb_calls[1].0, PathBuf::from("tasklist"));
+        assert_eq!(fb_calls[2].0, PathBuf::from("powershell.exe"));
+        assert!(fb_calls[2].1.iter().any(|a| a.contains("Win32_Process")));
     }
 
     #[test]
@@ -1066,5 +1149,57 @@ mod tests {
             &env,
             &runner_none
         ));
+    }
+
+    #[test]
+    fn reap_orphaned_service_cleans_configless_active_macos_and_linux_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = ServiceEnv {
+            home: Some(temp.path().to_path_buf()),
+            xdg_config_home: Some(temp.path().join("xdg")),
+            appdata: Some(temp.path().join("AppData")),
+        };
+
+        let runner_mac = ScriptedRunner::with_sequence(vec![
+            ok_out("PID\tStatus\tLabel\n65727\t0\tcom.ruum.watchdog\n"),
+            ok_out("501\n"),
+            ok_out(""),
+            ok_out(""),
+        ]);
+        assert!(
+            reap_orphaned_service_in(ServiceOs::MacOs, &env, &runner_mac)
+                .unwrap()
+        );
+        let mac_calls = runner_mac.calls();
+        assert_eq!(mac_calls[0].1, vec!["list", "com.ruum.watchdog"]);
+        assert_eq!(
+            mac_calls[2].1,
+            vec!["bootout", "gui/501/com.ruum.watchdog"]
+        );
+        assert_eq!(mac_calls[3].1, vec!["remove", "com.ruum.watchdog"]);
+
+        let runner_linux = ScriptedRunner::with_sequence(vec![
+            ok_out("active\n"),
+            ok_out(""),
+            ok_out(""),
+            ok_out(""),
+            ok_out(""),
+        ]);
+        assert!(
+            reap_orphaned_service_in(ServiceOs::Linux, &env, &runner_linux)
+                .unwrap()
+        );
+        assert_eq!(
+            runner_linux.calls()[0].1,
+            vec!["--user", "is-active", "ruum-watchdog.service"]
+        );
+
+        let runner_win = ScriptedRunner::with_default(err_out(1, "absent"));
+        assert!(
+            !reap_orphaned_service_in(ServiceOs::Windows, &env, &runner_win)
+                .unwrap()
+        );
+        assert_eq!(runner_win.calls().len(), 1);
+        assert_eq!(runner_win.calls()[0].0, PathBuf::from("reg"));
     }
 }

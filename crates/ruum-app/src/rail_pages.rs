@@ -492,6 +492,19 @@ fn ssh_profiles_card(
             let is_scanning = app.is_ssh_profile_scanning(&profile.id);
             let is_checking = app.ssh_checking_profiles.contains(&profile.id);
             let is_analyzing = app.ssh_analyzing_profiles.contains(&profile.id);
+            let ssh_ai_stage = if is_analyzing {
+                crate::ai_stage_for_key(
+                    &crate::AiEventKey::DiskCleanupSsh(profile.id.clone()),
+                    cx,
+                )
+            } else {
+                None
+            };
+            let ssh_ai_tooltip = if is_analyzing {
+                crate::i18n::explore::ai_stage_tooltip(ssh_ai_stage, locale)
+            } else {
+                crate::i18n::pages::ssh_ai_analyze_tooltip(locale)
+            };
             let id_connect = profile.id.clone();
             let id_browse = profile.id.clone();
             let id_check = profile.id.clone();
@@ -601,26 +614,43 @@ fn ssh_profiles_card(
                 .debug_selector(move || format!("ssh-ai-{index}"))
                 .child(with_tooltip(
                     if is_analyzing {
+                        let mut row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::XS)
+                            .child(spinning_loader(
+                                format!("ssh-ai-spin-{index}"),
+                                theme.foreground,
+                            ));
+                        if let Some(stage) = ssh_ai_stage {
+                            row = row.child(
+                                div()
+                                    .text_size(text::CAPTION)
+                                    .text_color(theme.foreground)
+                                    .whitespace_nowrap()
+                                    .child(
+                                        crate::i18n::explore::ai_stage_compact_label(
+                                            stage, locale,
+                                        ),
+                                    ),
+                            );
+                        }
                         button(
                             ElementId::Name(format!("ssh-ai-{index}").into()),
                             "",
                             ButtonVariant::Secondary,
                             cx,
                         )
-                        .accessibility_label(
-                            crate::i18n::pages::ssh_ai_analyze_tooltip(locale),
-                        )
+                        .accessibility_label(ssh_ai_tooltip)
                         .p(space::SM)
                         .justify_center()
-                        .child(spinning_loader(
-                            format!("ssh-ai-spin-{index}"),
-                            theme.foreground,
-                        ))
+                        .child(row)
                     } else {
                         gpui_omarchy::icon_button(
                             ElementId::Name(format!("ssh-ai-{index}").into()),
                             IconName::Bot,
-                            crate::i18n::pages::ssh_ai_analyze_tooltip(locale),
+                            ssh_ai_tooltip,
                             ButtonVariant::Secondary,
                             cx,
                         )
@@ -630,7 +660,7 @@ fn ssh_profiles_card(
                             this.analyze_ssh_profile(&id_ai, cx);
                         },
                     )),
-                    crate::i18n::pages::ssh_ai_analyze_tooltip(locale),
+                    ssh_ai_tooltip,
                 ));
 
             let edit_btn = div()
@@ -1377,66 +1407,146 @@ pub fn watchdog_page(
                                     locale,
                                 )),
                         ),
-                ),
+                )
+                .when(app.watchdog_analyzing, |col| {
+                    let stage = crate::ai_stage_for_key(
+                        &crate::AiEventKey::DiskCleanupLocal,
+                        cx,
+                    );
+                    col.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_color(theme.secondary).child(
+                                crate::i18n::explore::ai_analyze_local_tooltip(
+                                    locale,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(space::XS)
+                                    .debug_selector(|| {
+                                        "watchdog-ai-stage".into()
+                                    })
+                                    .text_color(theme.accent)
+                                    .child(spinning_loader(
+                                        "watchdog-ai-stage-spin",
+                                        theme.accent,
+                                    ))
+                                    .child(
+                                        crate::i18n::explore::ai_stage_tooltip(
+                                            stage, locale,
+                                        ),
+                                    ),
+                            ),
+                    )
+                }),
         );
 
-    let proposal_card =
-        if let Some(ref prop) = app.ai_proposal {
-            let total_candidate_bytes: u64 =
-                prop.items.iter().map(|i| i.bytes).sum();
-            dialog_popup(cx)
-                .w_full()
-                .child(dialog_title(
-                    crate::i18n::pages::latest_proposal_title(locale),
-                    cx,
-                ))
-                .child(dialog_description(&prop.summary, cx))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .items_center()
-                        .py(space::SM)
-                        .child(div().text_color(theme.bright).child(
-                            crate::i18n::pages::candidate_items_summary(
-                                prop.items.len(),
-                                &human_bytes(total_candidate_bytes),
-                                locale,
-                            ),
-                        ))
-                        .child(
-                            div()
-                                .debug_selector(|| {
-                                    "watchdog-review-proposal".into()
+    let proposal_card = if let Some(ref prop) = app.ai_proposal {
+        let item_bytes: u64 = prop.items.iter().map(|i| i.bytes).sum();
+        let docker_bytes: u64 = match &app.local_docker {
+            DockerProbeStatus::Available(summary) => prop
+                .docker_targets
+                .iter()
+                .map(|target| match target {
+                    DockerCleanTarget::BuildCache => summary
+                        .build_cache_reclaimable_bytes
+                        .max(summary.build_cache.reclaimable_bytes),
+                    DockerCleanTarget::Image { id, reference, .. } => summary
+                        .removable_images
+                        .iter()
+                        .find(|img| {
+                            img.id == *id
+                                && reference.as_deref().is_none_or(|req| {
+                                    !img.dangling
+                                        && format!(
+                                            "{}:{}",
+                                            img.repository, img.tag
+                                        ) == req
                                 })
-                                .child(
-                                    button(
-                                        "watchdog-review-proposal",
-                                        crate::i18n::pages::review_and_confirm(
-                                            locale,
-                                        ),
-                                        ButtonVariant::Primary,
-                                        cx,
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_last_proposal(cx);
-                                    })),
-                                ),
-                        ),
-                )
-        } else {
-            dialog_popup(cx)
-                .w_full()
-                .child(dialog_title(
-                    crate::i18n::pages::latest_proposal_title(locale),
-                    cx,
-                ))
-                .child(dialog_description(
-                    crate::i18n::pages::no_proposals_yet(locale),
-                    cx,
-                ))
+                        })
+                        .map_or(0, |img| {
+                            if img.unique_bytes > 0 {
+                                img.unique_bytes
+                            } else {
+                                img.size_bytes
+                            }
+                        }),
+                    DockerCleanTarget::Container { id, .. } => summary
+                        .stopped_containers
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .map_or(0, |c| c.size_bytes),
+                })
+                .sum(),
+            DockerProbeStatus::NotInstalled
+            | DockerProbeStatus::DaemonStopped
+            | DockerProbeStatus::PermissionDenied { .. } => 0,
         };
+        let total_candidate_bytes = item_bytes.saturating_add(docker_bytes);
+        let total_candidate_count =
+            prop.items.len() + prop.docker_targets.len();
+        dialog_popup(cx)
+            .w_full()
+            .child(dialog_title(
+                crate::i18n::pages::latest_proposal_title(locale),
+                cx,
+            ))
+            .child(dialog_description(&prop.summary, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .py(space::SM)
+                    .child(div().text_color(theme.bright).child(
+                        crate::i18n::pages::candidate_items_summary(
+                            total_candidate_count,
+                            &human_bytes(total_candidate_bytes),
+                            locale,
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .debug_selector(|| {
+                                "watchdog-review-proposal".into()
+                            })
+                            .child(
+                                button(
+                                    "watchdog-review-proposal",
+                                    crate::i18n::pages::review_and_confirm(
+                                        locale,
+                                    ),
+                                    ButtonVariant::Primary,
+                                    cx,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.open_last_proposal(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    } else {
+        dialog_popup(cx)
+            .w_full()
+            .child(dialog_title(
+                crate::i18n::pages::latest_proposal_title(locale),
+                cx,
+            ))
+            .child(dialog_description(
+                crate::i18n::pages::no_proposals_yet(locale),
+                cx,
+            ))
+    };
 
     let ai_error_card = app.ai_last_error.as_ref().map(|err_summary| {
         div()
@@ -2897,11 +3007,7 @@ fn ai_settings_section(
                     } else if let Some(res) = speed_opt {
                         div()
                             .text_size(text::CAPTION)
-                            .text_color(if res.ok {
-                                theme.success
-                            } else {
-                                theme.danger
-                            })
+                            .text_color(speed_result_color(res, &theme))
                             .child(if res.ok {
                                 format!("{} ms", res.elapsed_ms)
                             } else {
@@ -3059,8 +3165,12 @@ fn ai_settings_section(
                     .border_color(theme.control_border())
                     .bg(theme.normal_fill())
                     .hover(|style| style.bg(theme.hover_fill()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.benchmark_all_watchdog_models(cx);
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if any_benchmarking {
+                            this.benchmark_cancel(cx);
+                        } else {
+                            this.benchmark_all_watchdog_models(cx);
+                        }
                     }))
                     .child(if any_benchmarking {
                         spinning_loader("setting-speed-all-spin", theme.accent)
@@ -3204,11 +3314,23 @@ fn cloud_entitlement_status_row(
     row
 }
 
+const fn speed_result_color(
+    res: &ruum_core::ai_cli::ModelSpeedResult,
+    theme: &gpui_omarchy::Theme,
+) -> Hsla {
+    if !res.ok || res.elapsed_ms >= 4_000 {
+        theme.danger
+    } else if res.elapsed_ms >= 1_500 {
+        theme.warning
+    } else {
+        theme.success
+    }
+}
+
 fn cloud_virtual_model_row(
     app: &Ruum,
     index: usize,
     model: &ruum_core::cloud_client::CloudVirtualModel,
-    is_paid: bool,
     cx: &Context<'_, Ruum>,
 ) -> Stateful<Div> {
     let theme = cx.omarchy().clone();
@@ -3291,7 +3413,7 @@ fn cloud_virtual_model_row(
 
     let mut right_col = div().flex().flex_row().items_center().gap(space::SM);
 
-    if is_paid && model.available {
+    if model.available {
         let speed_btn = div()
             .id(ElementId::Name(
                 format!("setting-model-speed-{index}").into(),
@@ -3321,11 +3443,7 @@ fn cloud_virtual_model_row(
             } else if let Some(res) = speed_opt {
                 div()
                     .text_size(text::CAPTION)
-                    .text_color(if res.ok {
-                        theme.success
-                    } else {
-                        theme.danger
-                    })
+                    .text_color(speed_result_color(res, &theme))
                     .child(if res.ok {
                         format!("{} ms", res.elapsed_ms)
                     } else {
@@ -3605,9 +3723,6 @@ fn ruum_cloud_settings_card(
     let now_secs = crate::state::current_unix_secs();
     let entitlement = app.cached_cloud_entitlement();
     let models = app.cached_cloud_models();
-    let is_paid = entitlement
-        .as_ref()
-        .is_some_and(|e| e.is_effectively_paid_at(now_secs));
     let alipay_active = entitlement
         .as_ref()
         .is_some_and(|e| e.is_alipay_active_at(now_secs));
@@ -3762,20 +3877,59 @@ fn ruum_cloud_settings_card(
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .child(cloud_auto_model_row(app, cx));
     for (index, model) in models.iter().enumerate() {
-        list =
-            list.child(cloud_virtual_model_row(app, index, model, is_paid, cx));
+        list = list.child(cloud_virtual_model_row(app, index, model, cx));
     }
 
     if !models.is_empty() {
-        card = card.child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(crate::i18n::pages::cloud_virtual_models_title(
-                    models.len(),
-                    locale,
-                )),
-        );
+        let has_available = models.iter().any(|m| m.available);
+        let any_benchmarking = !app.watchdog_benchmarking_models.is_empty();
+        let mut header_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(space::SM)
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(crate::i18n::pages::cloud_virtual_models_title(
+                        models.len(),
+                        locale,
+                    )),
+            );
+        if has_available {
+            header_row = header_row.child(with_tooltip(
+                div()
+                    .id("setting-speed-all-btn")
+                    .debug_selector(|| "setting-speed-all-btn".into())
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(space::XS)
+                    .rounded(space::XS)
+                    .border_1()
+                    .border_color(theme.control_border())
+                    .bg(theme.normal_fill())
+                    .hover(|style| style.bg(theme.hover_fill()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if any_benchmarking {
+                            this.benchmark_cancel(cx);
+                        } else {
+                            this.benchmark_all_watchdog_models(cx);
+                        }
+                    }))
+                    .child(if any_benchmarking {
+                        spinning_loader("setting-speed-all-spin", theme.accent)
+                            .into_any_element()
+                    } else {
+                        zap_icon(theme.accent).into_any_element()
+                    }),
+                crate::i18n::pages::test_all_models_tooltip(locale),
+            ));
+        }
+        card = card.child(header_row);
     }
     card = card.child(list);
     if models.is_empty() {

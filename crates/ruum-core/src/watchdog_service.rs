@@ -134,6 +134,19 @@ pub fn uninstall_legacy_service_if_present(
     )
 }
 
+/// One-shot startup sweep cleaning both residue and orphaned OS services.
+pub fn reap_orphaned_legacy_service(
+    timeout: std::time::Duration,
+) -> io::Result<bool> {
+    let runner = crate::ai_cli::TimedCommandRunner::new(timeout);
+    let bridge = CommandServiceRunner::new(&runner);
+    ruum_watchdog::service::reap_orphaned_service_in(
+        ServiceAdapterFactory::current_os(),
+        &ServiceEnv::current(),
+        &bridge,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +263,10 @@ mod tests {
         .unwrap();
         assert!(uninstalled);
         assert!(!plist.exists());
-        assert_eq!(cmd_runner.calls.lock().unwrap().len(), 1);
+        let calls = cmd_runner.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[1].1, vec!["bootout", "gui/4242/com.ruum.watchdog"]);
+        assert_eq!(calls[2].1, vec!["remove", "com.ruum.watchdog"]);
+        assert_eq!(calls[3].1[0], "unload");
     }
 }

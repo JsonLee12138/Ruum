@@ -338,6 +338,24 @@ mod tests {
             assert!(
                 !explore::ai_analyze_disconnected_tooltip(locale).is_empty()
             );
+            for stage in [
+                ruum_core::AiProgressStage::Scanning,
+                ruum_core::AiProgressStage::Queued,
+                ruum_core::AiProgressStage::Connecting,
+                ruum_core::AiProgressStage::Thinking,
+                ruum_core::AiProgressStage::Generating,
+            ] {
+                assert!(
+                    !explore::ai_stage_compact_label(stage, locale).is_empty()
+                );
+            }
+            assert!(
+                !explore::ai_stage_tooltip(
+                    Some(ruum_core::AiProgressStage::Thinking),
+                    locale
+                )
+                .is_empty()
+            );
             assert!(!pages::docker_close_button(locale).is_empty());
             assert!(!pages::ssh_browse_dirs_tooltip(locale).is_empty());
             assert!(!pages::modal_mounts_local_title(locale).is_empty());
@@ -624,6 +642,18 @@ mod tests {
                 explore::ai_analyze_disconnected_tooltip(locale),
                 explore::ai_analyze_disconnected_tooltip(Locale::En)
             );
+            for stage in [
+                ruum_core::AiProgressStage::Scanning,
+                ruum_core::AiProgressStage::Queued,
+                ruum_core::AiProgressStage::Connecting,
+                ruum_core::AiProgressStage::Thinking,
+                ruum_core::AiProgressStage::Generating,
+            ] {
+                assert_ne!(
+                    explore::ai_stage_compact_label(stage, locale),
+                    explore::ai_stage_compact_label(stage, Locale::En)
+                );
+            }
             assert_ne!(
                 pages::docker_not_installed_title(locale),
                 pages::docker_not_installed_title(Locale::En)

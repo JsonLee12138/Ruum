@@ -1352,6 +1352,8 @@ pub struct ExploreSessionSnapshot {
     pub scan_root: PathBuf,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
+    pub local_scan_flight:
+        Option<crate::scan_cache::ExternalFlightHandle<PathBuf, Arc<Node>>>,
     pub remote_scan: Option<ruum_core::remote::RemoteScan>,
     pub remote_disk: bool,
     pub remote_progress: ruum_core::remote_progress::Progress,
@@ -1409,6 +1411,7 @@ impl Default for ExploreSessionSnapshot {
             scan_root: PathBuf::new(),
             tree: None,
             scan: None,
+            local_scan_flight: None,
             remote_scan: None,
             remote_disk: false,
             remote_progress: ruum_core::remote_progress::Progress::default(),
@@ -1611,6 +1614,8 @@ pub struct Ruum {
     pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
+    pub local_scan_flight:
+        Option<crate::scan_cache::ExternalFlightHandle<PathBuf, Arc<Node>>>,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
@@ -1739,6 +1744,8 @@ pub struct Ruum {
     pub ssh_checking_profiles: FxHashSet<String>,
     /// SSH profile IDs currently running a remote AI analysis.
     pub ssh_analyzing_profiles: FxHashSet<String>,
+    /// Per-profile generation counters discarding stale superseded SSH runs.
+    pub ssh_analysis_epochs: FxHashMap<String, u64>,
     /// Active left-sidebar category on `Screen::Settings`.
     pub settings_category: SettingsCategory,
     /// Configured webhook endpoints loaded from `webhook_endpoints`.
@@ -1868,6 +1875,8 @@ pub struct Ruum {
     pub watchdog_benchmarking_models: FxHashSet<String>,
     /// Generation counter for discarding stale model speed probes on switch.
     pub watchdog_benchmark_epoch: u64,
+    /// Cooperative cancel token aborting in-flight batch speed benchmarks.
+    pub benchmark_cancel_token: Option<ruum_core::ai_cli::CancelToken>,
     /// Latest per-model speed test results in milliseconds.
     pub watchdog_speed_results: Vec<ruum_core::ai_cli::ModelSpeedResult>,
     /// True while saving settings / updating OS background service.
@@ -2221,6 +2230,7 @@ impl Ruum {
             cpu_threads: crate::power::cpu_threads(),
             tree: None,
             scan: None,
+            local_scan_flight: None,
             scan_epoch: 0,
             progress: ScanSnapshot::default(),
             scan_error: None,
@@ -2307,6 +2317,7 @@ impl Ruum {
             active_host_tab: HostTabKey::Local,
             ssh_checking_profiles: FxHashSet::default(),
             ssh_analyzing_profiles: FxHashSet::default(),
+            ssh_analysis_epochs: FxHashMap::default(),
             settings_category: SettingsCategory::General,
             webhooks,
             webhook_form_open: false,
@@ -2371,6 +2382,7 @@ impl Ruum {
             watchdog_models: Vec::new(),
             watchdog_benchmarking_models: FxHashSet::default(),
             watchdog_benchmark_epoch: 0,
+            benchmark_cancel_token: None,
             watchdog_speed_results: Vec::new(),
             watchdog_saving: false,
             watchdog_analyzing: false,
@@ -2455,7 +2467,11 @@ impl Ruum {
         }
         app.scan_epoch += 1;
         app.marks.refresh(&app.root_path, &tree, app.options.metric);
-        app.tree = Some(Arc::new(tree));
+        let tree_arc = Arc::new(tree);
+        if let Some(flight) = app.local_scan_flight.take() {
+            flight.finish(Ok(Arc::clone(&tree_arc)));
+        }
+        app.tree = Some(tree_arc);
         app.cache = None;
         app.refresh_insights();
         app.select_largest(cx);
@@ -2500,9 +2516,10 @@ impl Ruum {
         if !self.root_path.starts_with(&above) || self.root_path == above {
             return;
         }
-        if let Some(scan) = &self.scan {
+        if let Some(scan) = self.scan.take() {
             scan.cancel();
         }
+        self.local_scan_flight = None;
         self.scan_epoch += 1;
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
@@ -2515,6 +2532,12 @@ impl Ruum {
             path: self.root_path.clone(),
             tree,
         };
+        if let Some(coord) = crate::local_scan_coordinator(cx) {
+            coord.invalidate_all();
+            self.local_scan_flight = Some(coord.begin_external_flight(
+                crate::scan_cache::normalize_local_cache_key(&above),
+            ));
+        }
         self.scan = Some(ScanHandle::spawn_with(
             above,
             self.options.clone(),
@@ -4076,6 +4099,9 @@ impl Ruum {
             self.watchdog_test_epoch += 1;
             self.watchdog_fetch_epoch += 1;
             self.watchdog_benchmark_epoch += 1;
+            if let Some(tok) = self.benchmark_cancel_token.take() {
+                tok.cancel();
+            }
             self.cloud_refresh_epoch += 1;
             self.cloud_fetch_models_epoch += 1;
             self.redeem_epoch = self.redeem_epoch.wrapping_add(1);
@@ -4867,7 +4893,9 @@ impl Ruum {
                         modal.refreshing_status = true;
                         cx.notify();
                         BillingPollStep::Poll {
-                            ai_ctx: this.snapshot_cloud_execution_context(),
+                            ai_ctx: Box::new(
+                                this.snapshot_cloud_execution_context(),
+                            ),
                             lock: Arc::clone(&this.cloud_refresh_lock),
                             last_refresh_at: Arc::clone(
                                 &this.cloud_last_refresh_at,
@@ -5130,11 +5158,6 @@ impl Ruum {
             let res = task.await;
             let done_secs = u64::try_from(now_seconds()).unwrap_or(0);
             cx.update(|cx| {
-                let mut notif: Option<(
-                    ruum_core::watchdog::AiFailureKind,
-                    crate::i18n::Locale,
-                    String,
-                )> = None;
                 let updated = this.update(cx, |this, cx| {
                     if epoch != this.cloud_refresh_epoch {
                         return;
@@ -5165,39 +5188,15 @@ impl Ruum {
                             );
                         }
                         Err(err) => {
-                            let kind =
-                                ruum_core::watchdog::classify_ai_failure(&err);
-                            let summary =
-                                crate::i18n::messages::ai_analysis_error(
-                                    &err,
-                                    active_locale,
-                                );
-                            this.ai_last_error = Some(summary.clone());
-                            this.ai_last_error_at_secs = Some(done_secs);
                             this.cloud_payment_required =
-                                is_cloud_payment_required_message(&summary)
-                                    || is_cloud_payment_required_message(&err);
-                            if let Some(db) = open_db_for_window(this) {
-                                let _ = db.record_ai_error(&summary, done_secs);
-                            }
-                            this.push_toast(summary.clone(), Status::Error, cx);
-                            notif = Some((kind, active_locale, summary));
+                                is_cloud_payment_required_message(&err);
+                            this.push_toast(err, Status::Error, cx);
                         }
                     }
                     cx.notify();
                 });
 
-                if let Some((kind, notif_locale, summary)) = notif {
-                    crate::post_app_notification(
-                        ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS,
-                        crate::i18n::messages::ai_analysis_failure_notif_title(
-                            kind,
-                            notif_locale,
-                        ),
-                        &summary,
-                        cx,
-                    );
-                } else if updated.is_err()
+                if updated.is_err()
                     && let Some(db) = open_db_for_background(db_path.as_deref())
                 {
                     let _ = db.load_cloud_state();
@@ -5221,6 +5220,9 @@ impl Ruum {
             self.watchdog_test_epoch += 1;
             self.watchdog_fetch_epoch += 1;
             self.watchdog_benchmark_epoch += 1;
+            if let Some(tok) = self.benchmark_cancel_token.take() {
+                tok.cancel();
+            }
             self.watchdog_testing = false;
             self.watchdog_fetching_models = false;
             self.watchdog_benchmarking_models.clear();
@@ -5627,7 +5629,7 @@ impl Ruum {
                     .map(|()| AutostartStatus::Disabled)
             };
             let _ = ruum_core::watchdog::uninstall_legacy_service_if_present(
-                Duration::from_secs(2),
+                Duration::from_secs(8),
             );
             let status = ruum_core::watchdog::service_status(&runner).ok();
             (autostart_res, status)
@@ -6473,7 +6475,6 @@ impl Ruum {
         cx: &mut Context<'_, Self>,
     ) {
         let temp_cfg = self.snapshot_ai_config(cx);
-        let ai_ctx = self.snapshot_ai_execution_context(cx);
         let target_key = model_override
             .as_deref()
             .map(str::trim)
@@ -6484,15 +6485,20 @@ impl Ruum {
         if self.watchdog_benchmarking_models.contains(&target_key) {
             return;
         }
+        let bench_cancel = self
+            .benchmark_cancel_token
+            .get_or_insert_with(ruum_core::ai_cli::CancelToken::new)
+            .clone();
+        let ai_ctx = self
+            .snapshot_ai_execution_context(cx)
+            .with_cancel(bench_cancel.clone());
         self.watchdog_benchmarking_models.insert(target_key.clone());
         let epoch = self.watchdog_benchmark_epoch;
         cx.notify();
 
         let task = cx.background_executor().spawn(async move {
             let runner = ruum_core::ai_cli::TimedCommandRunner::new(
-                Duration::from_secs(
-                    ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
-                ),
+                Duration::from_secs(ruum_core::ai_cli::BENCHMARK_TIMEOUT_SECS),
             );
             ruum_core::ai_cli::benchmark_model_for_config_with_context(
                 &temp_cfg,
@@ -6506,7 +6512,15 @@ impl Ruum {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.watchdog_benchmarking_models.remove(&target_key);
-                if epoch != this.watchdog_benchmark_epoch {
+                let cancelled = epoch != this.watchdog_benchmark_epoch
+                    || bench_cancel.is_cancelled()
+                    || ruum_core::ai_cli::is_ai_cancelled_error(&result.detail);
+                if this.watchdog_benchmarking_models.is_empty()
+                    && epoch == this.watchdog_benchmark_epoch
+                {
+                    this.benchmark_cancel_token = None;
+                }
+                if cancelled {
                     cx.notify();
                     return;
                 }
@@ -6528,21 +6542,49 @@ impl Ruum {
         .detach();
     }
 
-    /// Benchmark latency sequentially for every discovered model.
+    /// Cancels all in-flight batch model speed probes cleanly without error toast.
+    pub fn benchmark_cancel(&mut self, cx: &mut Context<'_, Self>) {
+        self.watchdog_benchmark_epoch =
+            self.watchdog_benchmark_epoch.saturating_add(1);
+        if let Some(token) = self.benchmark_cancel_token.take() {
+            token.cancel();
+        }
+        self.watchdog_benchmarking_models.clear();
+        cx.notify();
+    }
+
+    /// Benchmark latency concurrently for available/discovered models, streaming
+    /// live per-row updates as each probe finishes.
     pub fn benchmark_all_watchdog_models(
         &mut self,
         cx: &mut Context<'_, Self>,
     ) {
         let temp_cfg = self.snapshot_ai_config(cx);
-        let ai_ctx = self.snapshot_ai_execution_context(cx);
-        let models_to_test: Vec<String> = self
-            .watchdog_models
-            .iter()
-            .filter(|m| !self.watchdog_benchmarking_models.contains(&m.id))
-            .map(|m| m.id.clone())
-            .collect();
+        let mut ai_ctx = self.snapshot_ai_execution_context(cx);
+        let is_cloud = temp_cfg.provider == AiCliProvider::RuumCloud;
+        let models_to_test: Vec<String> = if is_cloud {
+            self.cached_cloud_models()
+                .into_iter()
+                .filter(|m| {
+                    m.available
+                        && !self.watchdog_benchmarking_models.contains(&m.id)
+                })
+                .map(|m| m.id)
+                .collect()
+        } else {
+            self.watchdog_models
+                .iter()
+                .filter(|m| !self.watchdog_benchmarking_models.contains(&m.id))
+                .map(|m| m.id.clone())
+                .collect()
+        };
         if models_to_test.is_empty() {
-            if self.watchdog_models.is_empty() {
+            let empty_source = if is_cloud {
+                self.cached_cloud_models().is_empty()
+            } else {
+                self.watchdog_models.is_empty()
+            };
+            if empty_source {
                 self.push_toast(
                     crate::i18n::messages::fetch_models_first(self.locale),
                     Status::Warning,
@@ -6551,60 +6593,128 @@ impl Ruum {
             }
             return;
         }
+        let bench_cancel = self
+            .benchmark_cancel_token
+            .get_or_insert_with(ruum_core::ai_cli::CancelToken::new)
+            .clone();
+        ai_ctx = ai_ctx.with_cancel(bench_cancel.clone());
         for model_id in &models_to_test {
             self.watchdog_benchmarking_models.insert(model_id.clone());
         }
         let epoch = self.watchdog_benchmark_epoch;
         let total = models_to_test.len();
+        let worker_count = match ruum_core::ai_cli::AiBackendFactory::kind_for(
+            temp_cfg.provider,
+        ) {
+            ruum_core::ai_cli::AiBackendKind::Cli => 2,
+            ruum_core::ai_cli::AiBackendKind::DirectApi
+            | ruum_core::ai_cli::AiBackendKind::RuumCloud => 4,
+        }
+        .min(total)
+        .max(1);
+
         self.push_toast(
             crate::i18n::messages::benchmarking_models(total, self.locale),
             Status::Neutral,
             cx,
         );
 
+        let (tx, rx) =
+            std::sync::mpsc::channel::<ruum_core::ai_cli::ModelSpeedResult>();
+        let done = Arc::new(AtomicBool::new(false));
+        let bg_done = Arc::clone(&done);
+        let models_clone = models_to_test.clone();
+        let bg_task = cx.background_executor().spawn(async move {
+            let runner = ruum_core::ai_cli::TimedCommandRunner::new(
+                Duration::from_secs(ruum_core::ai_cli::BENCHMARK_TIMEOUT_SECS),
+            );
+            ruum_core::ai_cli::benchmark_models_concurrently(
+                &temp_cfg,
+                &models_clone,
+                worker_count,
+                &runner,
+                &ai_ctx,
+                |res| {
+                    let _ = tx.send(res);
+                },
+            );
+            bg_done.store(true, Ordering::Release);
+        });
+
         cx.spawn(async move |this, cx| {
             let mut ok_count = 0usize;
             let mut fail_count = 0usize;
-            for model_id in models_to_test {
-                let cfg_clone = temp_cfg.clone();
-                let ctx_clone = ai_ctx.clone();
-                let id_for_task = model_id.clone();
-                let task = cx.background_executor().spawn(async move {
-                    let runner = ruum_core::ai_cli::TimedCommandRunner::new(
-                        Duration::from_secs(
-                            ruum_core::ai_cli::SHORT_COMMAND_TIMEOUT_SECS,
-                        ),
-                    );
-                    ruum_core::ai_cli::benchmark_model_for_config_with_context(
-                        &cfg_clone,
-                        Some(&id_for_task),
-                        &runner,
-                        &ctx_clone,
-                    )
-                });
-                let result = task.await;
-                let keep_going = this.update(cx, |this, cx| {
-                    this.watchdog_benchmarking_models.remove(&model_id);
-                    if epoch != this.watchdog_benchmark_epoch {
-                        cx.notify();
-                        return false;
+            if !cfg!(test) {
+                loop {
+                    let mut batch = Vec::new();
+                    while let Ok(res) = rx.try_recv() {
+                        batch.push(res);
                     }
-                    if result.ok {
-                        ok_count += 1;
-                    } else {
-                        fail_count += 1;
+                    if !batch.is_empty() {
+                        let keep_going = this.update(cx, |this, cx| {
+                            let stale = epoch != this.watchdog_benchmark_epoch;
+                            for res in batch {
+                                this.watchdog_benchmarking_models
+                                    .remove(&res.model);
+                                if !stale
+                                    && !bench_cancel.is_cancelled()
+                                    && !ruum_core::ai_cli::is_ai_cancelled_error(
+                                        &res.detail,
+                                    )
+                                {
+                                    if res.ok {
+                                        ok_count += 1;
+                                    } else {
+                                        fail_count += 1;
+                                    }
+                                    this.upsert_speed_result(res);
+                                }
+                            }
+                            cx.notify();
+                            !stale
+                        });
+                        if !matches!(keep_going, Ok(true)) {
+                            break;
+                        }
                     }
-                    this.upsert_speed_result(result);
-                    cx.notify();
-                    true
-                });
-                if !matches!(keep_going, Ok(true)) {
-                    return;
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
                 }
             }
+            bg_task.await;
+            let mut tail = Vec::new();
+            while let Ok(res) = rx.try_recv() {
+                tail.push(res);
+            }
             let _ = this.update(cx, |this, cx| {
-                if epoch != this.watchdog_benchmark_epoch {
+                let stale = epoch != this.watchdog_benchmark_epoch
+                    || bench_cancel.is_cancelled();
+                for res in tail {
+                    this.watchdog_benchmarking_models.remove(&res.model);
+                    if !stale
+                        && !ruum_core::ai_cli::is_ai_cancelled_error(&res.detail)
+                    {
+                        if res.ok {
+                            ok_count += 1;
+                        } else {
+                            fail_count += 1;
+                        }
+                        this.upsert_speed_result(res);
+                    }
+                }
+                for model_id in &models_to_test {
+                    this.watchdog_benchmarking_models.remove(model_id);
+                }
+                if stale {
+                    cx.notify();
                     return;
+                }
+                if this.watchdog_benchmarking_models.is_empty() {
+                    this.benchmark_cancel_token = None;
                 }
                 let status = if fail_count == 0 {
                     Status::Success
@@ -6696,11 +6806,89 @@ impl Ruum {
         true
     }
 
-    /// Trigger manual AI analysis off the UI thread and open confirmation modal.
-    pub fn run_ai_analysis_now(&mut self, cx: &mut Context<'_, Self>) {
-        if self.watchdog_analyzing {
-            return;
+    const fn has_active_overlay_modal(&self) -> bool {
+        self.confirm_open
+            || self.volumes_open
+            || self.update_modal_open
+            || self.billing_modal.is_some()
+            || self.ai_setup_choice_modal.is_some()
+            || self.remote_docker_modal_open
+            || self.remote_connect_confirm.is_some()
+            || self.generated_script_dialog.is_some()
+    }
+
+    fn has_any_active_scan(&self) -> bool {
+        self.scan.is_some()
+            || self.remote_scan.is_some()
+            || self.host_tabs.iter().any(|tab| {
+                tab.key != self.active_host_tab
+                    && tab.session.as_ref().is_some_and(|s| {
+                        s.scan.is_some() || s.remote_scan.is_some()
+                    })
+            })
+    }
+
+    fn fresh_local_tree_if_valid(
+        tree: Option<&Arc<Node>>,
+        scanned_at: i64,
+        now_secs: i64,
+    ) -> Option<Arc<Node>> {
+        if scanned_at > 0 && now_secs.saturating_sub(scanned_at) <= 60 {
+            tree.cloned()
+        } else {
+            None
         }
+    }
+
+    fn resolve_local_analysis_target(
+        &self,
+    ) -> Option<(PathBuf, Option<Arc<Node>>, Option<SpaceInfo>)> {
+        let now = now_seconds();
+        if self.active_host_tab == HostTabKey::Local {
+            if !self.awaiting_root
+                && self.remote.is_none()
+                && !self.root_path.as_os_str().is_empty()
+            {
+                return Some((
+                    self.root_path.clone(),
+                    Self::fresh_local_tree_if_valid(
+                        self.tree.as_ref(),
+                        self.scanned_at,
+                        now,
+                    ),
+                    self.space,
+                ));
+            }
+        } else if let Some(snap) = self
+            .host_tabs
+            .iter()
+            .find(|tab| tab.key == HostTabKey::Local)
+            .and_then(|tab| tab.session.as_ref())
+            && !snap.awaiting_root
+            && snap.remote.is_none()
+            && !snap.root_path.as_os_str().is_empty()
+        {
+            return Some((
+                snap.root_path.clone(),
+                Self::fresh_local_tree_if_valid(
+                    snap.tree.as_ref(),
+                    snap.scanned_at,
+                    now,
+                ),
+                snap.space,
+            ));
+        }
+        self.home
+            .clone()
+            .or_else(std::env::home_dir)
+            .map(|h| (h, None, self.watchdog_home_space))
+    }
+
+    /// Trigger manual AI analysis off the UI thread and open confirmation modal.
+    ///
+    /// Re-triggering while a local analysis is active supersedes and cancels
+    /// the prior in-flight request (Option B event-keyed auto-cancel).
+    pub fn run_ai_analysis_now(&mut self, cx: &mut Context<'_, Self>) {
         if !self.ai_config.setup_completed {
             self.ai_setup_choice_modal = Some(AiSetupChoiceModalState {
                 pending_action: PendingAiSetupAction::LocalAnalysis,
@@ -6709,7 +6897,9 @@ impl Ruum {
             cx.notify();
             return;
         }
-        let Some(home) = std::env::home_dir() else {
+        let Some((target_root, ui_tree, volume_space)) =
+            self.resolve_local_analysis_target()
+        else {
             self.push_toast(
                 crate::i18n::messages::cannot_find_home_dir(self.locale),
                 Status::Error,
@@ -6717,30 +6907,54 @@ impl Ruum {
             );
             return;
         };
+        let local_coord = crate::local_scan_coordinator(cx);
+        let existing_tree = ui_tree.or_else(|| {
+            let key =
+                crate::scan_cache::normalize_local_cache_key(&target_root);
+            local_coord.as_ref().and_then(|c| c.get_fresh(&key))
+        });
         let ai_cfg = self.snapshot_ai_config(cx);
         if self.abort_if_cloud_models_locked(&ai_cfg, None, cx) {
             return;
         }
+        let event_key = crate::AiEventKey::DiskCleanupLocal;
+        let Some((job_seq, cancel_token)) = crate::begin_ai_job(
+            event_key.clone(),
+            crate::AiAnalysisOrigin::Manual,
+            cx,
+        ) else {
+            return;
+        };
+        let (stage_slot, stage_signal) =
+            crate::ai_stage_slot_and_signal(&event_key, cx);
+        let stage_signal_cb = Arc::clone(&stage_signal);
+        let on_stage: Arc<dyn Fn(ruum_core::AiProgressStage) + Send + Sync> =
+            Arc::new(move |_| {
+                stage_signal_cb.notify();
+            });
         let is_cloud = ai_cfg.provider == AiCliProvider::RuumCloud;
-        let ai_ctx = self.snapshot_ai_execution_context(cx);
+        let user_home = self.home.clone().or_else(std::env::home_dir);
+        let cached_docker = self.local_docker_status();
+        let should_probe_docker = !cfg!(test)
+            && matches!(cached_docker, DockerProbeStatus::NotInstalled);
+        let mut ai_ctx = self
+            .snapshot_ai_execution_context(cx)
+            .with_locale(self.locale)
+            .with_event_key(event_key.header_value())
+            .with_cancel(cancel_token.clone())
+            .with_stage_slot(stage_slot)
+            .with_on_stage(on_stage);
+        if let Some(home) = user_home {
+            ai_ctx = ai_ctx.with_user_home(home);
+        }
+        if let Some(sp) = volume_space {
+            ai_ctx = ai_ctx.with_volume_space(sp);
+        }
         let provider_label = ai_cfg.provider.label_in(self.locale);
         let cli_exe = crate::resolve_cli_exe();
         let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
-        let existing_tree = if self.active_host_tab == HostTabKey::Local {
-            (self.remote.is_none() && self.root_path == home)
-                .then(|| self.tree.clone())
-                .flatten()
-        } else {
-            self.host_tabs
-                .iter()
-                .find(|tab| tab.key == HostTabKey::Local)
-                .and_then(|tab| tab.session.as_ref())
-                .and_then(|snap| {
-                    (snap.remote.is_none() && snap.root_path == home)
-                        .then(|| snap.tree.clone())
-                        .flatten()
-                })
-        };
+        let scan_options = self.options.clone();
+        let allow_fallback_scan = !cfg!(test) || self.home.is_some();
 
         let db_path = self.db_path.clone();
         let locale = self.locale;
@@ -6757,27 +6971,90 @@ impl Ruum {
             cx,
         );
 
+        let cancel_flag = cancel_token.flag();
         let task = cx.background_executor().spawn(async move {
+            let (effective_docker, probed_docker) = if should_probe_docker {
+                let d = DockerFactory::create().probe(&DockerEnv::current());
+                (d.clone(), Some(d))
+            } else {
+                (cached_docker, None)
+            };
+            let resolved_tree = if let Some(tree) = existing_tree {
+                Some(tree)
+            } else if allow_fallback_scan
+                && let Some(coord) = local_coord.as_ref()
+            {
+                if cancel_flag.load(Ordering::Acquire) {
+                    return (
+                        target_root,
+                        probed_docker,
+                        Err(ruum_core::ai_cli::AI_CANCELLED_SENTINEL.to_owned()),
+                    );
+                }
+                ai_ctx.report_stage(ruum_core::AiProgressStage::Scanning);
+                stage_signal.notify();
+                let cache_key =
+                    crate::scan_cache::normalize_local_cache_key(&target_root);
+                let scan_root = target_root.clone();
+                match coord.get_or_scan_with(
+                    &cache_key,
+                    &cancel_flag,
+                    crate::scan_cache::SCAN_CACHE_TTL,
+                    move |worker_cancel| {
+                        let handle = ScanHandle::spawn(scan_root, scan_options);
+                        handle
+                            .wait_cancellable(&worker_cancel)
+                            .map(Arc::new)
+                            .map_err(|err| {
+                                if worker_cancel.load(Ordering::Acquire)
+                                    || err.kind()
+                                        == std::io::ErrorKind::Interrupted
+                                {
+                                    ruum_core::ai_cli::AI_CANCELLED_SENTINEL
+                                        .to_owned()
+                                } else {
+                                    err.to_string()
+                                }
+                            })
+                    },
+                ) {
+                    Ok(tree) => Some(tree),
+                    Err(err)
+                        if ruum_core::ai_cli::is_ai_cancelled_error(&err) =>
+                    {
+                        return (target_root, probed_docker, Err(err));
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let ai_ctx = ai_ctx.with_local_docker(effective_docker);
             let runner = ruum_core::ai_cli::DefaultCommandRunner;
             let res =
                 ruum_core::ai_cli::run_analysis_with_tree_for_config_with_context(
                     &ai_cfg,
-                    &home,
+                    &target_root,
                     &cli_exe,
                     now_secs,
-                    existing_tree.as_deref(),
+                    resolved_tree.as_deref(),
                     &runner,
                     &ai_ctx,
                 );
-            (home, res)
+            (target_root, probed_docker, res)
         });
 
         cx.spawn(async move |this, cx| {
-            let (home, res) = task.await;
+            let (target_root, probed_docker, res) = task.await;
             let err_raw = res.as_ref().err().cloned();
             cx.update(|cx| {
+                crate::finish_ai_job(&event_key, job_seq, cx);
                 let done_secs =
                     u64::try_from(now_seconds()).unwrap_or(now_secs);
+                let cancelled = cancel_token.is_cancelled()
+                    || err_raw
+                        .as_deref()
+                        .is_some_and(ruum_core::ai_cli::is_ai_cancelled_error);
                 let mut notif: Option<(
                     ruum_core::watchdog::AiFailureKind,
                     crate::i18n::Locale,
@@ -6788,9 +7065,16 @@ impl Ruum {
                         return false;
                     }
                     this.watchdog_analyzing = false;
+                    if cancelled {
+                        cx.notify();
+                        return false;
+                    }
                     if is_cloud {
                         this.reload_cloud_state();
                         this.sync_selected_cloud_model();
+                    }
+                    if let Some(d) = probed_docker {
+                        this.apply_local_docker_status(d);
                     }
                     let active_locale = this.locale;
                     match res {
@@ -6809,10 +7093,11 @@ impl Ruum {
                             if let Some(db) = open_db_for_window(this) {
                                 let _ = db.save_ai_state(&ai_state);
                             }
+                            let local_docker = this.local_docker_status();
                             if proposal.items.is_empty()
                                 && proposal.docker_targets.is_empty()
                                 && build_docker_confirm_items(
-                                    &this.local_docker_status(),
+                                    &local_docker,
                                     &[],
                                     active_locale,
                                 )
@@ -6827,22 +7112,32 @@ impl Ruum {
                                     cx,
                                 );
                             } else {
-                                let local_docker = this.local_docker_status();
                                 let request =
                                     proposal_confirm_request_with_docker(
-                                        home,
+                                        target_root,
                                         &proposal,
                                         &local_docker,
                                         active_locale,
                                     );
                                 let count = request.items.len()
                                     + request.docker_items.len();
-                                crate::open_local_confirm_window(
-                                    request,
-                                    this.db_path.clone(),
-                                    local_docker,
-                                    cx,
-                                );
+                                let should_open_confirm =
+                                    !this.has_active_overlay_modal()
+                                        && matches!(
+                                            this.screen,
+                                            Screen::Explore | Screen::Watchdog
+                                        )
+                                        && (this.screen != Screen::Explore
+                                            || this.active_host_tab
+                                                == HostTabKey::Local);
+                                if should_open_confirm {
+                                    crate::open_local_confirm_window(
+                                        request,
+                                        this.db_path.clone(),
+                                        local_docker,
+                                        cx,
+                                    );
+                                }
                                 crate::refresh_tray_status(cx);
                                 this.push_toast(
                                     crate::i18n::messages::ai_proposed_items(
@@ -6901,7 +7196,7 @@ impl Ruum {
                         }
                     }
                     Err(_) => {
-                        if let Some(err) = err_raw {
+                        if !cancelled && let Some(err) = err_raw {
                             let kind =
                                 ruum_core::watchdog::classify_ai_failure(&err);
                             let summary =
@@ -6934,12 +7229,26 @@ impl Ruum {
         let Some(proposal) = &self.ai_proposal else {
             return;
         };
-        let Some(home) = std::env::home_dir() else {
+        let home_fallback = self.home.clone().or_else(std::env::home_dir);
+        let root = if let Some(ref recorded) = proposal.root_path {
+            recorded.clone()
+        } else if let Some(ref h) = home_fallback
+            && (proposal.items.is_empty()
+                || proposal.items.iter().all(|i| i.path.starts_with(h)))
+        {
+            h.clone()
+        } else if let Some((resolved, _, _)) =
+            self.resolve_local_analysis_target()
+        {
+            resolved
+        } else if let Some(h) = home_fallback {
+            h
+        } else {
             return;
         };
         let local_docker = self.local_docker_status();
         let request = proposal_confirm_request_with_docker(
-            home,
+            root,
             proposal,
             &local_docker,
             self.locale,
@@ -6953,12 +7262,16 @@ impl Ruum {
         cx.notify();
     }
 
-    /// Remove confirmed/cleaned paths from the local Watchdog AI proposal.
-    pub fn prune_local_ai_proposal(&mut self, cleaned_paths: &[PathBuf]) {
+    /// Remove confirmed/cleaned paths and Docker targets from the local AI
+    /// proposal.
+    pub fn prune_local_ai_proposal_targets(
+        &mut self,
+        cleaned_paths: &[PathBuf],
+        cleaned_docker: &[DockerCleanTarget],
+    ) {
         if let Some(proposal) = &mut self.ai_proposal {
-            proposal
-                .items
-                .retain(|item| !cleaned_paths.contains(&item.path));
+            let _ = proposal.prune_paths(cleaned_paths);
+            let _ = proposal.prune_docker_targets(cleaned_docker);
             if proposal.items.is_empty() && proposal.docker_targets.is_empty() {
                 self.ai_proposal = None;
             }
@@ -7370,6 +7683,9 @@ impl Ruum {
         }
 
         self.reload_ssh_profiles();
+        if let Some(coords) = crate::remote_scan_coordinators(cx) {
+            coords.invalidate_profile(&profile_id);
+        }
         for tab in &mut self.host_tabs {
             if tab.key == HostTabKey::Ssh(profile_id.clone()) {
                 tab.label.clone_from(&alias);
@@ -7444,6 +7760,9 @@ impl Ruum {
             return;
         }
         self.close_host_tab(&HostTabKey::Ssh(id.to_owned()), cx);
+        if let Some(coords) = crate::remote_scan_coordinators(cx) {
+            coords.invalidate_profile(id);
+        }
         if self.ssh_form_editing_id.as_deref() == Some(id) {
             self.close_ssh_form(cx);
         }
@@ -7462,6 +7781,7 @@ impl Ruum {
             scan_root: std::mem::take(&mut self.scan_root),
             tree: self.tree.take(),
             scan: self.scan.take(),
+            local_scan_flight: self.local_scan_flight.take(),
             remote_scan: self.remote_scan.take(),
             remote_disk: std::mem::take(&mut self.remote_disk),
             remote_progress: std::mem::take(&mut self.remote_progress),
@@ -7522,6 +7842,7 @@ impl Ruum {
         self.scan_root = PathBuf::new();
         self.tree = None;
         self.scan = None;
+        self.local_scan_flight = None;
         self.remote_scan = None;
         self.remote_disk = false;
         self.remote_progress = ruum_core::remote_progress::Progress::default();
@@ -7580,6 +7901,7 @@ impl Ruum {
         self.scan_root = snap.scan_root;
         self.tree = snap.tree;
         self.scan = snap.scan;
+        self.local_scan_flight = snap.local_scan_flight;
         self.remote_scan = snap.remote_scan;
         self.remote_disk = snap.remote_disk;
         self.remote_progress = snap.remote_progress;
@@ -7630,7 +7952,7 @@ impl Ruum {
         self.active_ssh_session = snap.active_ssh_session;
 
         self.scan_epoch = self.scan_epoch.max(snap.scan_epoch) + 1;
-        if self.scan.is_some() || self.remote_scan.is_some() {
+        if self.has_any_active_scan() {
             Self::poll_scan(self.scan_epoch, cx);
         }
     }
@@ -7700,6 +8022,7 @@ impl Ruum {
             if let Some(scan) = self.scan.take() {
                 scan.cancel();
             }
+            self.local_scan_flight = None;
             self.remote_scan = None;
             self.active_ssh_session = None;
             self.active_ssh_profile_id = None;
@@ -7723,6 +8046,7 @@ impl Ruum {
                 if let Some(scan) = snap.scan.take() {
                     scan.cancel();
                 }
+                snap.local_scan_flight = None;
                 snap.remote_scan = None;
                 snap.active_ssh_session = None;
             }
@@ -8072,14 +8396,14 @@ impl Ruum {
     /// Run remote AI analysis by pulling an in-memory [`Snapshot`] via
     /// `RemoteScan::spawn_with_session` and running local AI CLI + pure-memory
     /// tree validation (zero remote AI CLI requirement).
+    ///
+    /// Re-triggering the same SSH profile supersedes only that profile's prior
+    /// in-flight request while leaving Local and other SSH profiles untouched.
     pub fn analyze_ssh_profile(
         &mut self,
         id: &str,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.ssh_analyzing_profiles.contains(id) {
-            return;
-        }
         let Some(profile) =
             self.ssh_profiles.iter().find(|p| p.id == id).cloned()
         else {
@@ -8130,17 +8454,99 @@ impl Ruum {
             }
         };
 
+        let event_key = crate::AiEventKey::DiskCleanupSsh(profile.id.clone());
+        let Some((job_seq, cancel_token)) = crate::begin_ai_job(
+            event_key.clone(),
+            crate::AiAnalysisOrigin::Manual,
+            cx,
+        ) else {
+            return;
+        };
+        let (stage_slot, stage_signal) =
+            crate::ai_stage_slot_and_signal(&event_key, cx);
+        let stage_signal_cb = Arc::clone(&stage_signal);
+        let on_stage: Arc<dyn Fn(ruum_core::AiProgressStage) + Send + Sync> =
+            Arc::new(move |_| {
+                stage_signal_cb.notify();
+            });
+        let cancel_flag = cancel_token.flag();
         let existing_session = self.find_live_ssh_session(id);
         let duration_minutes = self.app_settings.ssh_session_duration_minutes;
-        let ai_ctx = self.snapshot_ai_execution_context(cx);
+        let requested_root = profile
+            .default_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let requested_root_key = crate::scan_cache::normalize_remote_cache_key(
+            requested_root.as_deref(),
+        );
+        let now_i64 = now_seconds();
+        let ui_snapshot =
+            if self.active_host_tab == HostTabKey::Ssh(profile.id.clone()) {
+                if self.scanned_at > 0
+                    && now_i64.saturating_sub(self.scanned_at) <= 60
+                    && let (Some(header), Some(tree)) =
+                        (&self.remote_header, &self.tree)
+                    && crate::scan_cache::normalize_remote_cache_key(Some(
+                        &self.root_path,
+                    )) == requested_root_key
+                {
+                    Some(Arc::new(ruum_core::remote::Snapshot {
+                        header: header.clone(),
+                        tree: (**tree).clone(),
+                        docker: self.docker.clone(),
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                self.host_tabs
+                    .iter()
+                    .find(|t| t.key == HostTabKey::Ssh(profile.id.clone()))
+                    .and_then(|t| t.session.as_ref())
+                    .and_then(|snap| {
+                        (snap.scanned_at > 0
+                            && now_i64.saturating_sub(snap.scanned_at) <= 60)
+                            .then_some(())?;
+                        let (header, tree) =
+                            (snap.remote_header.as_ref()?, snap.tree.as_ref()?);
+                        (crate::scan_cache::normalize_remote_cache_key(Some(
+                            &snap.root_path,
+                        )) == requested_root_key)
+                            .then_some(())?;
+                        Some(Arc::new(ruum_core::remote::Snapshot {
+                            header: header.clone(),
+                            tree: (**tree).clone(),
+                            docker: snap.docker.clone(),
+                        }))
+                    })
+            };
+        let remote_coord = crate::remote_scan_coordinators(cx)
+            .map(|coords| coords.for_profile(&profile.id));
+        let ai_ctx = self
+            .snapshot_ai_execution_context(cx)
+            .with_locale(self.locale)
+            .with_event_key(event_key.header_value())
+            .with_cancel(cancel_token.clone())
+            .with_stage_slot(stage_slot)
+            .with_on_stage(on_stage);
         let provider_label = ai_cfg.provider.label_in(self.locale);
         let options = self.options.clone();
-        let now_secs = u64::try_from(now_seconds()).unwrap_or(0);
+        let now_secs = u64::try_from(now_i64).unwrap_or(0);
         let profile_id = profile.id.clone();
         let alias = profile.alias.clone();
         let db_path = self.db_path.clone();
         let locale = self.locale;
 
+        let epoch = {
+            let entry = self
+                .ssh_analysis_epochs
+                .entry(profile_id.clone())
+                .or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
         self.ssh_analyzing_profiles.insert(profile_id.clone());
         self.push_toast(
             crate::i18n::messages::running_ai_analysis(
@@ -8153,57 +8559,131 @@ impl Ruum {
         cx.notify();
 
         let task = cx.background_executor().spawn(async move {
-            let session = match existing_session {
-                Some(s) if !s.is_closed() && !s.is_expired() => s,
-                _ => Arc::new(start_ssh_session_with_store(
-                    &profile,
-                    &store,
-                    duration_minutes,
-                )?),
+            if cancel_flag.load(Ordering::Acquire) {
+                return Err(ruum_core::ai_cli::AI_CANCELLED_SENTINEL.to_owned());
+            }
+            let captured_session =
+                Arc::new(Mutex::new(existing_session.clone()));
+            let snapshot = if let Some(snap) = ui_snapshot {
+                snap
+            } else if let Some(coord) = remote_coord.as_ref()
+                && let Some(fresh) = coord.get_fresh(&requested_root_key)
+            {
+                fresh
+            } else {
+                ai_ctx.report_stage(ruum_core::AiProgressStage::Scanning);
+                stage_signal.notify();
+                let session_slot = Arc::clone(&captured_session);
+                let run_scan = move |worker_cancel: Arc<AtomicBool>| {
+                    if worker_cancel.load(Ordering::Acquire) {
+                        return Err(
+                            ruum_core::ai_cli::AI_CANCELLED_SENTINEL.to_owned()
+                        );
+                    }
+                    let session = match existing_session {
+                        Some(s) if !s.is_closed() && !s.is_expired() => s,
+                        _ => Arc::new(start_ssh_session_with_store(
+                            &profile,
+                            &store,
+                            duration_minutes,
+                        )?),
+                    };
+                    if let Ok(mut guard) = session_slot.lock() {
+                        *guard = Some(Arc::clone(&session));
+                    }
+                    if worker_cancel.load(Ordering::Acquire) {
+                        return Err(
+                            ruum_core::ai_cli::AI_CANCELLED_SENTINEL.to_owned()
+                        );
+                    }
+                    let request = ruum_core::remote::Request {
+                        root: requested_root,
+                        disk: false,
+                        options,
+                    };
+                    let scan =
+                        ruum_core::remote::RemoteScan::spawn_with_session(
+                            &session, &request,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    scan.wait_cancellable(&worker_cancel).map(Arc::new).map_err(
+                        |err| {
+                            if worker_cancel.load(Ordering::Acquire)
+                                || err.kind() == std::io::ErrorKind::Interrupted
+                            {
+                                ruum_core::ai_cli::AI_CANCELLED_SENTINEL
+                                    .to_owned()
+                            } else {
+                                err.to_string()
+                            }
+                        },
+                    )
+                };
+                if let Some(coord) = remote_coord.as_ref() {
+                    coord.get_or_scan_with(
+                        &requested_root_key,
+                        &cancel_flag,
+                        crate::scan_cache::SCAN_CACHE_TTL,
+                        run_scan,
+                    )?
+                } else {
+                    run_scan(Arc::clone(&cancel_flag))?
+                }
             };
-            let request = ruum_core::remote::Request {
-                root: profile
-                    .default_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from),
-                disk: false,
-                options,
-            };
-            let scan = ruum_core::remote::RemoteScan::spawn_with_session(
-                &session, &request,
-            )
-            .map_err(|err| err.to_string())?;
-            let snapshot = scan.wait().map_err(|err| err.to_string())?;
             let runner = ruum_core::ai_cli::DefaultCommandRunner;
             let proposal = analyze_remote_snapshot_with_context(
                 &ai_cfg, &snapshot, now_secs, &runner, &ai_ctx,
             )?;
-            Ok::<_, String>((session, snapshot.header, proposal))
+            let live_session =
+                captured_session.lock().ok().and_then(|mut g| g.take());
+            Ok::<_, String>((live_session, snapshot.header.clone(), proposal))
         });
 
         cx.spawn(async move |this, cx| {
             let res = task.await;
             let err_raw = res.as_ref().err().cloned();
             cx.update(|cx| {
+                crate::finish_ai_job(&event_key, job_seq, cx);
                 let done_secs =
                     u64::try_from(now_seconds()).unwrap_or(now_secs);
+                let cancelled = cancel_token.is_cancelled()
+                    || err_raw
+                        .as_deref()
+                        .is_some_and(ruum_core::ai_cli::is_ai_cancelled_error);
                 let mut notif: Option<(
                     ruum_core::watchdog::AiFailureKind,
                     crate::i18n::Locale,
                     String,
                 )> = None;
                 let updated = this.update(cx, |this, cx| {
+                    if this.ssh_analysis_epochs.get(&profile_id).copied()
+                        != Some(epoch)
+                    {
+                        return false;
+                    }
                     this.ssh_analyzing_profiles.remove(&profile_id);
+                    if cancelled {
+                        cx.notify();
+                        return false;
+                    }
                     if is_cloud {
                         this.reload_cloud_state();
                         this.sync_selected_cloud_model();
                     }
                     let active_locale = this.locale;
                     match res {
-                        Ok((session, header, proposal)) => {
-                            this.store_live_ssh_session(&profile_id, &session);
+                        Ok((maybe_session, header, proposal)) => {
+                            let confirm_session =
+                                maybe_session.clone().or_else(|| {
+                                    this.ensure_active_ssh_session(&profile_id)
+                                        .ok()
+                                });
+                            if let Some(session) = maybe_session {
+                                this.store_live_ssh_session(
+                                    &profile_id,
+                                    &session,
+                                );
+                            }
                             this.ai_last_error = None;
                             this.ai_last_error_at_secs = None;
                             if is_cloud {
@@ -8249,14 +8729,26 @@ impl Ruum {
                                     );
                                 let count = request.items.len()
                                     + request.docker_items.len();
-                                crate::open_remote_confirm_window(
-                                    request,
-                                    profile_id,
-                                    session,
-                                    header,
-                                    this.db_path.clone(),
-                                    cx,
-                                );
+                                let should_open_confirm = !this
+                                    .has_active_overlay_modal()
+                                    && (this.screen == Screen::Remote
+                                        || (this.screen == Screen::Explore
+                                            && this.active_host_tab
+                                                == HostTabKey::Ssh(
+                                                    profile_id.clone(),
+                                                )));
+                                if should_open_confirm
+                                    && let Some(session) = confirm_session
+                                {
+                                    crate::open_remote_confirm_window(
+                                        request,
+                                        profile_id,
+                                        session,
+                                        header,
+                                        this.db_path.clone(),
+                                        cx,
+                                    );
+                                }
                                 this.push_toast(
                                     crate::i18n::messages::ai_proposed_items(
                                         count,
@@ -8292,6 +8784,7 @@ impl Ruum {
                         }
                     }
                     cx.notify();
+                    true
                 });
 
                 if let Some((kind, notif_locale, summary)) = notif {
@@ -8304,7 +8797,8 @@ impl Ruum {
                         &summary,
                         cx,
                     );
-                } else if updated.is_err()
+                } else if !cancelled
+                    && updated.is_err()
                     && let Some(err) = err_raw
                 {
                     let kind = ruum_core::watchdog::classify_ai_failure(&err);
@@ -8568,6 +9062,7 @@ impl Ruum {
             return;
         };
         scan.cancel();
+        self.local_scan_flight = None;
         // The poller stops at its next tick instead of taking the result.
         self.scan_epoch += 1;
         self.progress = scan.progress.snapshot();
@@ -8693,6 +9188,7 @@ impl Ruum {
         if let Some(scan) = self.scan.take() {
             scan.cancel();
         }
+        self.local_scan_flight = None;
         self.scan_epoch += 1;
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
@@ -8719,6 +9215,12 @@ impl Ruum {
         self.scan_root.clone_from(&self.root_path);
         self.remote_scan = None;
         if let Some(host) = &self.remote {
+            if let (Some(profile_id), Some(coords)) = (
+                self.active_ssh_profile_id.as_deref(),
+                crate::remote_scan_coordinators(cx),
+            ) {
+                coords.invalidate_profile(profile_id);
+            }
             let request = ruum_core::remote::Request {
                 root: (!self.root_path.as_os_str().is_empty())
                     .then(|| self.root_path.clone()),
@@ -8743,10 +9245,21 @@ impl Ruum {
                     self.remote_scan = Some(scan);
                     Self::poll_scan(epoch, cx);
                 }
-                Err(error) => self.scan_error = Some(error.to_string()),
+                Err(error) => {
+                    self.scan_error = Some(error.to_string());
+                    if self.has_any_active_scan() {
+                        Self::poll_scan(epoch, cx);
+                    }
+                }
             }
             cx.notify();
             return;
+        }
+        if let Some(coord) = crate::local_scan_coordinator(cx) {
+            coord.invalidate_all();
+            self.local_scan_flight = Some(coord.begin_external_flight(
+                crate::scan_cache::normalize_local_cache_key(&self.root_path),
+            ));
         }
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
@@ -8777,6 +9290,22 @@ impl Ruum {
         .detach();
     }
 
+    pub(crate) fn update_remote_identity_with_cx(
+        &mut self,
+        identity: Option<ruum_core::identity::HostIdentity>,
+        cx: &App,
+    ) {
+        if self.remote_identity != identity
+            && let (Some(profile_id), Some(coords)) = (
+                self.active_ssh_profile_id.as_deref(),
+                crate::remote_scan_coordinators(cx),
+            )
+        {
+            coords.invalidate_profile(profile_id);
+        }
+        self.update_remote_identity(identity);
+    }
+
     pub(crate) fn update_remote_identity(
         &mut self,
         identity: Option<ruum_core::identity::HostIdentity>,
@@ -8794,6 +9323,167 @@ impl Ruum {
         self.remote_identity = identity;
     }
 
+    fn poll_background_host_tabs(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let active_key = self.active_host_tab.clone();
+        let metric = self.options.metric;
+        let now_secs = now_seconds();
+        let mut bg_still_running = false;
+        let mut bg_changed = false;
+        let mut completed_remote_summaries = Vec::new();
+        let mut completed_remote_cache = Vec::new();
+        let mut completed_local_cache = Vec::new();
+
+        for tab in &mut self.host_tabs {
+            if tab.key == active_key {
+                continue;
+            }
+            let Some(snap) = tab.session.as_mut() else {
+                continue;
+            };
+            if let Some(ref rscan) = snap.remote_scan {
+                bg_changed = true;
+                snap.remote_progress = rscan.progress();
+                snap.scan_preview.clone_from(&snap.remote_progress.preview);
+                snap.progress.files = snap.remote_progress.files;
+                snap.progress.dirs = snap.remote_progress.dirs;
+                snap.progress.bytes = snap.remote_progress.bytes;
+                snap.progress.errors = snap.remote_progress.errors;
+                if let Some(outcome) = rscan.poll() {
+                    match outcome {
+                        Ok(snapshot) => {
+                            snap.root_path.clone_from(&snapshot.header.root);
+                            snap.home.clone_from(&snapshot.header.home);
+                            snap.disk_root
+                                .clone_from(&snapshot.header.disk_root);
+                            snap.space = snapshot.header.space;
+                            snap.remote_platform
+                                .clone_from(&snapshot.header.platform);
+                            if snap.remote_identity != snapshot.header.identity
+                                && !snap.marks.is_empty()
+                            {
+                                snap.marks.clear();
+                            }
+                            snap.remote_identity
+                                .clone_from(&snapshot.header.identity);
+                            snap.docker = snapshot.docker.clone();
+                            snap.remote_header = Some(snapshot.header.clone());
+                            snap.scanned_at = now_secs;
+                            snap.scan_elapsed =
+                                snap.scan_started.map(|t| t.elapsed());
+                            let node = snapshot.tree.clone();
+                            snap.marks.refresh(&snap.root_path, &node, metric);
+                            snap.tree = Some(Arc::new(node));
+                            if let HostTabKey::Ssh(ref profile_id) = tab.key {
+                                if let Some(sp) = snap.space {
+                                    completed_remote_summaries
+                                        .push((profile_id.clone(), sp));
+                                }
+                                let root_key =
+                                    crate::scan_cache::normalize_remote_cache_key(
+                                        Some(&snap.root_path),
+                                    );
+                                completed_remote_cache.push((
+                                    profile_id.clone(),
+                                    root_key,
+                                    Arc::new(snapshot),
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            snap.scan_error = Some(err.to_string());
+                        }
+                    }
+                    snap.remote_scan = None;
+                    snap.scan_preview = None;
+                    snap.progress.finished = true;
+                } else {
+                    bg_still_running = true;
+                }
+            }
+            if let Some(ref lscan) = snap.scan {
+                bg_changed = true;
+                snap.progress = lscan.progress.snapshot();
+                if let Some(outcome) = lscan.poll() {
+                    match outcome {
+                        Ok(node) => {
+                            let came_from = (snap.scan_root != snap.root_path)
+                                .then(|| snap.root_path.clone());
+                            if came_from.is_some() {
+                                snap.root_path.clone_from(&snap.scan_root);
+                                snap.space = space_info(&snap.root_path).ok();
+                                snap.device = device_for(&snap.root_path);
+                                snap.file_table =
+                                    file_table_readable(&snap.root_path);
+                            }
+                            snap.marks.refresh(&snap.root_path, &node, metric);
+                            let arc_tree = Arc::new(node);
+                            snap.tree = Some(Arc::clone(&arc_tree));
+                            snap.cache = None;
+                            snap.scanned_at = now_secs;
+                            snap.scan_elapsed =
+                                snap.scan_started.map(|t| t.elapsed());
+                            if let Some(flight) = snap.local_scan_flight.take()
+                            {
+                                flight.finish(Ok(Arc::clone(&arc_tree)));
+                            }
+                            completed_local_cache
+                                .push((snap.root_path.clone(), arc_tree));
+                        }
+                        Err(err) => {
+                            let err_str = err.to_string();
+                            snap.scan_error = Some(err_str.clone());
+                            if let Some(flight) = snap.local_scan_flight.take()
+                            {
+                                flight.finish(Err(err_str));
+                            }
+                        }
+                    }
+                    snap.scan = None;
+                    snap.scan_preview = None;
+                    snap.progress.finished = true;
+                } else {
+                    bg_still_running = true;
+                }
+            }
+        }
+
+        if let Some(coords) = crate::remote_scan_coordinators(cx) {
+            for (profile_id, root_key, snapshot) in completed_remote_cache {
+                coords.for_profile(&profile_id).seed(root_key, snapshot);
+            }
+        }
+        if let Some(local_coord) = crate::local_scan_coordinator(cx) {
+            for (root, tree) in completed_local_cache {
+                local_coord.seed(
+                    crate::scan_cache::normalize_local_cache_key(&root),
+                    tree,
+                );
+            }
+        }
+        if !completed_remote_summaries.is_empty()
+            && self.db_path.is_some()
+            && let Ok(db) = self.open_db()
+        {
+            let ts = u64::try_from(now_secs).unwrap_or(0);
+            for (profile_id, sp) in completed_remote_summaries {
+                let _ = db.update_ssh_profile_scan_summary(
+                    &profile_id,
+                    sp.total,
+                    sp.available,
+                    ts,
+                );
+            }
+            self.reload_ssh_profiles();
+        }
+        if bg_changed {
+            cx.notify();
+        }
+        bg_still_running
+    }
+
     /// Drain the scan channel once. Returns whether the poller should keep
     /// ticking. Driven by the poll task above, and by the tests, which cannot
     /// wait on the test clock while a real worker thread walks a directory.
@@ -8805,6 +9495,7 @@ impl Ruum {
         if epoch != self.scan_epoch {
             return false;
         }
+        let bg_busy = self.poll_background_host_tabs(cx);
         if let Some(scan) = &self.remote_scan {
             let outcome = scan.poll();
             self.remote_progress = scan.progress();
@@ -8824,11 +9515,12 @@ impl Ruum {
                     self.disk_root.clone_from(&snapshot.header.disk_root);
                     self.space = snapshot.header.space;
                     self.remote_platform.clone_from(&snapshot.header.platform);
-                    self.update_remote_identity(
+                    self.update_remote_identity_with_cx(
                         snapshot.header.identity.clone(),
+                        cx,
                     );
                     self.docker = snapshot.docker.clone();
-                    self.remote_header = Some(snapshot.header);
+                    self.remote_header = Some(snapshot.header.clone());
                     self.sync_review_docker_defaults();
                     self.docker_probing = false;
                     self.device = self.remote.as_ref().map(|host| {
@@ -8837,6 +9529,7 @@ impl Ruum {
                             self.locale,
                         )
                     });
+                    self.scanned_at = now_seconds();
                     if let (Some(profile_id), Some(space)) =
                         (self.active_ssh_profile_id.clone(), self.space)
                         && self.db_path.is_some()
@@ -8852,13 +9545,25 @@ impl Ruum {
                         );
                         self.reload_ssh_profiles();
                     }
-                    let node = snapshot.tree;
+                    let node = snapshot.tree.clone();
                     self.marks.refresh(
                         &self.root_path,
                         &node,
                         self.options.metric,
                     );
                     self.tree = Some(Arc::new(node));
+                    if let (Some(profile_id), Some(coords)) = (
+                        self.active_ssh_profile_id.as_deref(),
+                        crate::remote_scan_coordinators(cx),
+                    ) {
+                        let root_key =
+                            crate::scan_cache::normalize_remote_cache_key(
+                                Some(&self.root_path),
+                            );
+                        coords
+                            .for_profile(profile_id)
+                            .seed(root_key, Arc::new(snapshot));
+                    }
                     self.refresh_insights();
                     self.select_largest(cx);
                     self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
@@ -8876,10 +9581,10 @@ impl Ruum {
             self.scan_preview = None;
             self.progress.finished = true;
             cx.notify();
-            return false;
+            return bg_busy;
         }
         let Some(scan) = &self.scan else {
-            return false;
+            return bg_busy;
         };
         self.progress = scan.progress.snapshot();
         if self
@@ -8914,7 +9619,19 @@ impl Ruum {
                 }
                 let metric = self.options.metric;
                 self.marks.refresh(&self.root_path, &node, metric);
-                discard(self.tree.replace(Arc::new(node)));
+                let tree_arc = Arc::new(node);
+                discard(self.tree.replace(Arc::clone(&tree_arc)));
+                self.scanned_at = now_seconds();
+                if let Some(flight) = self.local_scan_flight.take() {
+                    flight.finish(Ok(Arc::clone(&tree_arc)));
+                } else if let Some(coord) = crate::local_scan_coordinator(cx) {
+                    coord.seed(
+                        crate::scan_cache::normalize_local_cache_key(
+                            &self.root_path,
+                        ),
+                        tree_arc,
+                    );
+                }
                 self.cache = None;
                 self.refresh_insights();
                 self.scan_elapsed =
@@ -8938,13 +9655,19 @@ impl Ruum {
                 .flatten();
                 crate::refresh_tray_status_with_space(home_space, cx);
             }
-            Err(error) => self.scan_error = Some(error.to_string()),
+            Err(error) => {
+                let err_str = error.to_string();
+                self.scan_error = Some(err_str.clone());
+                if let Some(flight) = self.local_scan_flight.take() {
+                    flight.finish(Err(err_str));
+                }
+            }
         }
         self.scan = None;
         self.scan_preview = None;
         self.progress.finished = true;
         cx.notify();
-        false
+        bg_busy
     }
 
     fn keep_selection_valid(&mut self) {
@@ -10523,6 +11246,9 @@ impl Ruum {
         if had_files {
             self.marks.clear();
             if self.remote.is_none() {
+                if let Some(coord) = crate::local_scan_coordinator(cx) {
+                    coord.invalidate_all();
+                }
                 self.space = space_info(&self.root_path).ok();
             }
         }
@@ -12280,7 +13006,7 @@ enum BillingPollStep {
     Stop,
     Skip,
     Poll {
-        ai_ctx: ruum_core::ai_cli::AiExecutionContext,
+        ai_ctx: Box<ruum_core::ai_cli::AiExecutionContext>,
         lock: Arc<Mutex<()>>,
         last_refresh_at: Arc<Mutex<Option<Instant>>>,
     },
@@ -12537,6 +13263,17 @@ pub fn analyze_remote_snapshot_with_context(
 ) -> Result<CleanupProposal, String> {
     let target_os =
         ruum_core::removal::trash_os_for_platform(&snapshot.header.platform);
+    let mut effective_ctx = ctx.clone();
+    if effective_ctx.user_home.is_none()
+        && let Some(ref home) = snapshot.header.home
+    {
+        effective_ctx = effective_ctx.with_user_home(home.clone());
+    }
+    if effective_ctx.volume_space.is_none()
+        && let Some(space) = snapshot.header.space
+    {
+        effective_ctx = effective_ctx.with_volume_space(space);
+    }
     ruum_core::ai_cli::run_tree_analysis_for_config_with_context(
         ai_cfg,
         &snapshot.header.root,
@@ -12546,7 +13283,7 @@ pub fn analyze_remote_snapshot_with_context(
         target_os,
         now_secs,
         runner,
-        ctx,
+        &effective_ctx,
     )
 }
 

@@ -147,6 +147,60 @@ pub const fn ai_analyze_disconnected_tooltip(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn ai_stage_compact_label(
+    stage: ruum_core::AiProgressStage,
+    locale: Locale,
+) -> &'static str {
+    use ruum_core::AiProgressStage;
+    match stage {
+        AiProgressStage::Scanning => pick(
+            locale,
+            "Scanning\u{2026}",
+            "扫描中\u{2026}",
+            "スキャン中\u{2026}",
+            "스캔 중\u{2026}",
+        ),
+        AiProgressStage::Queued => pick(
+            locale,
+            "Queued\u{2026}",
+            "排队中\u{2026}",
+            "待機中\u{2026}",
+            "대기 중\u{2026}",
+        ),
+        AiProgressStage::Connecting => pick(
+            locale,
+            "Connecting\u{2026}",
+            "连接中\u{2026}",
+            "接続中\u{2026}",
+            "연결 중\u{2026}",
+        ),
+        AiProgressStage::Thinking => pick(
+            locale,
+            "Thinking\u{2026}",
+            "思考中\u{2026}",
+            "思考中\u{2026}",
+            "추론 중\u{2026}",
+        ),
+        AiProgressStage::Generating => pick(
+            locale,
+            "Generating\u{2026}",
+            "生成中\u{2026}",
+            "生成中\u{2026}",
+            "생성 중\u{2026}",
+        ),
+    }
+}
+
+pub const fn ai_stage_tooltip(
+    stage: Option<ruum_core::AiProgressStage>,
+    locale: Locale,
+) -> &'static str {
+    match stage {
+        Some(s) => ai_stage_compact_label(s, locale),
+        None => ai_analyze_running_tooltip(locale),
+    }
+}
+
 pub fn siblings_in(parent_name: &str, locale: Locale) -> String {
     match locale {
         Locale::En => format!("Siblings in {parent_name}"),

@@ -3001,6 +3001,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
                 None,
             )],
             docker_targets: Vec::new(),
+            root_path: None,
         });
         app.open_last_proposal(cx);
     });
@@ -5401,6 +5402,7 @@ fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
             ),
         ],
         docker_targets: Vec::new(),
+        root_path: None,
     };
     {
         let db = ruum_core::storage::StorageDb::open(&db_path).expect("db");
@@ -6290,6 +6292,7 @@ fn cleanup_confirm_window_docker_multiselect_defaults_and_docker_only_confirm(
             id: "deadbeef1234".into(),
             name: "old-worker".into(),
         }],
+        root_path: None,
     };
     let req = crate::state::proposal_confirm_request_with_docker(
         temp.path().to_path_buf(),
@@ -6884,6 +6887,7 @@ fn remote_review_and_confirm_generate_script_dialog_and_pending_card_actions(
         summary: "Remote docker cache".into(),
         items: Vec::new(),
         docker_targets: vec![DockerCleanTarget::BuildCache],
+        root_path: None,
     };
     let req = crate::state::remote_proposal_confirm_request_with_docker(
         header.root.clone(),
@@ -8905,6 +8909,7 @@ fn local_ai_analysis_failure_notifies_and_persists_open_and_closed(
             None,
         )],
         docker_targets: Vec::new(),
+        root_path: None,
     };
     {
         let db = StorageDb::open(&db_path).expect("open db");
@@ -9679,6 +9684,7 @@ fn has_actionable_proposal_counts_docker_targets() {
         summary: "none".to_owned(),
         items: Vec::new(),
         docker_targets: Vec::new(),
+        root_path: None,
     };
     assert!(!crate::has_actionable_proposal(&empty));
 
@@ -9687,6 +9693,7 @@ fn has_actionable_proposal_counts_docker_targets() {
         summary: "docker".to_owned(),
         items: Vec::new(),
         docker_targets: vec![DockerCleanTarget::BuildCache],
+        root_path: None,
     };
     assert!(crate::has_actionable_proposal(&docker_only));
 }
@@ -10086,6 +10093,7 @@ fn cleanup_progress_window_opens_on_confirm_background_keeps_running_tray_reopen
             ),
         ],
         docker_targets: Vec::new(),
+        root_path: None,
     };
     {
         let db = StorageDb::open(&db_path).expect("open db");
@@ -10436,6 +10444,7 @@ fn cleanup_progress_window_renders_under_csd_and_refreshes_main_window_on_comple
             None,
         )],
         docker_targets: Vec::new(),
+        root_path: None,
     };
     {
         let db = StorageDb::open(&db_path).expect("open db");
@@ -10671,6 +10680,7 @@ fn cleanup_progress_completion_states_manual_close_background_and_locales(
             None,
         )],
         docker_targets: Vec::new(),
+        root_path: None,
     };
     {
         let db = StorageDb::open(&db_path).expect("open db");
@@ -10746,6 +10756,7 @@ fn cleanup_progress_completion_states_manual_close_background_and_locales(
             None,
         )],
         docker_targets: Vec::new(),
+        root_path: None,
     };
     {
         let db = StorageDb::open(&db_path).expect("open db");
@@ -11037,7 +11048,8 @@ fn explore_ai_button_local_click_dispatches_and_guards_reentry(
     assert_eq!(req_count.load(Ordering::Acquire), 1);
 
     // 2. While `watchdog_analyzing` is true, `trail-ai-analyze-spin` renders
-    //    and clicking `trail-ai-analyze` is guarded against re-entry.
+    //    and clicking `trail-ai-analyze` supersedes the in-flight request
+    //    silently (Option B event-keyed auto-cancel).
     update(&view, win_cx, |app, cx| {
         app.notice = None;
         app.run_ai_analysis_now(cx);
@@ -11058,11 +11070,12 @@ fn explore_ai_button_local_click_dispatches_and_guards_reentry(
 
     read(&view, win_cx, |app| {
         assert!(!app.watchdog_analyzing);
-        assert_eq!(app.watchdog_analysis_epoch, in_flight_epoch);
+        assert_eq!(app.watchdog_analysis_epoch, in_flight_epoch + 1);
+        assert_eq!(app.ai_last_error, None);
     });
     draw(win_cx);
     assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_none());
-    assert_eq!(req_count.load(Ordering::Acquire), 2);
+    assert_eq!(req_count.load(Ordering::Acquire), 3);
 }
 
 #[gpui_kit::test]
@@ -11171,7 +11184,8 @@ fn explore_ai_button_ssh_tab_dispatches_and_respects_state(
         assert!(app.notice.is_none());
     });
 
-    // 3. Live SSH session shows spinner while in-flight and ignores clicks.
+    // 3. Live SSH session shows spinner while in-flight and clicking supersedes
+    //    without blocking UI interaction.
     let live_session =
         Arc::new(SshSession::start(endpoint, material, 15).expect("live"));
     update(&view, win_cx, |app, cx| {
@@ -11181,11 +11195,6 @@ fn explore_ai_button_ssh_tab_dispatches_and_respects_state(
     });
     draw(win_cx);
     assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_some());
-    win_cx.simulate_click(ai_bounds.center(), Modifiers::none());
-    draw(win_cx);
-    read(&view, win_cx, |app| {
-        assert!(app.notice.is_none());
-    });
 
     // 4. Connected idle SSH tab dispatches `analyze_ssh_profile(&id, cx)`.
     update(&view, win_cx, |app, cx| {
@@ -11836,8 +11845,8 @@ fn ruum_cloud_settings_virtual_models_auto_select_locked_notice_and_hidden_input
     assert!(win_cx.debug_bounds("setting-model-input").is_none());
 
     // `Test Connection` hits only `/v1/entitlement/status` & `/v1/models`,
-    // preserves `None` (`Auto (Recommended)`), and hides benchmark controls
-    // while `!is_paid`.
+    // preserves `None` (`Auto (Recommended)`), exposes probe buttons only on
+    // available models (even during free trial), and never calls completions.
     update(&view, win_cx, Ruum::test_watchdog_ai_cli);
     win_cx.run_until_parked();
     draw(win_cx);
@@ -11857,8 +11866,9 @@ fn ruum_cloud_settings_virtual_models_auto_select_locked_notice_and_hidden_input
     assert!(win_cx.debug_bounds("cloud-model-row-0").is_some());
     assert!(win_cx.debug_bounds("cloud-model-row-1").is_some());
     assert!(win_cx.debug_bounds("cloud-models-locked-notice").is_none());
-    assert!(win_cx.debug_bounds("setting-speed-all-btn").is_none());
+    assert!(win_cx.debug_bounds("setting-speed-all-btn").is_some());
     assert!(win_cx.debug_bounds("setting-model-speed-0").is_none());
+    assert!(win_cx.debug_bounds("setting-model-speed-1").is_some());
     assert!(
         server
             .recorded_requests()
@@ -13664,13 +13674,18 @@ fn assert_valid_cloud_chat_request(
         req.headers
     );
     assert!(headers_lower.contains("x-ruum-session:"));
-    assert!(headers_lower.contains("x-ruum-task: local_analysis"));
+    assert!(
+        headers_lower.contains("x-ruum-task: tree_analysis")
+            || headers_lower.contains("x-ruum-task: local_analysis"),
+        "missing expected x-ruum-task in headers: {}",
+        req.headers
+    );
     assert!(headers_lower.contains("x-ruum-client-version:"));
 
     let body: serde_json::Value =
         serde_json::from_str(&req.body).expect("chat JSON body");
     assert_eq!(body["model"].as_str(), Some(expected_model));
-    assert_eq!(body["stream"].as_bool(), Some(false));
+    assert_eq!(body["stream"].as_bool(), Some(true));
 }
 
 #[gpui_kit::test]
@@ -15856,4 +15871,1093 @@ fn cloud_plan_prewarming_back_during_creating_and_503_no_auto_retry(
         after_retry_reqs[1]["outRequestNo"]
     );
     assert!(win_cx.debug_bounds("cloud-billing-qr-canvas").is_some());
+}
+
+#[gpui_kit::test]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "gpui_kit::test passes &mut TestAppContext"
+)]
+fn explore_ai_analysis_uses_top_level_root_path_locale_and_local_docker(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::docker_adapter::{
+        DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
+    };
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let proj_dir = temp.path().join("proj");
+    let target_dir = proj_dir.join("target");
+    std::fs::create_dir_all(&target_dir).expect("mkdir target");
+    std::fs::write(
+        proj_dir.join("Cargo.toml"),
+        b"[package]\nname = \"proj\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(target_dir.join("big.rlib"), vec![b'x'; 70 << 20])
+        .expect("write large artifact");
+
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x43; 32]);
+    let store = counter.store_for(&enc_path);
+    store.set_ai_api_key("test-key").expect("save api key");
+
+    let captured_body = Arc::new(Mutex::new(String::new()));
+    let captured_clone = Arc::clone(&captured_body);
+    let target_str = target_dir.display().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock api");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let (_hdrs, body) = read_test_http_request(&mut stream);
+        *captured_clone.lock().expect("lock body") = body;
+        let proposal_json = serde_json::json!({
+            "summary": "发现可清理的构建缓存和 Docker 构建缓存。",
+            "items": [{
+                "path": target_str,
+                "mode": "permanent",
+                "reason": "大型 Rust 编译产物，下次构建会自动重建。"
+            }],
+            "docker_targets": [{"kind": "build_cache"}]
+        })
+        .to_string();
+        let chunk1 = serde_json::json!({
+            "id": "c-v2",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": proposal_json },
+                "finish_reason": null
+            }]
+        });
+        let chunk2 = serde_json::json!({
+            "id": "c-v2",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        let sse =
+            format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+        write_test_http_response(
+            &mut stream,
+            "200 OK",
+            "text/event-stream",
+            &sse,
+        );
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    let docker_summary = DockerUsageSummary {
+        build_cache_reclaimable_bytes: 256 << 20,
+        detailed: true,
+        ..DockerUsageSummary::default()
+    };
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store.clone());
+        app.set_locale(crate::i18n::Locale::Zh);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr}/v1");
+        app.ai_config.model = Some("gpt-test".into());
+        app.watchdog_draft.model = Some("gpt-test".into());
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_input_model = None;
+        app.local_docker = DockerProbeStatus::Available(docker_summary);
+        // Descend into `proj` so `crumbs` is non-empty; AI must still analyze
+        // top-level `root_path` (`temp.path()`).
+        let proj_idx = app
+            .tree()
+            .expect("tree")
+            .children
+            .iter()
+            .position(|c| &*c.name == "proj")
+            .expect("proj index");
+        app.crumbs.push(proj_idx);
+        app.run_ai_analysis_now(cx);
+    });
+    win_cx.run_until_parked();
+    server.join().expect("server join");
+
+    let sent_body = captured_body.lock().expect("lock").clone();
+    let expected_root = temp.path().display().to_string();
+    assert!(
+        sent_body.contains(&format!("Scanned Root: {expected_root}")),
+        "body={sent_body}"
+    );
+    assert!(sent_body.contains("DOCKER RECLAIMABLE SNAPSHOT"));
+    assert!(sent_body.contains("Simplified Chinese (简体中文)"));
+    assert!(sent_body.contains(&target_dir.display().to_string()));
+
+    let norm_root = ruum_core::removal::normalize(temp.path());
+    read(&view, win_cx, |app| {
+        let prop = app.ai_proposal.as_ref().expect("ai_proposal");
+        assert_eq!(prop.root_path.as_ref(), Some(&norm_root));
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.docker_targets, vec![DockerCleanTarget::BuildCache]);
+    });
+
+    // Closing the auto-opened confirm window and reopening via Settings ->
+    // open_last_proposal preserves the non-home root_path.
+    let windows = win_cx.cx.windows();
+    if windows.len() > 1 {
+        let _ = windows[1].update(&mut win_cx.cx, |_, window, _| {
+            window.remove_window();
+        });
+    }
+    update(&view, win_cx, |app, cx| app.open_last_proposal(cx));
+    draw(win_cx);
+    let windows_after = win_cx.cx.windows();
+    assert_eq!(windows_after.len(), 2);
+    let confirm_root = windows_after[1]
+        .update(&mut win_cx.cx, |_, _, _| ())
+        .ok()
+        .and_then(|()| {
+            windows_after[1]
+                .downcast::<crate::CleanupConfirmWindow>()
+                .and_then(|h| {
+                    h.read_with(&win_cx.cx, |win, _| {
+                        win.modal.request.root.clone()
+                    })
+                    .ok()
+                })
+        });
+    assert_eq!(confirm_root, Some(norm_root));
+
+    // Prune both filesystem items and Docker targets.
+    update(&view, win_cx, |app, _| {
+        let norm_target = ruum_core::removal::normalize(&target_dir);
+        app.prune_local_ai_proposal_targets(
+            &[norm_target],
+            &[DockerCleanTarget::BuildCache],
+        );
+        assert!(app.ai_proposal.is_none());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "gpui_kit::test macro expects &mut TestAppContext"
+)]
+fn option_b_event_key_isolation_and_manual_supersede_behavior(
+    cx: &mut TestAppContext,
+) {
+    use crate::{AiAnalysisOrigin, AiEventKey, begin_ai_job, finish_ai_job};
+
+    cx.update(|cx| {
+        crate::install_test_runtime(std::env::temp_dir(), false, None, cx);
+        let (seq_local, tok_local) = begin_ai_job(
+            AiEventKey::DiskCleanupLocal,
+            AiAnalysisOrigin::Manual,
+            cx,
+        )
+        .expect("manual local begins");
+        assert!(!tok_local.is_cancelled());
+
+        // Watchdog tick silently skips while manual Local is running.
+        assert!(
+            begin_ai_job(
+                AiEventKey::DiskCleanupLocal,
+                AiAnalysisOrigin::Watchdog,
+                cx,
+            )
+            .is_none()
+        );
+        assert!(!tok_local.is_cancelled());
+
+        // Independent SSH profiles stay isolated from Local and from each other.
+        let (seq_a1, tok_a1) = begin_ai_job(
+            AiEventKey::DiskCleanupSsh("srv-a".into()),
+            AiAnalysisOrigin::Manual,
+            cx,
+        )
+        .expect("ssh a begins");
+        let (seq_b1, tok_b1) = begin_ai_job(
+            AiEventKey::DiskCleanupSsh("srv-b".into()),
+            AiAnalysisOrigin::Manual,
+            cx,
+        )
+        .expect("ssh b begins");
+        assert!(!tok_local.is_cancelled());
+        assert!(!tok_a1.is_cancelled());
+        assert!(!tok_b1.is_cancelled());
+
+        // Re-triggering SSH `srv-a` cancels only `tok_a1`, leaving Local & `srv-b`.
+        let (_seq_a2, tok_a2) = begin_ai_job(
+            AiEventKey::DiskCleanupSsh("srv-a".into()),
+            AiAnalysisOrigin::Manual,
+            cx,
+        )
+        .expect("ssh a supersede begins");
+        assert!(tok_a1.is_cancelled());
+        assert!(!tok_a2.is_cancelled());
+        assert!(!tok_local.is_cancelled());
+        assert!(!tok_b1.is_cancelled());
+
+        // Finishing stale seq_a1 must not clear active seq_a2.
+        finish_ai_job(&AiEventKey::DiskCleanupSsh("srv-a".into()), seq_a1, cx);
+        let (seq_a3, tok_a3) = begin_ai_job(
+            AiEventKey::DiskCleanupSsh("srv-a".into()),
+            AiAnalysisOrigin::Manual,
+            cx,
+        )
+        .expect("ssh a second supersede begins");
+        assert!(tok_a2.is_cancelled());
+        finish_ai_job(&AiEventKey::DiskCleanupSsh("srv-a".into()), seq_a3, cx);
+        finish_ai_job(&AiEventKey::DiskCleanupSsh("srv-b".into()), seq_b1, cx);
+        finish_ai_job(&AiEventKey::DiskCleanupLocal, seq_local, cx);
+        assert!(!tok_a3.is_cancelled());
+    });
+}
+
+#[gpui_kit::test]
+fn option_b_local_supersede_cancels_first_silently_and_accepts_second(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let store = CountingRootSecret::new([0x71; 32])
+        .store_for(&cfg_dir.path().join("creds.enc"));
+    store
+        .set_ai_api_key("superseded-secret-key")
+        .expect("set api key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handled = Arc::new(AtomicUsize::new(0));
+    let handled_bg = Arc::clone(&handled);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+
+    let server = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        while !stop_bg.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            if stop_bg.load(Ordering::Acquire) {
+                break;
+            }
+            let cnt = Arc::clone(&handled_bg);
+            workers.push(std::thread::spawn(move || {
+                let _ = read_test_http_request(&mut stream);
+                let idx = cnt.fetch_add(1, Ordering::AcqRel);
+                let content = if idx == 0 {
+                    std::thread::sleep(Duration::from_millis(80));
+                    r#"{"summary":"First win or second win","items":[]}"#
+                } else {
+                    r#"{"summary":"Second wins","items":[]}"#
+                };
+                let chunk1 = serde_json::json!({
+                    "id": format!("chatcmpl-{idx}"),
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "role": "assistant", "content": content },
+                        "finish_reason": null
+                    }]
+                });
+                let chunk2 = serde_json::json!({
+                    "id": format!("chatcmpl-{idx}"),
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                let sse = format!(
+                    "data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n"
+                );
+                write_test_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/event-stream",
+                    &sse,
+                );
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr}/v1");
+        app.ai_config.model = Some("gpt-test".into());
+        app.watchdog_draft.model = Some("gpt-test".into());
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_input_model = None;
+        app.run_ai_analysis_now(cx);
+        app.run_ai_analysis_now(cx);
+    });
+    win_cx.run_until_parked();
+    stop.store(true, Ordering::Release);
+    let _ = TcpStream::connect(addr);
+    server.join().expect("server join");
+
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert_eq!(app.watchdog_analysis_epoch, 2);
+        assert_eq!(app.ai_last_error, None);
+        assert!(app.ai_proposal.is_some());
+    });
+    assert!(win_cx.shown_system_notifications().is_empty());
+}
+
+#[gpui_kit::test]
+fn benchmark_all_watchdog_models_probes_concurrently(cx: &mut TestAppContext) {
+    use ruum_core::ai_cli::DiscoveredModel;
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Barrier};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let store = CountingRootSecret::new([0x72; 32])
+        .store_for(&cfg_dir.path().join("creds.enc"));
+    store
+        .set_ai_api_key("bench-secret-key")
+        .expect("set api key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    // Only passes without hanging if 4 workers connect in parallel!
+    let barrier = Arc::new(Barrier::new(4));
+    let server = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let b = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let _ = read_test_http_request(&mut stream);
+                b.wait();
+                let sse = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+                write_test_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/event-stream",
+                    sse,
+                );
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.cred_store = Some(store);
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr}/v1");
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_models = (0..4)
+            .map(|i| DiscoveredModel {
+                id: format!("model-{i}"),
+                label: format!("Model {i}"),
+                provider: None,
+            })
+            .collect();
+        app.benchmark_all_watchdog_models(cx);
+    });
+    win_cx.run_until_parked();
+    server.join().expect("server join");
+
+    read(&view, win_cx, |app| {
+        assert!(app.watchdog_benchmarking_models.is_empty());
+        assert_eq!(app.watchdog_speed_results.len(), 4);
+        assert!(
+            app.watchdog_speed_results.iter().all(|r| r.ok),
+            "results={:?}",
+            app.watchdog_speed_results
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn benchmark_cancel_and_non_blocking_completion_respect_switched_view(
+    cx: &mut TestAppContext,
+) {
+    use ruum_core::ai_cli::{AiExecutionContext, CommandOutput, CommandRunner};
+    use ruum_core::confirm::{
+        CleanupConfirmAdapter, CleanupConfirmDecision, CleanupConfirmRequest,
+    };
+    use ruum_core::notify::NotificationAdapter;
+    use ruum_core::watchdog::{NOTIF_TAG_AI_ANALYSIS, NOTIF_TAG_LOW_SPACE};
+    use ruum_core::watchdog_config::AiCliProvider;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum.db");
+    let store = CountingRootSecret::new([0x73; 32])
+        .store_for(&cfg_dir.path().join("creds.enc"));
+    store
+        .set_ai_api_key("nonblock-secret-key")
+        .expect("set api key");
+
+    // 1. User starts Local AI analysis then switches to Screen::Settings before
+    //    it finishes: proposal is saved & toast shown, but NO confirm window opens.
+    let target = temp.path().join("cache.tmp");
+    std::fs::write(&target, b"123456").expect("write target");
+    let target_str = target.to_string_lossy().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = read_test_http_request(&mut stream);
+        let proposal_json = serde_json::json!({
+            "summary": "Background clean",
+            "items": [{
+                "path": target_str,
+                "mode": "trash",
+                "reason": "temp cache"
+            }]
+        })
+        .to_string();
+        let chunk1 = serde_json::json!({
+            "id": "chatcmpl-nb",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": proposal_json },
+                "finish_reason": null
+            }]
+        });
+        let chunk2 = serde_json::json!({
+            "id": "chatcmpl-nb",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        let sse =
+            format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+        write_test_http_response(
+            &mut stream,
+            "200 OK",
+            "text/event-stream",
+            &sse,
+        );
+    });
+
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.set_locale(crate::i18n::Locale::En);
+        app.ai_config.setup_completed = true;
+        app.ai_config.provider = AiCliProvider::Api;
+        app.watchdog_draft.ai_provider = AiCliProvider::Api;
+        app.ai_config.api_base_url = format!("http://{addr}/v1");
+        app.ai_config.model = Some("gpt-test".into());
+        app.watchdog_draft.model = Some("gpt-test".into());
+        app.watchdog_input_api_base_url = None;
+        app.watchdog_input_model = None;
+        app.run_ai_analysis_now(cx);
+        // Switch away to Settings while analysis is running.
+        app.navigate_rail(Screen::Settings, cx);
+        // Also verify `benchmark_cancel` cancels single-model benchmark silently.
+        app.benchmark_watchdog_model(Some("gpt-cancel".into()), cx);
+        let tok = app
+            .benchmark_cancel_token
+            .clone()
+            .expect("single-model benchmark registers CancelToken");
+        assert!(app.watchdog_benchmarking_models.contains("gpt-cancel"));
+        let prev_epoch = app.watchdog_benchmark_epoch;
+        app.benchmark_cancel(cx);
+        assert!(tok.is_cancelled());
+        assert!(app.watchdog_benchmarking_models.is_empty());
+        assert_eq!(app.watchdog_benchmark_epoch, prev_epoch + 1);
+    });
+    win_cx.run_until_parked();
+    server.join().expect("server join");
+
+    read(&view, win_cx, |app| {
+        assert!(!app.watchdog_analyzing);
+        assert!(app.ai_proposal.is_some());
+        assert!(matches!(
+            app.notice,
+            Some((_, gpui_omarchy::Status::Success))
+        ));
+    });
+    assert_eq!(
+        win_cx.cx.windows().len(),
+        1,
+        "must not steal focus by opening confirm window when user switched to Settings"
+    );
+
+    // 2. Watchdog with `with_skip_analysis(true)` still evaluates disk space &
+    //    emits low-space alert while skipping only the AI step.
+    {
+        struct NoopRunner(Arc<std::sync::atomic::AtomicUsize>);
+        impl CommandRunner for NoopRunner {
+            fn run(
+                &self,
+                _: &std::path::Path,
+                _: &[&str],
+                _: &[(&str, &str)],
+            ) -> std::io::Result<CommandOutput> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                Ok(CommandOutput {
+                    status_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        #[derive(Debug)]
+        struct CancelConfirm;
+        impl CleanupConfirmAdapter for CancelConfirm {
+            fn confirm(
+                &self,
+                _: &CleanupConfirmRequest,
+            ) -> std::io::Result<CleanupConfirmDecision> {
+                Ok(CleanupConfirmDecision::Cancelled)
+            }
+        }
+        #[derive(Default)]
+        struct CaptureNotif(Mutex<Vec<String>>);
+        impl NotificationAdapter for CaptureNotif {
+            fn notify(&self, _: &str, _: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn notify_tagged(
+                &self,
+                tag: &str,
+                _: &str,
+                _: &str,
+            ) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(tag.to_owned());
+                Ok(())
+            }
+        }
+
+        let db =
+            ruum_core::storage::StorageDb::open(&db_path).expect("open db");
+        let wd = db.watchdog().expect("wd service");
+        let mut wd_cfg = wd.load_config().expect("load wd");
+        wd_cfg.enabled = true;
+        wd_cfg.min_free_gb = 100_000_000;
+        wd_cfg.cooldown_secs = 60;
+        wd.save_config(&wd_cfg).expect("save wd");
+        db.save_ai_config(&ruum_core::storage::AiConfig {
+            setup_completed: true,
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: "sh".into(),
+            ..ruum_core::storage::AiConfig::default()
+        })
+        .expect("save ai");
+
+        let runner_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = NoopRunner(Arc::clone(&runner_hits));
+        let notif = CaptureNotif::default();
+        let tick = ruum_core::watchdog::run_once_with_db_and_context(
+            &db,
+            temp.path(),
+            std::path::Path::new("/bin/ruum"),
+            1_700_000_500,
+            &runner,
+            &CancelConfirm,
+            &notif,
+            AiExecutionContext::default()
+                .with_db_path(&db_path)
+                .with_skip_analysis(true),
+        )
+        .expect("watchdog tick should succeed");
+        assert!(matches!(tick, ruum_watchdog::TickResult::Breached { .. }));
+        assert_eq!(
+            runner_hits.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "skip_analysis must skip only AI execution"
+        );
+        let tags = notif.0.lock().unwrap();
+        assert!(tags.iter().any(|t| t == NOTIF_TAG_LOW_SPACE));
+        assert!(!tags.iter().any(|t| t == NOTIF_TAG_AI_ANALYSIS));
+        drop(tags);
+    }
+}
+
+#[test]
+fn scan_coordinators_isolate_local_and_multiple_ssh_hosts_independently() {
+    use ruum_core::tree::{Metric, Node, NodeKind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let local = crate::scan_cache::LocalScanCoordinator::default();
+    let remotes = crate::scan_cache::RemoteScanCoordinators::default();
+    let key_local =
+        crate::scan_cache::normalize_local_cache_key(Path::new("/tmp/root"));
+    let key_r1 = crate::scan_cache::normalize_remote_cache_key(Some(
+        Path::new("/srv1/"),
+    ));
+    let key_r2 =
+        crate::scan_cache::normalize_remote_cache_key(Some(Path::new("/srv2")));
+    assert_eq!(key_r1, "/srv1");
+    assert_eq!(key_r2, "/srv2");
+
+    let make_remote_snap = |host: &str| {
+        let mut tree = Node::directory(host);
+        tree.children
+            .push(Node::entry("file.bin", NodeKind::File, 512));
+        ruum_core::tree::aggregate(&mut tree, Metric::Bytes);
+        Arc::new(ruum_core::remote::Snapshot {
+            header: ruum_core::remote::Header::new(
+                PathBuf::from(format!("/{host}")),
+                None,
+                "linux".to_owned(),
+                None,
+            ),
+            tree,
+            docker: ruum_core::docker_adapter::DockerProbeStatus::NotInstalled,
+        })
+    };
+
+    let local_calls = Arc::new(AtomicUsize::new(0));
+    let r1_calls = Arc::new(AtomicUsize::new(0));
+    let r2_calls = Arc::new(AtomicUsize::new(0));
+    let cancel = AtomicBool::new(false);
+
+    let local_calls_c = Arc::clone(&local_calls);
+    let t_local = local
+        .get_or_scan_with(
+            &key_local,
+            &cancel,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            move |_| {
+                local_calls_c.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(Node::directory("local")))
+            },
+        )
+        .expect("local scan");
+    assert_eq!(t_local.name.as_ref(), "local");
+
+    // Host 1 blocks briefly on a barrier/delay while Host 2 runs freely.
+    let r1_started = Arc::new(std::sync::Barrier::new(2));
+    let r1_release = Arc::new(AtomicBool::new(false));
+    let r1_started_w = Arc::clone(&r1_started);
+    let r1_release_w = Arc::clone(&r1_release);
+    let r1_calls_w = Arc::clone(&r1_calls);
+    let remotes_c1 = remotes.for_profile("srv-1");
+    let snap1_expected = make_remote_snap("srv-1");
+    let k1 = key_r1.clone();
+    let h1 = std::thread::spawn(move || {
+        let cancel1 = AtomicBool::new(false);
+        remotes_c1.get_or_scan_with(
+            &k1,
+            &cancel1,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            move |_| {
+                r1_calls_w.fetch_add(1, Ordering::SeqCst);
+                r1_started_w.wait();
+                while !r1_release_w.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(snap1_expected)
+            },
+        )
+    });
+
+    r1_started.wait();
+    let r2_calls_w = Arc::clone(&r2_calls);
+    let snap2_expected = make_remote_snap("srv-2");
+    let snap2 = remotes
+        .for_profile("srv-2")
+        .get_or_scan_with(
+            &key_r2,
+            &cancel,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            move |_| {
+                r2_calls_w.fetch_add(1, Ordering::SeqCst);
+                Ok(snap2_expected)
+            },
+        )
+        .expect("srv-2 must finish independently while srv-1 is busy");
+    assert_eq!(snap2.tree.name.as_ref(), "srv-2");
+
+    r1_release.store(true, Ordering::Release);
+    let snap1 = h1.join().expect("h1 join").expect("srv-1 ok");
+    assert_eq!(snap1.tree.name.as_ref(), "srv-1");
+
+    // Invalidating srv-1 clears ONLY srv-1 while Local and srv-2 stay cached.
+    remotes.invalidate_profile("srv-1");
+    assert!(remotes.for_profile("srv-1").get_fresh(&key_r1).is_none());
+    assert!(remotes.for_profile("srv-2").get_fresh(&key_r2).is_some());
+    assert!(local.get_fresh(&key_local).is_some());
+    assert_eq!(local_calls.load(Ordering::Acquire), 1);
+    assert_eq!(r1_calls.load(Ordering::Acquire), 1);
+    assert_eq!(r2_calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn scan_coordinator_60s_cache_coalescing_and_waiter_safe_cancel() {
+    use ruum_core::tree::Node;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let coord = Arc::new(crate::scan_cache::LocalScanCoordinator::default());
+    let key = PathBuf::from("/tmp/coalesce-root");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker_started = Arc::new(std::sync::Barrier::new(2));
+    let release_worker = Arc::new(AtomicBool::new(false));
+    let worker_saw_cancel = Arc::new(AtomicBool::new(false));
+
+    let c1 = Arc::clone(&coord);
+    let k1 = key.clone();
+    let calls_w = Arc::clone(&calls);
+    let started_w = Arc::clone(&worker_started);
+    let release_w = Arc::clone(&release_worker);
+    let saw_cancel_w = Arc::clone(&worker_saw_cancel);
+    let t_owner = std::thread::spawn(move || {
+        let cancel_owner = AtomicBool::new(false);
+        c1.get_or_scan_with(
+            &k1,
+            &cancel_owner,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            move |worker_cancel| {
+                calls_w.fetch_add(1, Ordering::SeqCst);
+                started_w.wait();
+                while !release_w.load(Ordering::Acquire) {
+                    if worker_cancel.load(Ordering::Acquire) {
+                        saw_cancel_w.store(true, Ordering::Release);
+                        return Err("aborted".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(Arc::new(Node::directory("coalesced")))
+            },
+        )
+    });
+
+    worker_started.wait();
+
+    // Waiter 2 joins the same in-flight scan and then cancels itself.
+    let c2 = Arc::clone(&coord);
+    let k2 = key.clone();
+    let waiter_cancel = Arc::new(AtomicBool::new(false));
+    let waiter_cancel_bg = Arc::clone(&waiter_cancel);
+    let t_cancelling = std::thread::spawn(move || {
+        c2.get_or_scan_with(
+            &k2,
+            &waiter_cancel_bg,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            |_| unreachable!("must coalesce onto existing worker"),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    waiter_cancel.store(true, Ordering::Release);
+    let err = t_cancelling
+        .join()
+        .expect("join waiter")
+        .expect_err("cancelled waiter fails");
+    assert!(ruum_core::ai_cli::is_ai_cancelled_error(&err));
+
+    // Cancelling waiter 2 must NOT abort the shared worker still serving t_owner.
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(!worker_saw_cancel.load(Ordering::Acquire));
+    release_worker.store(true, Ordering::Release);
+    let owner_res = t_owner.join().expect("join owner").expect("owner ok");
+    assert_eq!(owner_res.name.as_ref(), "coalesced");
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+
+    // Fresh 60s hit serves immediately without re-running worker; zero TTL forces miss.
+    let cancel_hit = AtomicBool::new(false);
+    let hit = coord
+        .get_or_scan_with(
+            &key,
+            &cancel_hit,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            |_| unreachable!("60s cache must hit"),
+        )
+        .expect("cache hit");
+    assert_eq!(hit.name.as_ref(), "coalesced");
+    assert!(coord.get_fresh_with_ttl(&key, Duration::ZERO).is_none());
+}
+
+#[gpui_kit::test]
+fn explore_ai_button_and_watchdog_render_live_sse_stages_across_locales(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use crate::state::{ExploreHostTab, ExploreSessionSnapshot, HostTabKey};
+    use gpui_kit::{px, size};
+    use ruum_core::AiProgressStage;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, win_cx) = view_over(temp.path(), cx);
+    win_cx.update(|window, app_cx| {
+        let handle = window
+            .window_handle()
+            .downcast::<Ruum>()
+            .expect("Ruum handle");
+        crate::install_test_runtime(
+            temp.path().to_path_buf(),
+            false,
+            Some(handle),
+            app_cx,
+        );
+    });
+    win_cx.simulate_resize(size(px(900.), px(600.)));
+
+    update(&view, win_cx, |app, cx| {
+        app.watchdog_analyzing = true;
+        app.active_host_tab = HostTabKey::Local;
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh("srv-1".into()),
+            label: "srv-1".into(),
+            session: Some(ExploreSessionSnapshot::default()),
+        });
+        app.host_tabs.push(ExploreHostTab {
+            key: HostTabKey::Ssh("srv-2".into()),
+            label: "srv-2".into(),
+            session: Some(ExploreSessionSnapshot::default()),
+        });
+        app.ssh_analyzing_profiles.insert("srv-1".into());
+        cx.notify();
+    });
+
+    let local_key = crate::AiEventKey::DiskCleanupLocal;
+    let ssh1_key = crate::AiEventKey::DiskCleanupSsh("srv-1".into());
+    let ssh2_key = crate::AiEventKey::DiskCleanupSsh("srv-2".into());
+
+    win_cx.update(|_, app_cx| {
+        crate::set_ai_stage_for_test(
+            &local_key,
+            Some(AiProgressStage::Thinking),
+            app_cx,
+        );
+        crate::set_ai_stage_for_test(
+            &ssh1_key,
+            Some(AiProgressStage::Generating),
+            app_cx,
+        );
+        assert_eq!(
+            crate::ai_stage_for_key(&local_key, app_cx),
+            Some(AiProgressStage::Thinking)
+        );
+        assert_eq!(
+            crate::ai_stage_for_key(&ssh1_key, app_cx),
+            Some(AiProgressStage::Generating)
+        );
+        assert_eq!(crate::ai_stage_for_key(&ssh2_key, app_cx), None);
+    });
+
+    for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
+        update(&view, win_cx, |app, cx| {
+            app.set_locale(locale);
+            app.screen = Screen::Explore;
+            cx.notify();
+        });
+        draw(win_cx);
+        let btn = win_cx
+            .debug_bounds("trail-ai-analyze")
+            .expect("trail-ai-analyze visible");
+        assert!(win_cx.debug_bounds("trail-ai-analyze-spin").is_some());
+        assert!(
+            btn.right() <= px(900.),
+            "stage pill must fit inside 900x600 top bar"
+        );
+
+        update(&view, win_cx, |app, cx| {
+            app.screen = Screen::Watchdog;
+            cx.notify();
+        });
+        draw(win_cx);
+        assert!(win_cx.debug_bounds("watchdog-ai-stage").is_some());
+    }
+}
+
+#[gpui_kit::test]
+fn refresh_cloud_entitlement_failure_does_not_pollute_ai_last_error(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use ruum_core::storage::StorageDb;
+
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| crate::install_notification_handler(cx));
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("cfg dir");
+    let db_path = cfg_dir.path().join("ruum-ent-err.db");
+    let enc_path = cfg_dir.path().join("creds.enc");
+    let counter = CountingRootSecret::new([0x44; 32]);
+    let store = counter.store_for(&enc_path);
+    let server = TestCloudStubServer::start(|_req| StubCloudReply {
+        status: "504 Gateway Timeout".into(),
+        trace_id: Some("tr-ent-504".into()),
+        body: serde_json::json!({
+            "code": "COMMON_UPSTREAM_TIMEOUT",
+            "message": "entitlement refresh timed out",
+            "traceId": "tr-ent-504"
+        })
+        .to_string(),
+    });
+    seed_cloud_auth_and_state(
+        &db_path,
+        &store,
+        &server.base_url(),
+        None,
+        None,
+        None,
+    );
+    let db = StorageDb::open(&db_path).expect("open db");
+    let (view, win_cx) = view_over(temp.path(), cx);
+    update(&view, win_cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.cred_store = Some(store);
+        app.cloud_base_url_override = Some(server.base_url());
+        app.set_locale(crate::i18n::Locale::Zh);
+        app.ai_last_error = None;
+        app.ai_last_error_at_secs = None;
+        app.refresh_cloud_entitlement(cx);
+    });
+    win_cx.run_until_parked();
+    draw(win_cx);
+
+    read(&view, win_cx, |app| {
+        assert!(!app.cloud_refreshing);
+        assert!(matches!(app.notice, Some((_, gpui_omarchy::Status::Error))));
+        assert_eq!(app.ai_last_error, None);
+        assert_eq!(app.ai_last_error_at_secs, None);
+    });
+    assert_eq!(db.load_ai_state().unwrap().last_error, None);
+}
+
+#[test]
+fn local_scan_coordinator_external_flight_coalesces_survives_cancel_and_unblocks_on_drop()
+ {
+    use ruum_core::tree::Node;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let coord = crate::scan_cache::LocalScanCoordinator::default();
+    let key =
+        crate::scan_cache::normalize_local_cache_key(Path::new("/tmp/ext"));
+
+    let flight = coord.begin_external_flight(key.clone());
+    let scan_calls = Arc::new(AtomicUsize::new(0));
+
+    let calls_w1 = Arc::clone(&scan_calls);
+    let coord_w1 = Arc::new(coord);
+    let c1 = Arc::clone(&coord_w1);
+    let k1 = key.clone();
+    let cancel_w1 = Arc::new(AtomicBool::new(false));
+    let cancel_w1_bg = Arc::clone(&cancel_w1);
+    let h1 = std::thread::spawn(move || {
+        c1.get_or_scan_with(
+            &k1,
+            &cancel_w1_bg,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            move |_| {
+                calls_w1.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::new(Node::directory("unexpected")))
+            },
+        )
+    });
+
+    let calls_w2 = Arc::clone(&scan_calls);
+    let c2 = Arc::clone(&coord_w1);
+    let k2 = key.clone();
+    let cancel_w2 = Arc::new(AtomicBool::new(false));
+    let h2 = std::thread::spawn(move || {
+        c2.get_or_scan_with(
+            &k2,
+            &cancel_w2,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            move |_| {
+                calls_w2.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::new(Node::directory("unexpected")))
+            },
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(25));
+    cancel_w1.store(true, Ordering::Release);
+    assert!(ruum_core::ai_cli::is_ai_cancelled_error(
+        &h1.join().unwrap().unwrap_err()
+    ));
+
+    let mut finished_tree = Node::directory("ext");
+    finished_tree.bytes = 4096;
+    let tree_arc = Arc::new(finished_tree);
+    flight.finish(Ok(Arc::clone(&tree_arc)));
+
+    let res2 = h2
+        .join()
+        .unwrap()
+        .expect("second waiter receives external result");
+    assert_eq!(res2.bytes, 4096);
+    assert_eq!(scan_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(coord_w1.get_fresh(&key).unwrap().bytes, 4096);
+
+    // Dropped external flight must wake waiters immediately with an error.
+    let key_drop = crate::scan_cache::normalize_local_cache_key(Path::new(
+        "/tmp/ext-drop",
+    ));
+    let dropped_flight = coord_w1.begin_external_flight(key_drop.clone());
+    let c3 = Arc::clone(&coord_w1);
+    let cancel_w3 = Arc::new(AtomicBool::new(false));
+    let h3 = std::thread::spawn(move || {
+        c3.get_or_scan_with(
+            &key_drop,
+            &cancel_w3,
+            crate::scan_cache::SCAN_CACHE_TTL,
+            |_| Ok(Arc::new(Node::directory("unexpected"))),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    drop(dropped_flight);
+    let err3 = h3.join().unwrap().unwrap_err();
+    assert_eq!(err3, "external scan cancelled");
+    assert!(!ruum_core::ai_cli::is_ai_cancelled_error(&err3));
 }

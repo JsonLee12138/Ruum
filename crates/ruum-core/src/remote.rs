@@ -1047,6 +1047,38 @@ impl<T: Send + 'static> RemoteJob<T> {
             Err(io::Error::other("remote worker disconnected"))
         })
     }
+
+    /// Waits for the remote job while polling `cancel` every 25 ms, killing the
+    /// child SSH process immediately if cancellation is requested.
+    pub fn wait_cancellable(
+        self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<T> {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::RecvTimeoutError;
+
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                if let Ok(mut child) = self.child.lock() {
+                    let _ = child.kill();
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "ssh scan cancelled",
+                ));
+            }
+            match self
+                .result
+                .recv_timeout(std::time::Duration::from_millis(25))
+            {
+                Ok(outcome) => return outcome,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("remote worker disconnected"));
+                }
+            }
+        }
+    }
 }
 
 impl<T> Drop for RemoteJob<T> {

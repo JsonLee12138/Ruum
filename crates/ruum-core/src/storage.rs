@@ -26,6 +26,7 @@ use ruum_watchdog::WatchdogConfigService;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::docker_adapter::DockerCleanTarget;
 use crate::i18n::{
     MAX_AI_FAILURE_SUMMARY_CHARS, clean_ai_failure_reason, truncate_single_line,
 };
@@ -775,20 +776,23 @@ impl AiState {
         })
     }
 
-    /// Remove confirmed/cleaned paths from `last_proposal_json`, clearing
-    /// `last_proposal_json` to `None` when no items remain.
+    /// Remove confirmed/cleaned paths and Docker targets from
+    /// `last_proposal_json`, clearing `last_proposal_json` to `None` when
+    /// neither filesystem items nor Docker targets remain.
     ///
     /// Returns the remaining proposal (`None` when absent or empty).
-    pub fn prune_confirmed_paths(
+    pub fn prune_confirmed_targets(
         &mut self,
         removed_paths: &[PathBuf],
+        removed_docker: &[DockerCleanTarget],
         now_secs: u64,
     ) -> io::Result<Option<CleanupProposal>> {
         let Some(mut proposal) = self.parse_proposal()? else {
             return Ok(None);
         };
-        let pruned = proposal.prune_paths(removed_paths);
-        if proposal.items.is_empty() {
+        let pruned = proposal.prune_paths(removed_paths)
+            + proposal.prune_docker_targets(removed_docker);
+        if proposal.items.is_empty() && proposal.docker_targets.is_empty() {
             if self.last_proposal_json.is_some() {
                 self.last_proposal_json = None;
                 self.updated_at_secs = now_secs;
@@ -806,6 +810,18 @@ impl AiState {
             self.updated_at_secs = now_secs;
         }
         Ok(Some(proposal))
+    }
+
+    /// Remove confirmed/cleaned paths from `last_proposal_json`, clearing
+    /// `last_proposal_json` to `None` when no items or Docker targets remain.
+    ///
+    /// Returns the remaining proposal (`None` when absent or empty).
+    pub fn prune_confirmed_paths(
+        &mut self,
+        removed_paths: &[PathBuf],
+        now_secs: u64,
+    ) -> io::Result<Option<CleanupProposal>> {
+        self.prune_confirmed_targets(removed_paths, &[], now_secs)
     }
 }
 
@@ -2426,11 +2442,24 @@ impl StorageDb {
     }
 
     /// Remove confirmed/cleaned paths from `ai_state.last_proposal_json`,
-    /// clearing `last_proposal_json` to `None` when no items remain, persisting
-    /// the updated state, and returning the remaining proposal.
+    /// clearing `last_proposal_json` to `None` when no items or Docker targets
+    /// remain, persisting the updated state, and returning the remaining
+    /// proposal.
     pub fn prune_ai_state_paths(
         &self,
         removed_paths: &[PathBuf],
+        now_secs: u64,
+    ) -> io::Result<Option<CleanupProposal>> {
+        self.prune_ai_state_targets(removed_paths, &[], now_secs)
+    }
+
+    /// Remove confirmed/cleaned paths and Docker targets from
+    /// `ai_state.last_proposal_json`, clearing `last_proposal_json` to `None`
+    /// when neither remains.
+    pub fn prune_ai_state_targets(
+        &self,
+        removed_paths: &[PathBuf],
+        removed_docker: &[DockerCleanTarget],
         now_secs: u64,
     ) -> io::Result<Option<CleanupProposal>> {
         self.with_conn_retry_io(|conn| {
@@ -2460,8 +2489,11 @@ impl StorageDb {
 
             let mut state = row.unwrap_or_default();
             let before_json = state.last_proposal_json.clone();
-            let remaining =
-                state.prune_confirmed_paths(removed_paths, now_secs)?;
+            let remaining = state.prune_confirmed_targets(
+                removed_paths,
+                removed_docker,
+                now_secs,
+            )?;
             if state.last_proposal_json != before_json {
                 tx.execute(
                     "INSERT INTO ai_state
@@ -3135,6 +3167,7 @@ mod tests {
                 None,
             )],
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let state = AiState::from_proposal(&proposal, 1_700_000_401).unwrap();
         db.save_ai_state(&state).unwrap();
@@ -3512,6 +3545,7 @@ mod tests {
                 ),
             ],
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let state = AiState::from_proposal(&proposal, 1_700_000_000).unwrap();
         db.save_ai_state(&state).unwrap();
@@ -3818,6 +3852,7 @@ mod tests {
                 ),
             ],
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let state = AiState::from_proposal(&proposal, 1_700_000_000).unwrap();
         db.save_ai_state(&state).unwrap();
@@ -3991,6 +4026,7 @@ mod tests {
                 None,
             )],
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let old_json = serde_json::to_string(&old_proposal).unwrap();
 
@@ -4061,6 +4097,7 @@ mod tests {
             summary: "Fresh proposal".to_owned(),
             items: Vec::new(),
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let fresh_state =
             AiState::from_proposal(&new_proposal, 1_700_000_700).unwrap();
@@ -4411,5 +4448,42 @@ mod tests {
         cleared.plans_cached_at_secs = 0;
         reopened.save_cloud_state(&cleared).unwrap();
         assert_eq!(reopened.load_cloud_state().unwrap().plans_json, None);
+    }
+
+    #[test]
+    fn ai_state_prune_confirmed_targets_retains_docker_and_clears_when_empty() {
+        use crate::docker_adapter::DockerCleanTarget;
+
+        let p1 = PathBuf::from("/tmp/cache/one");
+        let proposal = CleanupProposal {
+            timestamp_secs: 100,
+            summary: "Mixed".to_owned(),
+            items: vec![ProposalItem::new(
+                p1.clone(),
+                100,
+                RemovalMode::Trash,
+                None,
+                None,
+            )],
+            docker_targets: vec![DockerCleanTarget::BuildCache],
+            root_path: Some(PathBuf::from("/tmp")),
+        };
+        let mut state = AiState::from_proposal(&proposal, 100).unwrap();
+
+        // Removing the only file item keeps the proposal because BuildCache remains.
+        let rem = state
+            .prune_confirmed_paths(std::slice::from_ref(&p1), 110)
+            .unwrap()
+            .expect("docker target must keep proposal alive");
+        assert!(rem.items.is_empty());
+        assert_eq!(rem.docker_targets, vec![DockerCleanTarget::BuildCache]);
+        assert!(state.last_proposal_json.is_some());
+
+        // Removing the remaining Docker target clears last_proposal_json.
+        let after = state
+            .prune_confirmed_targets(&[], &[DockerCleanTarget::BuildCache], 120)
+            .unwrap();
+        assert_eq!(after, None);
+        assert_eq!(state.last_proposal_json, None);
     }
 }

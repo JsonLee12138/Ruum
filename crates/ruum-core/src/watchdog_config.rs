@@ -257,10 +257,44 @@ pub struct CleanupProposal {
     pub items: Vec<ProposalItem>,
     #[serde(default)]
     pub docker_targets: Vec<DockerCleanTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<PathBuf>,
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
     crate::removal::normalize(dunce::simplified(path))
+}
+
+fn docker_target_matches(
+    left: &DockerCleanTarget,
+    right: &DockerCleanTarget,
+) -> bool {
+    match (left, right) {
+        (DockerCleanTarget::BuildCache, DockerCleanTarget::BuildCache) => true,
+        (
+            DockerCleanTarget::Container { id: a, .. },
+            DockerCleanTarget::Container { id: b, .. },
+        ) => a == b,
+        (
+            DockerCleanTarget::Image {
+                id: a_id,
+                reference: a_ref,
+                ..
+            },
+            DockerCleanTarget::Image {
+                id: b_id,
+                reference: b_ref,
+                ..
+            },
+        ) => {
+            a_id == b_id
+                && match (a_ref.as_deref(), b_ref.as_deref()) {
+                    (Some(ar), Some(br)) => ar == br,
+                    _ => true,
+                }
+        }
+        _ => false,
+    }
 }
 
 impl CleanupProposal {
@@ -286,6 +320,24 @@ impl CleanupProposal {
                 .any(|rem| item_norm == *rem || item_norm.starts_with(rem))
         });
         before.saturating_sub(self.items.len())
+    }
+
+    /// Remove cleaned Docker targets from `docker_targets`. Returns the number
+    /// of pruned entries.
+    pub fn prune_docker_targets(
+        &mut self,
+        removed_targets: &[DockerCleanTarget],
+    ) -> usize {
+        if removed_targets.is_empty() || self.docker_targets.is_empty() {
+            return 0;
+        }
+        let before = self.docker_targets.len();
+        self.docker_targets.retain(|target| {
+            !removed_targets
+                .iter()
+                .any(|rem| docker_target_matches(target, rem))
+        });
+        before.saturating_sub(self.docker_targets.len())
     }
 }
 
@@ -552,6 +604,7 @@ mod tests {
                 None,
             )],
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let state = WatchdogState {
             last_checked_secs: Some(1_700_000_100),
@@ -675,6 +728,7 @@ mod tests {
                 ),
             ],
             docker_targets: Vec::new(),
+            root_path: None,
         };
 
         // Sibling directory `/tmp/cache/a` must not prune `/tmp/cache2/keep`.
@@ -724,6 +778,7 @@ mod tests {
                 },
                 DockerCleanTarget::BuildCache,
             ],
+            root_path: None,
         };
         let encoded = serde_json::to_string(&with_docker).expect("serialize");
         let decoded: CleanupProposal =
@@ -836,5 +891,45 @@ mod tests {
             AiCliProvider::RuumCloud.label_in(Locale::Zh),
             "Ruum 云端 AI（内置）"
         );
+    }
+
+    #[test]
+    fn cleanup_proposal_prune_docker_targets_and_root_path_serde() {
+        use crate::docker_adapter::DockerCleanTarget;
+
+        let shared_id = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+        let mut proposal = CleanupProposal {
+            timestamp_secs: 42,
+            summary: "Docker tags".to_owned(),
+            items: Vec::new(),
+            docker_targets: vec![
+                DockerCleanTarget::Image {
+                    id: shared_id.clone(),
+                    reference: Some("repo/app:v1".to_owned()),
+                    dangling: false,
+                },
+                DockerCleanTarget::Image {
+                    id: shared_id.clone(),
+                    reference: Some("repo/app:v2".to_owned()),
+                    dangling: false,
+                },
+                DockerCleanTarget::BuildCache,
+            ],
+            root_path: Some(PathBuf::from("/Volumes/Work")),
+        };
+
+        let encoded = serde_json::to_string(&proposal).unwrap();
+        assert!(encoded.contains("\"/Volumes/Work\""));
+        let decoded: CleanupProposal = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, proposal);
+
+        let removed =
+            proposal.prune_docker_targets(&[DockerCleanTarget::Image {
+                id: shared_id,
+                reference: Some("repo/app:v1".to_owned()),
+                dangling: false,
+            }]);
+        assert_eq!(removed, 1);
+        assert_eq!(proposal.docker_targets.len(), 2);
     }
 }

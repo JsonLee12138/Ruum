@@ -22,6 +22,7 @@ mod palette;
 mod power;
 mod qr;
 mod rail_pages;
+mod scan_cache;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -37,10 +38,12 @@ mod window_chrome;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc::{Receiver, Sender, channel},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use rustc_hash::FxHashMap;
 #[cfg(target_os = "macos")]
 use std::{
     io::IsTerminal as _,
@@ -270,6 +273,18 @@ fn run() -> Result<()> {
             tray_show_disk_space,
             last_tray_space_refresh: None,
             background_analysis_in_flight: false,
+            watchdog_tick_in_flight: false,
+            active_ai_jobs: FxHashMap::default(),
+            next_ai_job_seq: 0,
+            ai_stages: FxHashMap::default(),
+            ai_stage_signal: Arc::new(AsyncSignal::default()),
+            ai_stage_watcher_active: false,
+            local_scan_coordinator: Arc::new(
+                scan_cache::LocalScanCoordinator::default(),
+            ),
+            remote_scan_coordinators: Arc::new(
+                scan_cache::RemoteScanCoordinators::default(),
+            ),
             watchdog_config: initial_watchdog_config,
             update_state: state::UpdateUiState::Idle,
             update_settings: initial_update_settings,
@@ -941,13 +956,8 @@ impl CleanupConfirmWindow {
                     }
                 }
             }
-            if !pruned_paths.is_empty()
-                && let Some(path) = db_path.as_deref()
-                && let Ok(db) = StorageDb::open(path)
-            {
-                let _ = db.prune_ai_state_paths(&pruned_paths, now_unix_secs());
-            }
             let mut docker_err: Option<String> = None;
+            let mut pruned_docker_targets = Vec::new();
             let fresh_docker = if selected_docker_targets.is_empty()
                 || cancelled
                 || cancel_bg.load(Ordering::Acquire)
@@ -998,6 +1008,7 @@ impl CleanupConfirmWindow {
                             Ok(()) => {
                                 total_bytes = total_bytes.saturating_add(est);
                                 total_count += 1;
+                                pruned_docker_targets.push(outcome.target);
                             }
                             Err(err) if docker_err.is_none() => {
                                 docker_err = Some(err);
@@ -1014,6 +1025,16 @@ impl CleanupConfirmWindow {
                 }
                 Some(adapter.probe(&env))
             };
+            if (!pruned_paths.is_empty() || !pruned_docker_targets.is_empty())
+                && let Some(path) = db_path.as_deref()
+                && let Ok(db) = StorageDb::open(path)
+            {
+                let _ = db.prune_ai_state_targets(
+                    &pruned_paths,
+                    &pruned_docker_targets,
+                    now_unix_secs(),
+                );
+            }
             let fresh_space = ruum_core::space::space_info(&task_root).ok();
             let home_space = std::env::home_dir().and_then(|h| {
                 if h == task_root {
@@ -1030,6 +1051,7 @@ impl CleanupConfirmWindow {
                 bytes: total_bytes,
                 count: total_count,
                 pruned_paths,
+                pruned_docker_targets,
                 fresh_space,
                 home_space,
                 fresh_docker,
@@ -1288,6 +1310,7 @@ struct CleanupTaskOutcome {
     bytes: u64,
     count: usize,
     pruned_paths: Vec<PathBuf>,
+    pruned_docker_targets: Vec<ruum_core::docker_adapter::DockerCleanTarget>,
     fresh_space: Option<ruum_core::space::SpaceInfo>,
     home_space: Option<ruum_core::space::SpaceInfo>,
     fresh_docker: Option<DockerProbeStatus>,
@@ -1415,8 +1438,28 @@ fn finish_active_cleanup_task(outcome: CleanupTaskOutcome, cx: &mut App) {
     }
 
     refresh_tray_status_with_space(outcome.home_space, cx);
+    let invalidated_local_paths = !outcome.pruned_paths.is_empty();
+    if invalidated_local_paths && let Some(coord) = local_scan_coordinator(cx) {
+        coord.invalidate_all();
+    }
     update_open_main_window(cx, |app, cx| {
-        app.prune_local_ai_proposal(&outcome.pruned_paths);
+        app.prune_local_ai_proposal_targets(
+            &outcome.pruned_paths,
+            &outcome.pruned_docker_targets,
+        );
+        if invalidated_local_paths {
+            if app.active_host_tab == state::HostTabKey::Local {
+                app.scanned_at = 0;
+            }
+            if let Some(local_tab) = app
+                .host_tabs
+                .iter_mut()
+                .find(|t| t.key == state::HostTabKey::Local)
+                && let Some(snap) = &mut local_tab.session
+            {
+                snap.scanned_at = 0;
+            }
+        }
         if let Some(space) = outcome.fresh_space {
             if app.active_host_tab == state::HostTabKey::Local
                 && app.root_path == outcome.root
@@ -2110,6 +2153,206 @@ pub(crate) struct ActiveCleanupTask {
     pub(crate) progress: Arc<Mutex<CleanupProgressSnapshot>>,
 }
 
+/// Option B AI event lane key: same-event re-triggers supersede previous runs,
+/// while Local and distinct SSH profiles remain independent.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AiEventKey {
+    DiskCleanupLocal,
+    DiskCleanupSsh(String),
+}
+
+impl AiEventKey {
+    pub(crate) fn header_value(&self) -> String {
+        match self {
+            Self::DiskCleanupLocal => "disk_cleanup_local".to_owned(),
+            Self::DiskCleanupSsh(profile_id) => {
+                let mut out = String::from("disk_cleanup_ssh:");
+                for ch in profile_id.chars() {
+                    if out.len() >= 96 {
+                        break;
+                    }
+                    if ch.is_ascii_alphanumeric()
+                        || matches!(ch, '_' | '.' | ':' | '-')
+                    {
+                        out.push(ch);
+                    } else {
+                        out.push('_');
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Caller origin for an in-flight Local AI run (governs Watchdog vs Manual).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AiAnalysisOrigin {
+    Manual,
+    Watchdog,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveAiJob {
+    token: ruum_core::ai_cli::CancelToken,
+    origin: AiAnalysisOrigin,
+    seq: u64,
+}
+
+/// Registers an active AI job under Option B event-key semantics:
+/// - `Watchdog` silently yields if a `Manual` job is already active for `key`.
+/// - Otherwise cancels any existing job for `key` and starts a new token.
+pub(crate) fn begin_ai_job(
+    key: AiEventKey,
+    origin: AiAnalysisOrigin,
+    cx: &mut App,
+) -> Option<(u64, ruum_core::ai_cli::CancelToken)> {
+    let token = ruum_core::ai_cli::CancelToken::new();
+    if !cx.has_global::<AppRuntime>() {
+        return Some((1, token));
+    }
+    let stage_watcher_needed = {
+        let rt = cx.global_mut::<AppRuntime>();
+        if origin == AiAnalysisOrigin::Watchdog
+            && rt
+                .active_ai_jobs
+                .get(&key)
+                .is_some_and(|job| job.origin == AiAnalysisOrigin::Manual)
+        {
+            return None;
+        }
+        if let Some(prev) = rt.active_ai_jobs.remove(&key) {
+            prev.token.cancel();
+        }
+        rt.next_ai_job_seq = rt.next_ai_job_seq.saturating_add(1);
+        let seq = rt.next_ai_job_seq;
+        rt.active_ai_jobs.insert(
+            key.clone(),
+            ActiveAiJob {
+                token: token.clone(),
+                origin,
+                seq,
+            },
+        );
+        rt.ai_stages.insert(key, Arc::new(AtomicU8::new(0)));
+        rt.background_analysis_in_flight = rt
+            .active_ai_jobs
+            .contains_key(&AiEventKey::DiskCleanupLocal);
+        let spawn_watcher =
+            !rt.ai_stage_watcher_active && rt.main_window.is_some();
+        if spawn_watcher {
+            rt.ai_stage_watcher_active = true;
+        }
+        let sig = Arc::clone(&rt.ai_stage_signal);
+        sig.notify();
+        (seq, spawn_watcher.then_some(sig))
+    };
+
+    if let Some(signal) = stage_watcher_needed.1 {
+        cx.spawn(async move |cx| {
+            loop {
+                signal.wait().await;
+                let keep_going = cx.update(|cx| {
+                    let (maybe_win, has_jobs) = {
+                        let Some(rt) = cx.try_global::<AppRuntime>() else {
+                            return false;
+                        };
+                        (rt.main_window, !rt.active_ai_jobs.is_empty())
+                    };
+                    if let Some(window) = maybe_win {
+                        let _ = window.update(cx, |_, _, cx| cx.notify());
+                    }
+                    if !has_jobs {
+                        with_runtime_mut(cx, |rt| {
+                            rt.ai_stage_watcher_active = false;
+                        });
+                    }
+                    has_jobs
+                });
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    Some((stage_watcher_needed.0, token))
+}
+
+/// Clears an active AI job only if its sequence matches `seq` (stale superseded
+/// jobs must not clear newer runs).
+pub(crate) fn finish_ai_job(key: &AiEventKey, seq: u64, cx: &mut App) {
+    with_runtime_mut(cx, |rt| {
+        if rt.active_ai_jobs.get(key).is_some_and(|job| job.seq == seq) {
+            rt.active_ai_jobs.remove(key);
+            rt.ai_stages.remove(key);
+        }
+        rt.background_analysis_in_flight = rt
+            .active_ai_jobs
+            .contains_key(&AiEventKey::DiskCleanupLocal);
+        rt.ai_stage_signal.notify();
+    });
+}
+
+pub(crate) fn ai_stage_slot_and_signal(
+    key: &AiEventKey,
+    cx: &mut App,
+) -> (Arc<AtomicU8>, Arc<AsyncSignal>) {
+    if let Some(rt) = cx.try_global::<AppRuntime>() {
+        let sig = Arc::clone(&rt.ai_stage_signal);
+        if let Some(slot) = rt.ai_stages.get(key) {
+            return (Arc::clone(slot), sig);
+        }
+        let slot = Arc::new(AtomicU8::new(0));
+        with_runtime_mut(cx, |rt| {
+            rt.ai_stages.insert(key.clone(), Arc::clone(&slot));
+        });
+        return (slot, sig);
+    }
+    (Arc::new(AtomicU8::new(0)), Arc::new(AsyncSignal::default()))
+}
+
+pub(crate) fn ai_stage_for_key(
+    key: &AiEventKey,
+    cx: &App,
+) -> Option<ruum_core::AiProgressStage> {
+    let rt = cx.try_global::<AppRuntime>()?;
+    let slot = rt.ai_stages.get(key)?;
+    ruum_core::AiProgressStage::from_raw(slot.load(Ordering::Acquire))
+}
+
+#[cfg(test)]
+pub(crate) fn set_ai_stage_for_test(
+    key: &AiEventKey,
+    stage: Option<ruum_core::AiProgressStage>,
+    cx: &mut App,
+) {
+    let (slot, signal) = ai_stage_slot_and_signal(key, cx);
+    let raw = stage.map_or(0, ruum_core::AiProgressStage::as_raw);
+    slot.store(raw, Ordering::Release);
+    signal.notify();
+    if let Some(window) =
+        cx.try_global::<AppRuntime>().and_then(|rt| rt.main_window)
+    {
+        let _ = window.update(cx, |_, _, cx| cx.notify());
+    }
+}
+
+pub(crate) fn local_scan_coordinator(
+    cx: &App,
+) -> Option<Arc<scan_cache::LocalScanCoordinator>> {
+    cx.try_global::<AppRuntime>()
+        .map(|rt| Arc::clone(&rt.local_scan_coordinator))
+}
+
+pub(crate) fn remote_scan_coordinators(
+    cx: &App,
+) -> Option<Arc<scan_cache::RemoteScanCoordinators>> {
+    cx.try_global::<AppRuntime>()
+        .map(|rt| Arc::clone(&rt.remote_scan_coordinators))
+}
+
 #[derive(Debug)]
 pub(crate) struct AppRuntime {
     launch: LaunchConfig,
@@ -2130,6 +2373,15 @@ pub(crate) struct AppRuntime {
     pub(crate) tray_show_disk_space: bool,
     pub(crate) last_tray_space_refresh: Option<Instant>,
     background_analysis_in_flight: bool,
+    watchdog_tick_in_flight: bool,
+    active_ai_jobs: FxHashMap<AiEventKey, ActiveAiJob>,
+    next_ai_job_seq: u64,
+    ai_stages: FxHashMap<AiEventKey, Arc<AtomicU8>>,
+    ai_stage_signal: Arc<AsyncSignal>,
+    ai_stage_watcher_active: bool,
+    pub(crate) local_scan_coordinator: Arc<scan_cache::LocalScanCoordinator>,
+    pub(crate) remote_scan_coordinators:
+        Arc<scan_cache::RemoteScanCoordinators>,
     watchdog_config: ruum_watchdog::WatchdogConfig,
     pub(crate) update_state: state::UpdateUiState,
     pub(crate) update_settings: ruum_core::storage::UpdateSettings,
@@ -2182,6 +2434,18 @@ pub(crate) fn install_test_runtime(
         tray_show_disk_space: false,
         last_tray_space_refresh: None,
         background_analysis_in_flight: false,
+        watchdog_tick_in_flight: false,
+        active_ai_jobs: FxHashMap::default(),
+        next_ai_job_seq: 0,
+        ai_stages: FxHashMap::default(),
+        ai_stage_signal: Arc::new(AsyncSignal::default()),
+        ai_stage_watcher_active: false,
+        local_scan_coordinator: Arc::new(
+            scan_cache::LocalScanCoordinator::default(),
+        ),
+        remote_scan_coordinators: Arc::new(
+            scan_cache::RemoteScanCoordinators::default(),
+        ),
         watchdog_config: ruum_watchdog::WatchdogConfig::default(),
         update_state: state::UpdateUiState::Idle,
         update_settings: ruum_core::storage::UpdateSettings::default(),
@@ -2671,8 +2935,8 @@ fn spawn_startup_update_and_sync(
             // [RISK-NOTE 7] Sync installed Windows CLI copy after updates and
             // retire any legacy headless `ruum watchdog` OS service residue.
             let _ = ruum_core::updater::sync_installed_windows_cli_if_needed();
-            let _ = ruum_core::watchdog::uninstall_legacy_service_if_present(
-                Duration::from_secs(2),
+            let _ = ruum_core::watchdog::reap_orphaned_legacy_service(
+                Duration::from_secs(8),
             );
 
             if ruum_core::updater::is_auto_check_disabled() {
@@ -2916,7 +3180,7 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
     let Some(rt) = cx.try_global::<AppRuntime>() else {
         return;
     };
-    if rt.background_analysis_in_flight {
+    if rt.watchdog_tick_in_flight {
         return;
     }
     let cfg = &rt.watchdog_config;
@@ -2931,12 +3195,22 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
     }
     let confirm_tx = rt.in_proc_confirm_tx.clone();
     let notif_tx = rt.in_proc_notif_tx.clone();
+    // If a Manual local AI task is active, skip ONLY the Watchdog AI step while
+    // keeping space probing, low-space alerts, and webhooks running.
+    let ai_job = begin_ai_job(
+        AiEventKey::DiskCleanupLocal,
+        AiAnalysisOrigin::Watchdog,
+        cx,
+    );
     let exe = resolve_cli_exe();
     with_runtime_mut(cx, |rt| {
         rt.last_watchdog_poll = Some(Instant::now());
-        rt.background_analysis_in_flight = true;
+        rt.watchdog_tick_in_flight = true;
     });
 
+    let event_key = AiEventKey::DiskCleanupLocal.header_value();
+    let job_seq = ai_job.as_ref().map(|(seq, _)| *seq);
+    let cancel_token = ai_job.map(|(_, tok)| tok);
     let task = cx.background_executor().spawn(async move {
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
         if ruum_core::watchdog::has_legacy_service_residue(&runner)
@@ -2954,8 +3228,16 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         let now_secs = now_unix_secs();
         let adapter = InProcessConfirmAdapter { tx: confirm_tx };
         let notifier = InProcessNotificationAdapter { tx: notif_tx };
-        let _ = ruum_core::watchdog::run_once_with_db(
-            &db, &home, &exe, now_secs, &runner, &adapter, &notifier,
+        let mut ai_ctx = ruum_core::ai_cli::AiExecutionContext::default()
+            .with_db_path(db.db_path().to_path_buf())
+            .with_event_key(event_key);
+        if let Some(tok) = cancel_token {
+            ai_ctx = ai_ctx.with_cancel(tok);
+        } else {
+            ai_ctx = ai_ctx.with_skip_analysis(true);
+        }
+        let _ = ruum_core::watchdog::run_once_with_db_and_context(
+            &db, &home, &exe, now_secs, &runner, &adapter, &notifier, ai_ctx,
         );
         ruum_core::space::space_info(&home).ok()
     });
@@ -2964,8 +3246,11 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         let home_space = task.await;
         cx.update(|cx| {
             with_runtime_mut(cx, |rt| {
-                rt.background_analysis_in_flight = false;
+                rt.watchdog_tick_in_flight = false;
             });
+            if let Some(seq) = job_seq {
+                finish_ai_job(&AiEventKey::DiskCleanupLocal, seq, cx);
+            }
             update_open_main_window(cx, |app, cx| {
                 app.reload_watchdog_state();
                 if let Some(hs) = home_space {
@@ -3055,16 +3340,27 @@ pub(crate) fn trigger_background_ai_analysis_with(
     locale: i18n::Locale,
     cx: &mut App,
 ) {
-    if let Some(rt) = cx.try_global::<AppRuntime>()
-        && rt.background_analysis_in_flight
-    {
+    let event_key = AiEventKey::DiskCleanupLocal;
+    let Some((job_seq, cancel_token)) =
+        begin_ai_job(event_key.clone(), AiAnalysisOrigin::Manual, cx)
+    else {
         return;
-    }
+    };
+    let cancel_for_bg = cancel_token.clone();
+    let cancel_flag = cancel_token.flag();
+    let (stage_slot, stage_signal) = ai_stage_slot_and_signal(&event_key, cx);
+    let stage_signal_cb = Arc::clone(&stage_signal);
+    let on_stage: Arc<dyn Fn(ruum_core::AiProgressStage) + Send + Sync> =
+        Arc::new(move |_| {
+            stage_signal_cb.notify();
+        });
+    let event_key_header = event_key.header_value();
     let exe = resolve_cli_exe();
     let shared_cred_store = cx
         .try_global::<AppRuntime>()
         .and_then(|rt| rt.cred_store.clone());
-    with_runtime_mut(cx, |rt| rt.background_analysis_in_flight = true);
+    let local_coord = local_scan_coordinator(cx);
+    let allow_bg_scan = !cfg!(test) || home_override.is_some();
 
     let task = cx.background_executor().spawn(async move {
         let home =
@@ -3093,16 +3389,90 @@ pub(crate) fn trigger_background_ai_analysis_with(
         let ai_cfg = db.load_ai_config().unwrap_or_default();
         let now_secs = now_unix_secs();
         let runner = ruum_core::ai_cli::DefaultCommandRunner;
+        let docker = DockerFactory::create().probe(&DockerEnv::current());
         let mut ai_ctx = ruum_core::ai_cli::AiExecutionContext::default()
-            .with_db_path(db.db_path().to_path_buf());
+            .with_db_path(db.db_path().to_path_buf())
+            .with_locale(locale)
+            .with_user_home(home.clone())
+            .with_local_docker(docker.clone())
+            .with_event_key(event_key_header)
+            .with_cancel(cancel_for_bg)
+            .with_stage_slot(stage_slot)
+            .with_on_stage(on_stage);
+        if let Ok(sp) = ruum_core::space::space_info(&home) {
+            ai_ctx = ai_ctx.with_volume_space(sp);
+        }
         if let Some(store) = shared_cred_store {
             ai_ctx = ai_ctx.with_credential_store(store);
         }
+        let cache_key = crate::scan_cache::normalize_local_cache_key(&home);
+        let existing_tree = if let Some(fresh) =
+            local_coord.as_ref().and_then(|c| c.get_fresh(&cache_key))
+        {
+            Some(fresh)
+        } else if allow_bg_scan && let Some(coord) = local_coord.as_ref() {
+            if cancel_flag.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    ruum_core::ai_cli::AI_CANCELLED_SENTINEL,
+                ));
+            }
+            ai_ctx.report_stage(ruum_core::AiProgressStage::Scanning);
+            stage_signal.notify();
+            let scan_root = home.clone();
+            match coord.get_or_scan_with(
+                &cache_key,
+                &cancel_flag,
+                crate::scan_cache::SCAN_CACHE_TTL,
+                move |worker_cancel| {
+                    let handle = ruum_core::scan::ScanHandle::spawn(
+                        scan_root,
+                        ruum_core::scan::ScanOptions::default(),
+                    );
+                    handle
+                        .wait_cancellable(&worker_cancel)
+                        .map(Arc::new)
+                        .map_err(|err| {
+                            if worker_cancel.load(Ordering::Acquire)
+                                || err.kind() == std::io::ErrorKind::Interrupted
+                            {
+                                ruum_core::ai_cli::AI_CANCELLED_SENTINEL
+                                    .to_owned()
+                            } else {
+                                err.to_string()
+                            }
+                        })
+                },
+            ) {
+                Ok(tree) => Some(tree),
+                Err(err) if ruum_core::ai_cli::is_ai_cancelled_error(&err) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        err,
+                    ));
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let proposal =
             match ruum_core::ai_cli::run_analysis_with_tree_for_config_with_context(
-                &ai_cfg, &home, &exe, now_secs, None, &runner, &ai_ctx,
+                &ai_cfg,
+                &home,
+                &exe,
+                now_secs,
+                existing_tree.as_deref(),
+                &runner,
+                &ai_ctx,
             ) {
                 Ok(proposal) => proposal,
+                Err(err) if ruum_core::ai_cli::is_ai_cancelled_error(&err) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        err,
+                    ));
+                }
                 Err(err) => {
                     let err_secs = now_unix_secs();
                     let summary = ruum_core::watchdog::format_ai_failure_summary(
@@ -3118,17 +3488,17 @@ pub(crate) fn trigger_background_ai_analysis_with(
                 .unwrap_or_default();
         let _ = db.save_ai_state(&ai_state);
         let resolved_db_path = db.db_path().to_path_buf();
-        let docker = DockerFactory::create().probe(&DockerEnv::current());
         Ok::<_, std::io::Error>((home, proposal, docker, resolved_db_path))
     });
 
     cx.spawn(async move |cx| {
         let res = task.await;
         cx.update(|cx| {
-            with_runtime_mut(cx, |rt| {
-                rt.background_analysis_in_flight = false;
-            });
+            finish_ai_job(&AiEventKey::DiskCleanupLocal, job_seq, cx);
             refresh_tray_status(cx);
+            if cancel_token.is_cancelled() {
+                return;
+            }
             match res {
                 Ok((home, proposal, docker, resolved_db_path)) => {
                     update_open_main_window(cx, |app, cx| {
@@ -3158,6 +3528,9 @@ pub(crate) fn trigger_background_ai_analysis_with(
                 }
                 Err(err) => {
                     let raw = err.to_string();
+                    if ruum_core::ai_cli::is_ai_cancelled_error(&raw) {
+                        return;
+                    }
                     let kind = ruum_core::watchdog::classify_ai_failure(&raw);
                     let summary =
                         ruum_core::watchdog::format_ai_failure_summary(

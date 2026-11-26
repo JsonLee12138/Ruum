@@ -2351,30 +2351,36 @@ pub fn stop_running_watchdog_with(
 
     match os {
         UpdateOs::MacOs => {
-            if let Some(h) = home {
-                let plist =
-                    h.join("Library/LaunchAgents/com.ruum.watchdog.plist");
-                if plist.is_file() {
-                    let svc =
-                        ServiceAdapterFactory::create_for(ServiceOs::MacOs);
-                    let bridge = CommandServiceRunner::new(runner);
-                    let s_env = ruum_watchdog::ServiceEnv {
-                        home: Some(h.to_path_buf()),
-                        xdg_config_home: None,
-                        appdata: None,
-                    };
-                    if svc.status(&bridge, &s_env).ok()
-                        == Some(ServiceStatus::Active)
-                    {
-                        let plist_str = plist.to_string_lossy();
-                        let _ = runner.run(
-                            Path::new("launchctl"),
-                            &["unload", plist_str.as_ref()],
-                            &[],
-                        );
-                        stopped = true;
-                    }
+            let svc = ServiceAdapterFactory::create_for(ServiceOs::MacOs);
+            let bridge = CommandServiceRunner::new(runner);
+            let s_env = ruum_watchdog::ServiceEnv {
+                home: home.map(Path::to_path_buf),
+                xdg_config_home: None,
+                appdata: None,
+            };
+            let plist = home.map(|h| {
+                h.join("Library/LaunchAgents/com.ruum.watchdog.plist")
+            });
+            if plist.as_ref().is_some_and(|p| p.is_file())
+                && let Some(ref plist_path) = plist
+            {
+                if svc.status(&bridge, &s_env).ok()
+                    == Some(ServiceStatus::Active)
+                {
+                    let plist_str = plist_path.to_string_lossy();
+                    let _ = runner.run(
+                        Path::new("launchctl"),
+                        &["unload", plist_str.as_ref()],
+                        &[],
+                    );
+                    stopped = true;
                 }
+            } else if home.is_some()
+                && svc.status(&bridge, &s_env).ok()
+                    == Some(ServiceStatus::Active)
+            {
+                let _ = svc.uninstall(&bridge, &s_env);
+                stopped = true;
             }
             if stop_pid_file_unix(pid_path, runner) {
                 stopped = true;

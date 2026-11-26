@@ -3,7 +3,7 @@
 //! endpoints, and virtual model discovery.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -34,13 +34,13 @@ pub const HEADER_CLIENT_VERSION: &str = "X-Ruum-Client-Version";
 pub const HEADER_TRACE_ID: &str = "X-Trace-ID";
 
 /// TCP/TLS connect timeout for Ruum Cloud control-plane requests.
-pub const CLOUD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CLOUD_CONNECT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Read/write/global timeout for Ruum Cloud control-plane requests.
-pub const CLOUD_CONTROL_TIMEOUT: Duration = Duration::from_secs(25);
+pub const CLOUD_CONTROL_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Read/write/global timeout for Ruum Cloud billing checkout requests.
-pub const CLOUD_BILLING_TIMEOUT: Duration = Duration::from_secs(90);
+pub const CLOUD_BILLING_TIMEOUT: Duration = Duration::from_mins(2);
 
 #[cfg(not(test))]
 const BILLING_RETRY_BACKOFF: Duration = Duration::from_secs(1);
@@ -439,6 +439,11 @@ impl fmt::Debug for CloudClient {
     }
 }
 
+fn jwt_refresh_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl CloudClient {
     /// Construct a [`CloudClient`] sharing `db` and `cred_store`.
     #[must_use]
@@ -520,6 +525,15 @@ impl CloudClient {
     /// re-registration once on `404 DEVICE_NOT_FOUND` or `401 AUTH_UNAUTHORIZED`,
     /// and never retrying `403 AUTH_DEVICE_REVOKED`.
     pub fn refresh_access_token(&self) -> Result<CloudState, CloudApiError> {
+        let _guard = jwt_refresh_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_access_token_unlocked()
+    }
+
+    fn refresh_access_token_unlocked(
+        &self,
+    ) -> Result<CloudState, CloudApiError> {
         let state = self.load_state()?;
         let has_key = self
             .cred_store
@@ -584,7 +598,7 @@ impl CloudClient {
     }
 
     /// Return a valid JWT, refreshing proactively when empty or within 60s of
-    /// expiry.
+    /// expiry under a single-flight mutex to avoid concurrent refresh storms.
     pub fn ensure_valid_jwt(&self) -> Result<String, CloudApiError> {
         let state = self.load_state()?;
         let has_key = self
@@ -600,7 +614,21 @@ impl CloudClient {
             {
                 return Ok(tok);
             }
-            let refreshed = self.refresh_access_token()?;
+            let _guard = jwt_refresh_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Another thread may have already refreshed while we waited on the mutex.
+            let latest = self.load_state()?;
+            let now = now_unix_secs();
+            if latest.device_id.is_some()
+                && let Some(tok) = latest.access_token
+                && !tok.trim().is_empty()
+                && latest.token_expires_at_secs
+                    > now.saturating_add(JWT_REFRESH_SKEW_SECS)
+            {
+                return Ok(tok);
+            }
+            let refreshed = self.refresh_access_token_unlocked()?;
             return refreshed.access_token.ok_or_else(|| {
                 CloudApiError::new(
                     None,
@@ -609,6 +637,19 @@ impl CloudClient {
                     None,
                 )
             });
+        }
+        let _guard = jwt_refresh_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest = self.load_state()?;
+        let now = now_unix_secs();
+        if latest.device_id.is_some()
+            && let Some(tok) = latest.access_token
+            && !tok.trim().is_empty()
+            && latest.token_expires_at_secs
+                > now.saturating_add(JWT_REFRESH_SKEW_SECS)
+        {
+            return Ok(tok);
         }
         let registered = self.register_device_internal(true)?;
         registered.access_token.ok_or_else(|| {
@@ -2545,8 +2586,9 @@ mod tests {
 
     #[test]
     fn create_purchase_timeout_constant_and_request_no_generation() {
-        assert_eq!(CLOUD_BILLING_TIMEOUT, Duration::from_secs(90));
-        assert_eq!(CLOUD_CONTROL_TIMEOUT, Duration::from_secs(25));
+        assert_eq!(CLOUD_BILLING_TIMEOUT, Duration::from_mins(2));
+        assert_eq!(CLOUD_CONTROL_TIMEOUT, Duration::from_mins(2));
+        assert_eq!(CLOUD_CONNECT_TIMEOUT, Duration::from_mins(1));
         let req_a = generate_purchase_request_no();
         let req_b = generate_purchase_request_no();
         assert!(req_a.starts_with("req_"));

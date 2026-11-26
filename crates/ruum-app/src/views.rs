@@ -5474,22 +5474,38 @@ fn switch_root_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
 }
 
 fn explore_ai_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
-    let (analyzing, ssh_disconnected, target_ssh_id, tooltip) =
+    let (analyzing, stage, ssh_disconnected, target_ssh_id, tooltip) =
         match &app.active_host_tab {
             HostTabKey::Local => {
                 let analyzing = app.watchdog_analyzing;
+                let stage = if analyzing {
+                    crate::ai_stage_for_key(
+                        &crate::AiEventKey::DiskCleanupLocal,
+                        cx,
+                    )
+                } else {
+                    None
+                };
                 let tip = if analyzing {
-                    crate::i18n::explore::ai_analyze_running_tooltip(app.locale)
+                    crate::i18n::explore::ai_stage_tooltip(stage, app.locale)
                 } else {
                     crate::i18n::explore::ai_analyze_local_tooltip(app.locale)
                 };
-                (analyzing, false, None, tip)
+                (analyzing, stage, false, None, tip)
             }
             HostTabKey::Ssh(id) => {
                 let analyzing = app.ssh_analyzing_profiles.contains(id);
+                let stage = if analyzing {
+                    crate::ai_stage_for_key(
+                        &crate::AiEventKey::DiskCleanupSsh(id.clone()),
+                        cx,
+                    )
+                } else {
+                    None
+                };
                 let disconnected = !app.has_connected_ssh_tab(id);
                 let tip = if analyzing {
-                    crate::i18n::explore::ai_analyze_running_tooltip(app.locale)
+                    crate::i18n::explore::ai_stage_tooltip(stage, app.locale)
                 } else if disconnected {
                     crate::i18n::explore::ai_analyze_disconnected_tooltip(
                         app.locale,
@@ -5497,20 +5513,42 @@ fn explore_ai_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                 } else {
                     crate::i18n::explore::ai_analyze_remote_tooltip(app.locale)
                 };
-                (analyzing, disconnected, Some(id.clone()), tip)
+                (analyzing, stage, disconnected, Some(id.clone()), tip)
             }
         };
-    let disabled = analyzing || ssh_disconnected;
+    let disabled = ssh_disconnected;
     let spin_color = cx.omarchy().foreground;
     let btn = if analyzing {
-        button("trail-ai-analyze", "", ButtonVariant::Secondary, cx)
-            .accessibility_label(tooltip)
-            .p(space::ICON_BUTTON)
-            .justify_center()
-            .child(crate::rail_pages::spinning_loader(
-                "trail-ai-analyze-spin",
-                spin_color,
-            ))
+        let mut inner =
+            div().flex().flex_row().items_center().gap(space::XS).child(
+                crate::rail_pages::spinning_loader(
+                    "trail-ai-analyze-spin",
+                    spin_color,
+                ),
+            );
+        if let Some(active_stage) = stage {
+            inner = inner.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(spin_color)
+                    .whitespace_nowrap()
+                    .child(crate::i18n::explore::ai_stage_compact_label(
+                        active_stage,
+                        app.locale,
+                    )),
+            );
+        }
+        let mut b =
+            button("trail-ai-analyze", "", ButtonVariant::Secondary, cx)
+                .accessibility_label(tooltip)
+                .justify_center()
+                .child(inner);
+        b = if stage.is_some() {
+            b.px(space::SM).py(space::ICON_BUTTON)
+        } else {
+            b.p(space::ICON_BUTTON)
+        };
+        b
     } else {
         gpui_omarchy::icon_button(
             "trail-ai-analyze",
@@ -5524,14 +5562,10 @@ fn explore_ai_button(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
     .on_click(cx.listener(move |this, _, window, cx| {
         match &target_ssh_id {
             None => {
-                if !this.watchdog_analyzing {
-                    this.run_ai_analysis_now(cx);
-                }
+                this.run_ai_analysis_now(cx);
             }
             Some(id) => {
-                if !this.ssh_analyzing_profiles.contains(id)
-                    && this.has_connected_ssh_tab(id)
-                {
+                if this.has_connected_ssh_tab(id) {
                     this.analyze_ssh_profile(id, cx);
                 }
             }

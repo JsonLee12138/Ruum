@@ -13,6 +13,7 @@ use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -28,15 +29,19 @@ use crate::docker_adapter::{
     DockerCleanTarget, DockerProbeStatus, DockerUsageSummary,
     validate_targets_against_summary,
 };
-use crate::i18n::{Locale, format_cloud_error_message};
+use crate::i18n::{
+    Locale, ai_fallback_proposal_summary, ai_output_language_spec,
+    format_cloud_error_message, git_dirty_warning,
+};
 use crate::identity::HostIdentity;
 use crate::insights::{self, Finding};
 use crate::mcp::{McpServer, local_read_only_tool_definitions};
 use crate::remote::Header;
 use crate::removal::RemovalMode;
 use crate::size::human_bytes;
+use crate::space::SpaceInfo;
 use crate::storage::{AiConfig, StorageDb};
-use crate::trash_adapter::TrashOs;
+use crate::trash_adapter::{TrashAdapterFactory, TrashEnv, TrashOs};
 use crate::tree::{Node, NodeKind, path_of};
 use crate::watchdog_config::{
     AiCliProvider, ApiProtocol, CleanupProposal, ProposalItem, WatchdogConfig,
@@ -47,6 +52,19 @@ pub const ENV_AI_API_KEY: &str = "RUUM_AI_API_KEY";
 
 /// Sentinel model identifier sent to Ruum Cloud when Auto routing is active.
 pub const CLOUD_AUTO_MODEL_ID: &str = "auto";
+
+/// Pure-sync stage enum re-exported alongside [`AiExecutionContext`].
+pub use crate::AiProgressStage;
+
+/// Re-exported cooperative cancellation token shared across Core, ADK, and GUI.
+pub use ruum_adk::CancelToken;
+
+/// Pre-warm the cached Ruum Cloud JWT once under the shared single-flight lock.
+pub fn prewarm_cloud_jwt_for_context(ctx: &AiExecutionContext) {
+    if let Ok(client) = build_cloud_client_from_context(ctx) {
+        let _ = client.ensure_valid_jwt();
+    }
+}
 
 /// Returns `true` when `RUUM_AI_API_KEY` is present and non-empty.
 #[must_use]
@@ -66,9 +84,21 @@ fn ai_config_from_legacy(config: &WatchdogConfig) -> AiConfig {
 }
 
 /// Default timeout for full AI analysis CLI runs (seconds).
-pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 /// Short timeout for quick CLI probes, model listing, and speed checks.
-pub const SHORT_COMMAND_TIMEOUT_SECS: u64 = 30;
+pub const SHORT_COMMAND_TIMEOUT_SECS: u64 = 60;
+/// Loose zombie-safety timeout for Direct API & CLI model speed checks (seconds).
+pub const BENCHMARK_TIMEOUT_SECS: u64 = DEFAULT_COMMAND_TIMEOUT_SECS;
+
+/// Sentinel error string returned when an AI operation is cooperatively cancelled.
+pub const AI_CANCELLED_SENTINEL: &str = "__ruum_ai_cancelled__";
+
+/// Returns `true` when `err` represents cooperative cancellation (must stay silent).
+#[must_use]
+pub fn is_ai_cancelled_error(err: &str) -> bool {
+    let trimmed = err.trim();
+    trimmed == AI_CANCELLED_SENTINEL || trimmed.contains(AI_CANCELLED_SENTINEL)
+}
 
 /// Result of running a subprocess command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +123,23 @@ pub trait CommandRunner: Send + Sync {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> io::Result<CommandOutput>;
+
+    /// Executes a command while watching an optional cooperative cancellation flag.
+    fn run_cancellable(
+        &self,
+        program: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<CommandOutput> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                AI_CANCELLED_SENTINEL,
+            ));
+        }
+        self.run(program, args, envs)
+    }
 }
 
 fn is_windows_batch_script(program: &Path) -> bool {
@@ -204,13 +251,21 @@ fn unwrap_npm_cmd_shim_with(
     Some((node_exe, js_path))
 }
 
-/// Run an external command with piped output, non-interactive defaults, and timeout.
-fn run_command_with_timeout(
+/// Run an external command with piped output, non-interactive defaults, timeout,
+/// and optional cooperative cancellation flag.
+fn run_command_with_timeout_and_cancel(
     program: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<CommandOutput> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            AI_CANCELLED_SENTINEL,
+        ));
+    }
     let (effective_program, effective_args): (PathBuf, Vec<String>) =
         if cfg!(windows) && is_windows_batch_script(program) {
             let path_env = envs
@@ -284,6 +339,15 @@ fn run_command_with_timeout(
         if let Some(status) = child.try_wait()? {
             break status;
         }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop((stdout_handle, stderr_handle));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                AI_CANCELLED_SENTINEL,
+            ));
+        }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
@@ -325,11 +389,28 @@ impl CommandRunner for DefaultCommandRunner {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> io::Result<CommandOutput> {
-        run_command_with_timeout(
+        run_command_with_timeout_and_cancel(
             program,
             args,
             envs,
             Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
+            None,
+        )
+    }
+
+    fn run_cancellable(
+        &self,
+        program: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<CommandOutput> {
+        run_command_with_timeout_and_cancel(
+            program,
+            args,
+            envs,
+            Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
+            cancel,
         )
     }
 }
@@ -354,7 +435,29 @@ impl CommandRunner for TimedCommandRunner {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> io::Result<CommandOutput> {
-        run_command_with_timeout(program, args, envs, self.timeout)
+        run_command_with_timeout_and_cancel(
+            program,
+            args,
+            envs,
+            self.timeout,
+            None,
+        )
+    }
+
+    fn run_cancellable(
+        &self,
+        program: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<CommandOutput> {
+        run_command_with_timeout_and_cancel(
+            program,
+            args,
+            envs,
+            self.timeout,
+            cancel,
+        )
     }
 }
 
@@ -509,10 +612,19 @@ impl CliInvocation {
 pub struct ReclaimCandidateSummary {
     pub path: PathBuf,
     pub bytes: u64,
+    pub is_dir: bool,
+    pub files: Option<u64>,
+    pub modified_secs: Option<i64>,
+    pub accessed_secs: Option<i64>,
     pub category: &'static str,
     pub finding: String,
     pub git_summary: Option<String>,
 }
+
+const MAX_SNAPSHOT_BLOCK_BYTES: usize = 20 * 1024;
+const MAX_DOCKER_IMAGES_IN_PROMPT: usize = 15;
+const MAX_DOCKER_CONTAINERS_IN_PROMPT: usize = 15;
+const DAY_SECS: i64 = 86_400;
 
 fn format_finding_label(finding: &Finding) -> String {
     match finding {
@@ -526,8 +638,106 @@ fn format_finding_label(finding: &Finding) -> String {
     }
 }
 
+fn sanitize_prompt_text(raw: &str) -> String {
+    clean_terminal_line(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn path_has_control_chars(path: &Path) -> bool {
+    path.to_string_lossy().chars().any(char::is_control)
+}
+
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (idx, ch) in s.chars().enumerate() {
+        if idx > 0 && (s.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_relative_age(ts_secs: i64, now_secs: u64) -> String {
+    if ts_secs <= 0 {
+        return "n/a".to_owned();
+    }
+    let now_i64 = i64::try_from(now_secs).unwrap_or(i64::MAX);
+    let age = now_i64.saturating_sub(ts_secs).max(0);
+    if age < 3_600 {
+        "<1h ago".to_owned()
+    } else if age < DAY_SECS {
+        format!("{}h ago", age / 3_600)
+    } else {
+        format!("{}d ago", age / DAY_SECS)
+    }
+}
+
+fn system_time_to_unix_secs(
+    time: io::Result<std::time::SystemTime>,
+) -> Option<i64> {
+    time.ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .filter(|&s| s > 0)
+}
+
+fn metadata_unix_times(path: &Path) -> (Option<i64>, Option<i64>) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return (None, None);
+    };
+    (
+        system_time_to_unix_secs(meta.modified()),
+        system_time_to_unix_secs(meta.accessed()),
+    )
+}
+
+fn filter_accessed_secs(
+    atime: Option<i64>,
+    is_dir: bool,
+    now_secs: u64,
+) -> Option<i64> {
+    let ts = atime?;
+    let now_i64 = i64::try_from(now_secs).unwrap_or(i64::MAX);
+    if ts <= 0 || ts > now_i64.saturating_add(60) {
+        return None;
+    }
+    // Suppress recent directory `atime` updates caused by scanning or indexing.
+    if is_dir && now_i64.saturating_sub(ts) < DAY_SECS {
+        return None;
+    }
+    Some(ts)
+}
+
+fn is_skipped_headless_walk_dir(name: &str) -> bool {
+    const SKIP_DIRS: [&str; 17] = [
+        ".git",
+        "Library",
+        "System",
+        "Windows",
+        "Program Files",
+        "Program Files (x86)",
+        "ProgramData",
+        "System Volume Information",
+        "proc",
+        "sys",
+        "dev",
+        "run",
+        "Volumes",
+        "mnt",
+        "media",
+        "$Recycle.Bin",
+        "Recovery",
+    ];
+    SKIP_DIRS.iter().any(|skip| name.eq_ignore_ascii_case(skip))
+}
+
 fn collect_bounded_headless_candidates(
-    home_dir: &Path,
+    target_root: &Path,
+    user_home: Option<&Path>,
     out: &mut Vec<ReclaimCandidateSummary>,
 ) {
     let fixed_dirs = [
@@ -546,18 +756,24 @@ fn collect_bounded_headless_candidates(
             "Build",
             "Xcode derived build artifacts",
         ),
+        ("AppData/Local/Temp", "Cache", "Windows user temp directory"),
+        ("AppData/Local/npm-cache", "Cache", "npm cache directory"),
+        ("AppData/Local/pnpm/store", "Cache", "pnpm store cache"),
+        ("AppData/Local/Yarn/Cache", "Cache", "Yarn cache directory"),
+        ("AppData/Local/pip/cache", "Cache", "pip cache directory"),
+        (".nuget/packages", "Cache", "NuGet package cache"),
     ];
 
     let mut candidate_paths: Vec<(PathBuf, &'static str, &'static str)> =
         Vec::new();
     for (rel, cat, desc) in fixed_dirs {
-        let p = home_dir.join(rel);
+        let p = target_root.join(rel);
         if p.is_dir() {
             candidate_paths.push((p, cat, desc));
         }
     }
 
-    // Bounded depth-3 walk for project build/dependency artifacts under home.
+    // Bounded depth-3 walk for project build/dependency artifacts under root.
     let artifact_names = [
         "target",
         "node_modules",
@@ -567,7 +783,7 @@ fn collect_bounded_headless_candidates(
         ".mypy_cache",
         "DerivedData",
     ];
-    let mut stack: Vec<(PathBuf, usize)> = vec![(home_dir.to_path_buf(), 0)];
+    let mut stack: Vec<(PathBuf, usize)> = vec![(target_root.to_path_buf(), 0)];
     let mut visited_dirs = 0_usize;
     while let Some((dir, depth)) = stack.pop() {
         if depth >= 3 || visited_dirs >= 4_000 {
@@ -582,13 +798,14 @@ fn collect_bounded_headless_candidates(
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
-            if !meta.is_dir() || meta.is_symlink() {
+            let ftype = meta.file_type();
+            if !ftype.is_dir() || ftype.is_symlink() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name == ".git" || name == "Library" {
+            if is_skipped_headless_walk_dir(name) {
                 continue;
             }
             if artifact_names.contains(&name) {
@@ -606,14 +823,16 @@ fn collect_bounded_headless_candidates(
     }
 
     let mut targets = Vec::new();
-    let mut meta_map: Vec<(PathBuf, &'static str, &'static str)> = Vec::new();
+    let mut meta_map: Vec<(PathBuf, &'static str, &'static str, u64, i64)> =
+        Vec::new();
     for (path, cat, desc) in candidate_paths {
         let normalized = crate::removal::normalize(&path);
         if meta_map.iter().any(|(p, ..)| p == &normalized) {
             continue;
         }
         let mut visited = 0;
-        let bytes = compute_dir_bytes(&normalized, 0, &mut visited);
+        let (bytes, files, newest_mtime) =
+            compute_dir_stats(&normalized, 0, &mut visited);
         if bytes < 1024 {
             continue;
         }
@@ -626,12 +845,23 @@ fn collect_bounded_headless_candidates(
             is_dir: true,
             hidden,
         });
-        meta_map.push((normalized, cat, desc));
+        meta_map.push((normalized, cat, desc, files, newest_mtime));
     }
 
-    let safe = crate::removal::plan(&targets, home_dir);
+    let adapter = TrashAdapterFactory::create();
+    let mut env = TrashEnv::current();
+    if let Some(home) = user_home {
+        env.home = Some(home.to_path_buf());
+    }
+    let safe = crate::removal::plan_with_trash_adapter(
+        &targets,
+        target_root,
+        RemovalMode::Permanent,
+        adapter.as_ref(),
+        &env,
+    );
     for target in safe.targets {
-        if let Some((_, cat, desc)) =
+        if let Some((_, cat, desc, files, newest_mtime)) =
             meta_map.iter().find(|(p, ..)| p == &target.path)
         {
             let git_summary =
@@ -639,6 +869,10 @@ fn collect_bounded_headless_candidates(
             out.push(ReclaimCandidateSummary {
                 path: target.path,
                 bytes: target.bytes,
+                is_dir: true,
+                files: Some(*files),
+                modified_secs: (*newest_mtime > 0).then_some(*newest_mtime),
+                accessed_secs: None,
                 category: cat,
                 finding: (*desc).to_string(),
                 git_summary,
@@ -655,33 +889,167 @@ pub fn collect_reclaimable_candidates(
     existing_tree: Option<&Node>,
     now_secs: u64,
 ) -> Vec<ReclaimCandidateSummary> {
+    collect_reclaimable_candidates_with_home(
+        home_dir,
+        None,
+        existing_tree,
+        now_secs,
+    )
+}
+
+struct LocalCandidateMeta {
+    path: PathBuf,
+    is_dir: bool,
+    files: u64,
+    modified_secs: Option<i64>,
+    category: &'static str,
+    finding: String,
+}
+
+/// Collect top reclaimable candidates under `target_root`.
+///
+/// Enforces removal guards against `user_home` (or `std::env::home_dir()`
+/// when `None`) and enriches Top-20 entries with file counts and
+/// `mtime`/`atime`.
+#[must_use]
+pub fn collect_reclaimable_candidates_with_home(
+    target_root: &Path,
+    user_home: Option<&Path>,
+    existing_tree: Option<&Node>,
+    now_secs: u64,
+) -> Vec<ReclaimCandidateSummary> {
     let mut out = Vec::new();
     if let Some(tree) = existing_tree {
         let now_i64 = i64::try_from(now_secs).unwrap_or(0);
+        let mut targets = Vec::new();
+        let mut raw_meta: Vec<LocalCandidateMeta> = Vec::new();
         for candidate in insights::worth_a_look(tree, now_i64, 25) {
             let Some(node) = tree.resolve(&candidate.crumbs) else {
                 continue;
             };
-            let path = path_of(home_dir, tree, &candidate.crumbs);
-            let git_summary = crate::git::state(&path).map(|s| s.summary());
-            out.push(ReclaimCandidateSummary {
-                path,
+            let path = crate::removal::normalize(&path_of(
+                target_root,
+                tree,
+                &candidate.crumbs,
+            ));
+            if raw_meta.iter().any(|m| m.path == path) {
+                continue;
+            }
+            let hidden = node.name.starts_with('.');
+            targets.push(crate::removal::Target {
+                path: path.clone(),
                 bytes: candidate.bytes,
+                is_dir: node.is_dir(),
+                hidden,
+            });
+            raw_meta.push(LocalCandidateMeta {
+                path,
+                is_dir: node.is_dir(),
+                files: node.files,
+                modified_secs: (node.modified > 0).then_some(node.modified),
                 category: node.category.label(),
                 finding: format_finding_label(&candidate.finding),
-                git_summary,
             });
         }
+
+        let adapter = TrashAdapterFactory::create();
+        let mut env = TrashEnv::current();
+        if let Some(home) = user_home {
+            env.home = Some(home.to_path_buf());
+        }
+        let safe = crate::removal::plan_with_trash_adapter(
+            &targets,
+            target_root,
+            RemovalMode::Permanent,
+            adapter.as_ref(),
+            &env,
+        );
+        for target in safe.targets {
+            if let Some(meta) = raw_meta.iter().find(|m| m.path == target.path)
+            {
+                let git_summary =
+                    crate::git::state(&target.path).map(|s| s.summary());
+                out.push(ReclaimCandidateSummary {
+                    path: target.path,
+                    bytes: target.bytes,
+                    is_dir: meta.is_dir,
+                    files: Some(meta.files),
+                    modified_secs: meta.modified_secs,
+                    accessed_secs: None,
+                    category: meta.category,
+                    finding: meta.finding.clone(),
+                    git_summary,
+                });
+            }
+        }
     } else {
-        collect_bounded_headless_candidates(home_dir, &mut out);
+        collect_bounded_headless_candidates(target_root, user_home, &mut out);
     }
 
     out.sort_by_key(|item| std::cmp::Reverse(item.bytes));
     out.truncate(20);
+
+    for item in &mut out {
+        let (mtime, atime) = metadata_unix_times(&item.path);
+        if item.modified_secs.is_none() {
+            item.modified_secs = mtime;
+        }
+        item.accessed_secs = filter_accessed_secs(atime, item.is_dir, now_secs);
+    }
+
     out
 }
 
-fn format_candidates_block(candidates: &[ReclaimCandidateSummary]) -> String {
+#[derive(Clone, Copy, Debug)]
+struct PromptContext<'a> {
+    target_os: TrashOs,
+    target_root: &'a Path,
+    user_home: Option<&'a Path>,
+    volume_space: Option<SpaceInfo>,
+    locale: Locale,
+    now_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PromptToolMode<'a> {
+    CliMcp { current_exe: &'a Path },
+    DirectTools,
+    SnapshotOnly,
+}
+
+const fn os_display_label(os: TrashOs) -> &'static str {
+    match os {
+        TrashOs::MacOs => "macOS",
+        TrashOs::Linux => "Linux",
+        TrashOs::Windows => "Windows",
+    }
+}
+
+fn format_volume_space_line(space: Option<SpaceInfo>) -> String {
+    let Some(sp) = space.filter(|s| s.total > 0) else {
+        return "unknown".to_owned();
+    };
+    let used_pct = (sp.used_fraction() * 100.0).clamp(0.0, 100.0);
+    let free_pct = 100.0 - used_pct;
+    if free_pct < 5.0 {
+        format!(
+            "{} free of {} ({used_pct:.1}% used, CRITICALLY LOW <5% free)",
+            human_bytes(sp.available),
+            human_bytes(sp.total),
+        )
+    } else {
+        format!(
+            "{} free of {} ({used_pct:.1}% used)",
+            human_bytes(sp.available),
+            human_bytes(sp.total),
+        )
+    }
+}
+
+fn format_candidates_block(
+    candidates: &[ReclaimCandidateSummary],
+    now_secs: u64,
+) -> String {
     use std::fmt::Write as _;
 
     let mut cand_block = String::new();
@@ -691,30 +1059,311 @@ fn format_candidates_block(candidates: &[ReclaimCandidateSummary]) -> String {
              If you cannot discover safe targets in read-only mode, return an \
              empty `items` array.\n",
         );
-    } else {
-        cand_block.push_str(
-            "PRE-SCANNED RECLAIMABLE CANDIDATES (already verified inside home \
-             directory):\n",
+        return cand_block;
+    }
+
+    cand_block.push_str(
+        "PRE-SCANNED RECLAIMABLE CANDIDATES (verified under scanned root, \
+         sorted by size):\n",
+    );
+    let mut rendered = 0_usize;
+    for (idx, item) in candidates.iter().enumerate() {
+        if path_has_control_chars(&item.path) {
+            continue;
+        }
+        let kind = if item.is_dir { "dir" } else { "file" };
+        let files_note = item.files.map_or_else(String::new, |f| {
+            format!(", {} files", format_thousands(f))
+        });
+        let modified_note = item.modified_secs.map_or_else(
+            || "n/a".to_owned(),
+            |ts| format_relative_age(ts, now_secs),
         );
-        for (idx, item) in candidates.iter().enumerate() {
-            let git_note = item
-                .git_summary
-                .as_deref()
-                .map_or(String::new(), |g| format!(", git: {g}"));
+        let accessed_note = item.accessed_secs.map_or_else(
+            || "n/a".to_owned(),
+            |ts| format_relative_age(ts, now_secs),
+        );
+        let git_note = item
+            .git_summary
+            .as_deref()
+            .map(sanitize_prompt_text)
+            .filter(|g| !g.is_empty())
+            .map_or_else(String::new, |g| format!(", git: {g}"));
+        let finding = sanitize_prompt_text(&item.finding);
+        let line = format!(
+            "{}. {} ({}, {}{}, category: {}, signal: {}, modified: {}, \
+             accessed: {}{})\n",
+            idx + 1,
+            item.path.display(),
+            human_bytes(item.bytes),
+            kind,
+            files_note,
+            item.category,
+            finding,
+            modified_note,
+            accessed_note,
+            git_note,
+        );
+        if cand_block.len() + line.len() > MAX_SNAPSHOT_BLOCK_BYTES / 2 {
+            let omitted = candidates.len().saturating_sub(rendered);
             let _ = writeln!(
                 cand_block,
-                "{}. {} ({}, {}, {}{})",
-                idx + 1,
-                item.path.display(),
-                human_bytes(item.bytes),
-                item.category,
-                item.finding,
-                git_note
+                "... ({omitted} additional candidates omitted to stay within \
+                 prompt budget)"
             );
+            break;
         }
-        cand_block.push('\n');
+        cand_block.push_str(&line);
+        rendered += 1;
     }
+    cand_block.push('\n');
     cand_block
+}
+
+fn format_docker_snapshot_block(
+    docker: Option<&DockerUsageSummary>,
+    budget_bytes: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    let Some(summary) = docker else {
+        return String::new();
+    };
+    let standalone_bc = summary
+        .build_cache_reclaimable_bytes
+        .max(summary.build_cache.reclaimable_bytes);
+    if standalone_bc == 0
+        && summary.removable_images.is_empty()
+        && summary.stopped_containers.is_empty()
+    {
+        return String::new();
+    }
+
+    let mut block = String::from("DOCKER RECLAIMABLE SNAPSHOT:\n");
+    let _ = writeln!(
+        block,
+        "- Build cache reclaimable: {}",
+        human_bytes(standalone_bc)
+    );
+
+    let mut sorted_imgs: Vec<&_> = summary.removable_images.iter().collect();
+    sorted_imgs.sort_by_key(|img| {
+        std::cmp::Reverse(img.unique_bytes.max(img.size_bytes))
+    });
+    let total_imgs = sorted_imgs.len();
+    let mut shown_imgs = 0_usize;
+    for img in sorted_imgs.into_iter().take(MAX_DOCKER_IMAGES_IN_PROMPT) {
+        let label = if img.dangling {
+            "<none>:<none>".to_owned()
+        } else {
+            format!(
+                "{}:{}",
+                sanitize_prompt_text(&img.repository),
+                sanitize_prompt_text(&img.tag)
+            )
+        };
+        let created = sanitize_prompt_text(&img.created_since);
+        let created_part = if created.is_empty() {
+            String::new()
+        } else {
+            format!(", created={created}")
+        };
+        let line = format!(
+            "- Unused image: id={}, ref={}, unique={}, dangling={}{}\n",
+            sanitize_prompt_text(&img.id),
+            label,
+            human_bytes(img.unique_bytes),
+            img.dangling,
+            created_part,
+        );
+        if block.len() + line.len() > budget_bytes {
+            break;
+        }
+        block.push_str(&line);
+        shown_imgs += 1;
+    }
+    if total_imgs > shown_imgs {
+        let _ = writeln!(
+            block,
+            "- ... ({} additional unused images omitted)",
+            total_imgs - shown_imgs
+        );
+    }
+
+    let mut sorted_ctrs: Vec<&_> = summary.stopped_containers.iter().collect();
+    sorted_ctrs.sort_by_key(|c| std::cmp::Reverse(c.size_bytes));
+    let total_ctrs = sorted_ctrs.len();
+    let mut shown_ctrs = 0_usize;
+    for ctr in sorted_ctrs
+        .into_iter()
+        .take(MAX_DOCKER_CONTAINERS_IN_PROMPT)
+    {
+        let status_raw = if ctr.status.trim().is_empty() {
+            &ctr.state
+        } else {
+            &ctr.status
+        };
+        let line = format!(
+            "- Stopped container: id={}, name={}, image={}, status={}, \
+             size={}\n",
+            sanitize_prompt_text(&ctr.id),
+            sanitize_prompt_text(&ctr.name),
+            sanitize_prompt_text(&ctr.image),
+            sanitize_prompt_text(status_raw),
+            human_bytes(ctr.size_bytes),
+        );
+        if block.len() + line.len() > budget_bytes {
+            break;
+        }
+        block.push_str(&line);
+        shown_ctrs += 1;
+    }
+    if total_ctrs > shown_ctrs {
+        let _ = writeln!(
+            block,
+            "- ... ({} additional stopped containers omitted)",
+            total_ctrs - shown_ctrs
+        );
+    }
+
+    block.push('\n');
+    block
+}
+
+fn build_v2_prompt_parts(
+    ctx: &PromptContext<'_>,
+    tool_mode: PromptToolMode<'_>,
+    cand_block: &str,
+    docker_block: &str,
+) -> (String, String) {
+    let os_label = os_display_label(ctx.target_os);
+    let root_str = sanitize_prompt_text(&ctx.target_root.display().to_string());
+    let home_str = ctx.user_home.map_or_else(
+        || "unknown".to_owned(),
+        |h| sanitize_prompt_text(&h.display().to_string()),
+    );
+    let volume_str = format_volume_space_line(ctx.volume_space);
+    let (lang_label, lang_tag) = ai_output_language_spec(ctx.locale);
+
+    let tool_capability_block = match tool_mode {
+        PromptToolMode::CliMcp { current_exe } => format!(
+            "TOOL ACCESS:\n\
+             - Read-only MCP server available via `{exe} mcp --read-only` \
+             (tools: list_volumes, scan_directory, inspect_subtree, \
+             find_reclaimable, check_git_safety, plan_removal).\n\
+             - Prefer analyzing the pre-scanned snapshot below and returning \
+             the JSON directly in a single response; invoke read-only MCP \
+             tools only when crucial context (such as git safety or \
+             subdirectory breakdown) is missing.",
+            exe = current_exe.display(),
+        ),
+        PromptToolMode::DirectTools => "TOOL ACCESS:\n\
+             - In-process read-only local tools attached: list_volumes, \
+             scan_directory, inspect_subtree, find_reclaimable, \
+             check_git_safety, plan_removal.\n\
+             - Prefer analyzing the pre-scanned snapshot below when \
+             sufficient; invoke attached read-only tools only if you need \
+             extra subdirectory detail, git safety verification, or removal \
+             guard validation."
+            .to_owned(),
+        PromptToolMode::SnapshotOnly => "TOOL ACCESS:\n\
+             - Pure in-memory snapshot mode: no filesystem, SSH, or shell \
+             tools are attached. Base your analysis strictly on the \
+             pre-scanned candidates and Docker snapshot below."
+            .to_owned(),
+    };
+
+    let instruction = format!(
+        "You are Ruum's senior disk-cleanup advisor. Help the user reclaim \
+         meaningful disk space safely without disrupting active work or \
+         risking irreplaceable personal data.\n\n\
+         SESSION ENVIRONMENT:\n\
+         - Target OS: {os_label}\n\
+         - Scanned Root: {root_str}\n\
+         - User Home: {home_str}\n\
+         - Volume Space: {volume_str}\n\n\
+         {tool_capability_block}\n\n\
+         HARD SAFETY BOUNDARIES (STRICT READ-ONLY):\n\
+         1. This is a STRICT READ-ONLY diagnostic session: never delete, \
+         modify, or run destructive shell commands.\n\
+         2. Every filesystem `path` MUST reside strictly inside `{root_str}` \
+         and MUST NOT be `{root_str}` itself, `{home_str}`, OS/system \
+         directories (such as `/System`, `/Library`, `C:\\Windows`, \
+         `C:\\Program Files`, `C:\\Users`), mount points, or symlinks.\n\
+         3. Never suggest container/VM backing disk files (`Docker.raw`, \
+         OrbStack/Colima/Lima stores) in `items`, and never suggest Docker \
+         volumes. Recommend Docker cleanup only via `docker_targets` using \
+         exact IDs from the Docker snapshot.\n\
+         4. Never recommend deleting user-authored source code, documents, \
+         media, databases, credentials, or any Git checkout/worktree with \
+         uncommitted changes, stashes, or unpushed commits.\n\n\
+         HOW TO THINK LIKE A CAREFUL USER (DECISION RUBRIC):\n\
+         1. Purpose & Reconstructibility:\n\
+            - Tier 1 (Pain-free): Caches, package stores (npm, pnpm, cargo, \
+         pip, gradle, Homebrew, NuGet), temp/trash folders.\n\
+            - Tier 2 (Rebuild-cost aware): Build outputs (`target`, \
+         `DerivedData`, `build`, `dist`) and reinstallable deps \
+         (`node_modules`, `.venv`). Safe to delete, but cleaning recently \
+         active projects forces a slow rebuild.\n\
+            - Tier 3 (Review-worthy): Clean Git worktrees, stale experiment \
+         sandboxes (`tries`/`experiments`), or old installers. Use `trash`.\n\
+         2. Recency & Activity (`modified` primary, `accessed` secondary):\n\
+            - Active (`modified < 7d`): SKIP Tier 2 build/dep directories \
+         unless Volume Space is critically low (<5% free).\n\
+            - Warm (`modified 7d..30d`): Recommend Tier 1 freely; Tier 2 \
+         only when large (>= 500 MiB).\n\
+            - Cold/Stale (`modified >= 30d`): High-priority across Tier 1-3.\n\
+            - `accessed` caveat: `relatime`/`noatime`, APFS, and NTFS \
+         throttle `atime`, and scans may refresh directory `atime`. Treat \
+         `modified` as primary and `accessed` as supporting cold evidence.\n\
+         3. Space & Inode ROI (`size` and `files`): Prioritize big space \
+         wins or huge tiny-file trees; skip trivial few-MiB folders; aim for \
+         <= 12 high-signal items (or `[]` if nothing is worth cleaning).\n\
+         4. Choosing `mode` (`\"permanent\"` vs `\"trash\"`): Use `\"permanent\"` \
+         ONLY for 100% machine-regenerable caches, package stores, build \
+         outputs, and reinstallable dependency folders; use `\"trash\"` for \
+         all user/reviewable items.\n\
+         5. User-friendly `reason`: Write 1 concise sentence explaining what \
+         the item is, why now (size/idle age/file count), and the practical \
+         impact after cleanup."
+    );
+
+    let docker_schema_note = if docker_block.is_empty() {
+        ""
+    } else {
+        ",\n  \"docker_targets\": [\n    \
+         {\"kind\": \"build_cache\"},\n    \
+         {\"kind\": \"image\", \"id\": \"sha256:...\"},\n    \
+         {\"kind\": \"container\", \"id\": \"...\"}\n  \
+         ]"
+    };
+
+    let user_prompt = format!(
+        "Analyze reclaimable disk space under `{root_str}` on {os_label}.\n\n\
+         {cand_block}\
+         {docker_block}\
+         OUTPUT LANGUAGE REQUIREMENT:\n\
+         - Write `summary` and every `items[].reason` strictly in \
+         {lang_label} (`{lang_tag}`).\n\
+         - Keep all JSON keys, `path` values, `mode` literals (`\"trash\"` or \
+         `\"permanent\"`), and `docker_targets` identifiers exact.\n\n\
+         You MUST output ONLY a valid JSON object (raw JSON or a single \
+         ```json block) matching this schema:\n\
+         {{\n  \
+           \"summary\": \"1-2 sentences in {lang_label} summarizing total \
+         reclaimable space and what active items were skipped\",\n  \
+           \"items\": [\n    \
+             {{\n      \
+               \"path\": \"/exact/absolute/path/under/scanned/root\",\n      \
+               \"mode\": \"trash\" or \"permanent\",\n      \
+               \"reason\": \"1 concise sentence in {lang_label}\"\n    \
+             }}\n  \
+           ]{docker_schema_note}\n\
+         }}\n\
+         Do not include conversational filler outside the JSON."
+    );
+
+    (instruction, user_prompt)
 }
 
 /// Generate the strict read-only diagnostic prompt including pre-scanned items.
@@ -724,89 +1373,63 @@ pub fn build_analysis_prompt_with_candidates(
     current_exe: &Path,
     candidates: &[ReclaimCandidateSummary],
 ) -> String {
-    let cand_block = format_candidates_block(candidates);
-
-    format!(
-        "You are an automated disk cleanup advisor for Ruum.\n\
-        The user's home directory is: {home}\n\
-        You have access to Ruum's read-only Model Context Protocol (MCP) \
-        server via:\n\
-        `{exe} mcp --read-only`\n\n\
-        CRITICAL SAFETY CONSTRAINTS:\n\
-        - This is a STRICT READ-ONLY diagnostic session.\n\
-        - You MUST NOT execute any destructive deletions, modifications, \
-        or run arbitrary shell commands to remove files.\n\
-        - Prefer analyzing the pre-scanned candidates below and returning the \
-        JSON object directly in a single response without extra tool calls \
-        unless inspection is strictly required.\n\
-        - If calling MCP tools, use only read-only discovery tools: \
-        scan_directory, find_reclaimable, and check_git_safety.\n\
-        - All candidate paths MUST be located inside the home directory \
-        ({home}).\n\
-        - Target safely reclaimable items such as build artifacts \
-        (target, node_modules, .cache, package caches) or old temp files.\n\
-        - Check git safety for any repositories before suggesting removal.\n\n\
-        {cand_block}\
-        You MUST output ONLY a valid JSON object (either raw JSON or within \
-        a single ```json markdown block) matching this schema:\n\
-        {{\n  \
-          \"summary\": \"Brief explanation of reclaimable space found\",\n  \
-          \"items\": [\n    \
-            {{\n      \
-              \"path\": \"/absolute/path/to/reclaimable/target\",\n      \
-              \"mode\": \"trash\" or \"permanent\",\n      \
-              \"reason\": \"Why this item is safe to clean up\"\n    \
-            }}\n  \
-          ]\n\
-        }}\n\
-        Do not include conversational filler outside the JSON.",
-        home = home_dir.display(),
-        exe = current_exe.display(),
-        cand_block = cand_block,
-    )
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ctx = PromptContext {
+        target_os: TrashAdapterFactory::current_os(),
+        target_root: home_dir,
+        user_home: Some(home_dir),
+        volume_space: None,
+        locale: Locale::En,
+        now_secs,
+    };
+    let cand_block = format_candidates_block(candidates, ctx.now_secs);
+    let (instruction, user_prompt) = build_v2_prompt_parts(
+        &ctx,
+        PromptToolMode::CliMcp { current_exe },
+        &cand_block,
+        "",
+    );
+    format!("{instruction}\n\n{user_prompt}")
 }
 
-fn build_direct_api_analysis_prompt(
-    home_dir: &Path,
+fn build_cli_analysis_prompt_with_context(
+    ctx: &PromptContext<'_>,
+    current_exe: &Path,
     candidates: &[ReclaimCandidateSummary],
+    docker: Option<&DockerUsageSummary>,
+) -> String {
+    let cand_block = format_candidates_block(candidates, ctx.now_secs);
+    let docker_budget = MAX_SNAPSHOT_BLOCK_BYTES
+        .saturating_sub(cand_block.len())
+        .max(2048);
+    let docker_block = format_docker_snapshot_block(docker, docker_budget);
+    let (instruction, user_prompt) = build_v2_prompt_parts(
+        ctx,
+        PromptToolMode::CliMcp { current_exe },
+        &cand_block,
+        &docker_block,
+    );
+    format!("{instruction}\n\n{user_prompt}")
+}
+
+fn build_direct_api_analysis_prompt_with_context(
+    ctx: &PromptContext<'_>,
+    candidates: &[ReclaimCandidateSummary],
+    docker: Option<&DockerUsageSummary>,
 ) -> (String, String) {
-    let cand_block = format_candidates_block(candidates);
-    let instruction = format!(
-        "You are an automated disk cleanup advisor for Ruum.\n\
-         The user's target directory is: {home}\n\
-         You have direct in-process read-only local inspection tools attached: \
-         list_volumes, scan_directory, inspect_subtree, find_reclaimable, \
-         check_git_safety, and plan_removal.\n\n\
-         CRITICAL SAFETY CONSTRAINTS:\n\
-         - This is a STRICT READ-ONLY diagnostic session.\n\
-         - Never suggest deleting system paths, the home root, or paths \
-         outside {home}.\n\
-         - Call the attached read-only tools directly if you need to inspect \
-         additional subdirectories, verify git safety, or validate removal \
-         guards.\n\
-         - Prefer analyzing the pre-scanned candidates when sufficient.\n\
-         - Output ONLY a valid JSON object matching the requested schema.",
-        home = home_dir.display(),
-    );
-    let user_prompt = format!(
-        "Analyze reclaimable disk space under {home}.\n\n\
-         {cand_block}\
-         You MUST output ONLY a valid JSON object (either raw JSON or within \
-         a single ```json markdown block) matching this schema:\n\
-         {{\n  \
-           \"summary\": \"Brief explanation of reclaimable space found\",\n  \
-           \"items\": [\n    \
-             {{\n      \
-               \"path\": \"/absolute/path/to/reclaimable/target\",\n      \
-               \"mode\": \"trash\" or \"permanent\",\n      \
-               \"reason\": \"Why this item is safe to clean up\"\n    \
-             }}\n  \
-           ]\n\
-         }}\n\
-         Do not include conversational filler outside the JSON.",
-        home = home_dir.display(),
-    );
-    (instruction, user_prompt)
+    let cand_block = format_candidates_block(candidates, ctx.now_secs);
+    let docker_budget = MAX_SNAPSHOT_BLOCK_BYTES
+        .saturating_sub(cand_block.len())
+        .max(2048);
+    let docker_block = format_docker_snapshot_block(docker, docker_budget);
+    build_v2_prompt_parts(
+        ctx,
+        PromptToolMode::DirectTools,
+        &cand_block,
+        &docker_block,
+    )
 }
 
 /// Generate the strict read-only diagnostic prompt for the AI assistant.
@@ -1600,10 +2223,71 @@ pub fn benchmark_model_for_config_with_context(
     )
 }
 
+/// Probe multiple models concurrently across up to `max_concurrency` workers.
+pub fn benchmark_models_concurrently(
+    config: &AiConfig,
+    model_ids: &[String],
+    max_concurrency: usize,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+    on_result: impl Fn(ModelSpeedResult) + Send + Sync,
+) -> Vec<ModelSpeedResult> {
+    use std::collections::VecDeque;
+
+    if model_ids.is_empty() {
+        return Vec::new();
+    }
+    if config.provider == AiCliProvider::RuumCloud {
+        prewarm_cloud_jwt_for_context(ctx);
+    }
+    let worker_count = max_concurrency.max(1).min(model_ids.len());
+    let queue = Mutex::new(VecDeque::from(model_ids.to_vec()));
+    let results = Mutex::new(Vec::with_capacity(model_ids.len()));
+    let adapter = AiBackendFactory::create(config.provider);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                loop {
+                    if ctx
+                        .cancel
+                        .as_ref()
+                        .is_some_and(ruum_adk::CancelToken::is_cancelled)
+                    {
+                        break;
+                    }
+                    let next = {
+                        let Ok(mut guard) = queue.lock() else {
+                            break;
+                        };
+                        guard.pop_front()
+                    };
+                    let Some(model_id) = next else {
+                        break;
+                    };
+                    let res = adapter.benchmark_model(
+                        config,
+                        Some(&model_id),
+                        runner,
+                        ctx,
+                    );
+                    on_result(res.clone());
+                    if let Ok(mut out) = results.lock() {
+                        out.push(res);
+                    }
+                }
+            });
+        }
+    });
+
+    results.into_inner().unwrap_or_default()
+}
+
 fn cli_benchmark_model(
     config: &AiConfig,
     model_override: Option<&str>,
     runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
 ) -> ModelSpeedResult {
     let mut cfg = config.clone();
     if let Some(override_id) = model_override {
@@ -1615,6 +2299,19 @@ fn cli_benchmark_model(
         .clone()
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| "(default)".to_string());
+
+    let cancel_flag = ctx.cancel.as_ref().map(ruum_adk::CancelToken::flag);
+    if cancel_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return ModelSpeedResult {
+            model: model_name,
+            elapsed_ms: 0,
+            ok: false,
+            detail: AI_CANCELLED_SENTINEL.to_owned(),
+        };
+    }
 
     let invocation =
         match build_invocation_for_config(&cfg, "Reply with only OK.") {
@@ -1635,7 +2332,12 @@ fn cli_benchmark_model(
         invocation.args.iter().map(String::as_str).collect();
 
     let start = Instant::now();
-    let run_res = runner.run(&invocation.program, &arg_refs, &envs);
+    let run_res = runner.run_cancellable(
+        &invocation.program,
+        &arg_refs,
+        &envs,
+        cancel_flag.as_deref(),
+    );
     let elapsed_ms =
         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -1667,12 +2369,23 @@ fn cli_benchmark_model(
                 detail,
             }
         }
-        Err(err) => ModelSpeedResult {
-            model: model_name,
-            elapsed_ms,
-            ok: false,
-            detail: err.to_string(),
-        },
+        Err(err) => {
+            let cancelled = cancel_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                || (err.kind() == io::ErrorKind::Interrupted
+                    && is_ai_cancelled_error(&err.to_string()));
+            ModelSpeedResult {
+                model: model_name,
+                elapsed_ms,
+                ok: false,
+                detail: if cancelled {
+                    AI_CANCELLED_SENTINEL.to_owned()
+                } else {
+                    err.to_string()
+                },
+            }
+        }
     }
 }
 
@@ -1825,29 +2538,48 @@ fn extract_proposal_from_output(raw: &str) -> Result<RawProposal, String> {
     }
 }
 
-/// Recursively sum bytes inside a directory up to a bounded depth and count.
-fn compute_dir_bytes(dir: &Path, depth: usize, visited: &mut usize) -> u64 {
+/// Recursively sum bytes, file count, and newest `mtime` inside a directory
+/// up to a bounded depth and entry count.
+fn compute_dir_stats(
+    dir: &Path,
+    depth: usize,
+    visited: &mut usize,
+) -> (u64, u64, i64) {
     if depth > 16 || *visited > 20_000 {
-        return 0;
+        return (0, 0, 0);
     }
-    let mut total = 0_u64;
+    let mut total_bytes = 0_u64;
+    let mut total_files = 0_u64;
+    let mut newest_mtime = 0_i64;
     let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
+        return (0, 0, 0);
     };
     for entry in entries.flatten() {
         *visited += 1;
         if let Ok(meta) = fs::symlink_metadata(entry.path()) {
-            total = total.saturating_add(meta.len());
-            if meta.is_dir() && !meta.is_symlink() {
-                total = total.saturating_add(compute_dir_bytes(
-                    &entry.path(),
-                    depth + 1,
-                    visited,
-                ));
+            let ftype = meta.file_type();
+            if let Some(ts) = system_time_to_unix_secs(meta.modified()) {
+                newest_mtime = newest_mtime.max(ts);
+            }
+            if ftype.is_file() {
+                total_files = total_files.saturating_add(1);
+            }
+            total_bytes = total_bytes.saturating_add(meta.len());
+            if ftype.is_dir() && !ftype.is_symlink() {
+                let (sub_bytes, sub_files, sub_mtime) =
+                    compute_dir_stats(&entry.path(), depth + 1, visited);
+                total_bytes = total_bytes.saturating_add(sub_bytes);
+                total_files = total_files.saturating_add(sub_files);
+                newest_mtime = newest_mtime.max(sub_mtime);
             }
         }
     }
-    total
+    (total_bytes, total_files, newest_mtime)
+}
+
+/// Recursively sum bytes inside a directory up to a bounded depth and count.
+fn compute_dir_bytes(dir: &Path, depth: usize, visited: &mut usize) -> u64 {
+    compute_dir_stats(dir, depth, visited).0
 }
 
 #[derive(serde::Deserialize)]
@@ -1911,6 +2643,8 @@ pub struct TreeCandidate {
     pub path: PathBuf,
     pub bytes: u64,
     pub is_dir: bool,
+    pub files: Option<u64>,
+    pub modified_secs: Option<i64>,
     pub category: &'static str,
     pub finding: String,
 }
@@ -2190,6 +2924,9 @@ fn collect_bounded_tree_nodes(
                         path: PathBuf::from(&child_path),
                         bytes: child.bytes,
                         is_dir: child.is_dir(),
+                        files: Some(child.files),
+                        modified_secs: (child.modified > 0)
+                            .then_some(child.modified),
                         category: child.category.label(),
                         finding: reclaim.label().to_owned(),
                     });
@@ -2206,6 +2943,9 @@ fn collect_bounded_tree_nodes(
                     path: PathBuf::from(&child_path),
                     bytes: child.bytes,
                     is_dir: child.is_dir(),
+                    files: Some(child.files),
+                    modified_secs: (child.modified > 0)
+                        .then_some(child.modified),
                     category: child.category.label(),
                     finding: kind_label.to_owned(),
                 });
@@ -2226,37 +2966,116 @@ pub fn collect_tree_candidates(
     tree: &Node,
     docker: &DockerProbeStatus,
 ) -> TreeCandidates {
-    let os = infer_os_from_root(root_path);
+    collect_tree_candidates_for_os(
+        root_path,
+        None,
+        tree,
+        docker,
+        infer_os_from_root(root_path),
+    )
+}
+
+/// Collect in-memory candidates and Docker usage for `target_os`.
+///
+/// Reads purely from the [`Node`] tree without touching the host filesystem,
+/// pre-filtering candidates through [`crate::removal::plan_remote_for_os`].
+#[must_use]
+pub fn collect_tree_candidates_for_os(
+    root_path: &Path,
+    home_path: Option<&Path>,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+    target_os: TrashOs,
+) -> TreeCandidates {
     let root_raw = root_path.to_string_lossy();
-    let root_norm = normalize_lexical_for_os(&root_raw, os)
+    let root_norm = normalize_lexical_for_os(&root_raw, target_os)
         .unwrap_or_else(|_| root_raw.into_owned());
+    let home_norm = home_path
+        .and_then(Path::to_str)
+        .and_then(|s| normalize_lexical_for_os(s, target_os).ok());
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let now_i64 = i64::try_from(now_secs).unwrap_or(0);
 
-    let mut items = Vec::new();
+    let mut raw_items = Vec::new();
     let mut seen = HashSet::new();
 
     for candidate in insights::worth_a_look(tree, now_i64, 25) {
-        let Some((path_str, node)) =
-            path_from_crumbs_for_os(&root_norm, tree, &candidate.crumbs, os)
-        else {
+        let Some((path_str, node)) = path_from_crumbs_for_os(
+            &root_norm,
+            tree,
+            &candidate.crumbs,
+            target_os,
+        ) else {
             continue;
         };
         if seen.insert(path_str.clone()) {
-            items.push(TreeCandidate {
+            raw_items.push(TreeCandidate {
                 path: PathBuf::from(path_str),
                 bytes: candidate.bytes,
                 is_dir: node.is_dir(),
+                files: Some(node.files),
+                modified_secs: (node.modified > 0).then_some(node.modified),
                 category: node.category.label(),
                 finding: format_finding_label(&candidate.finding),
             });
         }
     }
 
-    collect_bounded_tree_nodes(&root_norm, tree, os, &mut items, &mut seen);
+    collect_bounded_tree_nodes(
+        &root_norm,
+        tree,
+        target_os,
+        &mut raw_items,
+        &mut seen,
+    );
+
+    let targets: Vec<crate::removal::Target> = raw_items
+        .iter()
+        .map(|item| {
+            let hidden = item
+                .path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            crate::removal::Target {
+                path: item.path.clone(),
+                bytes: item.bytes,
+                is_dir: item.is_dir,
+                hidden,
+            }
+        })
+        .collect();
+    let synthetic_header = Header::new(
+        PathBuf::from(&root_norm),
+        home_norm.map(PathBuf::from),
+        platform_for_os(target_os),
+        Some(HostIdentity {
+            hostname: "ruum-tree".to_owned(),
+            machine_id: None,
+        }),
+    );
+    let safe_plan = crate::removal::plan_remote_for_os(
+        &targets,
+        &synthetic_header,
+        target_os,
+    );
+    let mut items: Vec<TreeCandidate> = raw_items
+        .into_iter()
+        .filter(|item| {
+            let item_s = item.path.to_string_lossy();
+            !safe_plan.blocked.iter().any(|blocked| {
+                let blk_s = blocked.path.to_string_lossy();
+                if target_os == TrashOs::Linux {
+                    item_s == blk_s
+                } else {
+                    item_s.eq_ignore_ascii_case(&blk_s)
+                }
+            })
+        })
+        .collect();
+
     items.sort_by_key(|item| std::cmp::Reverse(item.bytes));
     items.truncate(25);
 
@@ -2273,6 +3092,44 @@ pub fn collect_tree_candidates(
     }
 }
 
+fn format_tree_candidates_block(
+    candidates: &TreeCandidates,
+    now_secs: u64,
+) -> (String, String) {
+    let mapped: Vec<ReclaimCandidateSummary> = candidates
+        .items
+        .iter()
+        .map(|item| ReclaimCandidateSummary {
+            path: item.path.clone(),
+            bytes: item.bytes,
+            is_dir: item.is_dir,
+            files: item.files,
+            modified_secs: item.modified_secs,
+            accessed_secs: None,
+            category: item.category,
+            finding: item.finding.clone(),
+            git_summary: None,
+        })
+        .collect();
+    let cand_block = format_candidates_block(&mapped, now_secs);
+    let docker_budget = MAX_SNAPSHOT_BLOCK_BYTES
+        .saturating_sub(cand_block.len())
+        .max(2048);
+    let docker_block =
+        format_docker_snapshot_block(candidates.docker.as_ref(), docker_budget);
+    (cand_block, docker_block)
+}
+
+fn build_tree_analysis_prompt_parts(
+    ctx: &PromptContext<'_>,
+    tool_mode: PromptToolMode<'_>,
+    candidates: &TreeCandidates,
+) -> (String, String) {
+    let (cand_block, docker_block) =
+        format_tree_candidates_block(candidates, ctx.now_secs);
+    build_v2_prompt_parts(ctx, tool_mode, &cand_block, &docker_block)
+}
+
 /// Build an offline/in-memory diagnostic prompt from [`TreeCandidates`] for the
 /// target OS (no remote AI CLI or host filesystem probing required).
 #[must_use]
@@ -2281,104 +3138,23 @@ pub fn build_tree_analysis_prompt(
     target_os: TrashOs,
     candidates: &TreeCandidates,
 ) -> String {
-    use std::fmt::Write as _;
-
-    let os_label = match target_os {
-        TrashOs::MacOs => "macOS",
-        TrashOs::Linux => "Linux",
-        TrashOs::Windows => "Windows",
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ctx = PromptContext {
+        target_os,
+        target_root: root_path,
+        user_home: None,
+        volume_space: None,
+        locale: Locale::En,
+        now_secs,
     };
-
-    let mut cand_block = String::new();
-    if candidates.items.is_empty() {
-        cand_block.push_str(
-            "Pre-scanned file/directory candidates: none detected.\n",
-        );
-    } else {
-        cand_block.push_str(
-            "PRE-SCANNED FILE/DIRECTORY CANDIDATES (verified in memory snapshot):\n",
-        );
-        for (idx, item) in candidates.items.iter().enumerate() {
-            let kind = if item.is_dir { "dir" } else { "file" };
-            let _ = writeln!(
-                cand_block,
-                "{}. {} ({}, {}, {}, {})",
-                idx + 1,
-                item.path.display(),
-                human_bytes(item.bytes),
-                kind,
-                item.category,
-                item.finding,
-            );
-        }
-        cand_block.push('\n');
-    }
-
-    if let Some(summary) = &candidates.docker {
-        cand_block.push_str("DOCKER RECLAIMABLE SNAPSHOT:\n");
-        let _ = writeln!(
-            cand_block,
-            "- Build cache reclaimable: {}",
-            human_bytes(summary.build_cache_reclaimable_bytes)
-        );
-        for img in &summary.removable_images {
-            let label = if img.dangling {
-                "<none>:<none>".to_owned()
-            } else {
-                format!("{}:{}", img.repository, img.tag)
-            };
-            let _ = writeln!(
-                cand_block,
-                "- Unused image: id={}, ref={}, unique={}, dangling={}",
-                img.id,
-                label,
-                human_bytes(img.unique_bytes),
-                img.dangling
-            );
-        }
-        for ctr in &summary.stopped_containers {
-            let _ = writeln!(
-                cand_block,
-                "- Stopped container: id={}, name={}, image={}, state={}, size={}",
-                ctr.id,
-                ctr.name,
-                ctr.image,
-                ctr.state,
-                human_bytes(ctr.size_bytes)
-            );
-        }
-        cand_block.push('\n');
-    }
-
-    format!(
-        "You are an automated disk cleanup advisor for Ruum.\n\
-         Target OS: {os_label}\n\
-         Scanned root: {root}\n\n\
-         CRITICAL SAFETY CONSTRAINTS:\n\
-         - Analyze ONLY the pre-scanned in-memory candidates and Docker snapshot below.\n\
-         - Do NOT execute any shell commands or delete anything.\n\
-         - Never suggest system directories, home root, container backing storage, or Docker volumes.\n\
-         - For Docker cleanup, reference ONLY exact IDs from the Docker snapshot above.\n\n\
-         {cand_block}\
-         You MUST output ONLY a valid JSON object matching this schema:\n\
-         {{\n  \
-           \"summary\": \"Brief explanation of reclaimable space found\",\n  \
-           \"items\": [\n    \
-             {{\n      \
-               \"path\": \"/exact/path/from/candidates\",\n      \
-               \"mode\": \"trash\" or \"permanent\",\n      \
-               \"reason\": \"Why this item is safe to clean up\"\n    \
-             }}\n  \
-           ],\n  \
-           \"docker_targets\": [\n    \
-             {{\"kind\": \"build_cache\"}},\n    \
-             {{\"kind\": \"image\", \"id\": \"sha256:...\"}},\n    \
-             {{\"kind\": \"container\", \"id\": \"...\"}}\n  \
-           ]\n\
-         }}\n\
-         Do not include conversational filler outside the JSON.",
-        root = root_path.display(),
-    )
+    let (instruction, user_prompt) = build_tree_analysis_prompt_parts(
+        &ctx,
+        PromptToolMode::SnapshotOnly,
+        candidates,
+    );
+    format!("{instruction}\n\n{user_prompt}")
 }
 
 /// Validate an AI proposal purely in memory against a scanned [`Node`] tree,
@@ -2391,6 +3167,34 @@ pub fn validate_proposal_against_tree(
     tree: &Node,
     docker: &DockerProbeStatus,
     target_os: TrashOs,
+    now_secs: u64,
+) -> Result<CleanupProposal, String> {
+    validate_proposal_against_tree_with_locale(
+        raw_output,
+        root_path,
+        home_path,
+        tree,
+        docker,
+        target_os,
+        Locale::En,
+        now_secs,
+    )
+}
+
+/// Validate an AI proposal purely in memory with an explicit UI [`Locale`] for
+/// localized fallback summaries.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "in-memory validation needs explicit root, home, tree, docker, target OS, locale, and timestamp"
+)]
+pub fn validate_proposal_against_tree_with_locale(
+    raw_output: &str,
+    root_path: &Path,
+    home_path: Option<&Path>,
+    tree: &Node,
+    docker: &DockerProbeStatus,
+    target_os: TrashOs,
+    locale: Locale,
     now_secs: u64,
 ) -> Result<CleanupProposal, String> {
     let parsed = extract_proposal_from_output(raw_output)?;
@@ -2501,13 +3305,14 @@ pub fn validate_proposal_against_tree(
     Ok(CleanupProposal {
         timestamp_secs: now_secs,
         summary: parsed.summary.unwrap_or_else(|| {
-            format!(
-                "AI proposed {} items for cleanup",
-                proposal_items.len() + docker_targets.len()
+            ai_fallback_proposal_summary(
+                proposal_items.len() + docker_targets.len(),
+                locale,
             )
         }),
         items: proposal_items,
         docker_targets,
+        root_path: Some(PathBuf::from(&root_norm)),
     })
 }
 
@@ -2566,7 +3371,7 @@ pub fn run_tree_analysis_for_config_with_context(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "in-memory CLI tree analysis needs explicit root, home, tree, docker, and target OS"
+    reason = "in-memory CLI tree analysis needs explicit root, home, tree, docker, target OS, and execution context"
 )]
 fn cli_run_tree_analysis(
     config: &AiConfig,
@@ -2577,24 +3382,61 @@ fn cli_run_tree_analysis(
     target_os: TrashOs,
     now_secs: u64,
     runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
 ) -> Result<CleanupProposal, String> {
-    let candidates = collect_tree_candidates(root_path, tree, docker);
-    let prompt = build_tree_analysis_prompt(root_path, target_os, &candidates);
+    let cancel_flag = ctx.cancel.as_ref().map(ruum_adk::CancelToken::flag);
+    if cancel_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(AI_CANCELLED_SENTINEL.to_owned());
+    }
+    let locale = ctx.locale.unwrap_or_else(Locale::current);
+    let candidates = collect_tree_candidates_for_os(
+        root_path, home_path, tree, docker, target_os,
+    );
+    let prompt_ctx = PromptContext {
+        target_os,
+        target_root: root_path,
+        user_home: home_path.or(ctx.user_home.as_deref()),
+        volume_space: ctx.volume_space,
+        locale,
+        now_secs,
+    };
+    let (instruction, user_prompt) = build_tree_analysis_prompt_parts(
+        &prompt_ctx,
+        PromptToolMode::SnapshotOnly,
+        &candidates,
+    );
+    let prompt = format!("{instruction}\n\n{user_prompt}");
     let invocation = build_invocation_for_config(config, &prompt)?;
     let path_env = enriched_path_var();
     let envs = [("PATH", path_env.as_str())];
 
     let arg_refs: Vec<&str> =
         invocation.args.iter().map(String::as_str).collect();
-    let output =
-        runner
-            .run(&invocation.program, &arg_refs, &envs)
-            .map_err(|e| {
+    let output = runner
+        .run_cancellable(
+            &invocation.program,
+            &arg_refs,
+            &envs,
+            cancel_flag.as_deref(),
+        )
+        .map_err(|e| {
+            if cancel_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                || (e.kind() == io::ErrorKind::Interrupted
+                    && is_ai_cancelled_error(&e.to_string()))
+            {
+                AI_CANCELLED_SENTINEL.to_owned()
+            } else {
                 format!(
                     "failed to execute `{}`: {e}",
                     invocation.program.display()
                 )
-            })?;
+            }
+        })?;
 
     if !output.success() {
         let stderr = output.stderr.trim();
@@ -2614,8 +3456,8 @@ fn cli_run_tree_analysis(
     } else {
         &output.stdout
     };
-    validate_proposal_against_tree(
-        raw, root_path, home_path, tree, docker, target_os, now_secs,
+    validate_proposal_against_tree_with_locale(
+        raw, root_path, home_path, tree, docker, target_os, locale, now_secs,
     )
 }
 
@@ -2625,21 +3467,48 @@ pub fn parse_and_validate_proposal(
     home_dir: &Path,
     now_secs: u64,
 ) -> Result<CleanupProposal, String> {
-    parse_and_validate_proposal_with(
+    parse_and_validate_proposal_full(
         raw_output,
         home_dir,
+        None,
+        &DockerProbeStatus::NotInstalled,
+        Locale::En,
         now_secs,
         crate::removal::is_trash_target,
     )
 }
 
+#[cfg(test)]
 fn parse_and_validate_proposal_with(
     raw_output: &str,
     home_dir: &Path,
     now_secs: u64,
     is_trash: impl Fn(&Path) -> bool,
 ) -> Result<CleanupProposal, String> {
+    parse_and_validate_proposal_full(
+        raw_output,
+        home_dir,
+        None,
+        &DockerProbeStatus::NotInstalled,
+        Locale::En,
+        now_secs,
+        is_trash,
+    )
+}
+
+/// Parse and validate a local AI response against `target_root`, optional
+/// `user_home` removal guards, local [`DockerProbeStatus`], and UI [`Locale`].
+pub fn parse_and_validate_proposal_full(
+    raw_output: &str,
+    target_root: &Path,
+    user_home: Option<&Path>,
+    docker: &DockerProbeStatus,
+    locale: Locale,
+    now_secs: u64,
+    is_trash: impl Fn(&Path) -> bool,
+) -> Result<CleanupProposal, String> {
     let parsed = extract_proposal_from_output(raw_output)?;
+    let normalized_root = crate::removal::normalize(target_root);
 
     let mut candidate_targets = Vec::new();
     let mut item_meta = Vec::new();
@@ -2649,7 +3518,7 @@ fn parse_and_validate_proposal_with(
         let resolved = if raw_p.is_absolute() {
             raw_p
         } else {
-            home_dir.join(raw_p)
+            normalized_root.join(raw_p)
         };
         let normalized = crate::removal::normalize(&resolved);
 
@@ -2684,8 +3553,19 @@ fn parse_and_validate_proposal_with(
         item_meta.push((normalized, mode, item.reason));
     }
 
-    // Safety gate: judge targets against scanned home root
-    let safe_plan = crate::removal::plan(&candidate_targets, home_dir);
+    // Safety gate: judge targets against the analyzed root and user home.
+    let adapter = TrashAdapterFactory::create();
+    let mut env = TrashEnv::current();
+    if let Some(home) = user_home {
+        env.home = Some(home.to_path_buf());
+    }
+    let safe_plan = crate::removal::plan_with_trash_adapter(
+        &candidate_targets,
+        &normalized_root,
+        RemovalMode::Permanent,
+        adapter.as_ref(),
+        &env,
+    );
 
     let mut proposal_items = Vec::new();
     for target in safe_plan.targets {
@@ -2703,7 +3583,7 @@ fn parse_and_validate_proposal_with(
             if st.is_clean() {
                 None
             } else {
-                Some(format!("Git checkout not clean: {}", st.summary()))
+                Some(git_dirty_warning(&st.summary_in(locale), locale))
             }
         });
 
@@ -2716,13 +3596,32 @@ fn parse_and_validate_proposal_with(
         ));
     }
 
+    let raw_docker_targets: Vec<DockerCleanTarget> = parsed
+        .docker_targets
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<RawDockerTarget>(v).ok())
+        .map(DockerCleanTarget::from)
+        .collect();
+    let docker_targets = match docker {
+        DockerProbeStatus::Available(summary) => {
+            validate_targets_against_summary(&raw_docker_targets, summary)
+        }
+        DockerProbeStatus::NotInstalled
+        | DockerProbeStatus::DaemonStopped
+        | DockerProbeStatus::PermissionDenied { .. } => Vec::new(),
+    };
+
     Ok(CleanupProposal {
         timestamp_secs: now_secs,
         summary: parsed.summary.unwrap_or_else(|| {
-            format!("AI proposed {} items for cleanup", proposal_items.len())
+            ai_fallback_proposal_summary(
+                proposal_items.len() + docker_targets.len(),
+                locale,
+            )
         }),
         items: proposal_items,
-        docker_targets: Vec::new(),
+        docker_targets,
+        root_path: Some(normalized_root),
     })
 }
 
@@ -2776,13 +3675,49 @@ fn cli_run_analysis_with_tree(
     now_secs: u64,
     existing_tree: Option<&Node>,
     runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
 ) -> Result<CleanupProposal, String> {
-    let candidates =
-        collect_reclaimable_candidates(home_dir, existing_tree, now_secs);
-    let prompt = build_analysis_prompt_with_candidates(
+    let cancel_flag = ctx.cancel.as_ref().map(ruum_adk::CancelToken::flag);
+    if cancel_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(AI_CANCELLED_SENTINEL.to_owned());
+    }
+    let locale = ctx.locale.unwrap_or_else(Locale::current);
+    let user_home = ctx.user_home.as_deref();
+    let docker = ctx
+        .local_docker
+        .as_ref()
+        .unwrap_or(&DockerProbeStatus::NotInstalled);
+    let docker_summary = match docker {
+        DockerProbeStatus::Available(s) => Some(s),
+        DockerProbeStatus::NotInstalled
+        | DockerProbeStatus::DaemonStopped
+        | DockerProbeStatus::PermissionDenied { .. } => None,
+    };
+    let volume_space = ctx
+        .volume_space
+        .or_else(|| crate::space::space_info(home_dir).ok());
+    let candidates = collect_reclaimable_candidates_with_home(
         home_dir,
+        user_home,
+        existing_tree,
+        now_secs,
+    );
+    let prompt_ctx = PromptContext {
+        target_os: TrashAdapterFactory::current_os(),
+        target_root: home_dir,
+        user_home,
+        volume_space,
+        locale,
+        now_secs,
+    };
+    let prompt = build_cli_analysis_prompt_with_context(
+        &prompt_ctx,
         current_exe,
         &candidates,
+        docker_summary,
     );
     let invocation = build_invocation_for_config(config, &prompt)?;
     let path_env = enriched_path_var();
@@ -2790,15 +3725,28 @@ fn cli_run_analysis_with_tree(
 
     let arg_refs: Vec<&str> =
         invocation.args.iter().map(String::as_str).collect();
-    let output =
-        runner
-            .run(&invocation.program, &arg_refs, &envs)
-            .map_err(|e| {
+    let output = runner
+        .run_cancellable(
+            &invocation.program,
+            &arg_refs,
+            &envs,
+            cancel_flag.as_deref(),
+        )
+        .map_err(|e| {
+            if cancel_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                || (e.kind() == io::ErrorKind::Interrupted
+                    && is_ai_cancelled_error(&e.to_string()))
+            {
+                AI_CANCELLED_SENTINEL.to_owned()
+            } else {
                 format!(
                     "failed to execute `{}`: {e}",
                     invocation.program.display()
                 )
-            })?;
+            }
+        })?;
 
     if !output.success() {
         let stderr = output.stderr.trim();
@@ -2818,7 +3766,15 @@ fn cli_run_analysis_with_tree(
     } else {
         &output.stdout
     };
-    parse_and_validate_proposal(raw, home_dir, now_secs)
+    parse_and_validate_proposal_full(
+        raw,
+        home_dir,
+        user_home,
+        docker,
+        locale,
+        now_secs,
+        crate::removal::is_trash_target,
+    )
 }
 
 /// Run an AI diagnostic analysis directly from an [`AiConfig`].
@@ -2866,12 +3822,34 @@ pub fn run_analysis(
     now_secs: u64,
     runner: &dyn CommandRunner,
 ) -> Result<CleanupProposal, String> {
-    run_analysis_for_config(
-        &ai_config_from_legacy(config),
+    run_analysis_with_context(
+        config,
         home_dir,
         current_exe,
         now_secs,
         runner,
+        &AiExecutionContext::default(),
+    )
+}
+
+/// Run an AI diagnostic analysis from a legacy [`WatchdogConfig`] with an
+/// explicit [`AiExecutionContext`].
+pub fn run_analysis_with_context(
+    config: &WatchdogConfig,
+    home_dir: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    runner: &dyn CommandRunner,
+    ctx: &AiExecutionContext,
+) -> Result<CleanupProposal, String> {
+    run_analysis_with_tree_for_config_with_context(
+        &ai_config_from_legacy(config),
+        home_dir,
+        current_exe,
+        now_secs,
+        None,
+        runner,
+        ctx,
     )
 }
 
@@ -2883,7 +3861,7 @@ pub enum AiBackendKind {
     RuumCloud,
 }
 
-/// Execution-time credential and HTTP overrides for AI operations.
+/// Execution-time credential, locale, root, and HTTP overrides for AI operations.
 #[derive(Clone, Default)]
 pub struct AiExecutionContext {
     pub api_key: Option<Zeroizing<String>>,
@@ -2891,6 +3869,15 @@ pub struct AiExecutionContext {
     pub allow_insecure_http: bool,
     pub db_path: Option<PathBuf>,
     pub cloud_base_url: Option<String>,
+    pub locale: Option<Locale>,
+    pub user_home: Option<PathBuf>,
+    pub volume_space: Option<SpaceInfo>,
+    pub local_docker: Option<DockerProbeStatus>,
+    pub event_key: Option<String>,
+    pub cancel: Option<ruum_adk::CancelToken>,
+    pub stage_slot: Option<Arc<AtomicU8>>,
+    pub on_stage: Option<Arc<dyn Fn(AiProgressStage) + Send + Sync>>,
+    pub skip_analysis: bool,
 }
 
 impl AiExecutionContext {
@@ -2934,6 +3921,87 @@ impl AiExecutionContext {
         self.cloud_base_url = (!trimmed.is_empty()).then(|| trimmed.to_owned());
         self
     }
+
+    /// Override the UI/output [`Locale`] used for AI summaries, reasons, and warnings.
+    #[must_use]
+    pub const fn with_locale(mut self, locale: Locale) -> Self {
+        self.locale = Some(locale);
+        self
+    }
+
+    /// Provide the real user home directory when analyzing non-home roots.
+    #[must_use]
+    pub fn with_user_home(mut self, home: impl Into<PathBuf>) -> Self {
+        let p = home.into();
+        if !p.as_os_str().is_empty() {
+            self.user_home = Some(p);
+        }
+        self
+    }
+
+    /// Provide pre-measured [`SpaceInfo`] for the analyzed volume.
+    #[must_use]
+    pub const fn with_volume_space(mut self, space: SpaceInfo) -> Self {
+        self.volume_space = Some(space);
+        self
+    }
+
+    /// Provide a read-only local [`DockerProbeStatus`] snapshot for local analysis.
+    #[must_use]
+    pub fn with_local_docker(mut self, docker: DockerProbeStatus) -> Self {
+        self.local_docker = Some(docker);
+        self
+    }
+
+    /// Attach a canonical Option B event key (`X-Ruum-Event-Key`) for Cloud runs.
+    #[must_use]
+    pub fn with_event_key(mut self, key: impl Into<String>) -> Self {
+        let raw = key.into();
+        let trimmed = raw.trim();
+        self.event_key = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        self
+    }
+
+    /// Attach a cooperative [`ruum_adk::CancelToken`] aborting in-flight AI work.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: ruum_adk::CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Attach an atomic slot tracking live [`AiProgressStage`] transitions.
+    #[must_use]
+    pub fn with_stage_slot(mut self, slot: Arc<AtomicU8>) -> Self {
+        self.stage_slot = Some(slot);
+        self
+    }
+
+    /// Attach a synchronous stage callback invoked on [`AiProgressStage`] updates.
+    #[must_use]
+    pub fn with_on_stage(
+        mut self,
+        on_stage: Arc<dyn Fn(AiProgressStage) + Send + Sync>,
+    ) -> Self {
+        self.on_stage = Some(on_stage);
+        self
+    }
+
+    /// Record and broadcast an [`AiProgressStage`] transition to any attached sink.
+    pub fn report_stage(&self, stage: AiProgressStage) {
+        if let Some(ref slot) = self.stage_slot {
+            slot.store(stage.as_raw(), Ordering::Release);
+        }
+        if let Some(ref cb) = self.on_stage {
+            cb(stage);
+        }
+    }
+
+    /// Skip the AI analysis step while still running Watchdog space/webhook checks.
+    #[must_use]
+    pub const fn with_skip_analysis(mut self, skip: bool) -> Self {
+        self.skip_analysis = skip;
+        self
+    }
 }
 
 impl fmt::Debug for AiExecutionContext {
@@ -2944,6 +4012,15 @@ impl fmt::Debug for AiExecutionContext {
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("db_path", &self.db_path)
             .field("cloud_base_url", &self.cloud_base_url)
+            .field("locale", &self.locale)
+            .field("user_home", &self.user_home)
+            .field("volume_space", &self.volume_space)
+            .field("has_local_docker", &self.local_docker.is_some())
+            .field("event_key", &self.event_key)
+            .field("has_cancel", &self.cancel.is_some())
+            .field("has_stage_slot", &self.stage_slot.is_some())
+            .field("has_on_stage", &self.on_stage.is_some())
+            .field("skip_analysis", &self.skip_analysis)
             .finish()
     }
 }
@@ -3039,9 +4116,9 @@ impl AiExecutionAdapter for CliAiAdapter {
         config: &AiConfig,
         model_override: Option<&str>,
         runner: &dyn CommandRunner,
-        _ctx: &AiExecutionContext,
+        ctx: &AiExecutionContext,
     ) -> ModelSpeedResult {
-        cli_benchmark_model(config, model_override, runner)
+        cli_benchmark_model(config, model_override, runner, ctx)
     }
 
     fn run_analysis_with_tree(
@@ -3052,7 +4129,7 @@ impl AiExecutionAdapter for CliAiAdapter {
         now_secs: u64,
         existing_tree: Option<&Node>,
         runner: &dyn CommandRunner,
-        _ctx: &AiExecutionContext,
+        ctx: &AiExecutionContext,
     ) -> Result<CleanupProposal, String> {
         cli_run_analysis_with_tree(
             config,
@@ -3061,6 +4138,7 @@ impl AiExecutionAdapter for CliAiAdapter {
             now_secs,
             existing_tree,
             runner,
+            ctx,
         )
     }
 
@@ -3074,11 +4152,11 @@ impl AiExecutionAdapter for CliAiAdapter {
         target_os: TrashOs,
         now_secs: u64,
         runner: &dyn CommandRunner,
-        _ctx: &AiExecutionContext,
+        ctx: &AiExecutionContext,
     ) -> Result<CleanupProposal, String> {
         cli_run_tree_analysis(
             config, root_path, home_path, tree, docker, target_os, now_secs,
-            runner,
+            runner, ctx,
         )
     }
 }
@@ -3093,12 +4171,16 @@ pub struct DirectApiAiAdapter;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuumCloudAiAdapter;
 
-fn format_cloud_api_err(err: &CloudApiError) -> String {
-    err.format_localized(Locale::current())
+fn format_cloud_api_err(err: &CloudApiError, locale: Locale) -> String {
+    err.format_localized(locale)
 }
 
-fn format_cloud_adk_err(err: &ruum_adk::AdkClientError) -> String {
+fn format_cloud_adk_err(
+    err: &ruum_adk::AdkClientError,
+    locale: Locale,
+) -> String {
     match err {
+        ruum_adk::AdkClientError::Cancelled => AI_CANCELLED_SENTINEL.to_owned(),
         ruum_adk::AdkClientError::CloudGateway {
             status,
             code,
@@ -3111,7 +4193,7 @@ fn format_cloud_adk_err(err: &ruum_adk::AdkClientError) -> String {
             message,
             trace_id.as_deref(),
             *is_timeout,
-            Locale::current(),
+            locale,
         ),
         other => other.to_string(),
     }
@@ -3120,6 +4202,7 @@ fn format_cloud_adk_err(err: &ruum_adk::AdkClientError) -> String {
 fn build_cloud_client_from_context(
     ctx: &AiExecutionContext,
 ) -> Result<CloudClient, String> {
+    let locale = ctx.locale.unwrap_or_else(Locale::current);
     let db = match ctx.db_path {
         Some(ref path) => Arc::new(
             StorageDb::open(path)
@@ -3145,7 +4228,7 @@ fn build_cloud_client_from_context(
     if let Some(ref base_url) = ctx.cloud_base_url {
         client = client
             .with_base_url(base_url)
-            .map_err(|e| format_cloud_api_err(&e))?;
+            .map_err(|e| format_cloud_api_err(&e, locale))?;
     }
     Ok(client)
 }
@@ -3168,14 +4251,29 @@ fn resolve_cloud_preferred_model<'a>(
         .or_else(|| cached_selected.map(str::trim).filter(|s| !s.is_empty()))
 }
 
+#[cfg(test)]
 fn prepare_cloud_inference_model(
     client: &CloudClient,
     config: &AiConfig,
     model_override: Option<&str>,
 ) -> Result<(String, String), String> {
+    prepare_cloud_inference_model_in(
+        client,
+        config,
+        model_override,
+        Locale::current(),
+    )
+}
+
+fn prepare_cloud_inference_model_in(
+    client: &CloudClient,
+    config: &AiConfig,
+    model_override: Option<&str>,
+    locale: Locale,
+) -> Result<(String, String), String> {
     let ent = client
         .fetch_entitlement(false)
-        .map_err(|e| format_cloud_api_err(&e))?;
+        .map_err(|e| format_cloud_api_err(&e, locale))?;
     if ent.decision.eq_ignore_ascii_case("DENY")
         || (!ent.is_paid && ent.trial_remaining == 0)
     {
@@ -3185,12 +4283,12 @@ fn prepare_cloud_inference_model(
             "Free trial exhausted or plan expired",
             None,
         )
-        .format_localized(Locale::current()));
+        .format_localized(locale));
     }
 
     let models = client
         .fetch_virtual_models()
-        .map_err(|e| format_cloud_api_err(&e))?;
+        .map_err(|e| format_cloud_api_err(&e, locale))?;
     if !models.iter().any(|m| m.available) {
         return Err(CloudApiError::new(
             Some(403),
@@ -3198,7 +4296,7 @@ fn prepare_cloud_inference_model(
             "No Ruum Cloud models are currently available for this account",
             None,
         )
-        .format_localized(Locale::current()));
+        .format_localized(locale));
     }
     let cached_selected = client.cached_selected_model_id();
     let preferred = resolve_cloud_preferred_model(
@@ -3215,7 +4313,7 @@ fn prepare_cloud_inference_model(
     };
     let base_url = client
         .resolved_base_url()
-        .map_err(|e| format_cloud_api_err(&e))?;
+        .map_err(|e| format_cloud_api_err(&e, locale))?;
     Ok((base_url, chosen_id))
 }
 
@@ -3352,13 +4450,14 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> Result<String, String> {
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
         let client = build_cloud_client_from_context(ctx)?;
         let ent = client
             .fetch_entitlement(false)
-            .map_err(|e| format_cloud_api_err(&e))?;
+            .map_err(|e| format_cloud_api_err(&e, locale))?;
         let models = client
             .fetch_virtual_models()
-            .map_err(|e| format_cloud_api_err(&e))?;
+            .map_err(|e| format_cloud_api_err(&e, locale))?;
         let avail = models.iter().filter(|m| m.available).count();
         let status_label = if ent.is_paid {
             "paid plan active".to_owned()
@@ -3377,10 +4476,11 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> Result<(Vec<DiscoveredModel>, Option<String>), String> {
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
         let client = build_cloud_client_from_context(ctx)?;
         let models = client
             .fetch_virtual_models()
-            .map_err(|e| format_cloud_api_err(&e))?;
+            .map_err(|e| format_cloud_api_err(&e, locale))?;
         let any_available = models.iter().any(|m| m.available);
         let mapped = models
             .into_iter()
@@ -3423,12 +4523,25 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> ModelSpeedResult {
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
         let requested_model = model_override
             .or(config.model.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("(auto)")
             .to_owned();
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(ruum_adk::CancelToken::is_cancelled)
+        {
+            return ModelSpeedResult {
+                model: requested_model,
+                elapsed_ms: 0,
+                ok: false,
+                detail: AI_CANCELLED_SENTINEL.to_owned(),
+            };
+        }
         let client = match build_cloud_client_from_context(ctx) {
             Ok(c) => Arc::new(c),
             Err(err) => {
@@ -3440,63 +4553,48 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
                 };
             }
         };
-        let ent = match client.fetch_entitlement(false) {
-            Ok(e) => e,
-            Err(err) => {
-                return ModelSpeedResult {
-                    model: requested_model,
-                    elapsed_ms: 0,
-                    ok: false,
-                    detail: format_cloud_api_err(&err),
-                };
-            }
-        };
-        if !ent.is_paid {
-            return ModelSpeedResult {
-                model: requested_model,
-                elapsed_ms: 0,
-                ok: false,
-                detail: "Model speed test is disabled during free trial to \
-                         preserve trial quota."
-                    .to_owned(),
-            };
-        }
 
-        let models = match client.fetch_virtual_models() {
-            Ok(m) => m,
-            Err(err) => {
-                return ModelSpeedResult {
-                    model: requested_model,
-                    elapsed_ms: 0,
-                    ok: false,
-                    detail: format_cloud_api_err(&err),
-                };
-            }
-        };
         let cached_selected = client.cached_selected_model_id();
         let preferred = resolve_cloud_preferred_model(
             model_override,
             config,
             cached_selected.as_deref(),
-        );
-        let Some(chosen) = select_best_available_model(&models, preferred)
-        else {
-            return ModelSpeedResult {
-                model: requested_model,
-                elapsed_ms: 0,
-                ok: false,
-                detail: "No available Ruum Cloud models for benchmark."
-                    .to_owned(),
+        )
+        .filter(|id| *id != CLOUD_AUTO_MODEL_ID);
+        let chosen_id = if let Some(explicit) = preferred {
+            explicit.to_owned()
+        } else {
+            let models = match client.fetch_virtual_models() {
+                Ok(m) => m,
+                Err(err) => {
+                    return ModelSpeedResult {
+                        model: requested_model,
+                        elapsed_ms: 0,
+                        ok: false,
+                        detail: format_cloud_api_err(&err, locale),
+                    };
+                }
             };
+            let Some(chosen) = select_best_available_model(&models, None)
+            else {
+                return ModelSpeedResult {
+                    model: requested_model,
+                    elapsed_ms: 0,
+                    ok: false,
+                    detail: "No available Ruum Cloud models for benchmark."
+                        .to_owned(),
+                };
+            };
+            chosen.id.clone()
         };
         let base_url = match client.resolved_base_url() {
             Ok(u) => u,
             Err(err) => {
                 return ModelSpeedResult {
-                    model: chosen.id.clone(),
+                    model: chosen_id,
                     elapsed_ms: 0,
                     ok: false,
-                    detail: format_cloud_api_err(&err),
+                    detail: format_cloud_api_err(&err, locale),
                 };
             }
         };
@@ -3504,7 +4602,7 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
             Ok(c) => c,
             Err(err) => {
                 return ModelSpeedResult {
-                    model: chosen.id.clone(),
+                    model: chosen_id,
                     elapsed_ms: 0,
                     ok: false,
                     detail: err.to_string(),
@@ -3512,44 +4610,96 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
             }
         };
         let token_provider: Arc<dyn ruum_adk::CloudTokenProvider> =
-            Arc::new(CoreCloudTokenProvider { client });
-        let cloud_cfg = ruum_adk::RuumCloudConfig::new(
+            Arc::new(CoreCloudTokenProvider {
+                client: Arc::clone(&client),
+            });
+        let mut cloud_cfg = ruum_adk::RuumCloudConfig::new(
             base_url,
-            chosen.id.clone(),
+            chosen_id.clone(),
             ruum_adk::RuumTask::LocalAnalysis,
             token_provider,
         )
         .with_client_version(env!("CARGO_PKG_VERSION"));
-        let mut req = ruum_adk::AdkAgentRequest::new(
-            "Reply concisely.",
-            "Reply with only OK.",
-        );
-        req.max_iterations = 1;
-        req.fallback_without_tools_on_unsupported = false;
+        if let Some(ref cancel) = ctx.cancel {
+            cloud_cfg = cloud_cfg.with_cancel(cancel.clone());
+        }
 
         let start = Instant::now();
-        let res = adk.run_cloud_agent(&cloud_cfg, req);
+        let probe_res = adk.probe_cloud_model(&cloud_cfg);
         let elapsed_ms =
             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match res {
-            Ok(resp) => {
-                let reply = first_line_snippet(&resp.text, 60);
-                ModelSpeedResult {
-                    model: resp.model,
-                    elapsed_ms,
-                    ok: true,
-                    detail: if reply.is_empty() {
-                        "OK".to_owned()
-                    } else {
-                        reply
+        match probe_res {
+            Ok(probe) => ModelSpeedResult {
+                model: probe.model,
+                elapsed_ms: probe.ttft_ms,
+                ok: true,
+                detail: probe.detail,
+            },
+            Err(ruum_adk::AdkClientError::Cancelled) => ModelSpeedResult {
+                model: chosen_id,
+                elapsed_ms: 0,
+                ok: false,
+                detail: AI_CANCELLED_SENTINEL.to_owned(),
+            },
+            Err(ruum_adk::AdkClientError::CloudGateway {
+                status: Some(404),
+                ..
+            }) => {
+                // Only paid plans may fall back to `/v1/chat/completions` when an
+                // older gateway lacks `/v1/models/probe`; trial quota must stay intact.
+                let is_paid = client
+                    .fetch_entitlement(false)
+                    .is_ok_and(|ent| ent.is_paid);
+                if !is_paid {
+                    return ModelSpeedResult {
+                        model: chosen_id,
+                        elapsed_ms,
+                        ok: false,
+                        detail: "Model speed test requires gateway probe \
+                                 support during free trial."
+                            .to_owned(),
+                    };
+                }
+                let mut req = ruum_adk::AdkAgentRequest::new(
+                    "Reply concisely.",
+                    "Reply with only OK.",
+                );
+                req.max_iterations = 1;
+                req.fallback_without_tools_on_unsupported = false;
+                if let Some(ref cancel) = ctx.cancel {
+                    req.cancel = Some(cancel.clone());
+                }
+                let fb_start = Instant::now();
+                let res = adk.run_cloud_agent(&cloud_cfg, req);
+                let fb_ms = u64::try_from(fb_start.elapsed().as_millis())
+                    .unwrap_or(u64::MAX);
+                match res {
+                    Ok(resp) => {
+                        let reply = first_line_snippet(&resp.text, 60);
+                        ModelSpeedResult {
+                            model: resp.model,
+                            elapsed_ms: fb_ms,
+                            ok: true,
+                            detail: if reply.is_empty() {
+                                "OK".to_owned()
+                            } else {
+                                reply
+                            },
+                        }
+                    }
+                    Err(err) => ModelSpeedResult {
+                        model: chosen_id,
+                        elapsed_ms: fb_ms,
+                        ok: false,
+                        detail: format_cloud_adk_err(&err, locale),
                     },
                 }
             }
             Err(err) => ModelSpeedResult {
-                model: chosen.id.clone(),
+                model: chosen_id,
                 elapsed_ms,
                 ok: false,
-                detail: format_cloud_adk_err(&err),
+                detail: format_cloud_adk_err(&err, locale),
             },
         }
     }
@@ -3564,46 +4714,136 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> Result<CleanupProposal, String> {
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(ruum_adk::CancelToken::is_cancelled)
+        {
+            return Err(AI_CANCELLED_SENTINEL.to_owned());
+        }
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
+        let user_home = ctx.user_home.as_deref();
+        let docker = ctx
+            .local_docker
+            .as_ref()
+            .unwrap_or(&DockerProbeStatus::NotInstalled);
+        let docker_summary = match docker {
+            DockerProbeStatus::Available(s) => Some(s),
+            DockerProbeStatus::NotInstalled
+            | DockerProbeStatus::DaemonStopped
+            | DockerProbeStatus::PermissionDenied { .. } => None,
+        };
+        let volume_space = ctx
+            .volume_space
+            .or_else(|| crate::space::space_info(home_dir).ok());
+
         let client = Arc::new(build_cloud_client_from_context(ctx)?);
         let (base_url, model_id) =
-            prepare_cloud_inference_model(&client, config, None)?;
+            prepare_cloud_inference_model_in(&client, config, None, locale)?;
         let adk = ruum_adk::BlockingAdkClient::new()
-            .map_err(|err| format_cloud_adk_err(&err))?;
+            .map_err(|err| format_cloud_adk_err(&err, locale))?;
 
-        let candidates =
-            collect_reclaimable_candidates(home_dir, existing_tree, now_secs);
-        let (instruction, prompt) =
-            build_direct_api_analysis_prompt(home_dir, &candidates);
-
-        let mut mcp = McpServer::default().with_read_only(true);
+        let mut candidates = collect_reclaimable_candidates_with_home(
+            home_dir,
+            user_home,
+            existing_tree,
+            now_secs,
+        );
         if let Some(tree) = existing_tree {
-            mcp.seed_local_tree_cache(
+            supplement_local_tree_candidates(
                 home_dir,
-                tree.clone(),
-                Some(home_dir.to_path_buf()),
+                user_home,
+                tree,
+                &mut candidates,
+                24,
+                now_secs,
             );
         }
-        let shared_mcp = Arc::new(Mutex::new(mcp));
+        let prompt_ctx = PromptContext {
+            target_os: TrashAdapterFactory::current_os(),
+            target_root: home_dir,
+            user_home,
+            volume_space,
+            locale,
+            now_secs,
+        };
+        let has_tree_snapshot = existing_tree.is_some();
+        let (instruction, prompt) = if has_tree_snapshot {
+            let cand_block = format_candidates_block(&candidates, now_secs);
+            let docker_budget = MAX_SNAPSHOT_BLOCK_BYTES
+                .saturating_sub(cand_block.len())
+                .max(2048);
+            let docker_block =
+                format_docker_snapshot_block(docker_summary, docker_budget);
+            build_v2_prompt_parts(
+                &prompt_ctx,
+                PromptToolMode::SnapshotOnly,
+                &cand_block,
+                &docker_block,
+            )
+        } else {
+            build_direct_api_analysis_prompt_with_context(
+                &prompt_ctx,
+                &candidates,
+                docker_summary,
+            )
+        };
+        // Inline v2 instruction into the initial user turn because ruum-server's
+        // `buildServerGuardedMessages` filters out client `role === "system"`.
+        let merged_prompt = if instruction.trim().is_empty() {
+            prompt
+        } else {
+            format!("{instruction}\n\n{prompt}")
+        };
 
-        let mut req = ruum_adk::AdkAgentRequest::new(instruction, prompt);
-        req.tools = build_local_mcp_adk_tools(&shared_mcp);
-        req.max_iterations = ruum_adk::MAX_CLOUD_ITERATIONS;
+        let mut req = ruum_adk::AdkAgentRequest::new("", merged_prompt);
+        if has_tree_snapshot {
+            req.tools = Vec::new();
+            req.max_iterations = 1;
+        } else {
+            let mcp = McpServer::default().with_read_only(true);
+            let shared_mcp = Arc::new(Mutex::new(mcp));
+            req.tools = build_local_mcp_adk_tools(&shared_mcp);
+            req.max_iterations = ruum_adk::MAX_CLOUD_ITERATIONS;
+        }
         req.fallback_without_tools_on_unsupported = false;
+        req.cancel.clone_from(&ctx.cancel);
 
+        let task = if has_tree_snapshot {
+            ruum_adk::RuumTask::TreeAnalysis
+        } else {
+            ruum_adk::RuumTask::LocalAnalysis
+        };
         let token_provider: Arc<dyn ruum_adk::CloudTokenProvider> =
             Arc::new(CoreCloudTokenProvider { client });
-        let cloud_cfg = ruum_adk::RuumCloudConfig::new(
+        let mut cloud_cfg = ruum_adk::RuumCloudConfig::new(
             base_url,
             model_id,
-            ruum_adk::RuumTask::LocalAnalysis,
+            task,
             token_provider,
         )
-        .with_client_version(env!("CARGO_PKG_VERSION"));
+        .with_client_version(env!("CARGO_PKG_VERSION"))
+        .with_on_stage(cloud_stage_callback(ctx));
+        if let Some(ref key) = ctx.event_key {
+            cloud_cfg = cloud_cfg.with_event_key(key);
+        }
+        if let Some(ref cancel) = ctx.cancel {
+            cloud_cfg = cloud_cfg.with_cancel(cancel.clone());
+        }
 
+        ctx.report_stage(AiProgressStage::Connecting);
         let resp = adk
             .run_cloud_agent(&cloud_cfg, req)
-            .map_err(|err| format_cloud_adk_err(&err))?;
-        parse_and_validate_proposal(&resp.text, home_dir, now_secs)
+            .map_err(|err| format_cloud_adk_err(&err, locale))?;
+        parse_and_validate_proposal_full(
+            &resp.text,
+            home_dir,
+            user_home,
+            docker,
+            locale,
+            now_secs,
+            crate::removal::is_trash_target,
+        )
     }
 
     fn run_tree_analysis(
@@ -3618,44 +4858,213 @@ impl AiExecutionAdapter for RuumCloudAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> Result<CleanupProposal, String> {
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(ruum_adk::CancelToken::is_cancelled)
+        {
+            return Err(AI_CANCELLED_SENTINEL.to_owned());
+        }
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
         let client = Arc::new(build_cloud_client_from_context(ctx)?);
         let (base_url, model_id) =
-            prepare_cloud_inference_model(&client, config, None)?;
+            prepare_cloud_inference_model_in(&client, config, None, locale)?;
         let adk = ruum_adk::BlockingAdkClient::new()
-            .map_err(|err| format_cloud_adk_err(&err))?;
+            .map_err(|err| format_cloud_adk_err(&err, locale))?;
 
-        let candidates = collect_tree_candidates(root_path, tree, docker);
-        let prompt =
-            build_tree_analysis_prompt(root_path, target_os, &candidates);
+        let candidates = collect_tree_candidates_for_os(
+            root_path, home_path, tree, docker, target_os,
+        );
+        let prompt_ctx = PromptContext {
+            target_os,
+            target_root: root_path,
+            user_home: home_path.or(ctx.user_home.as_deref()),
+            volume_space: ctx.volume_space,
+            locale,
+            now_secs,
+        };
+        let (instruction, prompt) = build_tree_analysis_prompt_parts(
+            &prompt_ctx,
+            PromptToolMode::SnapshotOnly,
+            &candidates,
+        );
+        // Inline v2 instruction into the initial user turn because ruum-server's
+        // `buildServerGuardedMessages` filters out client `role === "system"`.
+        let merged_prompt = if instruction.trim().is_empty() {
+            prompt
+        } else {
+            format!("{instruction}\n\n{prompt}")
+        };
 
         // Remote / in-memory analysis runs single-turn inference with zero
         // local disk or SSH tools mounted.
-        let mut req = ruum_adk::AdkAgentRequest::new(
-            "You are an automated disk cleanup advisor for Ruum. Analyze \
-             only the provided in-memory snapshot and output strictly valid \
-             JSON.",
-            prompt,
-        );
+        let mut req = ruum_adk::AdkAgentRequest::new("", merged_prompt);
         req.max_iterations = 1;
         req.fallback_without_tools_on_unsupported = false;
+        req.cancel.clone_from(&ctx.cancel);
 
         let token_provider: Arc<dyn ruum_adk::CloudTokenProvider> =
             Arc::new(CoreCloudTokenProvider { client });
-        let cloud_cfg = ruum_adk::RuumCloudConfig::new(
+        let mut cloud_cfg = ruum_adk::RuumCloudConfig::new(
             base_url,
             model_id,
             ruum_adk::RuumTask::TreeAnalysis,
             token_provider,
         )
-        .with_client_version(env!("CARGO_PKG_VERSION"));
+        .with_client_version(env!("CARGO_PKG_VERSION"))
+        .with_on_stage(cloud_stage_callback(ctx));
+        if let Some(ref key) = ctx.event_key {
+            cloud_cfg = cloud_cfg.with_event_key(key);
+        }
+        if let Some(ref cancel) = ctx.cancel {
+            cloud_cfg = cloud_cfg.with_cancel(cancel.clone());
+        }
 
+        ctx.report_stage(AiProgressStage::Connecting);
         let resp = adk
             .run_cloud_agent(&cloud_cfg, req)
-            .map_err(|err| format_cloud_adk_err(&err))?;
-        validate_proposal_against_tree(
-            &resp.text, root_path, home_path, tree, docker, target_os, now_secs,
+            .map_err(|err| format_cloud_adk_err(&err, locale))?;
+        validate_proposal_against_tree_with_locale(
+            &resp.text, root_path, home_path, tree, docker, target_os, locale,
+            now_secs,
         )
     }
+}
+
+fn supplement_local_tree_candidates(
+    target_root: &Path,
+    user_home: Option<&Path>,
+    tree: &Node,
+    out: &mut Vec<ReclaimCandidateSummary>,
+    max_total: usize,
+    now_secs: u64,
+) {
+    if out.len() >= 8 || out.len() >= max_total {
+        return;
+    }
+    let mut existing_paths: HashSet<PathBuf> = out
+        .iter()
+        .map(|c| crate::removal::normalize(&c.path))
+        .collect();
+    let mut targets = Vec::new();
+    let mut metas: Vec<LocalCandidateMeta> = Vec::new();
+    let mut stack: Vec<(PathBuf, &Node, usize)> =
+        vec![(target_root.to_path_buf(), tree, 0)];
+    let mut visited = 0_usize;
+
+    while let Some((dir_path, node, depth)) = stack.pop() {
+        if visited >= 4_000 || depth > 4 || metas.len() >= 48 {
+            continue;
+        }
+        for child in &node.children {
+            visited += 1;
+            if child.kind == NodeKind::Symlink
+                || child.kind == NodeKind::Other
+                || child.category == Category::Container
+                || child.bytes == 0
+            {
+                continue;
+            }
+            let raw_path = dir_path.join(child.name.as_ref());
+            let norm = crate::removal::normalize(&raw_path);
+            if !existing_paths.contains(&norm) {
+                existing_paths.insert(norm.clone());
+                let hidden = child.name.starts_with('.');
+                let kind_label = if child.is_dir() {
+                    "Directory in scanned tree"
+                } else {
+                    "File in scanned tree"
+                };
+                targets.push(crate::removal::Target {
+                    path: norm.clone(),
+                    bytes: child.bytes,
+                    is_dir: child.is_dir(),
+                    hidden,
+                });
+                metas.push(LocalCandidateMeta {
+                    path: norm,
+                    is_dir: child.is_dir(),
+                    files: child.files,
+                    modified_secs: (child.modified > 0)
+                        .then_some(child.modified),
+                    category: child.category.label(),
+                    finding: child.reclaim.map_or_else(
+                        || kind_label.to_owned(),
+                        |r| r.label().to_owned(),
+                    ),
+                });
+            }
+            if child.is_dir() && depth < 4 {
+                stack.push((raw_path, child, depth + 1));
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    let adapter = TrashAdapterFactory::create();
+    let mut env = TrashEnv::current();
+    if let Some(home) = user_home {
+        env.home = Some(home.to_path_buf());
+    }
+    let safe = crate::removal::plan_with_trash_adapter(
+        &targets,
+        target_root,
+        RemovalMode::Permanent,
+        adapter.as_ref(),
+        &env,
+    );
+    for target in safe.targets {
+        if let Some(meta) = metas.iter().find(|m| m.path == target.path) {
+            let (mtime, atime) = metadata_unix_times(&target.path);
+            let git_summary =
+                crate::git::state(&target.path).map(|s| s.summary());
+            out.push(ReclaimCandidateSummary {
+                path: target.path,
+                bytes: target.bytes,
+                is_dir: meta.is_dir,
+                files: Some(meta.files),
+                modified_secs: meta.modified_secs.or(mtime),
+                accessed_secs: filter_accessed_secs(
+                    atime,
+                    meta.is_dir,
+                    now_secs,
+                ),
+                category: meta.category,
+                finding: meta.finding.clone(),
+                git_summary,
+            });
+        }
+    }
+    out.sort_by_key(|item| std::cmp::Reverse(item.bytes));
+    out.truncate(max_total);
+}
+
+fn cloud_stage_callback(
+    ctx: &AiExecutionContext,
+) -> ruum_adk::CloudStageCallback {
+    let slot = ctx.stage_slot.clone();
+    let cb = ctx.on_stage.clone();
+    Arc::new(move |stage: ruum_adk::CloudStreamStage| {
+        let mapped = match stage {
+            ruum_adk::CloudStreamStage::Queued => AiProgressStage::Queued,
+            ruum_adk::CloudStreamStage::Connecting => {
+                AiProgressStage::Connecting
+            }
+            ruum_adk::CloudStreamStage::Thinking => AiProgressStage::Thinking,
+            ruum_adk::CloudStreamStage::Generating => {
+                AiProgressStage::Generating
+            }
+        };
+        if let Some(ref s) = slot {
+            s.store(mapped.as_raw(), Ordering::Release);
+        }
+        if let Some(ref handler) = cb {
+            handler(mapped);
+        }
+    })
 }
 
 /// Factory selecting the [`AiExecutionAdapter`] for a configured provider.
@@ -3768,6 +5177,9 @@ fn build_adk_model_config(
 }
 
 fn sanitize_adk_error(err: &ruum_adk::AdkClientError, api_key: &str) -> String {
+    if matches!(err, ruum_adk::AdkClientError::Cancelled) {
+        return AI_CANCELLED_SENTINEL.to_owned();
+    }
     ruum_adk::sanitize_error_message(&err.to_string(), api_key)
 }
 
@@ -3974,12 +5386,24 @@ impl AiExecutionAdapter for DirectApiAiAdapter {
             .filter(|s| !s.is_empty())
             .unwrap_or("(none)")
             .to_owned();
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(ruum_adk::CancelToken::is_cancelled)
+        {
+            return ModelSpeedResult {
+                model: requested_model,
+                elapsed_ms: 0,
+                ok: false,
+                detail: AI_CANCELLED_SENTINEL.to_owned(),
+            };
+        }
         let adk_cfg = match build_adk_model_config(
             config,
             ctx,
             model_override,
-            Duration::from_secs(SHORT_COMMAND_TIMEOUT_SECS),
-            Some(16),
+            Duration::from_secs(BENCHMARK_TIMEOUT_SECS),
+            None,
         ) {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -4003,31 +5427,18 @@ impl AiExecutionAdapter for DirectApiAiAdapter {
                 };
             }
         };
-        let mut req = ruum_adk::AdkAgentRequest::new(
-            "Reply concisely.",
-            "Reply with only OK.",
-        );
-        req.max_iterations = 1;
-        req.fallback_without_tools_on_unsupported = false;
 
         let start = Instant::now();
-        let res = client.run_agent(&adk_cfg, req);
+        let res = client.probe_model(&adk_cfg, ctx.cancel.as_ref());
         let elapsed_ms =
             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         match res {
-            Ok(resp) => {
-                let reply = first_line_snippet(&resp.text, 60);
-                ModelSpeedResult {
-                    model: resp.model,
-                    elapsed_ms,
-                    ok: true,
-                    detail: if reply.is_empty() {
-                        "OK".to_owned()
-                    } else {
-                        reply
-                    },
-                }
-            }
+            Ok(probe) => ModelSpeedResult {
+                model: probe.model,
+                elapsed_ms: probe.ttft_ms,
+                ok: true,
+                detail: probe.detail,
+            },
             Err(err) => ModelSpeedResult {
                 model: requested_model,
                 elapsed_ms,
@@ -4047,6 +5458,29 @@ impl AiExecutionAdapter for DirectApiAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> Result<CleanupProposal, String> {
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(ruum_adk::CancelToken::is_cancelled)
+        {
+            return Err(AI_CANCELLED_SENTINEL.to_owned());
+        }
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
+        let user_home = ctx.user_home.as_deref();
+        let docker = ctx
+            .local_docker
+            .as_ref()
+            .unwrap_or(&DockerProbeStatus::NotInstalled);
+        let docker_summary = match docker {
+            DockerProbeStatus::Available(s) => Some(s),
+            DockerProbeStatus::NotInstalled
+            | DockerProbeStatus::DaemonStopped
+            | DockerProbeStatus::PermissionDenied { .. } => None,
+        };
+        let volume_space = ctx
+            .volume_space
+            .or_else(|| crate::space::space_info(home_dir).ok());
+
         let adk_cfg = build_adk_model_config(
             config,
             ctx,
@@ -4058,28 +5492,53 @@ impl AiExecutionAdapter for DirectApiAiAdapter {
         let client = ruum_adk::BlockingAdkClient::new()
             .map_err(|err| sanitize_adk_error(&err, key_ref))?;
 
-        let candidates =
-            collect_reclaimable_candidates(home_dir, existing_tree, now_secs);
+        let candidates = collect_reclaimable_candidates_with_home(
+            home_dir,
+            user_home,
+            existing_tree,
+            now_secs,
+        );
+        let prompt_ctx = PromptContext {
+            target_os: TrashAdapterFactory::current_os(),
+            target_root: home_dir,
+            user_home,
+            volume_space,
+            locale,
+            now_secs,
+        };
         let (instruction, prompt) =
-            build_direct_api_analysis_prompt(home_dir, &candidates);
+            build_direct_api_analysis_prompt_with_context(
+                &prompt_ctx,
+                &candidates,
+                docker_summary,
+            );
 
         let mut mcp = McpServer::default().with_read_only(true);
         if let Some(tree) = existing_tree {
             mcp.seed_local_tree_cache(
                 home_dir,
                 tree.clone(),
-                Some(home_dir.to_path_buf()),
+                ctx.user_home.clone().or_else(std::env::home_dir),
             );
         }
         let shared_mcp = Arc::new(Mutex::new(mcp));
 
         let mut req = ruum_adk::AdkAgentRequest::new(instruction, prompt);
         req.tools = build_local_mcp_adk_tools(&shared_mcp);
+        req.cancel.clone_from(&ctx.cancel);
 
         let resp = client
             .run_agent(&adk_cfg, req)
             .map_err(|err| sanitize_adk_error(&err, key_ref))?;
-        parse_and_validate_proposal(&resp.text, home_dir, now_secs)
+        parse_and_validate_proposal_full(
+            &resp.text,
+            home_dir,
+            user_home,
+            docker,
+            locale,
+            now_secs,
+            crate::removal::is_trash_target,
+        )
     }
 
     fn run_tree_analysis(
@@ -4094,6 +5553,14 @@ impl AiExecutionAdapter for DirectApiAiAdapter {
         _runner: &dyn CommandRunner,
         ctx: &AiExecutionContext,
     ) -> Result<CleanupProposal, String> {
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(ruum_adk::CancelToken::is_cancelled)
+        {
+            return Err(AI_CANCELLED_SENTINEL.to_owned());
+        }
+        let locale = ctx.locale.unwrap_or_else(Locale::current);
         let adk_cfg = build_adk_model_config(
             config,
             ctx,
@@ -4105,26 +5572,36 @@ impl AiExecutionAdapter for DirectApiAiAdapter {
         let client = ruum_adk::BlockingAdkClient::new()
             .map_err(|err| sanitize_adk_error(&err, key_ref))?;
 
-        let candidates = collect_tree_candidates(root_path, tree, docker);
-        let prompt =
-            build_tree_analysis_prompt(root_path, target_os, &candidates);
+        let candidates = collect_tree_candidates_for_os(
+            root_path, home_path, tree, docker, target_os,
+        );
+        let prompt_ctx = PromptContext {
+            target_os,
+            target_root: root_path,
+            user_home: home_path.or(ctx.user_home.as_deref()),
+            volume_space: ctx.volume_space,
+            locale,
+            now_secs,
+        };
+        let (instruction, prompt) = build_tree_analysis_prompt_parts(
+            &prompt_ctx,
+            PromptToolMode::SnapshotOnly,
+            &candidates,
+        );
 
         // Remote / in-memory analysis runs single-turn inference with zero
         // local disk or SSH tools mounted.
-        let mut req = ruum_adk::AdkAgentRequest::new(
-            "You are an automated disk cleanup advisor for Ruum. Analyze \
-             only the provided in-memory snapshot and output strictly valid \
-             JSON.",
-            prompt,
-        );
+        let mut req = ruum_adk::AdkAgentRequest::new(instruction, prompt);
         req.max_iterations = 1;
         req.fallback_without_tools_on_unsupported = false;
+        req.cancel.clone_from(&ctx.cancel);
 
         let resp = client
             .run_agent(&adk_cfg, req)
             .map_err(|err| sanitize_adk_error(&err, key_ref))?;
-        validate_proposal_against_tree(
-            &resp.text, root_path, home_path, tree, docker, target_os, now_secs,
+        validate_proposal_against_tree_with_locale(
+            &resp.text, root_path, home_path, tree, docker, target_os, locale,
+            now_secs,
         )
     }
 }
@@ -5645,7 +7122,11 @@ mod tests {
             &ctx,
         );
         assert!(speed.ok, "benchmark failed: {}", speed.detail);
-        assert_eq!(speed.detail, "OK");
+        assert!(
+            speed.detail.contains("TTFT "),
+            "unexpected speed detail: {}",
+            speed.detail
+        );
 
         let err = test_connection_for_config_with_context(
             &cfg,
@@ -6001,12 +7482,18 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .unwrap_or_else(|| (500, Vec::new(), "{}".to_owned()));
+                let content_type = extra_headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map_or("application/json", |(_, v)| *v);
                 let mut resp = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
                     body.len()
                 );
                 for (k, v) in extra_headers {
-                    let _ = write!(resp, "{k}: {v}\r\n");
+                    if !k.eq_ignore_ascii_case("content-type") {
+                        let _ = write!(resp, "{k}: {v}\r\n");
+                    }
                 }
                 resp.push_str("\r\n");
                 let _ = stream.write_all(resp.as_bytes());
@@ -6061,7 +7548,7 @@ mod tests {
     }
 
     #[test]
-    fn ruum_cloud_test_connection_never_calls_completions_and_benchmark_blocked_on_trial()
+    fn ruum_cloud_test_connection_never_calls_completions_and_benchmark_uses_probe()
      {
         let temp = tempfile::tempdir().unwrap();
         let exp = std::time::SystemTime::now()
@@ -6096,10 +7583,28 @@ mod tests {
             }]
         })
         .to_string();
+        let probe_json = serde_json::json!({
+            "ok": true,
+            "model": "ruum-fast",
+            "ttftMs": 38,
+            "totalMs": 45,
+            "budgetExhausted": false
+        })
+        .to_string();
+        let err_404 = serde_json::json!({
+            "ok": false,
+            "code": "NOT_FOUND",
+            "message": "not found"
+        })
+        .to_string();
 
         let mut server = spawn_cloud_stub(vec![
             (200, vec![], ent_json.clone()),
             (200, vec![], models_json),
+            (200, vec![], probe_json),
+            // Second benchmark where probe returns 404 -> checks entitlement and
+            // blocks on free trial without ever calling /v1/chat/completions.
+            (404, vec![], err_404),
             (200, vec![], ent_json),
         ]);
         let (ctx, _db) =
@@ -6120,11 +7625,23 @@ mod tests {
 
         let bench = benchmark_model_for_config_with_context(
             &cfg,
-            None,
+            Some("ruum-fast"),
             &MockCommandRunner::default(),
             &ctx,
         );
-        assert!(!bench.ok, "benchmark must be blocked on free trial");
+        assert!(bench.ok, "trial probe should succeed: {}", bench.detail);
+        assert_eq!(bench.elapsed_ms, 38);
+
+        let fallback_bench = benchmark_model_for_config_with_context(
+            &cfg,
+            Some("ruum-fast"),
+            &MockCommandRunner::default(),
+            &ctx,
+        );
+        assert!(
+            !fallback_bench.ok,
+            "404 probe fallback must remain blocked on free trial"
+        );
 
         server.stop();
         let paths: Vec<String> =
@@ -6134,7 +7651,9 @@ mod tests {
             vec![
                 "/v1/entitlement/status",
                 "/v1/models",
-                "/v1/entitlement/status"
+                "/v1/models/probe",
+                "/v1/models/probe",
+                "/v1/entitlement/status",
             ]
         );
         assert!(!paths.iter().any(|p| p.contains("completions")));
@@ -6433,7 +7952,7 @@ mod tests {
         assert_eq!(s2, s4);
         assert_eq!(s4, s5);
         assert_eq!(reqs[4].header("x-ruum-task"), Some("local_analysis"));
-        assert_eq!(reqs[4].body["stream"], serde_json::json!(false));
+        assert_eq!(reqs[4].body["stream"], serde_json::json!(true));
         let sent_tools: Vec<&str> = reqs[4].body["tools"]
             .as_array()
             .unwrap()
@@ -6505,7 +8024,7 @@ mod tests {
         let tree_reqs = srv_tree.recorded();
         assert_eq!(tree_reqs[2].header("x-ruum-task"), Some("tree_analysis"));
         assert!(tree_reqs[2].body.get("tools").is_none());
-        assert_eq!(tree_reqs[2].body["stream"], serde_json::json!(false));
+        assert_eq!(tree_reqs[2].body["stream"], serde_json::json!(true));
     }
 
     #[test]
@@ -6749,5 +8268,583 @@ mod tests {
         assert_eq!(chosen_unavailable, CLOUD_AUTO_MODEL_ID);
 
         srv.stop();
+    }
+
+    #[test]
+    fn v2_prompt_renders_locale_space_metadata_and_docker_snapshot() {
+        let now_secs = 1_700_000_000_u64;
+        let now_i64 = i64::try_from(now_secs).unwrap();
+
+        assert_eq!(
+            filter_accessed_secs(Some(now_i64 - 1800), true, now_secs),
+            None,
+            "recent directory atime must be suppressed as scan noise"
+        );
+        assert_eq!(
+            filter_accessed_secs(Some(now_i64 - 90_000), true, now_secs),
+            Some(now_i64 - 90_000)
+        );
+        assert_eq!(
+            filter_accessed_secs(Some(now_i64 - 1800), false, now_secs),
+            Some(now_i64 - 1800),
+            "file atime stays preserved"
+        );
+
+        let candidates = vec![ReclaimCandidateSummary {
+            path: PathBuf::from("/Volumes/Work/app/target"),
+            bytes: 2 * (1 << 30),
+            is_dir: true,
+            files: Some(42_180),
+            modified_secs: Some(now_i64 - 45 * DAY_SECS),
+            accessed_secs: None,
+            category: "Code",
+            finding: "build output".to_owned(),
+            git_summary: Some("clean, no stash".to_owned()),
+        }];
+        let mut docker = build_sample_docker_summary();
+        docker.removable_images[0].created_since = "3 months ago".to_owned();
+        docker.stopped_containers[0].status =
+            "Exited (0) 2 weeks ago".to_owned();
+
+        let low_space = SpaceInfo {
+            total: 100 * (1 << 30),
+            free: 3 * (1 << 30),
+            available: 3 * (1 << 30),
+        };
+
+        for (locale, expected_lang) in [
+            (Locale::En, "English"),
+            (Locale::Zh, "Simplified Chinese (简体中文)"),
+            (Locale::Ja, "Japanese (日本語)"),
+            (Locale::Ko, "Korean (한국어)"),
+        ] {
+            let prompt_ctx = PromptContext {
+                target_os: TrashOs::MacOs,
+                target_root: Path::new("/Volumes/Work"),
+                user_home: Some(Path::new("/Users/alice")),
+                volume_space: Some(low_space),
+                locale,
+                now_secs,
+            };
+            let (instruction, user_prompt) =
+                build_direct_api_analysis_prompt_with_context(
+                    &prompt_ctx,
+                    &candidates,
+                    Some(&docker),
+                );
+            assert!(instruction.contains("Scanned Root: /Volumes/Work"));
+            assert!(instruction.contains("CRITICALLY LOW <5% free"));
+            assert!(instruction.contains("HOW TO THINK LIKE A CAREFUL USER"));
+            assert!(user_prompt.contains("42,180 files"));
+            assert!(user_prompt.contains("modified: 45d ago"));
+            assert!(user_prompt.contains("accessed: n/a"));
+            assert!(user_prompt.contains("created=3 months ago"));
+            assert!(user_prompt.contains("status=Exited (0) 2 weeks ago"));
+            assert!(user_prompt.contains(expected_lang));
+        }
+    }
+
+    #[test]
+    fn wide_root_candidate_collection_filters_home_and_system_paths() {
+        let mut linux_root = make_tree_dir(
+            "/",
+            vec![
+                make_tree_dir(
+                    "home",
+                    vec![make_tree_dir(
+                        "alice",
+                        vec![Node::entry(
+                            "notes.bin",
+                            NodeKind::File,
+                            200 << 20,
+                        )],
+                    )],
+                ),
+                make_tree_dir(
+                    "etc",
+                    vec![Node::entry("passwd", NodeKind::File, 120 << 20)],
+                ),
+                make_tree_dir(
+                    "srv",
+                    vec![make_tree_dir(
+                        "cache",
+                        vec![Node::entry("blob.bin", NodeKind::File, 90 << 20)],
+                    )],
+                ),
+            ],
+        );
+        crate::tree::aggregate(&mut linux_root, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut linux_root);
+
+        let linux_cands = collect_tree_candidates_for_os(
+            Path::new("/"),
+            Some(Path::new("/home/alice")),
+            &linux_root,
+            &DockerProbeStatus::NotInstalled,
+            TrashOs::Linux,
+        );
+        assert!(
+            !linux_cands
+                .items
+                .iter()
+                .any(|c| c.path == Path::new("/home")
+                    || c.path == Path::new("/home/alice")
+                    || c.path == Path::new("/etc")),
+            "home, home parent, and /etc must be blocked under /"
+        );
+        assert!(
+            linux_cands
+                .items
+                .iter()
+                .any(|c| c.path == Path::new("/srv/cache"))
+        );
+
+        let mut win_root = make_tree_dir(
+            "C:\\",
+            vec![
+                make_tree_dir(
+                    "Windows",
+                    vec![Node::entry("win.bin", NodeKind::File, 300 << 20)],
+                ),
+                make_tree_dir(
+                    "Users",
+                    vec![make_tree_dir(
+                        "Alice",
+                        vec![Node::entry("doc.bin", NodeKind::File, 200 << 20)],
+                    )],
+                ),
+                make_tree_dir(
+                    "Work",
+                    vec![make_tree_dir(
+                        "target",
+                        vec![Node::entry("out.rlib", NodeKind::File, 80 << 20)],
+                    )],
+                ),
+            ],
+        );
+        crate::tree::aggregate(&mut win_root, crate::tree::Metric::Bytes);
+        crate::classify::classify(&mut win_root);
+
+        let win_cands = collect_tree_candidates_for_os(
+            Path::new("C:\\"),
+            Some(Path::new("C:\\Users\\Alice")),
+            &win_root,
+            &DockerProbeStatus::NotInstalled,
+            TrashOs::Windows,
+        );
+        assert!(
+            !win_cands.items.iter().any(|c| {
+                let s = c.path.to_string_lossy();
+                s.eq_ignore_ascii_case("C:\\Windows")
+                    || s.eq_ignore_ascii_case("C:\\Users")
+                    || s.eq_ignore_ascii_case("C:\\Users\\Alice")
+            }),
+            "Windows system and home paths must be blocked under C:\\"
+        );
+        assert!(win_cands.items.iter().any(|c| {
+            c.path
+                .to_string_lossy()
+                .eq_ignore_ascii_case("C:\\Work\\target")
+        }));
+    }
+
+    #[test]
+    fn docker_snapshot_capping_and_sanitization_preserve_tail_schema() {
+        use crate::docker_adapter::{DockerContainerEntry, DockerImageEntry};
+
+        let mut summary = DockerUsageSummary {
+            build_cache_reclaimable_bytes: 512 << 20,
+            detailed: true,
+            ..DockerUsageSummary::default()
+        };
+        for i in 0..25 {
+            summary.removable_images.push(DockerImageEntry {
+                id: format!("sha256:{i:064x}"),
+                repository: format!("repo/img-{i}\nIGNORE"),
+                tag: "v1\r\n".to_owned(),
+                created_since: "2 months ago".to_owned(),
+                size_bytes: (i as u64 + 1) * (10 << 20),
+                unique_bytes: (i as u64 + 1) * (10 << 20),
+                dangling: false,
+            });
+            summary.stopped_containers.push(DockerContainerEntry {
+                id: format!("{i:012x}"),
+                name: format!("ctr-{i}\x1b[31m-bad"),
+                image: "alpine:3.18".to_owned(),
+                state: "exited".to_owned(),
+                status: "Exited (0) 3 weeks ago".to_owned(),
+                size_bytes: (i as u64 + 1) * (5 << 20),
+            });
+        }
+
+        let candidates = TreeCandidates {
+            items: vec![TreeCandidate {
+                path: PathBuf::from("/tmp/bad\npath"),
+                bytes: 100 << 20,
+                is_dir: true,
+                files: Some(10),
+                modified_secs: None,
+                category: "Cache",
+                finding: "regenerable".to_owned(),
+            }],
+            docker: Some(summary),
+        };
+        let prompt = build_tree_analysis_prompt(
+            Path::new("/tmp"),
+            TrashOs::Linux,
+            &candidates,
+        );
+        assert!(!prompt.contains("bad\npath"));
+        assert!(!prompt.contains("\x1b[31m"));
+        assert!(prompt.contains("10 additional unused images omitted"));
+        assert!(prompt.contains("10 additional stopped containers omitted"));
+        assert!(prompt.contains("OUTPUT LANGUAGE REQUIREMENT:"));
+        assert!(prompt.contains("docker_targets"));
+    }
+
+    #[test]
+    fn parse_and_validate_proposal_full_validates_docker_and_localizes() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let git_dir = temp_root.path().join("dirty-repo");
+        fs::create_dir_all(git_dir.join(".git")).unwrap();
+        fs::write(git_dir.join("untracked.txt"), b"hello").unwrap();
+
+        let summary = build_sample_docker_summary();
+        let docker = DockerProbeStatus::Available(summary.clone());
+        let raw = serde_json::json!({
+            "items": [{
+                "path": git_dir.to_string_lossy(),
+                "mode": "trash",
+                "reason": "test"
+            }],
+            "docker_targets": [
+                {"kind": "build_cache"},
+                {"kind": "image", "id": summary.removable_images[0].id},
+                {"kind": "container", "id": "000000000000"}
+            ]
+        })
+        .to_string();
+
+        let prop = parse_and_validate_proposal_full(
+            &raw,
+            temp_root.path(),
+            None,
+            &docker,
+            Locale::Zh,
+            1_700_000_000,
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prop.root_path,
+            Some(crate::removal::normalize(temp_root.path()))
+        );
+        assert!(prop.summary.contains("AI 建议清理"));
+        assert_eq!(prop.docker_targets.len(), 2);
+        assert!(matches!(
+            prop.docker_targets[0],
+            crate::docker_adapter::DockerCleanTarget::Image { .. }
+        ));
+        assert!(matches!(
+            prop.docker_targets[1],
+            crate::docker_adapter::DockerCleanTarget::BuildCache
+        ));
+        if crate::git::state(&git_dir).is_some() {
+            let warn = prop.items[0].git_warning.as_deref().unwrap_or("");
+            assert!(warn.contains("Git 工作区未干净"), "warn={warn}");
+        }
+    }
+
+    #[test]
+    fn is_ai_cancelled_error_and_cli_cancel_return_sentinel() {
+        assert!(is_ai_cancelled_error(AI_CANCELLED_SENTINEL));
+        assert!(is_ai_cancelled_error("wrapped: __ruum_ai_cancelled__"));
+        assert!(!is_ai_cancelled_error("upstream failed"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let cancel = ruum_adk::CancelToken::new();
+        cancel.cancel();
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::Custom,
+            custom_command: "sh".to_owned(),
+            ..AiConfig::default()
+        };
+        let ctx = AiExecutionContext::default().with_cancel(cancel);
+        let err = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_000_000,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(
+            is_ai_cancelled_error(&err),
+            "expected cancel sentinel: {err}"
+        );
+    }
+
+    #[test]
+    fn ruum_cloud_inlines_v2_instruction_and_forwards_event_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("a.bin"), b"123456").unwrap();
+
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        let ent_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": true,
+                "source": "alipay",
+                "decision": "ALLOW",
+                "trialRemaining": 0,
+                "validUntilSecs": exp + 86400,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-ent-v2"
+        })
+        .to_string();
+        let models_ok = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-mod-v2",
+            "data": [{
+                "id": "ruum-fast",
+                "display_name": "Ruum Fast",
+                "tier": "trial",
+                "available": true
+            }]
+        })
+        .to_string();
+        let chat_ok = serde_json::json!({
+            "id": "chatcmpl-v2",
+            "object": "chat.completion",
+            "model": "ruum-fast",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::json!({
+                        "summary": "清理建议",
+                        "items": [{
+                            "path": target.to_string_lossy(),
+                            "mode": "permanent",
+                            "reason": "构建产物"
+                        }]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+
+        let mut srv = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok),
+            (200, vec![], models_ok),
+            (200, vec![], chat_ok),
+        ]);
+        let (base_ctx, _db) =
+            seed_registered_cloud_ctx(temp.path(), &srv.base_url);
+        let ctx = base_ctx
+            .with_locale(Locale::Zh)
+            .with_event_key("disk_cleanup_local");
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+
+        let _prop = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_000_000,
+            None,
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("cloud analysis with inlined v2 instruction should succeed");
+        srv.stop();
+
+        let recorded = srv.recorded();
+        let comp = recorded
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("completions request recorded");
+        assert_eq!(comp.header("x-ruum-event-key"), Some("disk_cleanup_local"));
+        let msgs = comp.body["messages"].as_array().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m["role"] == "system"),
+            "RuumCloud must inline v2 instruction rather than relying on system role"
+        );
+        let user_content = msgs
+            .iter()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+            .expect("user message content present");
+        assert!(user_content.contains("SESSION ENVIRONMENT"));
+        assert!(user_content.contains("HARD SAFETY BOUNDARIES"));
+        assert!(user_content.contains("DECISION RUBRIC"));
+        assert!(user_content.contains("OUTPUT LANGUAGE REQUIREMENT:"));
+    }
+
+    #[test]
+    fn ruum_cloud_existing_tree_uses_one_turn_snapshot_supplements_safe_nodes_and_reports_sse_stages()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let safe_dir = temp.path().join("old-build-artifacts");
+        let docker_dir = temp.path().join("Docker.raw");
+        let link_file = temp.path().join("alias-link");
+        fs::create_dir_all(&safe_dir).unwrap();
+        fs::write(safe_dir.join("big.bin"), b"1234567890").unwrap();
+        fs::create_dir_all(&docker_dir).unwrap();
+        fs::write(&link_file, b"symlink-placeholder").unwrap();
+
+        let mut tree = Node::directory(
+            temp.path().file_name().unwrap().to_string_lossy().as_ref(),
+        );
+        let mut safe_node = Node::directory("old-build-artifacts");
+        let safe_child = Node::entry("big.bin", NodeKind::File, 4096);
+        safe_node.children.push(safe_child);
+        let mut container_node = Node::directory("Docker.raw");
+        container_node.category = Category::Container;
+        container_node.bytes = 8192;
+        container_node.children.push(Node::entry(
+            "disk.img",
+            NodeKind::File,
+            8192,
+        ));
+        let mut sym_node = Node::entry("alias-link", NodeKind::Symlink, 2048);
+        sym_node.category = Category::Cache;
+        tree.children.push(safe_node);
+        tree.children.push(container_node);
+        tree.children.push(sym_node);
+        crate::tree::aggregate(&mut tree, crate::tree::Metric::Bytes);
+
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        let ent_ok = serde_json::json!({
+            "code": "OK",
+            "message": "success",
+            "data": {
+                "subjectId": "sub_test",
+                "deviceId": "dev_test",
+                "isPaid": true,
+                "source": "alipay",
+                "decision": "ALLOW",
+                "trialRemaining": 0,
+                "validUntilSecs": exp + 86400,
+                "fupZone": "green",
+                "syncedAtSecs": exp - 10
+            },
+            "traceId": "tr-ent-snap"
+        })
+        .to_string();
+        let models_ok = serde_json::json!({
+            "object": "list",
+            "traceId": "tr-mod-snap",
+            "data": [{
+                "id": "ruum-pro",
+                "display_name": "Ruum Pro",
+                "tier": "paid",
+                "available": true
+            }]
+        })
+        .to_string();
+
+        let proposal_json = serde_json::json!({
+            "summary": "Snapshot 1-turn cleanup",
+            "items": [{
+                "path": safe_dir.to_string_lossy(),
+                "mode": "permanent",
+                "reason": "old build artifact"
+            }]
+        })
+        .to_string();
+        let sse_body = format!(
+            ": ruum-stage {{\"stage\":\"queued\"}}\n\n\
+             : ruum-stage {{\"stage\":\"connecting\"}}\n\n\
+             data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"checking\"}}}}]}}\n\n\
+             : ruum-stage {{\"stage\":\"generating\"}}\n\n\
+             data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n",
+            serde_json::to_string(&proposal_json).unwrap(),
+        );
+
+        let mut srv = spawn_cloud_stub(vec![
+            (200, vec![], ent_ok),
+            (200, vec![], models_ok),
+            (200, vec![("Content-Type", "text/event-stream")], sse_body),
+        ]);
+        let (base_ctx, _db) =
+            seed_registered_cloud_ctx(temp.path(), &srv.base_url);
+        let stage_slot = Arc::new(AtomicU8::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        let ctx = base_ctx
+            .with_locale(Locale::En)
+            .with_stage_slot(Arc::clone(&stage_slot))
+            .with_on_stage(Arc::new(move |s| {
+                observed_cb.lock().unwrap().push(s);
+            }));
+        let cfg = AiConfig {
+            setup_completed: true,
+            provider: AiCliProvider::RuumCloud,
+            ..AiConfig::default()
+        };
+
+        let prop = run_analysis_with_tree_for_config_with_context(
+            &cfg,
+            temp.path(),
+            Path::new("/bin/ruum"),
+            1_700_002_200,
+            Some(&tree),
+            &MockCommandRunner::default(),
+            &ctx,
+        )
+        .expect("1-turn snapshot analysis should succeed");
+        srv.stop();
+
+        assert_eq!(prop.summary, "Snapshot 1-turn cleanup");
+        assert_eq!(prop.items.len(), 1);
+        assert_eq!(prop.items[0].path, crate::removal::normalize(&safe_dir));
+
+        let reqs = srv.recorded();
+        let comp = reqs
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("completions request recorded");
+        assert_eq!(comp.header("x-ruum-task"), Some("tree_analysis"));
+        assert!(comp.body.get("tools").is_none());
+        assert_eq!(comp.body["stream"], serde_json::json!(true));
+        let user_prompt = comp.body["messages"][0]["content"].as_str().unwrap();
+        assert!(user_prompt.contains(&*safe_dir.to_string_lossy()));
+        assert!(!user_prompt.contains(&*docker_dir.to_string_lossy()));
+        assert!(!user_prompt.contains(&*link_file.to_string_lossy()));
+
+        assert_eq!(
+            AiProgressStage::from_raw(stage_slot.load(Ordering::Acquire)),
+            Some(AiProgressStage::Generating)
+        );
+        let hist = observed.lock().unwrap().clone();
+        assert!(hist.contains(&AiProgressStage::Queued));
+        assert!(hist.contains(&AiProgressStage::Connecting));
+        assert!(hist.contains(&AiProgressStage::Thinking));
+        assert!(hist.contains(&AiProgressStage::Generating));
     }
 }

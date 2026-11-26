@@ -286,6 +286,34 @@ impl ScanHandle {
     pub fn cancel(&self) {
         self.progress.cancel();
     }
+
+    /// Block until the scan completes or `cancel` becomes true.
+    ///
+    /// When `cancel` trips, explicitly cancels the background walk worker
+    /// before returning [`io::ErrorKind::Interrupted`] so no walk thread leaks.
+    pub fn wait_cancellable(&self, cancel: &AtomicBool) -> io::Result<Node> {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                self.cancel();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "scan cancelled",
+                ));
+            }
+            match self
+                .result
+                .recv_timeout(std::time::Duration::from_millis(25))
+            {
+                Ok(outcome) => return outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "the scan worker stopped without a result",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Walk `root` and return the aggregated tree. Blocking.
@@ -1859,6 +1887,21 @@ mod tests {
             "the rest was walked"
         );
         assert_eq!(tree.files, known.files + 1);
+    }
+
+    #[test]
+    fn wait_cancellable_cancels_worker_and_returns_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = ScanHandle::spawn(
+            temp.path().to_path_buf(),
+            ScanOptions::default(),
+        );
+        let cancel = AtomicBool::new(true);
+        let err = handle.wait_cancellable(&cancel).expect_err(
+            "pre-cancelled wait_cancellable must return Interrupted",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(handle.progress.is_cancelled());
     }
 
     /// A real whole-disk scan, run by hand: `cargo test -p ruum-core

@@ -666,6 +666,45 @@ pub fn format_cloud_error_message(
     }
 }
 
+/// Output language display label and BCP-47 tag used in AI analysis prompts.
+#[must_use]
+pub const fn ai_output_language_spec(
+    locale: Locale,
+) -> (&'static str, &'static str) {
+    match locale {
+        Locale::En => ("English", "en"),
+        Locale::Zh => ("Simplified Chinese (简体中文)", "zh-CN"),
+        Locale::Ja => ("Japanese (日本語)", "ja"),
+        Locale::Ko => ("Korean (한국어)", "ko"),
+    }
+}
+
+/// Localized fallback summary when the AI response omits `summary`.
+#[must_use]
+pub fn ai_fallback_proposal_summary(count: usize, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("AI proposed {count} items for cleanup"),
+        Locale::Zh => format!("AI 建议清理 {count} 个项目"),
+        Locale::Ja => {
+            format!("AI が {count} 件のクリーンアップ候補を提案しました")
+        }
+        Locale::Ko => format!("AI가 {count}개의 정리 항목을 제안했습니다"),
+    }
+}
+
+/// Localized warning attached to a proposed item with an unclean Git checkout.
+#[must_use]
+pub fn git_dirty_warning(git_summary: &str, locale: Locale) -> String {
+    match locale {
+        Locale::En => format!("Git checkout not clean: {git_summary}"),
+        Locale::Zh => format!("Git 工作区未干净：{git_summary}"),
+        Locale::Ja => {
+            format!("Git 作業ツリーがクリーンではありません: {git_summary}")
+        }
+        Locale::Ko => format!("Git 작업 트리가 깨끗하지 않음: {git_summary}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

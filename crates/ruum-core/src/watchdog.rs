@@ -215,10 +215,32 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
             }
         }
 
+        if self.ai_context.skip_analysis {
+            self.send_ipc_watchdog_update();
+            return Ok(());
+        }
+
         let ai_cfg = self.db.load_ai_config()?;
         if !ai_cfg.setup_completed || !ai_cfg.auto_analyze_on_alert {
             self.send_ipc_watchdog_update();
             return Ok(());
+        }
+
+        let mut ai_ctx = self.ai_context.clone();
+        if ai_ctx.locale.is_none() {
+            ai_ctx = ai_ctx.with_locale(self.locale);
+        }
+        if ai_ctx.user_home.is_none()
+            && let Some(home) = std::env::home_dir()
+        {
+            ai_ctx = ai_ctx.with_user_home(home);
+        }
+        if ai_ctx.volume_space.is_none() && *total_bytes > 0 {
+            ai_ctx = ai_ctx.with_volume_space(crate::space::SpaceInfo {
+                total: *total_bytes,
+                free: *available_bytes,
+                available: *available_bytes,
+            });
         }
 
         let proposal =
@@ -229,7 +251,7 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
                 *timestamp_secs,
                 None,
                 self.cmd_runner,
-                &self.ai_context,
+                &ai_ctx,
             ) {
                 Ok(prop) => {
                     let ai_state =
@@ -237,6 +259,10 @@ impl WatchdogEventSink for CoreWatchdogEventHandler<'_> {
                     self.db.save_ai_state(&ai_state)?;
                     self.send_ipc_watchdog_update();
                     Some(prop)
+                }
+                Err(err) if ai_cli::is_ai_cancelled_error(&err) => {
+                    self.send_ipc_watchdog_update();
+                    None
                 }
                 Err(err) => {
                     eprintln!("ruum watchdog: AI analysis error: {err}");
@@ -360,6 +386,35 @@ pub fn run_once_with_db(
     confirm_adapter: &dyn CleanupConfirmAdapter,
     notifier: &dyn NotificationAdapter,
 ) -> io::Result<ruum_watchdog::TickResult> {
+    let ctx = AiExecutionContext::default().with_db_path(db.db_path());
+    run_once_with_db_and_context(
+        db,
+        mount_path,
+        current_exe,
+        now_secs,
+        cmd_runner,
+        confirm_adapter,
+        notifier,
+        ctx,
+    )
+}
+
+/// Run a single `SQLite`-backed watchdog evaluation tick with an explicit
+/// [`AiExecutionContext`] (supporting cooperative cancellation and event keys).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit adapter injection for deterministic tests"
+)]
+pub fn run_once_with_db_and_context(
+    db: &StorageDb,
+    mount_path: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    cmd_runner: &dyn CommandRunner,
+    confirm_adapter: &dyn CleanupConfirmAdapter,
+    notifier: &dyn NotificationAdapter,
+    ai_context: AiExecutionContext,
+) -> io::Result<ruum_watchdog::TickResult> {
     let wd_service = db.watchdog()?;
     let handler = CoreWatchdogEventHandler::new(
         db,
@@ -367,7 +422,8 @@ pub fn run_once_with_db(
         cmd_runner,
         confirm_adapter,
         notifier,
-    );
+    )
+    .with_ai_context(ai_context);
     ruum_watchdog::run_once(
         &wd_service,
         mount_path,
@@ -514,7 +570,8 @@ pub fn evaluate_tick(
 pub use crate::watchdog_service::{
     ServiceStatus, has_legacy_service_residue, install_service,
     linux_systemd_service_path, linux_systemd_unit_content,
-    macos_launchd_plist_content, macos_launchd_plist_path, service_status,
+    macos_launchd_plist_content, macos_launchd_plist_path,
+    reap_orphaned_legacy_service, service_status,
     uninstall_legacy_service_if_present, uninstall_service,
 };
 
@@ -837,12 +894,19 @@ fn run_once_in(
     // 2. Invoke AI CLI for analysis if enabled
     let mut proposal = None;
     if config.ai_auto_analyze {
-        match ai_cli::run_analysis(
+        let mut ai_ctx = AiExecutionContext::default()
+            .with_locale(locale)
+            .with_user_home(home_dir.to_path_buf());
+        if let Ok(sp) = crate::space::space_info(home_dir) {
+            ai_ctx = ai_ctx.with_volume_space(sp);
+        }
+        match ai_cli::run_analysis_with_context(
             &config,
             home_dir,
             current_exe,
             now_secs,
             cmd_runner,
+            &ai_ctx,
         ) {
             Ok(prop) => {
                 state.last_proposal = Some(prop.clone());
@@ -2838,6 +2902,7 @@ mod tests {
                 None,
             )],
             docker_targets: Vec::new(),
+            root_path: None,
         };
         let prior_state =
             AiState::from_proposal(&prior_proposal, 1_699_999_000).unwrap();
@@ -3082,5 +3147,61 @@ mod tests {
         assert_eq!(db.load_ai_state().unwrap().last_error, None);
         assert_eq!(notifier.tagged.lock().unwrap().len(), 1);
         assert_eq!(notifier.tagged.lock().unwrap()[0].0, NOTIF_TAG_LOW_SPACE);
+    }
+
+    #[test]
+    fn cancelled_ai_stays_silent_without_recording_error_or_notifying() {
+        use crate::storage::AiConfig;
+        use crate::watchdog_config::AiCliProvider;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db = StorageDb::open(home.join("ruum.db")).unwrap();
+        db.save_ai_config(&AiConfig {
+            setup_completed: true,
+            auto_analyze_on_alert: true,
+            provider: AiCliProvider::Custom,
+            custom_command: "sh".to_owned(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+
+        let cancel = ruum_adk::CancelToken::new();
+        cancel.cancel();
+
+        let ai_runner = MockRunner::default();
+        let confirm = MockConfirm {
+            decision: CleanupConfirmDecision::Cancelled,
+        };
+        let notifier = MockNotification::default();
+        let handler = CoreWatchdogEventHandler::new(
+            &db,
+            PathBuf::from("/bin/ruum"),
+            &ai_runner,
+            &confirm,
+            &notifier,
+        )
+        .with_locale(Locale::En)
+        .with_ipc_target(None)
+        .with_ai_context(AiExecutionContext::default().with_cancel(cancel));
+
+        let event = WatchdogEvent::LowDiskSpace {
+            timestamp_secs: 1_794_895_500,
+            mount_path: home.to_path_buf(),
+            available_bytes: 512,
+            total_bytes: 1024,
+            threshold_bytes: 1024 * 1024 * 1024,
+        };
+        handler.on_event(&event).unwrap();
+
+        assert_eq!(db.load_ai_state().unwrap().last_error, None);
+        let tagged = notifier.tagged.lock().unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].0, NOTIF_TAG_LOW_SPACE);
+        assert!(
+            !tagged.iter().any(|(tag, ..)| tag == NOTIF_TAG_AI_ANALYSIS),
+            "cancelled AI must not emit failure notification"
+        );
+        drop(tagged);
     }
 }

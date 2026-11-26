@@ -1,18 +1,4 @@
 {
-  "harness-contract-approval-gate": {
-    "PreToolUse": [
-      {
-        "matcher": "invoke_subagent|define_subagent|swarm|run_workflow|exit_plan_mode",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "../scripts/harness-approval-gate.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  },
   "crg-transaction-sync": {
     "PostToolUse": [
       {
@@ -31,48 +17,6 @@
         "type": "command",
         "command": "../scripts/crg-hook.sh sync-on-stop",
         "timeout": 15
-      }
-    ]
-  },
-  "harness-parent-source-edit-guard": {
-    "PreToolUse": [
-      {
-        "matcher": "write_file|edit_file|create_file|delete_file|sed_file|write_to_file|replace_file_content|multi_replace_file_content|run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "../scripts/harness-source-edit-guard.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  },
-  "harness-lifecycle-guard": {
-    "PreInvocation": [
-      {
-        "type": "command",
-        "command": "../scripts/harness-lifecycle-hook.sh",
-        "timeout": 10
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "write_file|edit_file|create_file|delete_file|sed_file|write_to_file|replace_file_content|multi_replace_file_content|run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "../scripts/harness-lifecycle-hook.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command",
-        "command": "../scripts/harness-lifecycle-hook.sh",
-        "timeout": 10
       }
     ]
   }

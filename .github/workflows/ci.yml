@@ -192,9 +192,6 @@ jobs:
           if ([ExecutableIcons]::ExtractIconEx($guiExe, -1, $null, $null, 0) -lt 1) {
             throw "ruum-gui.exe (debug) has no embedded icon"
           }
-          if (-not ([System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($guiExe)) -match 'longPathAware')) {
-            throw "ruum-gui.exe (debug) is missing embedded longPathAware manifest"
-          }
           if (-not (Test-Path -LiteralPath target/debug/ruum.exe -PathType Leaf)) {
             throw "ruum.exe missing from debug output"
           }
@@ -219,9 +216,6 @@ jobs:
             $guiExe = (Resolve-Path target/release/ruum-gui.exe).Path
             if ([ExecutableIcons]::ExtractIconEx($guiExe, -1, $null, $null, 0) -lt 1) {
               throw "ruum-gui.exe (release) has no embedded icon"
-            }
-            if (-not ([System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($guiExe)) -match 'longPathAware')) {
-              throw "ruum-gui.exe (release) is missing embedded longPathAware manifest"
             }
             if (-not (Test-Path -LiteralPath target/release/ruum.exe -PathType Leaf)) {
               throw "ruum.exe missing from release output"

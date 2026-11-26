@@ -88,11 +88,19 @@ fn read<R>(view: &Entity<Ruum>, cx: &Window, f: impl FnOnce(&Ruum) -> R) -> R {
     view.read_with(cx, |app, _| f(app))
 }
 
+fn init_test_theme(cx: &mut gpui_kit::App) {
+    gpui_omarchy::init(cx);
+    // Stop `Theme::follow_system`'s OS file watcher immediately so parallel
+    // filesystem activity in `$HOME` never wakes GPUI's `TestScheduler` from
+    // the `notify-rs` thread on Linux CI.
+    Theme::tokyo_night().apply(cx);
+}
+
 #[gpui_kit::test]
 fn remote_indexing_draws_reading_meter_and_the_sampled_directory(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, _| {
@@ -120,7 +128,7 @@ fn remote_indexing_draws_reading_meter_and_the_sampled_directory(
 fn startup_chooser_never_scans_before_explicit_acceptance(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
     cx.run_until_parked();
@@ -147,7 +155,7 @@ fn startup_chooser_never_scans_before_explicit_acceptance(
 
 #[gpui_kit::test]
 fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let selected = fixture();
     let other = fixture();
     let (view, cx) =
@@ -188,7 +196,7 @@ fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
 fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
     cx.run_until_parked();
@@ -233,7 +241,7 @@ fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
 fn switching_from_remote_to_local_clears_machine_specific_marks(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let target = fixture();
     let (view, cx) = view_over(temp.path(), cx);
@@ -261,7 +269,7 @@ fn switching_from_remote_to_local_clears_machine_specific_marks(
 fn chooser_fits_a_small_window_at_large_interface_zoom(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let (_, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
     cx.run_until_parked();
@@ -286,7 +294,7 @@ fn chooser_fits_a_small_window_at_large_interface_zoom(
 
 #[gpui_kit::test]
 fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| app.navigate_rail(Screen::Remote, cx));
@@ -314,7 +322,7 @@ fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
 fn a_directory_error_can_be_corrected_without_reconnecting(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
@@ -334,7 +342,7 @@ fn a_directory_error_can_be_corrected_without_reconnecting(
 fn stale_local_discovery_cannot_overwrite_closed_picker_state(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let (view, cx) =
         cx.add_window_view(|_, cx| Ruum::choose(options(), 3, None, cx));
     update(&view, cx, Ruum::load_local_volumes);
@@ -352,7 +360,7 @@ fn stale_local_discovery_cannot_overwrite_closed_picker_state(
 fn local_mounts_never_scan_nonexistent_remote_only_paths(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -392,7 +400,7 @@ fn local_mounts_never_scan_nonexistent_remote_only_paths(
 fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -423,7 +431,7 @@ fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
 fn remote_review_never_deletes_even_through_direct_actions(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -464,7 +472,7 @@ fn remote_review_never_deletes_even_through_direct_actions(
 fn a_failed_remote_scan_stops_showing_the_reading_screen(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, _| {
@@ -481,7 +489,7 @@ fn a_failed_remote_scan_stops_showing_the_reading_screen(
 
 #[gpui_kit::test]
 fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -505,7 +513,7 @@ fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
 fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let root = temp.path().to_path_buf();
     // Through the real constructor, so this is the path every first run takes.
@@ -540,7 +548,7 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
 
 #[gpui_kit::test]
 fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -580,7 +588,7 @@ fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
 fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -662,7 +670,7 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
 fn a_parents_name_gets_its_own_band_above_its_children(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -712,7 +720,7 @@ fn a_parents_name_gets_its_own_band_above_its_children(
 
 #[gpui_kit::test]
 fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -760,7 +768,7 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -823,7 +831,7 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
 fn typing_filters_live_and_enter_shows_only_the_matches(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -892,7 +900,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
 
 #[gpui_kit::test]
 fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -905,7 +913,7 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -931,7 +939,7 @@ fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
 fn enter_in_the_focused_volume_picker_scans_the_selected_root(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let target = dunce::canonicalize(temp.path().join("junk"))
         .expect("canonical target");
@@ -960,7 +968,7 @@ fn enter_in_the_focused_volume_picker_scans_the_selected_root(
 fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -1019,7 +1027,7 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
 fn remote_page_renders_only_ssh_card_and_ignores_volume_keys(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     let initial_root = read(&view, cx, |app| app.root_path.clone());
@@ -1097,7 +1105,7 @@ fn breadcrumb_and_ssh_browse_open_unified_directory_modal(
     use gpui_kit::Modifiers;
     use ruum_core::storage::{AuthMode, SshProfile};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let other = fixture();
     let (view, cx) = view_over(temp.path(), cx);
@@ -1214,7 +1222,7 @@ fn breadcrumb_and_ssh_browse_open_unified_directory_modal(
 
 #[gpui_kit::test]
 fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1236,7 +1244,7 @@ fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn command_chords_are_not_read_as_plain_letters(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1253,7 +1261,7 @@ fn command_chords_are_not_read_as_plain_letters(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1276,7 +1284,7 @@ fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
 /// theme, so a light theme is a real second configuration.
 #[gpui_kit::test]
 fn both_appearances_draw(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     for theme in [Theme::tokyo_night(), Theme::flexoki_light()] {
@@ -1293,7 +1301,7 @@ fn both_appearances_draw(cx: &mut TestAppContext) {
 /// walk is in flight.
 #[gpui_kit::test]
 fn a_view_without_flags_or_marks_still_draws(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -1321,7 +1329,7 @@ fn a_view_without_flags_or_marks_still_draws(cx: &mut TestAppContext) {
 /// button both have to reach the same state.
 #[gpui_kit::test]
 fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -1353,7 +1361,7 @@ fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
 fn the_review_screen_copies_the_list_as_an_agent_prompt(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let junk = temp.path().join("junk");
     let (view, cx) = view_over(temp.path(), cx);
@@ -1401,7 +1409,7 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
 fn remote_review_copies_host_guarded_script_and_prompt(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -1445,7 +1453,7 @@ fn remote_review_copies_host_guarded_script_and_prompt(
 /// stays, and nothing on disk changes.
 #[gpui_kit::test]
 fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -1478,7 +1486,7 @@ fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
 /// commits without a dialog; the permanent one is a deliberate choice.
 #[gpui_kit::test]
 fn the_trash_is_the_default_when_there_is_one(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     let (mode, available) = read(&view, cx, |app| {
@@ -1495,7 +1503,7 @@ fn the_trash_is_the_default_when_there_is_one(cx: &mut TestAppContext) {
 /// in the app is expressed in, and the mosaic's header band follows it.
 #[gpui_kit::test]
 fn interface_zoom_scales_the_rem_and_the_header_band(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1544,7 +1552,7 @@ fn child_crumbs(app: &Ruum, parent: &[usize], name: &str) -> Vec<usize> {
 /// after the descent was never the area that was zoomed into.
 #[gpui_kit::test]
 fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1585,7 +1593,7 @@ fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
 /// directory, and on a file enters the directory holding it.
 #[gpui_kit::test]
 fn enter_opens_the_selected_directory_at_any_depth(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1623,7 +1631,7 @@ fn enter_opens_the_selected_directory_at_any_depth(cx: &mut TestAppContext) {
 fn the_mark_key_follows_the_pointer_until_the_keyboard_moves(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1677,7 +1685,7 @@ fn the_mark_key_follows_the_pointer_until_the_keyboard_moves(
 fn after_descending_every_tile_is_inside_the_directory_drawn(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1775,7 +1783,7 @@ fn dragging_the_panel_edge_resizes_it_within_its_limits(
     use crate::state::{PANEL_MAX_REMS, PANEL_MIN_REMS, panel_width};
     use gpui_kit::{Modifiers, MouseButton};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -1825,7 +1833,7 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
 ) {
     use crate::state::Crumb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let inner = temp.path().join("junk");
     let (view, cx) = view_over(&inner, cx);
@@ -1883,7 +1891,7 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
 fn enter_before_the_search_lands_applies_it_when_it_does(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1909,7 +1917,7 @@ fn enter_before_the_search_lands_applies_it_when_it_does(
 fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     use gpui_kit::{Modifiers, MouseButton};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -2003,7 +2011,7 @@ fn names_at(names: &[String], index: usize) -> String {
 
 #[gpui_kit::test]
 fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -2082,7 +2090,7 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
 fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
     use gpui_kit::Modifiers;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -2167,7 +2175,7 @@ fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
 fn switching_the_metric_keeps_the_directory_and_the_selection(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = tempfile::TempDir::new().expect("tempdir");
     let root = temp.path();
     // Largest by size, but fewest files: the two swap places.
@@ -2216,7 +2224,7 @@ fn switching_the_metric_keeps_the_directory_and_the_selection(
 fn escape_cancels_the_first_scan_and_r_starts_it_again(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let root = temp.path().to_path_buf();
     let (view, cx) =
@@ -2248,7 +2256,7 @@ fn escape_cancels_the_first_scan_and_r_starts_it_again(
 fn escape_cancels_widening_and_keeps_the_tree_on_screen(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let inner = temp.path().join("junk");
     let (view, cx) = view_over(&inner, cx);
@@ -2280,7 +2288,7 @@ fn escape_cancels_widening_and_keeps_the_tree_on_screen(
 fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
     use gpui_kit::{Modifiers, MouseButton, NavigationDirection};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -2343,7 +2351,7 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
     use gpui_kit::Modifiers;
     use ruum_core::storage::StorageDb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let config = tempfile::tempdir().expect("config");
     let path = config.path().join("ruum.db");
@@ -2418,7 +2426,7 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     use crate::power::PowerEfficiency as Power;
     use gpui_kit::Modifiers;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let config = tempfile::tempdir().expect("config");
     let (view, cx) = view_over(temp.path(), cx);
@@ -2508,7 +2516,7 @@ fn top_bar_wraps_cleanly_at_min_width_across_all_locales(
     use gpui_kit::Modifiers;
     use ruum_core::docker_adapter::{DockerProbeStatus, DockerUsageSummary};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -2608,7 +2616,7 @@ fn top_bar_wraps_cleanly_at_min_width_across_all_locales(
 fn icon_rail_switches_pages_and_settings_shortcut(cx: &mut TestAppContext) {
     use ruum_core::docker_adapter::{DockerProbeStatus, DockerUsageSummary};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -2849,7 +2857,7 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
 ) {
     use ruum_core::watchdog_config::ProposalItem;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -3035,7 +3043,7 @@ fn confirm_only_standalone_mode(cx: &mut TestAppContext) {
         CleanupConfirmDecision, CleanupConfirmItem, CleanupConfirmRequest,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = tempfile::tempdir().expect("tempdir");
     let resp_file = temp.path().join("resp.json");
 
@@ -3097,7 +3105,7 @@ fn open_confirm_window_toggles_confirms_and_fails_closed_on_close(
     };
     use std::sync::mpsc::channel;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (_, cx) = view_over(temp.path(), cx);
 
@@ -3186,7 +3194,7 @@ fn settings_feedback_model_selection_and_watchdog_refresh_ui(
     use ruum_core::ai_cli::{DiscoveredModel, ModelSpeedResult};
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -3339,7 +3347,7 @@ fn watchdog_cli_discovery_speed_test_and_analysis_are_nonblocking(
     use ruum_core::watchdog_config::AiCliProvider;
     use std::os::unix::fs::PermissionsExt as _;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let fake_cli = temp.path().join("fake-agy");
     std::fs::write(
@@ -3476,7 +3484,7 @@ fn all_screens_render_across_all_locales(cx: &mut TestAppContext) {
     use crate::i18n::Locale;
     use ruum_core::confirm::{CleanupConfirmItem, CleanupConfirmRequest};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -3638,7 +3646,7 @@ fn system_notification_posts_with_app_identity(cx: &TestAppContext) {
     use ruum_core::watchdog::NOTIF_TAG_LOW_SPACE;
 
     cx.update(|cx| {
-        gpui_omarchy::init(cx);
+        init_test_theme(cx);
         crate::install_notification_handler(cx);
         crate::post_app_notification(
             NOTIF_TAG_LOW_SPACE,
@@ -3666,7 +3674,7 @@ fn clicking_low_space_notification_navigates_open_window_to_watchdog(
     use gpui_kit::SystemNotificationResponse;
     use ruum_core::watchdog::NOTIF_TAG_LOW_SPACE;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let tree = scan(temp.path(), options()).expect("scan the fixture");
     let root_path = temp.path().to_path_buf();
@@ -3711,7 +3719,7 @@ fn clicking_notification_reopens_closed_main_window(cx: &TestAppContext) {
 
     let temp = fixture();
     cx.update(|cx| {
-        gpui_omarchy::init(cx);
+        init_test_theme(cx);
         crate::install_notification_handler(cx);
         crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
     });
@@ -3767,7 +3775,7 @@ fn review_auto_switches_to_permanent_for_trash_and_localizes_trash_block(
         ALREADY_IN_TRASH_REASON, TrashEnv, TrashOs,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = tempfile::TempDir::new().expect("tempdir");
     let trash_file = temp.path().join(".Trash/old.bin");
     let keep_file = temp.path().join("keep/notes.txt");
@@ -3926,7 +3934,7 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
     use ruum_core::watchdog_config::AiCliProvider;
     use ruum_watchdog::{DEFAULT_COOLDOWN_SECS, WatchdogConfig, WatchdogState};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let db_path = temp.path().join("ruum.db");
     let (view, cx) = view_over(temp.path(), cx);
@@ -4116,7 +4124,7 @@ fn settings_draft_isolation_validation_and_clamped_echo(
     use ruum_core::storage::StorageDb;
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let db_path = temp.path().join("ruum.db");
     let (view, cx) = view_over(temp.path(), cx);
@@ -4237,7 +4245,7 @@ fn settings_cli_install_card_and_menu_action_work_without_host_mutation(
         CliInstallEnv, CliInstallOs, CliInstallStatus,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let fake_exe = temp.path().join("bin/ruum");
     std::fs::create_dir_all(fake_exe.parent().unwrap()).expect("mkdir bin");
@@ -4312,7 +4320,7 @@ fn watchdog_page_handles_none_space_saturating_mul_and_syncs_checked_at(
     use ruum_core::storage::StorageDb;
     use ruum_watchdog::WatchdogState;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let db_path = temp.path().join("ruum.db");
     {
@@ -4363,7 +4371,7 @@ fn settings_model_list_scroll_is_isolated_from_outer_page(
     };
     use ruum_core::ai_cli::DiscoveredModel;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -4545,7 +4553,7 @@ fn default_explore_startup_does_not_touch_keychain_or_legacy_text_files(
 ) {
     use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -4610,7 +4618,7 @@ fn remote_ssh_card_crud_sqlite_persistence_and_on_demand_connect_entry(
     use gpui_kit::Modifiers;
     use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -4846,7 +4854,7 @@ fn remote_connect_confirm_modal_approve_deny_queue_and_fail_closed(
         RemoteConnectConfirmDecision, RemoteConnectConfirmRequest,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1000.), px(700.)));
@@ -4985,7 +4993,7 @@ fn settings_general_watchdog_webhook_and_ai_round_trip_in_sqlite(
     use ruum_core::watchdog_config::AiCliProvider;
     use ruum_watchdog::WatchdogConfig;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -5192,7 +5200,7 @@ fn host_tabs_strip_preserves_sessions_and_local_tab_is_unclosable(
 ) {
     use crate::state::{ExploreHostTab, ExploreSessionSnapshot, HostTabKey};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -5291,7 +5299,7 @@ fn host_tabs_strip_preserves_sessions_and_local_tab_is_unclosable(
 fn remote_ssh_tilde_default_and_action_icon_buttons_and_spinners(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -5372,7 +5380,7 @@ fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
     use ruum_core::removal::RemovalMode;
     use ruum_core::watchdog_config::{CleanupProposal, ProposalItem};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -5511,7 +5519,7 @@ fn local_cleanup_prunes_ai_proposal_and_remote_modal_never_touches_local(
 fn settings_categories_preserve_drafts_webhook_crud_guide_and_icon_model_select(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -5618,7 +5626,7 @@ fn local_confirm_cleanup_posts_started_then_done_notifications_and_toast(
         NOTIF_TAG_CLEANUP_DONE, NOTIF_TAG_CLEANUP_STARTED,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -5776,7 +5784,7 @@ fn ipc_and_standalone_confirm_notify_only_on_nonempty_confirm(
     use ruum_core::watchdog::NOTIF_TAG_CLEANUP_STARTED;
     use std::sync::mpsc::channel;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let item_path = temp.path().join("junk/blob.bin");
@@ -5893,7 +5901,7 @@ fn docker_probe_status_persists_across_host_tabs_and_renders_page_states(
         DockerImageEntry, DockerProbeStatus, DockerUsageSummary,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -6095,7 +6103,7 @@ fn slice3_remote_snapshot_ai_analysis_and_platform_script_selection(
         }
     }
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let fake_cli = temp.path().join("fake-ai");
     std::fs::write(&fake_cli, b"stub\n").expect("write stub ai");
@@ -6241,7 +6249,7 @@ fn cleanup_confirm_window_docker_multiselect_defaults_and_docker_only_confirm(
     use ruum_core::watchdog_config::CleanupProposal;
     use std::sync::mpsc::channel;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (_, cx) = view_over(temp.path(), cx);
 
@@ -6458,7 +6466,7 @@ fn local_docker_workspace_batch_cleanup_and_done_routing(
         }
     }
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     let runner = Arc::new(MockDockerRunner::default());
@@ -6666,7 +6674,7 @@ fn remote_review_and_confirm_generate_script_dialog_and_pending_card_actions(
     use ruum_core::watchdog_config::CleanupProposal;
     use std::sync::Arc;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let db_dir = tempfile::tempdir().expect("db dir");
     let db_path = db_dir.path().join("ruum.db");
@@ -7018,7 +7026,7 @@ fn ensure_cred_store_caches_and_reuses_shared_handle_across_reopens(
     //    `Ruum` inherits `AppRuntime.cred_store` automatically with 0 manual
     //    field assignment and 0 extra keychain calls.
     cx.update(|cx| {
-        gpui_omarchy::init(cx);
+        init_test_theme(cx);
         crate::install_notification_handler(cx);
         crate::install_test_runtime(temp.path().to_path_buf(), false, None, cx);
         crate::with_runtime_mut(cx, |rt| {
@@ -7093,7 +7101,7 @@ fn pending_open_docker_navigates_only_when_first_probe_is_available(
 ) {
     use ruum_core::docker_adapter::{DockerProbeStatus, DockerUsageSummary};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -7140,7 +7148,7 @@ fn pending_open_docker_navigates_only_when_first_probe_is_available(
 fn ssd_mode_omits_csd_title_bar_and_f11_toggles_fullscreen(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.update(|_, cx| {
@@ -7185,7 +7193,7 @@ fn confirm_windows_close_window_action_cancels_and_denies_safely(
     };
     use std::sync::mpsc::channel;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (_, cx) = view_over(temp.path(), cx);
     cx.update(|_, cx| {
@@ -7340,7 +7348,7 @@ fn injected_csd_chrome_renders_controls_layout_drag_resize_and_tiling(
         }
     }
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let calls = Rc::new(RefCell::new(ChromeCalls::default()));
     let calls_ref = Rc::clone(&calls);
     let initial_state = crate::window_chrome::WindowChromeState {
@@ -7560,7 +7568,7 @@ fn injected_csd_confirm_windows_preserve_buttons_and_safe_close(
         }
     }
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     // Keep a background window alive so closing the confirm window doesn't quit.
     let temp = fixture();
     let (_, cx) = view_over(temp.path(), cx);
@@ -7764,7 +7772,7 @@ fn settings_updates_tab_toggles_preferences_and_persists_to_isolated_db(
     use ruum_core::storage::{StorageDb, UpdateChannel};
     use ruum_core::updater::InstallKind;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("isolated cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -7825,7 +7833,7 @@ fn icon_rail_update_entry_tracks_active_states_and_opens_modal(
     use crate::state::UpdateUiState;
     use ruum_core::updater::InstallKind;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -7895,7 +7903,7 @@ fn update_banner_shows_once_per_version_is_non_blocking_and_respects_guards(
     use ruum_core::confirm::RemoteConnectConfirmRequest;
     use ruum_core::updater::InstallKind;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     let info_v1 = mock_update_result("0.9.0", InstallKind::MacAppBundle, true);
@@ -8042,7 +8050,7 @@ fn update_modal_renders_all_states_hideable_download_marks_warning_and_skip(
     use ruum_core::storage::StorageDb;
     use ruum_core::updater::InstallKind;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("isolated cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -8181,7 +8189,7 @@ fn update_ui_renders_cleanly_across_all_four_locales_and_runtime_reopen(
     use crate::state::UpdateUiState;
     use ruum_core::updater::InstallKind;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let info = mock_update_result("0.9.9", InstallKind::MacAppBundle, true);
 
@@ -8264,7 +8272,7 @@ fn update_modal_handles_none_manifest_and_friendly_errors_across_locales(
     use ruum_core::storage::UpdateSettings;
     use ruum_core::updater::{InstallKind, UpdateCheckResult};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -8420,7 +8428,7 @@ fn settings_api_provider_toggles_fields_links_default_urls_and_preserves_custom(
 ) {
     use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
@@ -8588,7 +8596,7 @@ fn settings_api_key_lazy_keychain_save_preserve_clear_and_draft_probe(
     use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
     use std::net::TcpListener;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -8848,7 +8856,7 @@ fn settings_api_renders_cleanly_across_all_four_locales(
     use crate::i18n::ALL_LOCALES;
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1000.), px(1400.)));
@@ -8891,7 +8899,7 @@ fn local_ai_analysis_failure_notifies_and_persists_open_and_closed(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -9129,7 +9137,7 @@ fn remote_ssh_ai_analysis_failure_notifies_and_persists_open_and_closed(
     use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
     use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -9257,7 +9265,7 @@ fn watchdog_runtime_ai_failure_notification_notifies_and_toasts_open_window(
     use ruum_core::watchdog::NOTIF_TAG_AI_ANALYSIS;
     use std::sync::mpsc::channel;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum-watchdog-runtime.db");
@@ -9381,7 +9389,7 @@ fn tray_background_ai_analysis_failure_notifies_persists_and_toasts_reopened_win
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum-tray.db");
@@ -9548,7 +9556,7 @@ fn settings_general_persists_background_and_autostart_without_legacy_service_tog
     use gpui_kit::Modifiers;
     use ruum_core::storage::StorageDb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -9613,7 +9621,7 @@ fn tray_toggle_watchdog_flips_db_runtime_and_open_window(
 ) {
     use ruum_core::storage::StorageDb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -9712,7 +9720,7 @@ fn request_quit_cancels_pending_ipc_confirm_windows_without_deadlock(
         RemoteConnectConfirmRequest, send_ipc_message,
     };
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = tempfile::tempdir().expect("tempdir");
     #[cfg(unix)]
     let socket_or_port = temp.path().join("quit-ipc.sock");
@@ -9827,7 +9835,7 @@ fn settings_general_persists_tray_show_disk_space_and_syncs_runtime(
     use gpui_kit::Modifiers;
     use ruum_core::storage::StorageDb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -9912,7 +9920,7 @@ fn settings_general_tray_disk_space_waits_for_save_before_persisting_and_applyin
     use gpui_kit::Modifiers;
     use ruum_core::storage::StorageDb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -10063,7 +10071,7 @@ fn cleanup_progress_window_opens_on_confirm_background_keeps_running_tray_reopen
     use ruum_core::watchdog_config::{CleanupProposal, ProposalItem};
     use std::sync::atomic::Ordering;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -10366,7 +10374,7 @@ fn cleanup_progress_window_renders_under_csd_and_refreshes_main_window_on_comple
         }
     }
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cancel = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(crate::CleanupProgressSnapshot {
@@ -10592,7 +10600,7 @@ fn cleanup_progress_completion_states_manual_close_background_and_locales(
         }
     }
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
 
     // 1. Render Completed, Cancelled, and Failed completion states across all
@@ -10832,7 +10840,7 @@ fn request_quit_cancels_active_cleanup_and_closes_progress_window(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = tempfile::tempdir().expect("tempdir");
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_bg = Arc::clone(&cancel);
@@ -10878,7 +10886,7 @@ fn explore_top_bar_ai_button_layout_icons_and_locales(cx: &mut TestAppContext) {
             .is_some()
     );
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
 
@@ -10943,7 +10951,7 @@ fn explore_ai_button_local_click_dispatches_and_guards_reentry(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -11090,7 +11098,7 @@ fn explore_ai_button_ssh_tab_dispatches_and_respects_state(
     use std::net::TcpListener;
     use std::sync::Arc;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -11398,7 +11406,7 @@ fn cloud_cold_startup_and_settings_render_zero_keychain_zero_network(
     use ruum_core::storage::StorageDb;
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum-cold.db");
@@ -11495,7 +11503,7 @@ fn ai_setup_choice_modal_triggers_across_all_three_entries_and_persists(
     use ruum_core::storage::{AuthMode, SshProfile, StorageDb};
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -11714,7 +11722,7 @@ fn ruum_cloud_settings_virtual_models_auto_select_locked_notice_and_hidden_input
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -12041,7 +12049,7 @@ fn ruum_cloud_errors_surface_toast_last_error_with_trace_and_keep_local_ops_inta
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -12331,7 +12339,7 @@ fn cloud_billing_modal_sku_qr_polling_unlocks_and_stops_on_paid_or_close(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -12636,7 +12644,7 @@ fn cloud_billing_modal_unavailable_plans_and_instant_allow_decision(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -12841,7 +12849,7 @@ fn cloud_billing_manual_refresh_back_to_plans_and_five_min_timeout(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -13061,7 +13069,7 @@ fn cloud_settings_redeem_code_unlocks_models_updates_expiry_and_guards_double_su
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -13276,7 +13284,7 @@ fn cloud_billing_modal_redeem_code_unlocks_closes_modal_and_stops_polling(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -13502,7 +13510,7 @@ fn cloud_redeem_rejected_code_surfaces_localized_error_with_trace_and_allows_ret
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -13772,7 +13780,7 @@ fn e2e_cloud_full_lifecycle_onboarding_trial_402_alipay_qr_unlock_and_pro_analys
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -14218,7 +14226,7 @@ fn e2e_cloud_redemption_code_unlock_leads_to_paid_pro_analysis(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -14478,7 +14486,7 @@ fn e2e_cloud_reinstall_recovery_restores_paid_entitlement_and_models(
     use ruum_core::storage::StorageDb;
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -14742,7 +14750,7 @@ fn cloud_billing_usage_policy_shared_vs_per_sku_and_two_step_checkout(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -14986,7 +14994,7 @@ fn cloud_billing_instant_cached_plans_and_silent_background_refresh(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum-cached-plans.db");
@@ -15122,7 +15130,7 @@ fn cloud_settings_fetch_models_auto_and_sqlite_persistence_across_reload(
     use ruum_core::storage::StorageDb;
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -15309,7 +15317,7 @@ fn billing_modal_preserves_out_request_no_on_retry_and_resets_sku(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -15551,7 +15559,7 @@ fn cloud_paid_state_ux_precisely_distinguishes_alipay_redemption_and_expired(
 ) {
     use ruum_core::watchdog_config::AiCliProvider;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -15706,7 +15714,7 @@ fn cloud_plan_prewarming_back_during_creating_and_503_no_auto_retry(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -15961,7 +15969,7 @@ fn explore_ai_analysis_uses_top_level_root_path_locale_and_local_docker(
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = tempfile::tempdir().expect("tempdir");
     let proj_dir = temp.path().join("proj");
@@ -16067,14 +16075,23 @@ fn explore_ai_analysis_uses_top_level_root_path_locale_and_local_docker(
     server.join().expect("server join");
 
     let sent_body = captured_body.lock().expect("lock").clone();
+    let sent_json: serde_json::Value =
+        serde_json::from_str(&sent_body).expect("valid chat request JSON");
+    let prompt = sent_json["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|msg| msg["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let expected_root = temp.path().display().to_string();
     assert!(
-        sent_body.contains(&format!("Scanned Root: {expected_root}")),
-        "body={sent_body}"
+        prompt.contains(&format!("Scanned Root: {expected_root}")),
+        "prompt={prompt}"
     );
-    assert!(sent_body.contains("DOCKER RECLAIMABLE SNAPSHOT"));
-    assert!(sent_body.contains("Simplified Chinese (简体中文)"));
-    assert!(sent_body.contains(&target_dir.display().to_string()));
+    assert!(prompt.contains("DOCKER RECLAIMABLE SNAPSHOT"));
+    assert!(prompt.contains("Simplified Chinese (简体中文)"));
+    assert!(prompt.contains(&target_dir.display().to_string()));
 
     let norm_root = ruum_core::removal::normalize(temp.path());
     read(&view, win_cx, |app| {
@@ -16208,7 +16225,7 @@ fn option_b_local_supersede_cancels_first_silently_and_accepts_second(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
@@ -16318,7 +16335,7 @@ fn benchmark_all_watchdog_models_probes_concurrently(cx: &mut TestAppContext) {
     use std::net::TcpListener;
     use std::sync::{Arc, Barrier};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let store = CountingRootSecret::new([0x72; 32])
@@ -16401,7 +16418,7 @@ fn benchmark_cancel_and_non_blocking_completion_respect_switched_view(
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
@@ -16805,7 +16822,7 @@ fn explore_ai_button_and_watchdog_render_live_sse_stages_across_locales(
     use gpui_kit::{px, size};
     use ruum_core::AiProgressStage;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     let temp = fixture();
     let (view, win_cx) = view_over(temp.path(), cx);
     win_cx.update(|window, app_cx| {
@@ -16896,7 +16913,7 @@ fn refresh_cloud_entitlement_failure_does_not_pollute_ai_last_error(
 ) {
     use ruum_core::storage::StorageDb;
 
-    cx.update(gpui_omarchy::init);
+    cx.update(init_test_theme);
     cx.update(|cx| crate::install_notification_handler(cx));
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");

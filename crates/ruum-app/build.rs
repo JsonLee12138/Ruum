@@ -59,29 +59,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", icon.display());
     println!("cargo:rustc-link-arg-bin=ruum-gui={}", res.display());
-
-    // `link.exe /MANIFESTINPUT:` rejects `\\?\` verbatim prefixes, so strip
-    // them from the canonicalized manifest path before emitting linker args.
-    let manifest_canonical =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-            .join("../../packaging/windows/ruum.manifest")
-            .canonicalize()
-            .expect("Windows manifest asset is missing");
-    let manifest_text = manifest_canonical.to_string_lossy();
-    let manifest_plain = manifest_text
-        .strip_prefix(r"\\?\UNC\")
-        .map(|rest| format!(r"\\{rest}"))
-        .or_else(|| manifest_text.strip_prefix(r"\\?\").map(str::to_owned))
-        .unwrap_or_else(|| manifest_text.into_owned());
-    assert!(
-        std::path::Path::new(&manifest_plain).is_file(),
-        "Windows manifest asset is missing at {manifest_plain}"
-    );
-    println!("cargo:rerun-if-changed={manifest_plain}");
-    println!("cargo:rustc-link-arg-bin=ruum-gui=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg-bin=ruum-gui=/MANIFESTINPUT:{manifest_plain}"
-    );
 }
 
 #[cfg(not(windows))]

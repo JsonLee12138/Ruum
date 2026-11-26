@@ -12,9 +12,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, Context, Div, ElementId, Entity,
     FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Rems, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, Svg, Transformation, Window, div,
-    radians, relative, svg,
+    KeyDownEvent, MouseButton, ParentElement as _, Rems, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled, Svg, Transformation,
+    Window, div, radians, relative, svg,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, ChoiceItem, IconName, button, button_group,
@@ -2993,6 +2993,7 @@ fn ai_settings_section(
                     .bg(theme.normal_fill())
                     .hover(|style| style.bg(theme.hover_fill()))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
                         this.benchmark_watchdog_model(
                             Some(bench_id.clone()),
                             cx,
@@ -3053,6 +3054,7 @@ fn ai_settings_section(
                     })
                     .on_click(cx.listener(
                         move |this, _, window, cx| {
+                            cx.stop_propagation();
                             this.select_watchdog_model(
                                 &select_btn_id,
                                 window,
@@ -3431,7 +3433,9 @@ fn cloud_virtual_model_row(
             .border_color(theme.control_border())
             .bg(theme.normal_fill())
             .hover(|style| style.bg(theme.hover_fill()))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
                 this.benchmark_watchdog_model(Some(model_id_bench.clone()), cx);
             }))
             .child(if is_benchmarking {
@@ -3489,8 +3493,12 @@ fn cloud_virtual_model_row(
                     } else {
                         circle_icon(theme.secondary).into_any_element()
                     })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .on_click(cx.listener(
                         move |this, _, _, cx| {
+                            cx.stop_propagation();
                             this.select_cloud_model(&select_id, cx);
                         },
                     )),
@@ -3592,7 +3600,11 @@ fn cloud_auto_model_row(app: &Ruum, cx: &Context<'_, Ruum>) -> Stateful<Div> {
                 } else {
                     circle_icon(theme.secondary).into_any_element()
                 })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
                     this.select_cloud_model_auto(cx);
                 })),
         );

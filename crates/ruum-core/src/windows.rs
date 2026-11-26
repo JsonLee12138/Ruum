@@ -29,15 +29,16 @@ use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE, MAX_PATH,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
-    FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW,
-    GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
+    FindVolumeClose, GetDiskFreeSpaceExW, GetFileAttributesW,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+    GetVolumePathNamesForVolumeNameW, INVALID_FILE_ATTRIBUTES, SYNCHRONIZE,
+    SetFileAttributesW,
 };
 
 use crate::space::SpaceInfo;
@@ -221,13 +222,14 @@ struct Records {
 /// asking per directory is several requests to the file system on top of
 /// the listing. `None` asks.
 pub fn read_dir(dir: &Path, volume: Option<u64>) -> io::Result<ReadDir> {
+    let open_dir = crate::removal_adapter::to_windows_extended_path(dir);
     let handle = OpenOptions::new()
         .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
         // Needed to open a directory at all. Without
         // `FILE_FLAG_OPEN_REPARSE_POINT` a link is followed, which is what
         // a walk that chose to enter one wants.
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(dir)?;
+        .open(&open_dir)?;
     let volume = volume.or_else(|| {
         winapi_util::file::information(&handle)
             .ok()
@@ -245,7 +247,7 @@ pub fn read_dir(dir: &Path, volume: Option<u64>) -> io::Result<ReadDir> {
     let source = match records.fill() {
         Ok(()) => Source::Records(records),
         Err(error) if unsupported(&error) => {
-            Source::Std(Box::new(fs::read_dir(dir)?))
+            Source::Std(Box::new(fs::read_dir(&open_dir)?))
         }
         Err(error) => return Err(error),
     };
@@ -476,18 +478,53 @@ pub fn walk_volume(canonical: &Path) -> Option<u64> {
     information(canonical).map(|info| info.volume_serial_number())
 }
 
+/// Clear `FILE_ATTRIBUTE_READONLY` on `path` only when it is NOT a reparse
+/// point (symlink, junction, or cloud placeholder), avoiding following links.
+pub fn clear_readonly_if_not_reparse(path: &Path) -> bool {
+    let Ok(name) = wide(path, false) else {
+        return false;
+    };
+    // SAFETY: `name` is NUL-terminated and outlives both calls; neither call
+    // follows reparse points when reading or updating attributes.
+    unsafe {
+        let attrs = GetFileAttributesW(name.as_ptr());
+        if attrs == INVALID_FILE_ATTRIBUTES
+            || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || attrs & FILE_ATTRIBUTE_READONLY == 0
+        {
+            return false;
+        }
+        SetFileAttributesW(name.as_ptr(), attrs & !FILE_ATTRIBUTE_READONLY) != 0
+    }
+}
+
 /// What the file system says about `path`, following links.
 fn information(path: &Path) -> Option<winapi_util::file::Information> {
+    let open_path = crate::removal_adapter::to_windows_extended_path(path);
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
+        .open(open_path)
         .ok()?;
     winapi_util::file::information(&file).ok()
 }
 
 /// Capacity and free space of the volume holding `path`.
 pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
+    match space_info_raw(path) {
+        Ok(info) => Ok(info),
+        Err(err) => {
+            let ext = crate::removal_adapter::to_windows_extended_path(path);
+            if ext == path {
+                Err(err)
+            } else {
+                space_info_raw(&ext)
+            }
+        }
+    }
+}
+
+fn space_info_raw(path: &Path) -> io::Result<SpaceInfo> {
     // A network share is only accepted with a trailing separator.
     let directory = wide(path, true)?;
     let (mut available, mut total, mut free) = (0_u64, 0_u64, 0_u64);
@@ -514,6 +551,16 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
 /// Where the volume holding `path` is mounted: a drive such as `C:\`, a
 /// share, or a folder another volume is mounted on.
 pub fn volume_root(path: &Path) -> Option<PathBuf> {
+    let raw = volume_root_raw(path).or_else(|| {
+        let ext = crate::removal_adapter::to_windows_extended_path(path);
+        (ext != path).then(|| volume_root_raw(&ext)).flatten()
+    })?;
+    Some(crate::removal_adapter::strip_windows_extended_prefix_path(
+        &raw,
+    ))
+}
+
+fn volume_root_raw(path: &Path) -> Option<PathBuf> {
     let name = wide(path, false).ok()?;
     // The answer is a prefix of the path made absolute; the path's length
     // plus room for the longest drive and directory it could gain is ample.
@@ -1195,5 +1242,29 @@ mod tests {
         assert_eq!(file_id(0), None, "no id at all");
         assert_eq!(file_id(0x0005_0000_0000_1234), Some(0x0005_0000_0000_1234));
         assert_eq!(file_id((1 << 64) | 7), None, "a ReFS id needs both halves");
+    }
+
+    #[test]
+    fn long_path_read_dir_and_stripped_volume_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut deep = temp.path().join("node_modules");
+        for i in 0..15 {
+            deep.push(format!("pkg_segment_{i:02}_abcdefghij"));
+        }
+        let deep_ext = crate::removal_adapter::to_windows_extended_path(&deep);
+        fs::create_dir_all(&deep_ext).expect("mkdir deep");
+        fs::write(deep_ext.join("index.js"), b"x").expect("write");
+        assert!(deep.as_os_str().to_string_lossy().len() > 280);
+
+        let entries = listed(&deep);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name(), "index.js");
+
+        let root = volume_root(&deep).expect("volume root for deep path");
+        assert!(!root.to_string_lossy().starts_with(r"\\?\"), "{root:?}");
+
+        crate::removal_adapter::RemovalAdapterFactory::create()
+            .remove_permanently(&temp.path().join("node_modules"), temp.path())
+            .expect("cleanup deep node_modules");
     }
 }

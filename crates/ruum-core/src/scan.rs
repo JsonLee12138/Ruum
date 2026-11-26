@@ -478,10 +478,11 @@ impl WalkContext {
     }
 
     fn classify_symlink(&self, path: &Path, name: Box<str>) -> Classified {
+        let sys_path = crate::removal::host_syscall_path(path);
         if !self.options.follow_links {
             // Not followed: the link occupies only its target string, which
             // `du` reports as a handful of bytes or nothing at all.
-            return match fs::symlink_metadata(path) {
+            return match fs::symlink_metadata(&sys_path) {
                 Ok(meta) => {
                     let facts = Facts::of(&meta, self.options.apparent_size);
                     Classified::Entry(leaf_node(
@@ -498,7 +499,7 @@ impl WalkContext {
             };
         }
 
-        let meta = match fs::metadata(path) {
+        let meta = match fs::metadata(&sys_path) {
             Ok(meta) => meta,
             Err(error) => {
                 // A dangling link is normal, not an error worth counting.
@@ -903,14 +904,15 @@ fn scan_on_pool(
     context: &Arc<WalkContext>,
     pool: &rayon::ThreadPool,
 ) -> io::Result<Node> {
-    let root_meta = fs::metadata(root)?;
+    let sys_root = crate::removal::host_syscall_path(root);
+    let root_meta = fs::metadata(&sys_root)?;
     if !root_meta.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a directory", root.display()),
         ));
     }
-    let resolved = root.canonicalize().ok();
+    let resolved = sys_root.canonicalize().ok();
     let canonical = resolved.as_deref().unwrap_or(root);
     let mut never = crate::space::never_scanned(root, canonical);
     // Hidden-entry and depth filters can leave an alias as the only route

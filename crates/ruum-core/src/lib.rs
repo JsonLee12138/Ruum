@@ -47,6 +47,7 @@ pub mod remote_progress;
 #[cfg(unix)]
 mod remote_walk;
 pub mod removal;
+pub mod removal_adapter;
 pub mod scan;
 pub mod scan_preview;
 pub mod scan_threads;

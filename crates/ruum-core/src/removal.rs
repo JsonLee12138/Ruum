@@ -221,7 +221,7 @@ fn plan_against(
     }
     // Once per plan, not per target: the review screen plans every frame.
     let home = env.home.as_deref().map(Home::of);
-    let real_root = fs::canonicalize(&root).ok();
+    let real_root = fs::canonicalize(host_syscall_path(&root)).ok();
 
     for target in targets {
         let path = normalize(&target.path);
@@ -339,11 +339,15 @@ const SYSTEM_TREES: [&str; 24] = [
 /// `\\?\C:\` is `C:\`. A guard that compared the spelling would be passed by
 /// the other one. Only for judging: what is removed is always the path as
 /// marked.
-fn guard_key(path: &Path) -> PathBuf {
+pub(crate) fn guard_key(path: &Path) -> PathBuf {
     if cfg!(windows) {
         return windows_key(&normalize(path));
     }
     guard_key_for(path, cfg!(target_os = "macos"))
+}
+
+pub(crate) fn host_syscall_path(path: &Path) -> PathBuf {
+    crate::removal_adapter::RemovalAdapterFactory::create().syscall_path(path)
 }
 
 pub(crate) fn guard_key_for(path: &Path, macos: bool) -> PathBuf {
@@ -682,7 +686,9 @@ fn linked(
     home: Option<&Home>,
 ) -> Option<String> {
     let (parent, name) = (path.parent()?, path.file_name()?);
-    let real = guard_key(&fs::canonicalize(parent).ok()?.join(name));
+    let real = guard_key(
+        &fs::canonicalize(host_syscall_path(parent)).ok()?.join(name),
+    );
     if let (Some(real_root), Ok(rest)) = (real_root, path.strip_prefix(root))
         && real != guard_key(&real_root.join(rest))
     {
@@ -923,7 +929,8 @@ const fn profiles_key() -> Option<&'static Path> {
 /// `profiles`. A file or a link there is no profile and stays removable.
 fn is_profile(path: &Path, key: &Path, profiles: &Path) -> bool {
     key.parent() == Some(profiles)
-        && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+        && fs::symlink_metadata(host_syscall_path(path))
+            .is_ok_and(|meta| meta.is_dir())
 }
 
 /// A mount point strictly inside the path keyed `key`, if there is one. A
@@ -1302,7 +1309,7 @@ fn run(
     // the trash out of the root. Permanent removal on Unix refuses that by
     // itself; see [`open_parent`].
     let home = trash_env.home.as_deref().map(Home::of);
-    let real_root = fs::canonicalize(&plan.root).ok();
+    let real_root = fs::canonicalize(host_syscall_path(&plan.root)).ok();
 
     for target in &plan.targets {
         if cancel.load(Ordering::Relaxed) {
@@ -1404,6 +1411,12 @@ fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
     })
 }
 
+/// Permanently remove `path` under `root` via the host [`RemovalAdapter`].
+pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
+    crate::removal_adapter::RemovalAdapterFactory::create()
+        .remove_permanently(path, root)
+}
+
 /// `rm -rf --one-file-system` semantics: a symlink is unlinked, never
 /// followed, and nothing on another filesystem is touched.
 ///
@@ -1416,7 +1429,10 @@ fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
 /// The same goes for the way down to `path` from `root`, the scanned root:
 /// see [`open_parent`].
 #[cfg(unix)]
-pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
+pub(crate) fn remove_permanently_unix(
+    path: &Path,
+    root: &Path,
+) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, statat, unlinkat};
 
     let (parent, name) = open_parent(path, root)?;
@@ -1521,21 +1537,6 @@ fn open_step<P: rustix::path::Arg>(
         access | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-}
-
-#[cfg(not(unix))]
-pub fn remove_permanently(path: &Path, _root: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.is_dir() {
-        fs::remove_dir_all(path)
-    } else if is_dir_link(&meta) {
-        // Windows removes a link to a directory, a junction or a directory
-        // symlink, as a directory: `RemoveDirectoryW` takes the link and
-        // leaves its target alone.
-        fs::remove_dir(path)
-    } else {
-        fs::remove_file(path)
-    }
 }
 
 /// Where a directory lives, as far as crossing into another filesystem goes.
@@ -1932,7 +1933,30 @@ fn trash_via_macos(_path: &Path) -> io::Result<()> {
 /// the reversible path cannot turn into a permanent one silently.
 #[cfg(windows)]
 fn recycle(path: &Path) -> io::Result<()> {
-    trash::delete(path).map_err(io::Error::other)
+    use crate::removal_adapter::{
+        RemovalAdapterFactory, RemovalOs, TrashErrorKind,
+        classify_windows_trash_hresult,
+    };
+
+    trash::delete(path).map_err(|error| {
+        let kind = match error {
+            trash::Error::CanonicalizePath { .. } => {
+                TrashErrorKind::LongPathOrRecycleLimit
+            }
+            trash::Error::Os { code, .. } => {
+                classify_windows_trash_hresult(code.cast_unsigned())
+            }
+            trash::Error::Unknown { ref description }
+                if description.to_ascii_lowercase().contains("aborted") =>
+            {
+                TrashErrorKind::LongPathOrRecycleLimit
+            }
+            _ => TrashErrorKind::Other,
+        };
+        let msg = RemovalAdapterFactory::create_for(RemovalOs::Windows)
+            .format_trash_error(kind, &error.to_string());
+        io::Error::other(msg)
+    })
 }
 
 #[cfg(not(windows))]

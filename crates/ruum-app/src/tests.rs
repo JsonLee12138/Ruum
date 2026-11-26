@@ -11803,6 +11803,18 @@ fn ruum_cloud_settings_virtual_models_auto_select_locked_notice_and_hidden_input
                 })
                 .to_string(),
             },
+            "/v1/models/probe" => StubCloudReply {
+                status: "200 OK".into(),
+                trace_id: Some("tr-probe".into()),
+                body: serde_json::json!({
+                    "ok": true,
+                    "model": "ruum-fast",
+                    "ttftMs": 38,
+                    "totalMs": 45,
+                    "budgetExhausted": false
+                })
+                .to_string(),
+            },
             "/v1/chat/completions" => {
                 panic!("test must NOT hit /v1/chat/completions")
             }
@@ -11876,10 +11888,71 @@ fn ruum_cloud_settings_virtual_models_auto_select_locked_notice_and_hidden_input
             .all(|r| r.path != "/v1/chat/completions")
     );
 
-    // Selecting `ruum-fast` persists it; clicking `Auto` restores `None`.
+    // Clicking the speed probe button benchmarks `ruum-fast` WITHOUT
+    // selecting it (neither on direct click nor on press-then-slide-out).
+    let speed_btn_1 = win_cx
+        .debug_bounds("setting-model-speed-1")
+        .expect("setting-model-speed-1");
     let fast_row = win_cx
         .debug_bounds("cloud-model-row-1")
         .expect("cloud-model-row-1");
+    win_cx.simulate_click(speed_btn_1.center(), Modifiers::none());
+    win_cx.run_until_parked();
+    draw(win_cx);
+    assert!(
+        server
+            .recorded_requests()
+            .iter()
+            .any(|r| r.path == "/v1/models/probe")
+    );
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+        assert!(
+            app.watchdog_speed_results
+                .iter()
+                .any(|r| r.model == "ruum-fast" && r.ok)
+        );
+    });
+    win_cx.simulate_mouse_down(
+        speed_btn_1.center(),
+        gpui_kit::MouseButton::Left,
+        Modifiers::none(),
+    );
+    win_cx.simulate_mouse_up(
+        fast_row.center(),
+        gpui_kit::MouseButton::Left,
+        Modifiers::none(),
+    );
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+    });
+
+    // Selecting `ruum-fast` via its Select button or row persists it;
+    // clicking `Auto` restores `None`.
+    let select_btn_1 = win_cx
+        .debug_bounds("cloud-model-select-1")
+        .expect("cloud-model-select-1");
+    win_cx.simulate_click(select_btn_1.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model.as_deref(), Some("ruum-fast"));
+        assert_eq!(
+            app.cloud_state.selected_model_id.as_deref(),
+            Some("ruum-fast")
+        );
+    });
+    let auto_select = win_cx
+        .debug_bounds("cloud-model-select-auto")
+        .expect("cloud-model-select-auto");
+    win_cx.simulate_click(auto_select.center(), Modifiers::none());
+    draw(win_cx);
+    read(&view, win_cx, |app| {
+        assert_eq!(app.watchdog_draft.model, None);
+        assert_eq!(app.cloud_state.selected_model_id, None);
+    });
     win_cx.simulate_click(fast_row.center(), Modifiers::none());
     draw(win_cx);
     read(&view, win_cx, |app| {

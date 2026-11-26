@@ -11,8 +11,10 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::removal::{
-    guard_key_for, is_dir_link, remove_permanently, summarize_drain_errors,
+    guard_key_for, host_syscall_path, is_dir_link, remove_permanently,
+    summarize_drain_errors,
 };
+use crate::removal_adapter::{RemovalAdapterFactory, RemovalOs};
 
 /// Operating system family for trash/recycle-bin semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -979,7 +981,8 @@ const fn unix_remove_paired_trashinfo(_info_path: &Path) -> io::Result<()> {
 }
 
 fn ensure_real_win_dir(path: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
+    let sys_path = host_syscall_path(path);
+    let meta = fs::symlink_metadata(&sys_path)?;
     if meta.file_type().is_symlink() || is_dir_link(&meta) || !meta.is_dir() {
         return Err(io::Error::other(format!(
             "refused to empty non-directory or link at {}",
@@ -987,7 +990,7 @@ fn ensure_real_win_dir(path: &Path) -> io::Result<()> {
         )));
     }
     #[cfg(windows)]
-    if crate::windows::is_mount_point(path) {
+    if crate::windows::is_mount_point(&sys_path) {
         return Err(io::Error::other(format!(
             "stopped at {}: another volume is mounted there",
             path.display()
@@ -997,7 +1000,8 @@ fn ensure_real_win_dir(path: &Path) -> io::Result<()> {
 }
 
 fn remove_windows_paired_metadata(info_path: &Path) -> io::Result<()> {
-    let meta = match fs::symlink_metadata(info_path) {
+    let sys_path = host_syscall_path(info_path);
+    let meta = match fs::symlink_metadata(&sys_path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
@@ -1008,9 +1012,20 @@ fn remove_windows_paired_metadata(info_path: &Path) -> io::Result<()> {
             info_path.display()
         )));
     }
-    match fs::remove_file(info_path) {
+    match fs::remove_file(&sys_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        #[cfg(windows)]
+        Err(err)
+            if err.kind() == io::ErrorKind::PermissionDenied
+                && crate::windows::clear_readonly_if_not_reparse(&sys_path) =>
+        {
+            match fs::remove_file(&sys_path) {
+                Ok(()) => Ok(()),
+                Err(next) if next.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(next) => Err(next),
+            }
+        }
         Err(err) => Err(err),
     }
 }
@@ -1026,7 +1041,8 @@ fn empty_windows_recycle_root(
     #[cfg(not(windows))]
     let _ = sanitize_windows_volume_root(volume_root)?;
 
-    let entries = match fs::read_dir(recycle_bin_path) {
+    let sys_bin = host_syscall_path(recycle_bin_path);
+    let entries = match fs::read_dir(&sys_bin) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
@@ -1113,12 +1129,14 @@ fn empty_windows_recycle_root(
 }
 
 fn drain_windows_sid_dir(sid_dir: &Path) -> io::Result<()> {
-    drain_windows_sid_entries(fs::read_dir(sid_dir)?)
+    let sys_sid = host_syscall_path(sid_dir);
+    drain_windows_sid_entries(fs::read_dir(&sys_sid)?)
 }
 
 fn drain_windows_sid_entries(entries: fs::ReadDir) -> io::Result<()> {
     let mut failures = 0_usize;
     let mut first_error: Option<io::Error> = None;
+    let mut targets = Vec::new();
 
     for entry in entries {
         let entry = match entry {
@@ -1138,7 +1156,12 @@ fn drain_windows_sid_entries(entries: fs::ReadDir) -> io::Result<()> {
         {
             continue;
         }
-        if let Err(err) = remove_win_entry_best_effort(&entry.path()) {
+        targets.push(entry.path());
+    }
+    // `entries` (`ReadDir`) is dropped here before deleting any child entries.
+    let adapter = RemovalAdapterFactory::create_for(RemovalOs::Windows);
+    for target in targets {
+        if let Err(err) = adapter.remove_entry_best_effort(&target) {
             failures += 1;
             if first_error.is_none() {
                 first_error = Some(err);
@@ -1151,53 +1174,6 @@ fn drain_windows_sid_entries(entries: fs::ReadDir) -> io::Result<()> {
     } else {
         Err(summarize_drain_errors(failures, first_error))
     }
-}
-
-fn remove_win_entry_best_effort(path: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        if is_dir_link(&meta) {
-            return fs::remove_dir(path);
-        }
-        return fs::remove_file(path);
-    }
-    if is_dir_link(&meta) {
-        return fs::remove_dir(path);
-    }
-    if !meta.is_dir() {
-        return fs::remove_file(path);
-    }
-    #[cfg(windows)]
-    if crate::windows::is_mount_point(path) {
-        return Err(io::Error::other(format!(
-            "stopped at {}: another volume is mounted there",
-            path.display()
-        )));
-    }
-    let mut failures = 0_usize;
-    let mut first_error: Option<io::Error> = None;
-    for entry in fs::read_dir(path)? {
-        match entry {
-            Ok(child) => {
-                if let Err(err) = remove_win_entry_best_effort(&child.path()) {
-                    failures += 1;
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-            Err(err) => {
-                failures += 1;
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
-    }
-    if failures > 0 {
-        return Err(summarize_drain_errors(failures, first_error));
-    }
-    fs::remove_dir(path)
 }
 
 #[cfg(test)]

@@ -89,6 +89,8 @@ pub struct AdkAgentRequest {
     pub tool_timeout: Duration,
     /// Retries once without tools if the model rejects tools with HTTP 400.
     pub fallback_without_tools_on_unsupported: bool,
+    /// Optional cooperative cancellation token aborting in-flight inference.
+    pub cancel: Option<crate::cancel::CancelToken>,
 }
 
 impl AdkAgentRequest {
@@ -106,7 +108,15 @@ impl AdkAgentRequest {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             fallback_without_tools_on_unsupported: true,
+            cancel: None,
         }
+    }
+
+    /// Attaches a cooperative cancellation token to this agent run.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: crate::cancel::CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 }
 
@@ -128,6 +138,7 @@ impl fmt::Debug for AdkAgentRequest {
                 "fallback_without_tools_on_unsupported",
                 &self.fallback_without_tools_on_unsupported,
             )
+            .field("has_cancel", &self.cancel.is_some())
             .finish()
     }
 }
@@ -196,6 +207,8 @@ pub async fn connect_mcp_stdio(
 #[derive(Debug, Clone)]
 pub struct AdkDirectClient {
     http: reqwest::Client,
+    probe_http: reqwest::Client,
+    cloud_probe_http: reqwest::Client,
 }
 
 impl AdkDirectClient {
@@ -204,13 +217,36 @@ impl AdkDirectClient {
         adk_core::ensure_crypto_provider();
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(crate::cloud_llm::DEFAULT_CLOUD_CONNECT_TIMEOUT)
             .build()
             .map_err(|err| {
                 AdkClientError::Model(format!(
                     "failed to build HTTP client: {err}"
                 ))
             })?;
-        Ok(Self { http })
+        let probe_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(crate::cloud_llm::DEFAULT_CLOUD_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|err| {
+                AdkClientError::Model(format!(
+                    "failed to build probe HTTP client: {err}"
+                ))
+            })?;
+        let cloud_probe_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(crate::cloud_llm::DEFAULT_CLOUD_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|err| {
+                AdkClientError::Model(format!(
+                    "failed to build cloud probe HTTP client: {err}"
+                ))
+            })?;
+        Ok(Self {
+            http,
+            probe_http,
+            cloud_probe_http,
+        })
     }
 
     /// Queries the endpoint's `/models` list.
@@ -231,6 +267,30 @@ impl AdkDirectClient {
         test_connection_with_http(&self.http, config).await
     }
 
+    /// Fast streaming TTFT probe against a direct OpenAI/Anthropic model.
+    pub async fn probe_model(
+        &self,
+        config: &AdkModelConfig,
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Result<crate::model::ModelProbeResult, AdkClientError> {
+        adk_core::ensure_crypto_provider();
+        crate::model::probe_model_with_http(&self.probe_http, config, cancel)
+            .await
+    }
+
+    /// Probes a Ruum Cloud virtual model via `POST /v1/models/probe`.
+    pub async fn probe_cloud_model(
+        &self,
+        config: &crate::cloud_llm::RuumCloudConfig,
+    ) -> Result<crate::model::ModelProbeResult, AdkClientError> {
+        adk_core::ensure_crypto_provider();
+        crate::cloud_llm::probe_cloud_model_with_http(
+            &self.cloud_probe_http,
+            config,
+        )
+        .await
+    }
+
     /// Runs a multi-turn agent loop until a final response or safety limit.
     pub async fn run_agent(
         &self,
@@ -238,6 +298,13 @@ impl AdkDirectClient {
         request: AdkAgentRequest,
     ) -> Result<AdkAgentResponse, AdkClientError> {
         adk_core::ensure_crypto_provider();
+        let cancel = request.cancel.clone();
+        if cancel
+            .as_ref()
+            .is_some_and(crate::cancel::CancelToken::is_cancelled)
+        {
+            return Err(AdkClientError::Cancelled);
+        }
         let (llm, _endpoints, model_name) =
             build_llm(config, None, None, false)?;
         let api_key = config.api_key.as_str();
@@ -269,9 +336,23 @@ impl AdkDirectClient {
             }
         };
 
-        tokio::time::timeout(config.timeout, fut)
+        let timed = async {
+            tokio::time::timeout(config.timeout, fut)
+                .await
+                .map_err(|_| AdkClientError::Timeout(config.timeout))?
+        };
+
+        let res = crate::cancel::race_cancel(cancel.as_ref(), timed)
             .await
-            .map_err(|_| AdkClientError::Timeout(config.timeout))?
+            .map_err(|()| AdkClientError::Cancelled)?;
+        if res.is_err()
+            && cancel
+                .as_ref()
+                .is_some_and(crate::cancel::CancelToken::is_cancelled)
+        {
+            return Err(AdkClientError::Cancelled);
+        }
+        res
     }
 
     /// Runs a multi-turn agent loop against Ruum Cloud (`POST /v1/chat/completions`)
@@ -284,6 +365,14 @@ impl AdkDirectClient {
         mut request: AdkAgentRequest,
     ) -> Result<AdkAgentResponse, AdkClientError> {
         adk_core::ensure_crypto_provider();
+        let effective_cancel =
+            request.cancel.clone().or_else(|| config.cancel.clone());
+        if effective_cancel
+            .as_ref()
+            .is_some_and(crate::cancel::CancelToken::is_cancelled)
+        {
+            return Err(AdkClientError::Cancelled);
+        }
         let session_id = config
             .session_id
             .as_deref()
@@ -294,8 +383,10 @@ impl AdkDirectClient {
                 ToOwned::to_owned,
             );
 
+        let mut cloud_config = config.clone();
+        cloud_config.cancel = effective_cancel.clone();
         let cloud_llm = Arc::new(crate::cloud_llm::RuumCloudLlm::new(
-            config.clone(),
+            cloud_config,
             session_id,
         )?);
         cloud_llm.clear_last_error();
@@ -311,11 +402,20 @@ impl AdkDirectClient {
 
         let has_tools = !request.tools.is_empty();
         let llm_trait: Arc<dyn adk_core::Llm> = cloud_llm.clone();
-        match run_agent_once(llm_trait, &config.model, "", &request, has_tools)
+        let run_fut =
+            run_agent_once(llm_trait, &config.model, "", &request, has_tools);
+        match crate::cancel::race_cancel(effective_cancel.as_ref(), run_fut)
             .await
         {
-            Ok(resp) => Ok(resp),
-            Err(attempt) => {
+            Err(()) => Err(AdkClientError::Cancelled),
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(attempt)) => {
+                if effective_cancel
+                    .as_ref()
+                    .is_some_and(crate::cancel::CancelToken::is_cancelled)
+                {
+                    return Err(AdkClientError::Cancelled);
+                }
                 if let Some(gw) = cloud_llm.take_last_error() {
                     return Err(AdkClientError::CloudGateway {
                         status: gw.status,

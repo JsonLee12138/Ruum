@@ -7,9 +7,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ruum_adk::{
     ALLOWED_RUUM_TOOLS, AdkAgentRequest, AdkClientError, AdkDirectClient,
-    AdkToolDef, AdkToolExecutor, CloudGatewayError, CloudTokenProvider,
-    MAX_CLOUD_COMPACTED_BYTES, MAX_CLOUD_MAX_TOKENS, MAX_CLOUD_MESSAGES,
-    RuumCloudConfig, RuumTask, compact_chat_request_payload,
+    AdkToolDef, AdkToolExecutor, CancelToken, CloudGatewayError,
+    CloudStreamStage, CloudTokenProvider, MAX_CLOUD_COMPACTED_BYTES,
+    MAX_CLOUD_MAX_TOKENS, MAX_CLOUD_MESSAGES, RuumCloudConfig, RuumTask,
+    compact_chat_request_payload,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,8 +30,9 @@ struct RecordedRequest {
 struct MockReply {
     status: u16,
     reason: &'static str,
+    content_type: &'static str,
     headers: Vec<(String, String)>,
-    body: String,
+    chunks: Vec<(Duration, String)>,
     delay: Duration,
 }
 
@@ -43,13 +45,26 @@ impl MockReply {
             403 => "Forbidden",
             429 => "Too Many Requests",
             503 => "Service Unavailable",
+            504 => "Gateway Timeout",
             _ => "Error",
         };
         Self {
             status,
             reason,
+            content_type: "application/json",
             headers: Vec::new(),
-            body: body.to_string(),
+            chunks: vec![(Duration::ZERO, body.to_string())],
+            delay: Duration::ZERO,
+        }
+    }
+
+    const fn sse(chunks: Vec<(Duration, String)>) -> Self {
+        Self {
+            status: 200,
+            reason: "OK",
+            content_type: "text/event-stream; charset=utf-8",
+            headers: Vec::new(),
+            chunks,
             delay: Duration::ZERO,
         }
     }
@@ -208,18 +223,37 @@ fn start_mock_server(replies: Vec<MockReply>) -> MockServer {
                     tokio::time::sleep(reply.delay).await;
                 }
                 let mut header_block = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                    reply.status,
-                    reply.reason,
-                    reply.body.len(),
+                    "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
+                    reply.status, reply.reason, reply.content_type,
                 );
+                if reply.content_type.starts_with("application/json") {
+                    let body_len: usize =
+                        reply.chunks.iter().map(|(_, s)| s.len()).sum();
+                    let _ =
+                        write!(header_block, "Content-Length: {body_len}\r\n");
+                }
+                header_block.push_str("Connection: close\r\n");
                 for (k, v) in reply.headers {
                     let _ = write!(header_block, "{k}: {v}\r\n");
                 }
                 header_block.push_str("\r\n");
                 let _ = stream.write_all(header_block.as_bytes()).await;
-                let _ = stream.write_all(reply.body.as_bytes()).await;
                 let _ = stream.flush().await;
+                for (chunk_delay, chunk_body) in reply.chunks {
+                    if !chunk_delay.is_zero() {
+                        tokio::time::sleep(chunk_delay).await;
+                    }
+                    if !chunk_body.is_empty() {
+                        if stream
+                            .write_all(chunk_body.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                }
             });
         }
     });
@@ -422,7 +456,11 @@ async fn cloud_agent_enforces_headers_non_streaming_max_tokens_whitelist_and_401
         Some(env!("CARGO_PKG_VERSION"))
     );
 
-    assert_eq!(recorded[1].body["stream"], json!(false));
+    assert_eq!(recorded[1].body["stream"], json!(true));
+    assert!(
+        header_value(&recorded[1], "accept")
+            .is_some_and(|v| v.contains("text/event-stream"))
+    );
     if let Some(mt) = recorded[1].body.get("max_tokens").and_then(Value::as_u64)
     {
         assert!(mt <= u64::from(MAX_CLOUD_MAX_TOKENS));
@@ -468,7 +506,8 @@ async fn cloud_agent_preserves_trace_id_and_never_retries_403_revoked() {
         RuumTask::TreeAnalysis,
         provider.clone(),
     );
-    assert_eq!(cfg.request_timeout, Duration::from_secs(150));
+    assert_eq!(cfg.connect_timeout, Duration::from_mins(1));
+    assert_eq!(cfg.request_timeout, Duration::from_mins(3));
     let client = AdkDirectClient::new().unwrap();
     let err = client
         .run_cloud_agent(&cfg, AdkAgentRequest::new("Sys", "Inspect tree"))
@@ -581,4 +620,367 @@ fn compact_chat_request_payload_bounds_messages_and_bytes_without_orphaning_tool
 
     let serialized = serde_json::to_vec(&payload).unwrap();
     assert!(serialized.len() <= MAX_CLOUD_COMPACTED_BYTES);
+}
+
+#[tokio::test]
+async fn cloud_agent_forwards_event_key_retries_429_skips_fup_and_honors_cancel()
+ {
+    let rate_limit_reply = MockReply::json(
+        429,
+        &json!({
+            "ok": false,
+            "code": "INFERENCE_RATE_LIMITED",
+            "message": "queued",
+            "traceId": "tr-rl-1"
+        }),
+    )
+    .with_header("Retry-After", "0");
+    let ok_reply = MockReply::json(
+        200,
+        &json!({
+            "id": "chatcmpl-ok",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Recovered"},
+                "finish_reason": "stop"
+            }]
+        }),
+    );
+    let server = start_mock_server(vec![rate_limit_reply, ok_reply]);
+
+    let tp = Arc::new(StubTokenProvider::new("jwt-ok", "jwt-refreshed"));
+    let cfg = RuumCloudConfig::new(
+        &server.base_url,
+        "ruum-fast",
+        RuumTask::LocalAnalysis,
+        tp.clone(),
+    )
+    .with_event_key("disk_cleanup_local");
+
+    let client = AdkDirectClient::new().unwrap();
+    let resp = client
+        .run_cloud_agent(&cfg, AdkAgentRequest::new("sys", "scan"))
+        .await
+        .expect("429 INFERENCE_RATE_LIMITED should retry and succeed");
+    assert_eq!(resp.text, "Recovered");
+
+    let recorded = server.recorded();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().all(|req| {
+        req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("x-ruum-event-key")
+                && v == "disk_cleanup_local"
+        })
+    }));
+
+    // Non-retryable FUP 429 must fail immediately without retry.
+    let fup_reply = MockReply::json(
+        429,
+        &json!({
+            "ok": false,
+            "code": "FUP_DAILY_CAP_EXCEEDED",
+            "message": "daily cap hit"
+        }),
+    );
+    let fup_server = start_mock_server(vec![fup_reply]);
+    let fup_cfg = RuumCloudConfig::new(
+        &fup_server.base_url,
+        "ruum-fast",
+        RuumTask::LocalAnalysis,
+        tp.clone(),
+    );
+    let fup_err = client
+        .run_cloud_agent(&fup_cfg, AdkAgentRequest::new("sys", "scan"))
+        .await
+        .expect_err("FUP 429 must not retry");
+    assert!(matches!(
+        fup_err,
+        AdkClientError::CloudGateway {
+            code: Some(ref c),
+            ..
+        } if c == "FUP_DAILY_CAP_EXCEEDED"
+    ));
+    assert_eq!(fup_server.recorded().len(), 1);
+
+    // CancelToken must abort an in-flight slow request cleanly.
+    let mut slow = MockReply::json(200, &json!({}));
+    slow.delay = Duration::from_secs(3);
+    let slow_server = start_mock_server(vec![slow]);
+    let cancel = CancelToken::new();
+    let cancel_trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_trigger.cancel();
+    });
+    let slow_cfg = RuumCloudConfig::new(
+        &slow_server.base_url,
+        "ruum-fast",
+        RuumTask::LocalAnalysis,
+        tp,
+    )
+    .with_request_timeout(Duration::from_secs(5));
+    let cancel_err = client
+        .run_cloud_agent(
+            &slow_cfg,
+            AdkAgentRequest::new("sys", "scan").with_cancel(cancel),
+        )
+        .await
+        .expect_err("cancelled cloud run must abort");
+    assert!(matches!(cancel_err, AdkClientError::Cancelled));
+}
+
+#[tokio::test]
+async fn probe_cloud_model_calls_models_probe_and_maps_result() {
+    let reply = MockReply::json(
+        200,
+        &json!({
+            "ok": true,
+            "model": "ruum-fast",
+            "ttftMs": 42,
+            "totalMs": 55,
+            "budgetExhausted": false
+        }),
+    );
+    let server = start_mock_server(vec![reply]);
+    let tp = Arc::new(StubTokenProvider::new("jwt-probe", "jwt-probe-2"));
+    let cfg = RuumCloudConfig::new(
+        &server.base_url,
+        "ruum-fast",
+        RuumTask::LocalAnalysis,
+        tp,
+    );
+    let client = AdkDirectClient::new().unwrap();
+    let res = client
+        .probe_cloud_model(&cfg)
+        .await
+        .expect("probe_cloud_model should succeed");
+    assert_eq!(res.model, "ruum-fast");
+    assert_eq!(res.ttft_ms, 42);
+    assert_eq!(res.total_ms, 55);
+    assert!(!res.budget_exhausted);
+
+    let recorded = server.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].method, "POST");
+    assert_eq!(recorded[0].path, "/v1/models/probe");
+    assert_eq!(recorded[0].body["model"], "ruum-fast");
+    assert!(recorded[0].body.get("timeoutMs").is_none());
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let cfg_cancelled = RuumCloudConfig::new(
+        &server.base_url,
+        "ruum-fast",
+        RuumTask::LocalAnalysis,
+        Arc::new(StubTokenProvider::new("jwt-probe-c", "jwt-probe-c2")),
+    )
+    .with_cancel(cancel);
+    let err = client
+        .probe_cloud_model(&cfg_cancelled)
+        .await
+        .expect_err("cancelled probe must return Cancelled");
+    assert!(matches!(err, AdkClientError::Cancelled));
+}
+
+#[test]
+fn compact_chat_request_payload_preserves_language_requirement_tail() {
+    let huge_body = "x".repeat(70 * 1024);
+    let tail = "\nOUTPUT LANGUAGE REQUIREMENT:\nMUST reply in Chinese (zh-CN).";
+    let mut payload = json!({
+        "model": "ruum-fast",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": format!("{huge_body}{tail}")}
+        ],
+        "stream": false
+    });
+    compact_chat_request_payload(
+        &mut payload,
+        MAX_CLOUD_MESSAGES,
+        MAX_CLOUD_COMPACTED_BYTES,
+    )
+    .expect("compaction succeeds");
+    let content = payload["messages"][1]["content"].as_str().unwrap();
+    assert!(content.ends_with(tail), "tail stripped: {content}");
+    assert!(
+        serde_json::to_vec(&payload).unwrap().len()
+            <= MAX_CLOUD_COMPACTED_BYTES
+    );
+}
+
+#[tokio::test]
+async fn cloud_agent_consumes_sse_stages_tool_calls_and_survives_past_single_chunk_timeout()
+ {
+    let server = start_mock_server(vec![
+        MockReply::sse(vec![
+            (
+                Duration::ZERO,
+                ": ruum-stage {\"stage\":\"queued\"}\n\n".to_owned(),
+            ),
+            (
+                Duration::from_millis(60),
+                ": ruum-stage {\"stage\":\"connecting\"}\n\n".to_owned(),
+            ),
+            (
+                Duration::from_millis(60),
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n"
+                    .to_owned(),
+            ),
+            (
+                Duration::from_millis(60),
+                ": ruum-stage {\"stage\":\"generating\"}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sse_1\",\"function\":{\"name\":\"scan_directory\",\"arguments\":\"{\\\"path\\\":\\\"/tmp\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+                    .to_owned(),
+            ),
+        ]),
+        MockReply::sse(vec![
+            (
+                Duration::ZERO,
+                ": ruum-stage {\"stage\":\"thinking\"}\n\n".to_owned(),
+            ),
+            (
+                Duration::from_millis(60),
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"{\\\"summary\\\":\"}}]}\n\n"
+                    .to_owned(),
+            ),
+            (
+                Duration::from_millis(60),
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\\"sse ok\\\",\\\"items\\\":[]}\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    .to_owned(),
+            ),
+        ]),
+    ]);
+
+    let stages = Arc::new(Mutex::new(Vec::new()));
+    let stages_cb = Arc::clone(&stages);
+    let provider = Arc::new(StubTokenProvider::new("jwt-valid", "jwt-new"));
+    let cfg = RuumCloudConfig::new(
+        &server.base_url,
+        "ruum-fast",
+        RuumTask::LocalAnalysis,
+        provider,
+    )
+    // Total SSE run exceeds 150ms across 3x60ms chunks while each read stays < 150ms.
+    .with_request_timeout(Duration::from_millis(150))
+    .with_on_stage(Arc::new(move |stage| {
+        stages_cb.lock().unwrap().push(stage);
+    }));
+
+    let mut req = AdkAgentRequest::new("Sys", "Inspect");
+    req.tools = vec![tool_def("scan_directory")];
+    let client = AdkDirectClient::new().unwrap();
+    let resp = client.run_cloud_agent(&cfg, req).await.unwrap();
+    assert_eq!(resp.text, "{\"summary\":\"sse ok\",\"items\":[]}");
+    assert_eq!(resp.tool_calls_made, 1);
+
+    let observed = stages.lock().unwrap().clone();
+    assert!(observed.contains(&CloudStreamStage::Queued));
+    assert!(observed.contains(&CloudStreamStage::Connecting));
+    assert!(observed.contains(&CloudStreamStage::Thinking));
+    assert!(observed.contains(&CloudStreamStage::Generating));
+}
+
+#[tokio::test]
+async fn cloud_agent_sse_rejects_premature_eof_midstream_error_idle_stall_and_never_retries_504()
+ {
+    // 1. Premature EOF (no [DONE] and no finish_reason) fails cleanly without retry.
+    let eof_server = start_mock_server(vec![MockReply::sse(vec![(
+        Duration::ZERO,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n"
+            .to_owned(),
+    )])]);
+    let provider = Arc::new(StubTokenProvider::new("jwt-valid", "jwt-new"));
+    let eof_cfg = RuumCloudConfig::new(
+        &eof_server.base_url,
+        "ruum-fast",
+        RuumTask::TreeAnalysis,
+        provider.clone(),
+    );
+    let client = AdkDirectClient::new().unwrap();
+    let eof_err = client
+        .run_cloud_agent(&eof_cfg, AdkAgentRequest::new("Sys", "Hello"))
+        .await
+        .expect_err("premature EOF must error");
+    assert_eq!(eof_server.recorded().len(), 1);
+    assert!(matches!(eof_err, AdkClientError::CloudGateway { .. }));
+
+    // 2. Mid-stream data: {"error": ...} fails immediately without retry.
+    let mid_err_server = start_mock_server(vec![MockReply::sse(vec![(
+        Duration::ZERO,
+        ": ruum-stage {\"stage\":\"connecting\"}\n\ndata: {\"error\":{\"code\":\"COMMON_UPSTREAM_TIMEOUT\",\"status\":504,\"message\":\"upstream stalled\"}}\n\n"
+            .to_owned(),
+    )])]);
+    let mid_cfg = RuumCloudConfig::new(
+        &mid_err_server.base_url,
+        "ruum-fast",
+        RuumTask::TreeAnalysis,
+        provider.clone(),
+    );
+    let mid_err = client
+        .run_cloud_agent(&mid_cfg, AdkAgentRequest::new("Sys", "Hello"))
+        .await
+        .expect_err("mid-stream SSE error must fail");
+    assert_eq!(mid_err_server.recorded().len(), 1);
+    assert!(matches!(
+        mid_err,
+        AdkClientError::CloudGateway {
+            is_timeout: true,
+            ..
+        }
+    ));
+
+    // 3. Socket-silence fallback aborts stalled SSE read.
+    let stall_server = start_mock_server(vec![MockReply::sse(vec![
+        (
+            Duration::ZERO,
+            ": ruum-stage {\"stage\":\"connecting\"}\n\n".to_owned(),
+        ),
+        (Duration::from_millis(400), "data: [DONE]\n\n".to_owned()),
+    ])]);
+    let stall_cfg = RuumCloudConfig::new(
+        &stall_server.base_url,
+        "ruum-fast",
+        RuumTask::TreeAnalysis,
+        provider.clone(),
+    )
+    .with_request_timeout(Duration::from_millis(90));
+    let stall_err = client
+        .run_cloud_agent(&stall_cfg, AdkAgentRequest::new("Sys", "Hello"))
+        .await
+        .expect_err("stalled SSE read must time out");
+    assert_eq!(stall_server.recorded().len(), 1);
+    assert!(matches!(
+        stall_err,
+        AdkClientError::CloudGateway {
+            is_timeout: true,
+            ..
+        }
+    ));
+
+    // 4. HTTP 504 never retries.
+    let t504_server = start_mock_server(vec![MockReply::json(
+        504,
+        &json!({
+            "code": "COMMON_UPSTREAM_TIMEOUT",
+            "message": "timeout"
+        }),
+    )]);
+    let t504_cfg = RuumCloudConfig::new(
+        &t504_server.base_url,
+        "ruum-fast",
+        RuumTask::TreeAnalysis,
+        provider,
+    );
+    let t504_err = client
+        .run_cloud_agent(&t504_cfg, AdkAgentRequest::new("Sys", "Hello"))
+        .await
+        .expect_err("HTTP 504 must fail without retry");
+    assert_eq!(t504_server.recorded().len(), 1);
+    assert!(matches!(
+        t504_err,
+        AdkClientError::CloudGateway {
+            status: Some(504),
+            is_timeout: true,
+            ..
+        }
+    ));
 }

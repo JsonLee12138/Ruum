@@ -4,11 +4,11 @@
 //! single-shot 401 JWT refresh + replay, 7-tool whitelist filtering, and
 //! 56 KiB / 20-message request budget compaction.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adk_core::{
     AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, Llm,
@@ -20,7 +20,8 @@ use futures::stream;
 use serde_json::{Map, Value, json};
 use url::{Host, Url};
 
-use crate::model::{AdkClientError, sanitize_error_message};
+use crate::cancel::{CancelToken, race_cancel};
+use crate::model::{AdkClientError, ModelProbeResult, sanitize_error_message};
 
 /// Maximum serialized request payload bytes for `/v1/chat/completions`.
 pub const MAX_CLOUD_COMPACTED_BYTES: usize = 56 * 1024;
@@ -34,11 +35,37 @@ pub const MAX_CLOUD_MAX_TOKENS: u32 = 4096;
 /// Maximum tool-calling iterations enforced for `RuumCloud`.
 pub const MAX_CLOUD_ITERATIONS: u32 = 8;
 
-/// TCP/TLS connect timeout for Ruum Cloud inference requests.
-pub const DEFAULT_CLOUD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP/TLS connect timeout for Ruum Cloud requests (generous for cross-border links).
+pub const DEFAULT_CLOUD_CONNECT_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Per-request timeout for Ruum Cloud `/v1/chat/completions`.
-pub const DEFAULT_CLOUD_INFERENCE_TIMEOUT: Duration = Duration::from_secs(150);
+/// Extra slack beyond `connect_timeout` allowed while waiting for HTTP response headers.
+const DEFAULT_CLOUD_HEADER_SLACK: Duration = Duration::from_mins(1);
+
+/// Per-read SSE dead-socket silence fallback for Ruum Cloud inference.
+/// Server emits `: ruum-ping` every 15s, so 180s tolerates 12 missed beats
+/// while allowing arbitrarily long server-side queueing.
+pub const DEFAULT_CLOUD_INFERENCE_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Maximum transient retries on `429` / concurrency / upstream-busy responses.
+const MAX_TRANSIENT_CLOUD_RETRIES: u32 = 3;
+
+/// Single-line cap for SSE framing (`1 MiB`).
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+/// Accumulated text/tool-call payload cap for SSE responses (`2 MiB`).
+const MAX_SSE_ACCUM_BYTES: usize = 2 * 1024 * 1024;
+
+/// Execution stage reported by `ruum-server` (`: ruum-stage`) and SSE deltas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudStreamStage {
+    Queued,
+    Connecting,
+    Thinking,
+    Generating,
+}
+
+/// Callback invoked when [`RuumCloudLlm`] transitions execution stage.
+pub type CloudStageCallback = Arc<dyn Fn(CloudStreamStage) + Send + Sync>;
 
 /// Strict read-only MCP tool whitelist permitted by `ruum-server`.
 pub const ALLOWED_RUUM_TOOLS: [&str; 7] = [
@@ -118,6 +145,9 @@ pub struct RuumCloudConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub session_id: Option<String>,
+    pub event_key: Option<String>,
+    pub cancel: Option<CancelToken>,
+    pub on_stage: Option<CloudStageCallback>,
     pub token_provider: Arc<dyn CloudTokenProvider>,
 }
 
@@ -131,13 +161,16 @@ impl fmt::Debug for RuumCloudConfig {
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("session_id", &self.session_id)
+            .field("event_key", &self.event_key)
+            .field("has_cancel", &self.cancel.is_some())
+            .field("has_on_stage", &self.on_stage.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl RuumCloudConfig {
-    /// Create a new Ruum Cloud LLM config with conservative timeouts (`10s`
-    /// connect, `150s` per-request).
+    /// Create a new Ruum Cloud LLM config (`60s` connect, `180s` per-read
+    /// dead-socket silence fallback).
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -152,6 +185,9 @@ impl RuumCloudConfig {
             connect_timeout: DEFAULT_CLOUD_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_CLOUD_INFERENCE_TIMEOUT,
             session_id: None,
+            event_key: None,
+            cancel: None,
+            on_stage: None,
             token_provider,
         }
     }
@@ -177,6 +213,24 @@ impl RuumCloudConfig {
     #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_key(mut self, event_key: impl Into<String>) -> Self {
+        self.event_key = Some(event_key.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    #[must_use]
+    pub fn with_on_stage(mut self, on_stage: CloudStageCallback) -> Self {
+        self.on_stage = Some(on_stage);
         self
     }
 }
@@ -245,8 +299,12 @@ pub struct RuumCloudLlm {
     model: String,
     task: RuumTask,
     client_version: String,
+    connect_timeout: Duration,
     request_timeout: Duration,
     session_id: String,
+    event_key: Option<String>,
+    cancel: Option<CancelToken>,
+    on_stage: Option<CloudStageCallback>,
     token_provider: Arc<dyn CloudTokenProvider>,
     last_error: Arc<Mutex<Option<CloudGatewayError>>>,
 }
@@ -258,6 +316,9 @@ impl fmt::Debug for RuumCloudLlm {
             .field("model", &self.model)
             .field("task", &self.task)
             .field("session_id", &self.session_id)
+            .field("event_key", &self.event_key)
+            .field("has_cancel", &self.cancel.is_some())
+            .field("has_on_stage", &self.on_stage.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +343,12 @@ impl RuumCloudLlm {
                 "Ruum Cloud session_id is required".to_owned(),
             ));
         }
+        let event_key = config
+            .event_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
@@ -298,8 +365,12 @@ impl RuumCloudLlm {
             model,
             task: config.task,
             client_version: config.client_version,
+            connect_timeout: config.connect_timeout,
             request_timeout: config.request_timeout,
             session_id: session,
+            event_key,
+            cancel: config.cancel,
+            on_stage: config.on_stage,
             token_provider: config.token_provider,
             last_error: Arc::new(Mutex::new(None)),
         })
@@ -355,39 +426,607 @@ impl RuumCloudLlm {
         adk_err
     }
 
+    fn record_cancelled_error(&self) -> AdkError {
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = None;
+        }
+        AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Unavailable,
+            "model.ruum_cloud.cancelled",
+            "request cancelled",
+        )
+        .with_provider("ruum-cloud")
+    }
+
     async fn send_once(
         &self,
         token: &str,
         body_bytes: &[u8],
     ) -> Result<reqwest::Response, CloudGatewayError> {
-        self.http
+        let mut req = self
+            .http
             .post(&self.completions_url)
-            .timeout(self.request_timeout)
             .bearer_auth(token)
             .header("X-Ruum-Session", &self.session_id)
             .header("X-Ruum-Task", self.task.as_str())
             .header("X-Ruum-Client-Version", &self.client_version)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body_bytes.to_vec())
-            .send()
-            .await
-            .map_err(|err| {
-                let is_timeout = err.is_timeout();
-                let msg = sanitize_error_message(&err.to_string(), token);
-                CloudGatewayError {
-                    status: err.status().map(|s| s.as_u16()),
-                    code: is_timeout
-                        .then(|| "COMMON_UPSTREAM_TIMEOUT".to_owned()),
-                    message: if is_timeout {
-                        format!("Ruum Cloud inference timed out: {msg}")
-                    } else {
-                        format!("Ruum Cloud network error: {msg}")
-                    },
-                    trace_id: None,
-                    retry_after_secs: None,
-                    is_timeout,
+            .header(
+                reqwest::header::ACCEPT,
+                "text/event-stream, application/json",
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(ref key) = self.event_key {
+            req = req.header("X-Ruum-Event-Key", key);
+        }
+        let header_timeout = self.request_timeout.min(
+            self.connect_timeout
+                .saturating_add(DEFAULT_CLOUD_HEADER_SLACK),
+        );
+        let resp = tokio::time::timeout(
+            header_timeout,
+            req.body(body_bytes.to_vec()).send(),
+        )
+        .await
+        .map_err(|_| CloudGatewayError {
+            status: None,
+            code: Some("COMMON_UPSTREAM_TIMEOUT".to_owned()),
+            message: "Ruum Cloud inference timed out".to_owned(),
+            trace_id: None,
+            retry_after_secs: None,
+            is_timeout: true,
+        })?;
+        resp.map_err(|err| {
+            let is_timeout = err.is_timeout();
+            let msg = sanitize_error_message(&err.to_string(), token);
+            CloudGatewayError {
+                status: err.status().map(|s| s.as_u16()),
+                code: is_timeout.then(|| "COMMON_UPSTREAM_TIMEOUT".to_owned()),
+                message: if is_timeout {
+                    format!("Ruum Cloud inference timed out: {msg}")
+                } else {
+                    format!("Ruum Cloud network error: {msg}")
+                },
+                trace_id: None,
+                retry_after_secs: None,
+                is_timeout,
+            }
+        })
+    }
+
+    async fn send_with_refresh(
+        &self,
+        body_bytes: &[u8],
+    ) -> Result<Result<reqwest::Response, CloudGatewayError>, ()> {
+        let token = race_cancel(
+            self.cancel.as_ref(),
+            self.token_provider.current_token(),
+        )
+        .await?;
+        let token = match token {
+            Ok(t) => t,
+            Err(err) => return Ok(Err(err)),
+        };
+
+        let first = race_cancel(
+            self.cancel.as_ref(),
+            self.send_once(&token, body_bytes),
+        )
+        .await?;
+        let mut resp = match first {
+            Ok(r) => r,
+            Err(err) => return Ok(Err(err)),
+        };
+
+        if resp.status().as_u16() == 401 {
+            let first_err = race_cancel(
+                self.cancel.as_ref(),
+                extract_gateway_error_from_response(resp, &token),
+            )
+            .await?;
+            if first_err.code.as_deref() == Some("AUTH_DEVICE_REVOKED") {
+                return Ok(Err(first_err));
+            }
+            let refreshed = race_cancel(
+                self.cancel.as_ref(),
+                self.token_provider.refresh_token(),
+            )
+            .await?;
+            let refreshed = match refreshed {
+                Ok(t) => t,
+                Err(err) => return Ok(Err(err)),
+            };
+            let retry_resp = race_cancel(
+                self.cancel.as_ref(),
+                self.send_once(&refreshed, body_bytes),
+            )
+            .await?;
+            resp = match retry_resp {
+                Ok(r) => r,
+                Err(err) => return Ok(Err(err)),
+            };
+            if !resp.status().is_success() {
+                let err = race_cancel(
+                    self.cancel.as_ref(),
+                    extract_gateway_error_from_response(resp, &refreshed),
+                )
+                .await?;
+                return Ok(Err(err));
+            }
+        } else if !resp.status().is_success() {
+            let err = race_cancel(
+                self.cancel.as_ref(),
+                extract_gateway_error_from_response(resp, &token),
+            )
+            .await?;
+            return Ok(Err(err));
+        }
+
+        Ok(Ok(resp))
+    }
+}
+
+fn is_retryable_cloud_error(err: &CloudGatewayError) -> bool {
+    if err.is_timeout
+        || err.status == Some(504)
+        || err.code.as_deref() == Some("COMMON_UPSTREAM_TIMEOUT")
+    {
+        return false;
+    }
+    matches!(
+        err.code.as_deref(),
+        Some("INFERENCE_CONCURRENCY_LIMITED" | "INFERENCE_RATE_LIMITED")
+    ) || (err.status == Some(503)
+        && err.code.as_deref() == Some("INFERENCE_NO_AVAILABLE_UPSTREAM"))
+}
+
+fn retry_backoff_duration(err: &CloudGatewayError, attempt: u32) -> Duration {
+    let ms = if let Some(secs) = err.retry_after_secs {
+        secs.saturating_mul(1000).clamp(250, 5_000)
+    } else {
+        match attempt {
+            0 => 500,
+            1 => 1500,
+            _ => 3000,
+        }
+    };
+    Duration::from_millis(ms)
+}
+
+fn protocol_error(message: impl Into<String>) -> CloudGatewayError {
+    CloudGatewayError {
+        status: None,
+        code: Some("COMMON_UPSTREAM_PROTOCOL_ERROR".to_owned()),
+        message: message.into(),
+        trace_id: None,
+        retry_after_secs: None,
+        is_timeout: false,
+    }
+}
+
+fn parse_stage_comment(raw: &str) -> Option<CloudStreamStage> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stage_str = if trimmed.starts_with('{') {
+        serde_json::from_str::<Value>(trimmed).ok().and_then(|v| {
+            v.get("stage")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })?
+    } else {
+        trimmed.split_whitespace().next()?.to_owned()
+    };
+    match stage_str.trim().to_ascii_lowercase().as_str() {
+        "queued" => Some(CloudStreamStage::Queued),
+        "connecting" => Some(CloudStreamStage::Connecting),
+        "thinking" => Some(CloudStreamStage::Thinking),
+        "generating" => Some(CloudStreamStage::Generating),
+        _ => None,
+    }
+}
+
+fn parse_sse_error_frame(
+    val: &Value,
+    default_trace: Option<&str>,
+) -> CloudGatewayError {
+    let err_obj = val.get("error");
+    let status = err_obj
+        .and_then(|e| e.get("status"))
+        .or_else(|| val.get("status"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u16::try_from(n).ok());
+    let code = err_obj
+        .and_then(|e| e.get("code"))
+        .or_else(|| val.get("code"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let trace_id = err_obj
+        .and_then(|e| e.get("traceId").or_else(|| e.get("trace_id")))
+        .or_else(|| val.get("traceId").or_else(|| val.get("trace_id")))
+        .and_then(Value::as_str)
+        .or(default_trace)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let message = err_obj
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| err_obj.and_then(Value::as_str))
+        .or_else(|| val.get("message").and_then(Value::as_str))
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(
+            || "upstream SSE stream returned error".to_owned(),
+            ToOwned::to_owned,
+        );
+    let is_timeout = matches!(status, Some(408 | 504))
+        || code.as_deref() == Some("COMMON_UPSTREAM_TIMEOUT");
+    CloudGatewayError {
+        status,
+        code,
+        message,
+        trace_id,
+        retry_after_secs: None,
+        is_timeout,
+    }
+}
+
+#[derive(Default)]
+struct SseToolCallAccum {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct SseAccumulator {
+    reasoning: String,
+    content: String,
+    tool_calls: BTreeMap<usize, SseToolCallAccum>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    accum_bytes: usize,
+    saw_terminal: bool,
+    last_stage: Option<CloudStreamStage>,
+}
+
+impl SseAccumulator {
+    fn emit_stage(
+        &mut self,
+        cb: Option<&CloudStageCallback>,
+        stage: CloudStreamStage,
+    ) {
+        if matches!(
+            (self.last_stage, stage),
+            (
+                Some(CloudStreamStage::Generating),
+                CloudStreamStage::Thinking
+            )
+        ) {
+            return;
+        }
+        if self.last_stage == Some(stage) {
+            return;
+        }
+        self.last_stage = Some(stage);
+        if let Some(handler) = cb {
+            handler(stage);
+        }
+    }
+
+    fn push_bounded(
+        &mut self,
+        buf: &mut String,
+        piece: &str,
+    ) -> Result<(), CloudGatewayError> {
+        let next = self.accum_bytes.saturating_add(piece.len());
+        if next > MAX_SSE_ACCUM_BYTES {
+            return Err(protocol_error(
+                "Ruum Cloud SSE response exceeded 2 MiB limit",
+            ));
+        }
+        self.accum_bytes = next;
+        buf.push_str(piece);
+        Ok(())
+    }
+
+    fn apply_delta_tool_calls(
+        &mut self,
+        arr: &[Value],
+        cb: Option<&CloudStageCallback>,
+    ) -> Result<(), CloudGatewayError> {
+        for item in arr {
+            let fallback_idx = self.tool_calls.len();
+            let idx = item
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(fallback_idx);
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                let entry = self.tool_calls.entry(idx).or_default();
+                if entry.id.is_empty() && !id.is_empty() {
+                    id.clone_into(&mut entry.id);
                 }
-            })
+            }
+            if let Some(func) = item.get("function") {
+                if let Some(name) = func.get("name").and_then(Value::as_str) {
+                    let entry = self.tool_calls.entry(idx).or_default();
+                    if entry.name.is_empty() && !name.is_empty() {
+                        name.clone_into(&mut entry.name);
+                    }
+                }
+                if let Some(args) =
+                    func.get("arguments").and_then(Value::as_str)
+                    && !args.is_empty()
+                {
+                    let next = self.accum_bytes.saturating_add(args.len());
+                    if next > MAX_SSE_ACCUM_BYTES {
+                        return Err(protocol_error(
+                            "Ruum Cloud SSE response exceeded 2 MiB limit",
+                        ));
+                    }
+                    self.accum_bytes = next;
+                    self.tool_calls
+                        .entry(idx)
+                        .or_default()
+                        .arguments
+                        .push_str(args);
+                }
+            }
+        }
+        if !arr.is_empty() {
+            self.emit_stage(cb, CloudStreamStage::Generating);
+        }
+        Ok(())
+    }
+
+    fn apply_data_payload(
+        &mut self,
+        payload: &str,
+        cb: Option<&CloudStageCallback>,
+        header_trace: Option<&str>,
+    ) -> Result<bool, CloudGatewayError> {
+        if payload == "[DONE]" {
+            self.saw_terminal = true;
+            return Ok(true);
+        }
+        let val: Value = serde_json::from_str(payload).map_err(|err| {
+            protocol_error(format!("invalid Ruum Cloud SSE JSON chunk: {err}"))
+        })?;
+        if val.get("error").is_some_and(|e| !e.is_null()) {
+            return Err(parse_sse_error_frame(&val, header_trace));
+        }
+        if let Some(u) = val.get("usage").filter(|u| u.is_object()) {
+            self.usage = Some(u.clone());
+        }
+        let Some(choice) = val
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+        else {
+            return Ok(false);
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                let mut tmp = std::mem::take(&mut self.reasoning);
+                let res = self.push_bounded(&mut tmp, reasoning);
+                self.reasoning = tmp;
+                res?;
+                self.emit_stage(cb, CloudStreamStage::Thinking);
+            }
+            if let Some(text) = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                let mut tmp = std::mem::take(&mut self.content);
+                let res = self.push_bounded(&mut tmp, text);
+                self.content = tmp;
+                res?;
+                self.emit_stage(cb, CloudStreamStage::Generating);
+            }
+            if let Some(tc_arr) =
+                delta.get("tool_calls").and_then(Value::as_array)
+            {
+                self.apply_delta_tool_calls(tc_arr, cb)?;
+            }
+        }
+        if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(fr.to_owned());
+            self.saw_terminal = true;
+        }
+        Ok(false)
+    }
+
+    fn process_line(
+        &mut self,
+        raw_line: &[u8],
+        cb: Option<&CloudStageCallback>,
+        header_trace: Option<&str>,
+    ) -> Result<bool, CloudGatewayError> {
+        let stripped = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let line = std::str::from_utf8(stripped).map_err(|err| {
+            protocol_error(format!("invalid UTF-8 in Ruum Cloud SSE: {err}"))
+        })?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        if let Some(stage_raw) = trimmed.strip_prefix(": ruum-stage") {
+            if let Some(stage) = parse_stage_comment(stage_raw) {
+                self.emit_stage(cb, stage);
+            }
+            return Ok(false);
+        }
+        if trimmed.starts_with(':') {
+            return Ok(false);
+        }
+        if let Some(data_raw) = trimmed.strip_prefix("data:") {
+            let payload = data_raw.trim();
+            if !payload.is_empty() {
+                return self.apply_data_payload(payload, cb, header_trace);
+            }
+        }
+        Ok(false)
+    }
+
+    fn into_completion_json(self) -> Result<Value, CloudGatewayError> {
+        if !self.saw_terminal {
+            return Err(protocol_error(
+                "Ruum Cloud SSE stream ended before [DONE] or finish_reason",
+            ));
+        }
+        let mut message = Map::new();
+        message
+            .insert("role".to_owned(), Value::String("assistant".to_owned()));
+        if !self.reasoning.is_empty() {
+            message.insert(
+                "reasoning_content".to_owned(),
+                Value::String(self.reasoning),
+            );
+        }
+        if !self.content.is_empty() {
+            message.insert("content".to_owned(), Value::String(self.content));
+        }
+        if !self.tool_calls.is_empty() {
+            let calls: Vec<Value> = self
+                .tool_calls
+                .into_values()
+                .map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                    })
+                })
+                .collect();
+            message.insert("tool_calls".to_owned(), Value::Array(calls));
+        }
+        let finish_reason =
+            self.finish_reason.unwrap_or_else(|| "stop".to_owned());
+        let mut root = Map::new();
+        root.insert(
+            "choices".to_owned(),
+            json!([{
+                "index": 0,
+                "message": Value::Object(message),
+                "finish_reason": finish_reason,
+            }]),
+        );
+        if let Some(usage) = self.usage {
+            root.insert("usage".to_owned(), usage);
+        }
+        Ok(Value::Object(root))
+    }
+}
+
+impl RuumCloudLlm {
+    async fn read_sse_response(
+        &self,
+        mut resp: reqwest::Response,
+        header_trace: Option<&str>,
+    ) -> Result<Result<Value, CloudGatewayError>, ()> {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut accum = SseAccumulator::default();
+        let mut done = false;
+
+        while !done {
+            let next_chunk = race_cancel(
+                self.cancel.as_ref(),
+                tokio::time::timeout(self.request_timeout, resp.chunk()),
+            )
+            .await?;
+            let chunk = match next_chunk {
+                Err(_) => {
+                    return Ok(Err(CloudGatewayError {
+                        status: Some(504),
+                        code: Some("COMMON_UPSTREAM_TIMEOUT".to_owned()),
+                        message: "Ruum Cloud SSE stream read timed out"
+                            .to_owned(),
+                        trace_id: header_trace.map(ToOwned::to_owned),
+                        retry_after_secs: None,
+                        is_timeout: true,
+                    }));
+                }
+                Ok(Err(err)) => {
+                    return Ok(Err(protocol_error(format!(
+                        "Ruum Cloud SSE stream error: {err}"
+                    ))));
+                }
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(bytes))) => bytes,
+            };
+
+            let mut slice = chunk.as_ref();
+            while let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') {
+                let seg = &slice[..nl_pos];
+                if pending.len().saturating_add(seg.len()) > MAX_SSE_LINE_BYTES
+                {
+                    return Ok(Err(protocol_error(
+                        "Ruum Cloud SSE line exceeded 1 MiB limit",
+                    )));
+                }
+                let stop_now = if pending.is_empty() {
+                    accum.process_line(
+                        seg,
+                        self.on_stage.as_ref(),
+                        header_trace,
+                    )
+                } else {
+                    pending.extend_from_slice(seg);
+                    let res = accum.process_line(
+                        &pending,
+                        self.on_stage.as_ref(),
+                        header_trace,
+                    );
+                    pending.clear();
+                    res
+                };
+                match stop_now {
+                    Ok(true) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(err) => return Ok(Err(err)),
+                }
+                slice = &slice[nl_pos + 1..];
+            }
+            if !done && !slice.is_empty() {
+                if pending.len().saturating_add(slice.len())
+                    > MAX_SSE_LINE_BYTES
+                {
+                    return Ok(Err(protocol_error(
+                        "Ruum Cloud SSE line exceeded 1 MiB limit",
+                    )));
+                }
+                pending.extend_from_slice(slice);
+            }
+        }
+
+        if !done
+            && !pending.is_empty()
+            && let Err(err) = accum.process_line(
+                &pending,
+                self.on_stage.as_ref(),
+                header_trace,
+            )
+        {
+            return Ok(Err(err));
+        }
+
+        Ok(accum.into_completion_json())
     }
 }
 
@@ -426,62 +1065,91 @@ impl Llm for RuumCloudLlm {
             .cloned()
             .collect();
 
-        let token = match self.token_provider.current_token().await {
-            Ok(t) => t,
-            Err(err) => return Err(self.record_error(err)),
-        };
-
-        let mut resp = match self.send_once(&token, &body_bytes).await {
-            Ok(r) => r,
-            Err(err) => return Err(self.record_error(err)),
-        };
-
-        if resp.status().as_u16() == 401 {
-            let first_err =
-                extract_gateway_error_from_response(resp, &token).await;
-            if first_err.code.as_deref() == Some("AUTH_DEVICE_REVOKED") {
-                return Err(self.record_error(first_err));
-            }
-            let refreshed = match self.token_provider.refresh_token().await {
-                Ok(t) => t,
-                Err(err) => return Err(self.record_error(err)),
-            };
-            resp = match self.send_once(&refreshed, &body_bytes).await {
-                Ok(r) => r,
-                Err(err) => return Err(self.record_error(err)),
-            };
-            if !resp.status().is_success() {
-                let err =
-                    extract_gateway_error_from_response(resp, &refreshed).await;
-                return Err(self.record_error(err));
-            }
-        } else if !resp.status().is_success() {
-            let err = extract_gateway_error_from_response(resp, &token).await;
-            return Err(self.record_error(err));
+        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return Err(self.record_cancelled_error());
         }
 
-        let raw_json: Value = resp.json().await.map_err(|err| {
-            self.record_error(CloudGatewayError {
-                status: None,
-                code: Some("COMMON_UPSTREAM_PROTOCOL_ERROR".to_owned()),
-                message: format!("invalid Ruum Cloud JSON response: {err}"),
-                trace_id: None,
-                retry_after_secs: None,
-                is_timeout: false,
-            })
-        })?;
+        let mut resp = None;
+        for attempt in 0..=MAX_TRANSIENT_CLOUD_RETRIES {
+            match self.send_with_refresh(&body_bytes).await {
+                Err(()) => return Err(self.record_cancelled_error()),
+                Ok(Ok(ok_resp)) => {
+                    resp = Some(ok_resp);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    if attempt < MAX_TRANSIENT_CLOUD_RETRIES
+                        && is_retryable_cloud_error(&err)
+                    {
+                        let delay = retry_backoff_duration(&err, attempt);
+                        if race_cancel(
+                            self.cancel.as_ref(),
+                            tokio::time::sleep(delay),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Err(self.record_cancelled_error());
+                        }
+                        continue;
+                    }
+                    return Err(self.record_error(err));
+                }
+            }
+        }
+        let Some(resp) = resp else {
+            return Err(self.record_cancelled_error());
+        };
+
+        let header_trace = resp
+            .headers()
+            .get("x-trace-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.to_ascii_lowercase().contains("text/event-stream")
+            });
+
+        let raw_json: Value = if is_sse {
+            match self.read_sse_response(resp, header_trace.as_deref()).await {
+                Err(()) => return Err(self.record_cancelled_error()),
+                Ok(Ok(val)) => val,
+                Ok(Err(err)) => return Err(self.record_error(err)),
+            }
+        } else {
+            let json_fut = async {
+                tokio::time::timeout(self.request_timeout, resp.json::<Value>())
+                    .await
+                    .map_err(|_| CloudGatewayError {
+                        status: Some(504),
+                        code: Some("COMMON_UPSTREAM_TIMEOUT".to_owned()),
+                        message: "Ruum Cloud inference response timed out"
+                            .to_owned(),
+                        trace_id: header_trace,
+                        retry_after_secs: None,
+                        is_timeout: true,
+                    })?
+                    .map_err(|err| {
+                        protocol_error(format!(
+                            "invalid Ruum Cloud JSON response: {err}"
+                        ))
+                    })
+            };
+            match race_cancel(self.cancel.as_ref(), json_fut).await {
+                Err(()) => return Err(self.record_cancelled_error()),
+                Ok(Ok(val)) => val,
+                Ok(Err(err)) => return Err(self.record_error(err)),
+            }
+        };
 
         let llm_resp = parse_cloud_chat_response(&raw_json, &declared_tools)
-            .map_err(|msg| {
-                self.record_error(CloudGatewayError {
-                    status: None,
-                    code: Some("COMMON_UPSTREAM_PROTOCOL_ERROR".to_owned()),
-                    message: msg,
-                    trace_id: None,
-                    retry_after_secs: None,
-                    is_timeout: false,
-                })
-            })?;
+            .map_err(|msg| self.record_error(protocol_error(msg)))?;
 
         let stream_out: Pin<
             Box<dyn futures::Stream<Item = AdkResult<LlmResponse>> + Send>,
@@ -608,7 +1276,7 @@ fn build_cloud_request_body(
     let mut obj = Map::new();
     obj.insert("model".to_owned(), Value::String(model.to_owned()));
     obj.insert("messages".to_owned(), Value::Array(messages));
-    obj.insert("stream".to_owned(), Value::Bool(false));
+    obj.insert("stream".to_owned(), Value::Bool(true));
 
     let mut allowed_tools: Vec<(&String, &Value)> = req
         .tools
@@ -801,6 +1469,8 @@ fn serialized_len(payload: &Value) -> Result<usize, AdkError> {
     })
 }
 
+const LANG_MARKER: &str = "\nOUTPUT LANGUAGE REQUIREMENT:";
+
 fn shrink_largest_message_content(
     payload: &mut Value,
     excess_bytes: usize,
@@ -831,12 +1501,174 @@ fn shrink_largest_message_content(
         return false;
     };
     let target_len = s.len().saturating_sub(excess_bytes.max(128)).max(64);
+    if let Some(marker_pos) = s.rfind(LANG_MARKER) {
+        let suffix = &s[marker_pos..];
+        let reserve = suffix.len() + 32;
+        if target_len > reserve {
+            let prefix_max = target_len - suffix.len();
+            let prefix =
+                truncate_str_to_max_bytes(&s[..marker_pos], prefix_max);
+            let combined = format!("{prefix}{suffix}");
+            if combined.len() < s.len() {
+                *content_val = Value::String(combined);
+                return true;
+            }
+        }
+    }
     let truncated = truncate_str_to_max_bytes(s, target_len);
     if truncated.len() >= s.len() {
         return false;
     }
     *content_val = Value::String(truncated);
     true
+}
+
+fn gateway_error_to_adk(err: CloudGatewayError) -> AdkClientError {
+    AdkClientError::CloudGateway {
+        status: err.status,
+        code: err.code,
+        message: err.message,
+        trace_id: err.trace_id,
+        is_timeout: err.is_timeout,
+    }
+}
+
+/// Probes a Ruum Cloud model via `POST /v1/models/probe` (streaming TTFT on gateway).
+pub(crate) async fn probe_cloud_model_with_http(
+    http: &reqwest::Client,
+    config: &RuumCloudConfig,
+) -> Result<ModelProbeResult, AdkClientError> {
+    if config
+        .cancel
+        .as_ref()
+        .is_some_and(CancelToken::is_cancelled)
+    {
+        return Err(AdkClientError::Cancelled);
+    }
+
+    let base = validate_gateway_base_url(&config.base_url)?;
+    let model = config.model.trim().to_owned();
+    if model.is_empty() {
+        return Err(AdkClientError::InvalidConfig(
+            "Ruum Cloud model name is required".to_owned(),
+        ));
+    }
+    let probe_url = format!("{base}/v1/models/probe");
+    let body = json!({ "model": model });
+    let cancel = config.cancel.as_ref();
+
+    let started = Instant::now();
+    let probe_fut = async {
+        let send_probe = |token: &str| {
+            let token_owned = token.to_owned();
+            let req = http
+                .post(&probe_url)
+                .bearer_auth(token)
+                .header("X-Ruum-Client-Version", &config.client_version)
+                .json(&body);
+            async move {
+                req.send().await.map_err(|err| {
+                    let is_timeout = err.is_timeout();
+                    let msg =
+                        sanitize_error_message(&err.to_string(), &token_owned);
+                    CloudGatewayError {
+                        status: err.status().map(|s| s.as_u16()),
+                        code: is_timeout
+                            .then(|| "COMMON_UPSTREAM_TIMEOUT".to_owned()),
+                        message: if is_timeout {
+                            format!("Ruum Cloud probe timed out: {msg}")
+                        } else {
+                            format!("Ruum Cloud network error: {msg}")
+                        },
+                        trace_id: None,
+                        retry_after_secs: None,
+                        is_timeout,
+                    }
+                })
+            }
+        };
+
+        let token = config
+            .token_provider
+            .current_token()
+            .await
+            .map_err(gateway_error_to_adk)?;
+        let mut resp =
+            send_probe(&token).await.map_err(gateway_error_to_adk)?;
+
+        let active_token = if resp.status().as_u16() == 401 {
+            let first_err =
+                extract_gateway_error_from_response(resp, &token).await;
+            if first_err.code.as_deref() == Some("AUTH_DEVICE_REVOKED") {
+                return Err(gateway_error_to_adk(first_err));
+            }
+            let refreshed = config
+                .token_provider
+                .refresh_token()
+                .await
+                .map_err(gateway_error_to_adk)?;
+            resp =
+                send_probe(&refreshed).await.map_err(gateway_error_to_adk)?;
+            if !resp.status().is_success() {
+                let err =
+                    extract_gateway_error_from_response(resp, &refreshed).await;
+                return Err(gateway_error_to_adk(err));
+            }
+            refreshed
+        } else {
+            if !resp.status().is_success() {
+                let err =
+                    extract_gateway_error_from_response(resp, &token).await;
+                return Err(gateway_error_to_adk(err));
+            }
+            token
+        };
+
+        let payload: Value = resp.json().await.map_err(|err| {
+            AdkClientError::Model(sanitize_error_message(
+                &format!("invalid Ruum Cloud probe JSON: {err}"),
+                &active_token,
+            ))
+        })?;
+        let data = payload.get("data").unwrap_or(&payload);
+        let fallback_ms =
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let ttft_ms = data
+            .get("ttftMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(fallback_ms);
+        let total_ms = data
+            .get("totalMs")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| fallback_ms.max(ttft_ms));
+        let budget_exhausted = data
+            .get("budgetExhausted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let resolved_model = data
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&model)
+            .to_owned();
+
+        Ok(ModelProbeResult {
+            model: resolved_model,
+            ttft_ms,
+            total_ms,
+            budget_exhausted,
+            detail: if budget_exhausted {
+                format!("OK (thinking budget {ttft_ms} ms)")
+            } else {
+                format!("OK (TTFT {ttft_ms} ms)")
+            },
+        })
+    };
+
+    race_cancel(cancel, probe_fut)
+        .await
+        .map_err(|()| AdkClientError::Cancelled)?
 }
 
 /// Compact a serialized chat completions JSON payload in-place.

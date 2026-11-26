@@ -3,22 +3,26 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adk_core::{AdkError, Content, ErrorCategory, Llm, LlmRequest};
 use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
 use adk_model::retry::RetryConfig;
 use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use url::Url;
 use zeroize::Zeroizing;
+
+use crate::cancel::{CancelToken, race_cancel};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const MAX_ERROR_SNIPPET_LEN: usize = 512;
+const MAX_PROBE_STREAM_BYTES: usize = 256 * 1024;
+const PROBE_MAX_TOKENS: u32 = 64;
 
 /// Wire protocol spoken by a direct AI API endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,9 +199,27 @@ pub struct ConnectionProbeResult {
     pub message: String,
 }
 
+/// Result returned by streaming or fallback model speed probing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProbeResult {
+    /// Target model identifier that was probed.
+    pub model: String,
+    /// Time to first substantive token (or response completion fallback), ms.
+    pub ttft_ms: u64,
+    /// Total elapsed round-trip time in milliseconds.
+    pub total_ms: u64,
+    /// `true` when a reasoning model consumed `max_tokens` during thinking.
+    pub budget_exhausted: bool,
+    /// Short human-readable probe detail.
+    pub detail: String,
+}
+
 /// Sanitized error returned by `ruum-adk` operations; never exposes `api_key`.
 #[derive(Debug, thiserror::Error)]
 pub enum AdkClientError {
+    /// Operation was cancelled via a [`CancelToken`](crate::CancelToken).
+    #[error("request cancelled")]
+    Cancelled,
     /// Invalid configuration or malformed URL.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
@@ -702,6 +724,393 @@ async fn probe_minimal_completion(
         model_count: None,
         message: format!("Connected via minimal completion ({model})"),
     })
+}
+
+/// Outcome of scanning one decoded SSE `data:` JSON chunk during TTFT probing.
+enum ProbeLineSignal {
+    Continue,
+    EventSeen,
+    FirstToken,
+    BudgetExhausted,
+    Error(String),
+}
+
+fn non_empty_str_field(obj: &Value, key: &str) -> bool {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+fn inspect_probe_chunk(protocol: AiProtocol, val: &Value) -> ProbeLineSignal {
+    if let Some(err) = val.get("error").filter(|e| !e.is_null()) {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .map_or_else(|| err.to_string(), ToOwned::to_owned);
+        return ProbeLineSignal::Error(msg);
+    }
+    if val.get("type").and_then(Value::as_str) == Some("error") {
+        return ProbeLineSignal::Error(val.to_string());
+    }
+
+    match protocol {
+        AiProtocol::OpenAi => {
+            let Some(choices) = val.get("choices").and_then(Value::as_array)
+            else {
+                return ProbeLineSignal::Continue;
+            };
+            if choices.is_empty() {
+                return ProbeLineSignal::Continue;
+            }
+            let mut saw = false;
+            for ch in choices {
+                saw = true;
+                if let Some(delta) = ch.get("delta")
+                    && (non_empty_str_field(delta, "content")
+                        || non_empty_str_field(delta, "reasoning_content")
+                        || non_empty_str_field(delta, "reasoning")
+                        || non_empty_str_field(delta, "thinking")
+                        || delta
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| !a.is_empty()))
+                {
+                    return ProbeLineSignal::FirstToken;
+                }
+                if let Some(msg) = ch.get("message")
+                    && (non_empty_str_field(msg, "content")
+                        || non_empty_str_field(msg, "reasoning_content"))
+                {
+                    return ProbeLineSignal::FirstToken;
+                }
+                if let Some(reason) =
+                    ch.get("finish_reason").and_then(Value::as_str)
+                    && matches!(reason, "length" | "max_tokens")
+                {
+                    return ProbeLineSignal::BudgetExhausted;
+                }
+            }
+            if saw {
+                ProbeLineSignal::EventSeen
+            } else {
+                ProbeLineSignal::Continue
+            }
+        }
+        AiProtocol::Anthropic => {
+            let ev_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+            if ev_type == "content_block_delta"
+                && let Some(delta) = val.get("delta")
+                && (non_empty_str_field(delta, "text")
+                    || non_empty_str_field(delta, "thinking"))
+            {
+                return ProbeLineSignal::FirstToken;
+            }
+            if ev_type == "message_delta"
+                && let Some(stop_reason) =
+                    val.pointer("/delta/stop_reason").and_then(Value::as_str)
+            {
+                if stop_reason == "max_tokens" {
+                    return ProbeLineSignal::BudgetExhausted;
+                }
+                return ProbeLineSignal::EventSeen;
+            }
+            if matches!(
+                ev_type,
+                "message_start" | "content_block_start" | "message_stop"
+            ) {
+                ProbeLineSignal::EventSeen
+            } else {
+                ProbeLineSignal::Continue
+            }
+        }
+    }
+}
+
+fn scan_sse_lines(
+    protocol: AiProtocol,
+    bytes: &[u8],
+    api_key: &str,
+) -> Result<(bool, bool, bool), AdkClientError> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_event = false;
+    let mut saw_budget = false;
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        let Some(rest) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = rest.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match inspect_probe_chunk(protocol, &val) {
+            ProbeLineSignal::Continue => {}
+            ProbeLineSignal::EventSeen => saw_event = true,
+            ProbeLineSignal::FirstToken => return Ok((true, true, false)),
+            ProbeLineSignal::BudgetExhausted => {
+                saw_event = true;
+                saw_budget = true;
+            }
+            ProbeLineSignal::Error(msg) => {
+                return Err(AdkClientError::Model(sanitize_error_message(
+                    &msg, api_key,
+                )));
+            }
+        }
+    }
+    Ok((false, saw_event, saw_budget))
+}
+
+/// Sends a minimal streaming request (`stream: true`, `max_tokens: 64`) and
+/// returns as soon as the first substantive text or thinking delta arrives.
+pub(crate) async fn probe_model_with_http(
+    http: &reqwest::Client,
+    config: &AdkModelConfig,
+    cancel: Option<&CancelToken>,
+) -> Result<ModelProbeResult, AdkClientError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(AdkClientError::Cancelled);
+    }
+
+    let endpoints = validate_endpoints(config)?;
+    let model = config
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| {
+            AdkClientError::InvalidConfig("model name is required".to_owned())
+        })?
+        .to_owned();
+    let api_key = config.api_key.as_str();
+    let timeout = config.timeout.max(Duration::from_secs(3));
+
+    let (url, body) = match config.protocol {
+        AiProtocol::OpenAi => (
+            format!("{}/chat/completions", endpoints.sdk_base_url),
+            json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": "ping" }],
+                "stream": true,
+                "max_tokens": PROBE_MAX_TOKENS,
+            }),
+        ),
+        AiProtocol::Anthropic => (
+            format!("{}/v1/messages", endpoints.sdk_base_url),
+            json!({
+                "model": model,
+                "max_tokens": PROBE_MAX_TOKENS,
+                "messages": [{ "role": "user", "content": "ping" }],
+                "stream": true,
+            }),
+        ),
+    };
+
+    let mut req = http
+        .post(&url)
+        .timeout(timeout)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream, application/json")
+        .json(&body);
+    match config.protocol {
+        AiProtocol::OpenAi => {
+            if !api_key.is_empty() {
+                req = req.bearer_auth(api_key);
+            }
+        }
+        AiProtocol::Anthropic => {
+            req = req
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_API_VERSION);
+        }
+    }
+
+    let started = Instant::now();
+    let probe_fut = async {
+        let mut resp = req.send().await.map_err(|err| {
+            if err.is_timeout() {
+                AdkClientError::Timeout(timeout)
+            } else {
+                AdkClientError::Http {
+                    status: err.status().map(|s| s.as_u16()),
+                    message: sanitize_error_message(&err.to_string(), api_key),
+                }
+            }
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let code = status.as_u16();
+            let err_body = resp.text().await.unwrap_or_default();
+            let msg = sanitize_error_message(&err_body, api_key);
+            if matches!(code, 401 | 403) {
+                return Err(AdkClientError::Unauthorized {
+                    status: code,
+                    message: msg,
+                });
+            }
+            return Err(AdkClientError::Http {
+                status: Some(code),
+                message: msg,
+            });
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_streaming = content_type.contains("text/event-stream")
+            || content_type.contains("application/x-ndjson");
+
+        let mut raw = Vec::new();
+        let mut line_buf = Vec::new();
+        let mut saw_event = false;
+        let mut saw_budget = false;
+
+        while let Some(chunk) = resp.chunk().await.map_err(|err| {
+            if err.is_timeout() {
+                AdkClientError::Timeout(timeout)
+            } else {
+                AdkClientError::Http {
+                    status: None,
+                    message: sanitize_error_message(&err.to_string(), api_key),
+                }
+            }
+        })? {
+            if raw.len().saturating_add(chunk.len()) > MAX_PROBE_STREAM_BYTES {
+                return Err(AdkClientError::Model(
+                    "probe stream exceeded byte limit before first token"
+                        .to_owned(),
+                ));
+            }
+            raw.extend_from_slice(chunk.as_ref());
+
+            if is_streaming {
+                line_buf.extend_from_slice(chunk.as_ref());
+                while let Some(nl) = line_buf.iter().position(|&b| b == b'\n') {
+                    let complete_line =
+                        line_buf.drain(..=nl).collect::<Vec<u8>>();
+                    let (first, ev, budget) = scan_sse_lines(
+                        config.protocol,
+                        &complete_line,
+                        api_key,
+                    )?;
+                    saw_event |= ev;
+                    saw_budget |= budget;
+                    if first {
+                        let ms = u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX)
+                            .max(1);
+                        return Ok(ModelProbeResult {
+                            model: model.clone(),
+                            ttft_ms: ms,
+                            total_ms: ms,
+                            budget_exhausted: false,
+                            detail: format!("TTFT {ms} ms"),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !line_buf.is_empty() {
+            let (first, ev, budget) =
+                scan_sse_lines(config.protocol, &line_buf, api_key)?;
+            saw_event |= ev;
+            saw_budget |= budget;
+            if first {
+                let ms = u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                return Ok(ModelProbeResult {
+                    model: model.clone(),
+                    ttft_ms: ms,
+                    total_ms: ms,
+                    budget_exhausted: false,
+                    detail: format!("TTFT {ms} ms"),
+                });
+            }
+        }
+
+        let elapsed = u64::try_from(started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+
+        if is_streaming || raw.trim_ascii_start().starts_with(b"data:") {
+            if !is_streaming {
+                let (first, ev, budget) =
+                    scan_sse_lines(config.protocol, &raw, api_key)?;
+                saw_event |= ev;
+                saw_budget |= budget;
+                if first {
+                    return Ok(ModelProbeResult {
+                        model: model.clone(),
+                        ttft_ms: elapsed,
+                        total_ms: elapsed,
+                        budget_exhausted: false,
+                        detail: format!("TTFT {elapsed} ms"),
+                    });
+                }
+            }
+            if saw_budget || saw_event {
+                return Ok(ModelProbeResult {
+                    model: model.clone(),
+                    ttft_ms: elapsed,
+                    total_ms: elapsed,
+                    budget_exhausted: saw_budget,
+                    detail: if saw_budget {
+                        format!("OK (thinking budget {elapsed} ms)")
+                    } else {
+                        format!("OK ({elapsed} ms)")
+                    },
+                });
+            }
+            return Err(AdkClientError::Model(
+                "probe stream closed without model output".to_owned(),
+            ));
+        }
+
+        let parsed: Value = serde_json::from_slice(&raw).map_err(|err| {
+            AdkClientError::Model(sanitize_error_message(
+                &format!("invalid probe JSON response: {err}"),
+                api_key,
+            ))
+        })?;
+        match inspect_probe_chunk(config.protocol, &parsed) {
+            ProbeLineSignal::Error(msg) => Err(AdkClientError::Model(
+                sanitize_error_message(&msg, api_key),
+            )),
+            ProbeLineSignal::BudgetExhausted => Ok(ModelProbeResult {
+                model: model.clone(),
+                ttft_ms: elapsed,
+                total_ms: elapsed,
+                budget_exhausted: true,
+                detail: format!("OK (thinking budget {elapsed} ms)"),
+            }),
+            _ => Ok(ModelProbeResult {
+                model: model.clone(),
+                ttft_ms: elapsed,
+                total_ms: elapsed,
+                budget_exhausted: false,
+                detail: format!("OK ({elapsed} ms)"),
+            }),
+        }
+    };
+
+    let timed = async {
+        tokio::time::timeout(timeout, probe_fut)
+            .await
+            .map_err(|_| AdkClientError::Timeout(timeout))?
+    };
+
+    race_cancel(cancel, timed)
+        .await
+        .map_err(|()| AdkClientError::Cancelled)?
 }
 
 #[cfg(test)]

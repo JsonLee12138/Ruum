@@ -6,8 +6,10 @@ use std::sync::OnceLock;
 use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::agent::{AdkAgentRequest, AdkAgentResponse, AdkDirectClient};
+use crate::cancel::CancelToken;
 use crate::model::{
-    AdkClientError, AdkModelConfig, ConnectionProbeResult, RemoteModel,
+    AdkClientError, AdkModelConfig, ConnectionProbeResult, ModelProbeResult,
+    RemoteModel,
 };
 
 static SHARED_RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
@@ -57,6 +59,23 @@ impl BlockingAdkClient {
         config: &AdkModelConfig,
     ) -> Result<ConnectionProbeResult, AdkClientError> {
         Self::block_on(self.inner.test_connection(config))
+    }
+
+    /// Synchronously runs a fast TTFT probe on a direct OpenAI/Anthropic model.
+    pub fn probe_model(
+        &self,
+        config: &AdkModelConfig,
+        cancel: Option<&CancelToken>,
+    ) -> Result<ModelProbeResult, AdkClientError> {
+        Self::block_on(self.inner.probe_model(config, cancel))
+    }
+
+    /// Synchronously probes a Ruum Cloud virtual model via `POST /v1/models/probe`.
+    pub fn probe_cloud_model(
+        &self,
+        config: &crate::cloud_llm::RuumCloudConfig,
+    ) -> Result<ModelProbeResult, AdkClientError> {
+        Self::block_on(self.inner.probe_cloud_model(config))
     }
 
     /// Synchronously runs a multi-turn agent loop.

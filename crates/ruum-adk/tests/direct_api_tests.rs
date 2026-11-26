@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ruum_adk::{
     AdkAgentRequest, AdkClientError, AdkDirectClient, AdkModelConfig,
-    AdkToolDef, AdkToolExecutor, AiProtocol, normalize_endpoints,
+    AdkToolDef, AdkToolExecutor, AiProtocol, CancelToken, normalize_endpoints,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -987,4 +987,117 @@ fn blocking_client_works_outside_and_inside_tokio_runtime() {
         blocking.run_agent(&cfg, AdkAgentRequest::new("Sys", "Hi"))
     });
     assert_eq!(resp_in.expect("blocking inside runtime").text, "Inside OK");
+}
+
+#[tokio::test]
+async fn run_agent_cancel_token_aborts_in_flight_request() {
+    let mut slow = MockReply::openai_sse(Some("Too late"), None, None);
+    slow.delay = Duration::from_secs(3);
+    let server = start_mock_server(vec![slow]).await;
+
+    let client = AdkDirectClient::new().expect("create client");
+    let cfg =
+        test_config(AiProtocol::OpenAi, format!("{}/v1", server.base_url))
+            .with_timeout(Duration::from_secs(5));
+    let cancel = CancelToken::new();
+    let cancel_trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_trigger.cancel();
+    });
+
+    let err = client
+        .run_agent(&cfg, AdkAgentRequest::new("Sys", "Hi").with_cancel(cancel))
+        .await
+        .expect_err("cancelled run must abort");
+    assert!(matches!(err, AdkClientError::Cancelled), "got {err:?}");
+}
+
+#[tokio::test]
+async fn probe_model_supports_openai_anthropic_json_fallback_thinking_budget_and_cancel()
+ {
+    let openai_sse = MockReply::openai_sse(Some("pong"), None, None);
+    let anthropic_sse = MockReply::anthropic_sse(Some("thinking"), None, None);
+    let json_fallback = MockReply::json(
+        200,
+        &json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "pong"},
+                "finish_reason": "stop"
+            }]
+        }),
+    );
+    let budget_exhausted = MockReply {
+        status: 200,
+        reason: "OK",
+        content_type: "text/event-stream",
+        body: format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "id": "chatcmpl-budget",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "length"
+                }]
+            })
+        ),
+        delay: Duration::ZERO,
+    };
+
+    let server = start_mock_server(vec![
+        openai_sse,
+        anthropic_sse,
+        json_fallback,
+        budget_exhausted,
+    ])
+    .await;
+
+    let client = AdkDirectClient::new().expect("create client");
+    let openai_cfg =
+        test_config(AiProtocol::OpenAi, format!("{}/v1", server.base_url))
+            .with_timeout(Duration::from_secs(5));
+    let r1 = client
+        .probe_model(&openai_cfg, None)
+        .await
+        .expect("openai sse probe");
+    assert!(!r1.budget_exhausted);
+
+    let anth_cfg = test_config(AiProtocol::Anthropic, &server.base_url)
+        .with_timeout(Duration::from_secs(5));
+    let r2 = client
+        .probe_model(&anth_cfg, None)
+        .await
+        .expect("anthropic thinking sse probe");
+    assert!(!r2.budget_exhausted);
+
+    let r3 = client
+        .probe_model(&openai_cfg, None)
+        .await
+        .expect("json fallback probe");
+    assert!(!r3.budget_exhausted);
+
+    let r4 = client
+        .probe_model(&openai_cfg, None)
+        .await
+        .expect("thinking budget exhausted probe");
+    assert!(r4.budget_exhausted);
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let aborted = client
+        .probe_model(&openai_cfg, Some(&cancel))
+        .await
+        .expect_err("cancelled probe must return Cancelled");
+    assert!(matches!(aborted, AdkClientError::Cancelled));
+
+    let recorded = server.recorded();
+    assert_eq!(recorded.len(), 4);
+    assert_eq!(recorded[0].body["stream"], true);
+    assert_eq!(recorded[0].body["max_tokens"], 64);
+    assert_eq!(recorded[1].body["stream"], true);
+    assert_eq!(recorded[1].body["max_tokens"], 64);
 }

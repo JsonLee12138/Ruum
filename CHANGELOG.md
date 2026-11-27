@@ -2,6 +2,13 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.5-beta.3] - 2026-11-27
+
+### Features & Fixes
+
+- **app,core,updater:** Add a **Run in Terminal** action alongside **Copy Command** in the update modal (with automatic clipboard fallback when no terminal emulator is found), powered by tri-platform `TerminalAdapter::launch_run_command` with AppImage env scrubbing and `0o700` self-cleaning launcher scripts.
+- **core,updater:** Make Linux upgrade command generation and asset selection Beta-aware across Arch/Omarchy (`yay` on stable, `install.sh --channel beta` on beta), Debian/Ubuntu (`.deb` SHA-256 verified install), Fedora/RHEL (`.rpm` SHA-256 verified install), and non-writable `/usr/local` tarball installs.
+
 ## [0.2.5-beta.2] - 2026-11-26
 
 ### Changes

@@ -15,11 +15,10 @@ pub const fn settings_title(locale: Locale) -> &'static str {
 pub const fn settings_subtitle(locale: Locale) -> &'static str {
     pick(
         locale,
-        "Configure Watchdog threshold, background daemon service, and AI \
-         assistant.",
-        "\u{914d}\u{7f6e}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{9608}\u{503c}\u{3001}\u{540e}\u{53f0}\u{5b88}\u{62a4}\u{670d}\u{52a1}\u{4e0e} AI \u{52a9}\u{624b}\u{3002}",
-        "\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}\u{306e}\u{3057}\u{304d}\u{3044}\u{5024}\u{3001}\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{30b5}\u{30fc}\u{30d3}\u{30b9}\u{3001}AI \u{30a2}\u{30b7}\u{30b9}\u{30bf}\u{30f3}\u{30c8}\u{3092}\u{8a2d}\u{5b9a}\u{3057}\u{307e}\u{3059}\u{3002}",
-        "\u{c6cc}\u{ce58}\u{b3c5} \u{c784}\u{acc4}\u{ac12}, \u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{b370}\u{baac} \u{c11c}\u{be44}\u{c2a4} \u{bc0f} AI \u{c5b4}\u{c2dc}\u{c2a4}\u{d134}\u{d2b8}\u{b97c} \u{ad6c}\u{c131}\u{d569}\u{b2c8}\u{b2e4}.",
+        "Configure general preferences, Watchdog thresholds, and AI assistant.",
+        "\u{914d}\u{7f6e}\u{5e38}\u{89c4}\u{504f}\u{597d}\u{3001}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{9608}\u{503c}\u{4e0e} AI \u{52a9}\u{624b}\u{3002}",
+        "\u{4e00}\u{822c}\u{8a2d}\u{5b9a}\u{3001}\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}\u{306e}\u{3057}\u{304d}\u{3044}\u{5024}\u{3001}AI \u{30a2}\u{30b7}\u{30b9}\u{30bf}\u{30f3}\u{30c8}\u{3092}\u{8a2d}\u{5b9a}\u{3057}\u{307e}\u{3059}\u{3002}",
+        "\u{c77c}\u{bc18} \u{c124}\u{c815}, \u{c6cc}\u{ce58}\u{b3c5} \u{c784}\u{acc4}\u{ac12} \u{bc0f} AI \u{c5b4}\u{c2dc}\u{c2a4}\u{d134}\u{d2b8}\u{b97c} \u{ad6c}\u{c131}\u{d569}\u{b2c8}\u{b2e4}.",
     )
 }
 
@@ -30,16 +29,6 @@ pub const fn watchdog_monitoring_title(locale: Locale) -> &'static str {
         "\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{76d1}\u{63a7}",
         "\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}\u{76e3}\u{8996}",
         "\u{c6cc}\u{ce58}\u{b3c5} \u{baa8}\u{b2c8}\u{d130}\u{b9c1}",
-    )
-}
-
-pub const fn enable_watchdog(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Enable Watchdog Free-Space Monitoring",
-        "\u{542f}\u{7528}\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{53ef}\u{7528}\u{7a7a}\u{95f4}\u{76d1}\u{63a7}",
-        "\u{30a6}\u{30a9}\u{30c3}\u{30c1}\u{30c9}\u{30c3}\u{30b0}\u{306e}\u{7a7a}\u{304d}\u{5bb9}\u{91cf}\u{76e3}\u{8996}\u{3092}\u{6709}\u{52b9}\u{306b}\u{3059}\u{308b}",
-        "\u{c6cc}\u{ce58}\u{b3c5} \u{c5ec}\u{c720} \u{acf5}\u{ac04} \u{baa8}\u{b2c8}\u{d130}\u{b9c1} \u{d65c}\u{c131}\u{d654}",
     )
 }
 

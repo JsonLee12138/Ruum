@@ -1,7 +1,5 @@
 //! Watchdog dashboard copy and relative check-age formatting.
 
-use ruum_core::watchdog::ServiceStatus;
-
 use crate::i18n::{Locale, pick};
 
 /// Format how recently the background disk check ran.
@@ -97,39 +95,36 @@ pub const fn unknown(locale: Locale) -> &'static str {
     )
 }
 
-pub const fn service_status(
-    status: Option<ServiceStatus>,
+pub const fn background_mode_label(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Background Monitoring:",
+        "\u{540e}\u{53f0}\u{76d1}\u{63a7}\u{ff1a}",
+        "\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{76e3}\u{8996}:",
+        "\u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{baa8}\u{b2c8}\u{d130}\u{b9c1}:",
+    )
+}
+
+pub const fn background_mode_status(
+    close_to_background: bool,
     locale: Locale,
 ) -> &'static str {
-    match status {
-        Some(ServiceStatus::Active) => pick(
+    if close_to_background {
+        pick(
             locale,
-            "Active (Running)",
-            "\u{6d3b}\u{8dc3}\u{ff08}\u{8fd0}\u{884c}\u{4e2d}\u{ff09}",
-            "\u{6709}\u{52b9}\u{ff08}\u{5b9f}\u{884c}\u{4e2d}\u{ff09}",
-            "\u{d65c}\u{c131}(\u{c2e4}\u{d589} \u{c911})",
-        ),
-        Some(ServiceStatus::Inactive) => pick(
+            "Active (System Tray)",
+            "\u{540e}\u{53f0}\u{5e38}\u{9a7b}\u{4e2d}\u{ff08}\u{7cfb}\u{7edf}\u{6258}\u{76d8}\u{ff09}",
+            "\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{5e38}\u{99d0}\u{4e2d}\u{ff08}\u{30c8}\u{30ec}\u{30a4}\u{ff09}",
+            "\u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c2e4}\u{d589} \u{c911}(\u{c2dc}\u{c2a4}\u{d15c} \u{d2b8}\u{b808}\u{c774})",
+        )
+    } else {
+        pick(
             locale,
-            "Inactive (Stopped)",
-            "\u{672a}\u{8fd0}\u{884c}\u{ff08}\u{5df2}\u{505c}\u{6b62}\u{ff09}",
-            "\u{975e}\u{30a2}\u{30af}\u{30c6}\u{30a3}\u{30d6}\u{ff08}\u{505c}\u{6b62}\u{4e2d}\u{ff09}",
-            "\u{be44}\u{d65c}\u{c131}(\u{c911}\u{c9c0}\u{b428})",
-        ),
-        Some(ServiceStatus::NotInstalled) => pick(
-            locale,
-            "Not Installed",
-            "\u{672a}\u{5b89}\u{88c5}",
-            "\u{672a}\u{30a4}\u{30f3}\u{30b9}\u{30c8}\u{30fc}\u{30eb}",
-            "\u{c124}\u{ce58}\u{b418}\u{c9c0} \u{c54a}\u{c74c}",
-        ),
-        Some(ServiceStatus::Unsupported) | None => pick(
-            locale,
-            "Not Registered",
-            "\u{672a}\u{6ce8}\u{518c}",
-            "\u{672a}\u{767b}\u{9332}",
-            "\u{b4f1}\u{b85d}\u{b418}\u{c9c0} \u{c54a}\u{c74c}",
-        ),
+            "Foreground Only (While App Open)",
+            "\u{4ec5}\u{524d}\u{53f0}\u{8fd0}\u{884c}\u{ff08}\u{5173}\u{95ed}\u{7a97}\u{53e3}\u{5373}\u{9000}\u{51fa}\u{ff09}",
+            "\u{30d5}\u{30a9}\u{30a2}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{306e}\u{307f}\u{ff08}\u{30a6}\u{30a3}\u{30f3}\u{30c9}\u{30a6}\u{3092}\u{9589}\u{3058}\u{308b}\u{3068}\u{7d42}\u{4e86}\u{ff09}",
+            "\u{d3ec}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c804}\u{c6a9}(\u{cc3d}\u{c744} \u{b2eb}\u{c73c}\u{ba74} \u{c885}\u{b8cc})",
+        )
     }
 }
 
@@ -208,16 +203,6 @@ pub const fn status_healthy(locale: Locale) -> &'static str {
         "\u{5065}\u{5eb7}\u{ff08}\u{9ad8}\u{4e8e}\u{9608}\u{503c}\u{ff09}",
         "\u{6b63}\u{5e38}\u{ff08}\u{3057}\u{304d}\u{3044}\u{5024}\u{4ee5}\u{4e0a}\u{ff09}",
         "\u{c815}\u{c0c1}(\u{c784}\u{acc4}\u{ac12} \u{c774}\u{c0c1})",
-    )
-}
-
-pub const fn background_service_label(locale: Locale) -> &'static str {
-    pick(
-        locale,
-        "Background Service:",
-        "\u{540e}\u{53f0}\u{670d}\u{52a1}\u{ff1a}",
-        "\u{30d0}\u{30c3}\u{30af}\u{30b0}\u{30e9}\u{30a6}\u{30f3}\u{30c9}\u{30b5}\u{30fc}\u{30d3}\u{30b9}:",
-        "\u{bc31}\u{adf8}\u{b77c}\u{c6b4}\u{b4dc} \u{c11c}\u{be44}\u{c2a4}:",
     )
 }
 

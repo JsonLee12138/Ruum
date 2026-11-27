@@ -2868,7 +2868,8 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
     });
     draw(cx);
     assert!(cx.debug_bounds("settings-page").is_some());
-    assert!(cx.debug_bounds("setting-enable-watchdog").is_some());
+    assert!(cx.debug_bounds("setting-enable-watchdog").is_none());
+    assert!(cx.debug_bounds("setting-enable-service").is_none());
     assert!(cx.debug_bounds("setting-min-free-input").is_some());
     assert!(cx.debug_bounds("setting-poll-interval-input").is_some());
     assert!(cx.debug_bounds("setting-cooldown-input").is_some());
@@ -2895,10 +2896,9 @@ fn watchdog_and_settings_pages_rendering_and_modal_flow(
         });
     });
 
-    // Toggle watchdog setting, update poll interval & cooldown (minutes), save
+    // Update threshold, poll interval & cooldown (minutes), save
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
-            app.watchdog_draft.enabled = true;
             if let Some(ref input) = app.watchdog_input_min_free {
                 input.update(cx, |inp, cx| inp.set_value("35", window, cx));
             }
@@ -3985,8 +3985,6 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
         view.update(cx, |app, cx| {
             app.db_path = Some(db_path.clone());
             app.reload_watchdog_state();
-            app.watchdog_draft.enabled = true;
-            app.watchdog_draft.background_service = true;
             app.watchdog_draft.ai_auto_analyze = false;
             app.set_watchdog_provider(AiCliProvider::Custom, cx);
             app.watchdog_input_min_free.as_ref().unwrap().update(
@@ -4031,7 +4029,7 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
     assert!(saved_wd.updated_at_secs > 0);
     let expected_wd = WatchdogConfig {
         enabled: true,
-        background_service: true,
+        background_service: false,
         min_free_gb: 42,
         poll_interval_secs: 900,
         cooldown_secs: 7200,
@@ -4069,8 +4067,6 @@ fn settings_default_360_echo_and_10_field_round_trip_without_host_pollution(
         assert!(app.ai_config.updated_at_secs > 0);
         assert_eq!(app.watchdog_config, expected_wd);
         assert_eq!(app.ai_config, expected_ai);
-        assert!(app.watchdog_draft.enabled);
-        assert!(app.watchdog_draft.background_service);
         assert!(!app.watchdog_draft.ai_auto_analyze);
         assert_eq!(app.watchdog_draft.ai_provider, AiCliProvider::Custom);
         assert_eq!(app.watchdog_draft.model.as_deref(), Some("gpt-5-codex"));
@@ -4137,7 +4133,6 @@ fn settings_draft_isolation_validation_and_clamped_echo(
     // Mutate draft + inputs without saving -> committed config unchanged.
     cx.update(|window, cx| {
         view.update(cx, |app, cx| {
-            app.watchdog_draft.enabled = true;
             app.watchdog_draft.ai_auto_analyze = false;
             app.set_watchdog_provider(AiCliProvider::Codex, cx);
             app.watchdog_input_min_free
@@ -4147,7 +4142,7 @@ fn settings_draft_isolation_validation_and_clamped_echo(
         });
     });
     read(&view, cx, |app| {
-        assert!(!app.watchdog_config.enabled);
+        assert_eq!(app.watchdog_config.min_free_gb, 20);
         assert!(app.ai_config.auto_analyze_on_alert);
         assert_eq!(app.ai_config.provider, AiCliProvider::Agy);
     });
@@ -4159,7 +4154,6 @@ fn settings_draft_isolation_validation_and_clamped_echo(
     });
     draw(cx);
     read(&view, cx, |app| {
-        assert!(!app.watchdog_draft.enabled);
         assert!(app.watchdog_draft.ai_auto_analyze);
         assert_eq!(app.watchdog_draft.ai_provider, AiCliProvider::Agy);
     });
@@ -4174,7 +4168,6 @@ fn settings_draft_isolation_validation_and_clamped_echo(
     for bad in ["", "abc", "-3"] {
         cx.update(|window, cx| {
             view.update(cx, |app, cx| {
-                app.watchdog_draft.enabled = true;
                 app.watchdog_input_min_free
                     .as_ref()
                     .unwrap()
@@ -4182,7 +4175,7 @@ fn settings_draft_isolation_validation_and_clamped_echo(
                 app.save_watchdog_settings(window, cx);
             });
         });
-        assert!(!read(&view, cx, |a| a.watchdog_config.enabled));
+        assert_eq!(read(&view, cx, |a| a.watchdog_config.min_free_gb), 20);
         assert!(!db_path.exists());
         assert_eq!(
             read(&view, cx, |a| a.notice.as_ref().map(|(_, s)| *s)),
@@ -5100,7 +5093,6 @@ fn settings_general_watchdog_webhook_and_ai_round_trip_in_sqlite(
                 crate::state::SettingsCategory::Watchdog,
                 cx,
             );
-            app.watchdog_draft.enabled = true;
             app.watchdog_input_min_free
                 .as_ref()
                 .unwrap()
@@ -9700,11 +9692,11 @@ fn settings_general_persists_background_and_autostart_without_legacy_service_tog
     cx.simulate_click(autostart_box.center(), Modifiers::none());
     draw(cx);
 
-    // Legacy headless service toggle must no longer be rendered in Watchdog.
+    // Watchdog settings must not render redundant enable/service toggles.
     let wd_tab = cx.debug_bounds("setting-tab-watchdog").expect("wd tab");
     cx.simulate_click(wd_tab.center(), Modifiers::none());
     draw(cx);
-    assert!(cx.debug_bounds("setting-enable-watchdog").is_some());
+    assert!(cx.debug_bounds("setting-enable-watchdog").is_none());
     assert!(cx.debug_bounds("setting-enable-service").is_none());
 
     let save_btn = cx.debug_bounds("setting-save-btn").expect("save btn");
@@ -9737,70 +9729,57 @@ fn settings_general_persists_background_and_autostart_without_legacy_service_tog
 }
 
 #[gpui_kit::test]
-fn tray_toggle_watchdog_flips_db_runtime_and_open_window(
+fn watchdog_dashboard_reflects_general_background_mode(
     cx: &mut TestAppContext,
 ) {
-    use ruum_core::storage::StorageDb;
+    use crate::i18n::{Locale, pages};
+    use gpui_kit::Modifiers;
 
     cx.update(init_test_theme);
     let temp = fixture();
     let cfg_dir = tempfile::tempdir().expect("cfg dir");
     let db_path = cfg_dir.path().join("ruum.db");
 
-    let root = temp.path().to_path_buf();
-    let tree = scan(temp.path(), options()).expect("scan");
-    let db_for_win = db_path.clone();
-    let win = cx.add_window(move |_, cx| {
-        let mut app = Ruum::with_tree(root, tree, options(), 3, cx);
-        app.db_path = Some(db_for_win);
-        app
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(1400.)));
+    update(&view, cx, |app, cx| {
+        app.db_path = Some(db_path.clone());
+        app.navigate_rail(Screen::Watchdog, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("watchdog-background-mode").is_some());
+    read(&view, cx, |app| {
+        assert!(app.app_settings.close_to_background);
     });
 
-    cx.update(|cx| {
-        crate::install_test_runtime(
-            temp.path().to_path_buf(),
-            false,
-            Some(win),
-            cx,
+    // Disable close-to-background in Settings -> General and verify Watchdog
+    // dashboard updates cleanly.
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Settings, cx);
+    });
+    draw(cx);
+    let close_bg_box = cx
+        .debug_bounds("setting-close-to-background")
+        .expect("close-to-background toggle");
+    let save_btn = cx.debug_bounds("setting-save-btn").expect("save btn");
+    cx.simulate_click(close_bg_box.center(), Modifiers::none());
+    cx.simulate_click(save_btn.center(), Modifiers::none());
+    draw(cx);
+
+    update(&view, cx, |app, cx| {
+        app.navigate_rail(Screen::Watchdog, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("watchdog-background-mode").is_some());
+    read(&view, cx, |app| {
+        assert!(!app.app_settings.close_to_background);
+    });
+    for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+        assert_ne!(
+            pages::background_mode_status(true, locale),
+            pages::background_mode_status(false, locale)
         );
-        crate::toggle_watchdog_in_db(Some(&db_path), cx);
-        let rt = cx.global::<crate::AppRuntime>();
-        assert!(rt.watchdog_config.enabled);
-    });
-
-    let enabled_in_db = StorageDb::open(&db_path)
-        .unwrap()
-        .watchdog()
-        .unwrap()
-        .load_config()
-        .unwrap()
-        .enabled;
-    assert!(enabled_in_db);
-    win.read_with(cx, |app, _| {
-        assert!(app.watchdog_config.enabled);
-        assert!(app.watchdog_draft.enabled);
-    })
-    .expect("read enabled main window");
-
-    cx.update(|cx| {
-        crate::toggle_watchdog_in_db(Some(&db_path), cx);
-        let rt = cx.global::<crate::AppRuntime>();
-        assert!(!rt.watchdog_config.enabled);
-    });
-
-    let disabled_in_db = StorageDb::open(&db_path)
-        .unwrap()
-        .watchdog()
-        .unwrap()
-        .load_config()
-        .unwrap()
-        .enabled;
-    assert!(!disabled_in_db);
-    win.read_with(cx, |app, _| {
-        assert!(!app.watchdog_config.enabled);
-        assert!(!app.watchdog_draft.enabled);
-    })
-    .expect("read disabled main window");
+    }
 }
 
 #[test]

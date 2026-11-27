@@ -256,52 +256,15 @@ pub const fn tray_quit_ruum(locale: Locale) -> &'static str {
     pick(locale, "Quit Ruum", "退出 Ruum", "Ruum を終了", "Ruum 종료")
 }
 
-pub const fn tray_toggle_watchdog(
-    enabled: bool,
-    locale: Locale,
-) -> &'static str {
-    if enabled {
-        pick(
-            locale,
-            "Pause Watchdog",
-            "暂停看门狗",
-            "ウォッチドッグを一時停止",
-            "워치독 일시 중지",
-        )
-    } else {
-        pick(
-            locale,
-            "Enable Watchdog",
-            "开启看门狗",
-            "ウォッチドッグを有効にする",
-            "워치독 켜기",
-        )
-    }
-}
-
-pub fn tray_status_label(
-    free_bytes: Option<u64>,
-    watchdog_enabled: bool,
-    locale: Locale,
-) -> String {
+pub fn tray_status_label(free_bytes: Option<u64>, locale: Locale) -> String {
     let free = free_bytes.map_or_else(|| "\u{2014}".to_owned(), human_bytes);
-    let watchdog = if watchdog_enabled {
-        pick(
-            locale,
-            "Watchdog On",
-            "守护已开启",
-            "監視オン",
-            "워치독 켜짐",
-        )
-    } else {
-        pick(
-            locale,
-            "Watchdog Off",
-            "守护已关闭",
-            "監視オフ",
-            "워치독 꺼짐",
-        )
-    };
+    let watchdog = pick(
+        locale,
+        "Watchdog Active",
+        "\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{4e2d}",
+        "\u{76e3}\u{8996}\u{4e2d}",
+        "\u{c6cc}\u{ce58}\u{b3c5} \u{d65c}\u{c131}",
+    );
     match locale {
         Locale::En => format!("Free: {free} \u{00b7} {watchdog}"),
         Locale::Zh => format!("可用：{free} \u{00b7} {watchdog}"),

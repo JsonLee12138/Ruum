@@ -29,7 +29,6 @@ use ruum_core::removal::RemovalMode;
 use ruum_core::size::human_bytes;
 use ruum_core::storage::{AuthMode, UpdateChannel};
 use ruum_core::updater::{Manifest, UpdateCheckResult};
-use ruum_core::watchdog::ServiceStatus;
 use ruum_core::watchdog_config::{AiCliProvider, ApiProtocol};
 
 use crate::palette;
@@ -1283,16 +1282,13 @@ pub fn watchdog_page(
         None => (crate::i18n::pages::unknown(locale), theme.secondary),
     };
 
-    let service_label =
-        crate::i18n::pages::service_status(app.watchdog_service_status, locale);
-    let service_color = match app.watchdog_service_status {
-        Some(ServiceStatus::Active) => theme.accent,
-        Some(
-            ServiceStatus::Inactive
-            | ServiceStatus::NotInstalled
-            | ServiceStatus::Unsupported,
-        )
-        | None => theme.secondary,
+    let bg_active = app.app_settings.close_to_background;
+    let bg_mode_label =
+        crate::i18n::pages::background_mode_status(bg_active, locale);
+    let bg_mode_color = if bg_active {
+        theme.accent
+    } else {
+        theme.secondary
     };
 
     let status_card = dialog_popup(cx)
@@ -1378,14 +1374,15 @@ pub fn watchdog_page(
                         .flex_row()
                         .justify_between()
                         .child(div().text_color(theme.secondary).child(
-                            crate::i18n::pages::background_service_label(
-                                locale,
-                            ),
+                            crate::i18n::pages::background_mode_label(locale),
                         ))
                         .child(
                             div()
-                                .text_color(service_color)
-                                .child(service_label),
+                                .debug_selector(|| {
+                                    "watchdog-background-mode".into()
+                                })
+                                .text_color(bg_mode_color)
+                                .child(bg_mode_label),
                         ),
                 )
                 .child(
@@ -2010,9 +2007,6 @@ fn watchdog_settings_section(
         .as_ref()
         .expect("inputs initialized");
 
-    let is_enabled = app.watchdog_draft.enabled;
-    let entity_watchdog = cx.entity().downgrade();
-
     dialog_popup(cx)
         .w_full()
         .child(dialog_title(
@@ -2024,35 +2018,6 @@ fn watchdog_settings_section(
                 .flex()
                 .flex_col()
                 .gap(space::MD)
-                .child(
-                    div()
-                        .debug_selector(|| "setting-enable-watchdog".into())
-                        .child(
-                            checkbox(
-                                "setting-enable-watchdog",
-                                crate::i18n::pages::enable_watchdog(locale),
-                                if is_enabled {
-                                    CheckboxState::Checked
-                                } else {
-                                    CheckboxState::Unchecked
-                                },
-                                cx,
-                            )
-                            .tab_stop(false)
-                            .on_change(
-                                move |_, _, _, cx| {
-                                    let _ = entity_watchdog.update(
-                                        cx,
-                                        |this, cx| {
-                                            this.watchdog_draft.enabled =
-                                                !this.watchdog_draft.enabled;
-                                            cx.notify();
-                                        },
-                                    );
-                                },
-                            ),
-                        ),
-                )
                 .child(setting_input_field(
                     "setting-min-free-input",
                     crate::i18n::pages::min_free_threshold(locale),

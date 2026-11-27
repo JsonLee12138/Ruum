@@ -301,11 +301,16 @@ mod tests {
             assert!(!pages::general_close_to_background(locale).is_empty());
             assert!(!pages::general_launch_at_login(locale).is_empty());
             assert!(!pages::general_tray_show_disk_space(locale).is_empty());
-            assert!(!common::tray_toggle_watchdog(false, locale).is_empty());
-            assert!(!common::tray_toggle_watchdog(true, locale).is_empty());
+            assert!(
+                !common::tray_status_label(Some(1024 * 1024 * 1024), locale)
+                    .is_empty()
+            );
+            assert!(!pages::background_mode_label(locale).is_empty());
+            assert!(!pages::background_mode_status(true, locale).is_empty());
+            assert!(!pages::background_mode_status(false, locale).is_empty());
             assert_ne!(
-                common::tray_toggle_watchdog(false, locale),
-                common::tray_toggle_watchdog(true, locale)
+                pages::background_mode_status(true, locale),
+                pages::background_mode_status(false, locale)
             );
             assert!(
                 !messages::settings_saved_autostart_requires_approval(locale)

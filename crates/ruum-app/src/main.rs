@@ -2014,7 +2014,6 @@ pub(crate) fn refresh_tray_status_with_space(
     if rt.tray.is_none() {
         return;
     }
-    let watchdog_enabled = rt.watchdog_config.enabled;
     let show_disk_space = rt.tray_show_disk_space;
     let space = home_space_override.or_else(|| {
         std::env::home_dir()
@@ -2032,12 +2031,7 @@ pub(crate) fn refresh_tray_status_with_space(
     if let Some(rt) = cx.try_global::<AppRuntime>()
         && let Some(tray) = &rt.tray
     {
-        tray.update_status(
-            space,
-            watchdog_enabled,
-            has_proposal,
-            show_disk_space,
-        );
+        tray.update_status(space, has_proposal, show_disk_space);
         tray.set_cleanup_progress(cleanup_status);
     }
     with_runtime_mut(cx, |rt| {
@@ -3035,9 +3029,6 @@ pub(crate) fn handle_tray_action(action: tray_menu::TrayAction, cx: &mut App) {
         tray_menu::TrayAction::CheckForUpdates => {
             trigger_check_for_updates_from_menu_or_tray(cx);
         }
-        tray_menu::TrayAction::ToggleWatchdog => {
-            toggle_watchdog_from_tray(cx);
-        }
         tray_menu::TrayAction::RunAiAnalysisNow => {
             trigger_background_ai_analysis(cx);
         }
@@ -3184,9 +3175,6 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         return;
     }
     let cfg = &rt.watchdog_config;
-    if !cfg.enabled {
-        return;
-    }
     let interval = Duration::from_secs(cfg.poll_interval_secs.max(1));
     if let Some(last) = rt.last_watchdog_poll
         && last.elapsed() < interval
@@ -3236,7 +3224,7 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         } else {
             ai_ctx = ai_ctx.with_skip_analysis(true);
         }
-        let _ = ruum_core::watchdog::run_once_with_db_and_context(
+        let _ = ruum_core::watchdog::run_once_active_with_db_and_context(
             &db, &home, &exe, now_secs, &runner, &adapter, &notifier, ai_ctx,
         );
         ruum_core::space::space_info(&home).ok()
@@ -3262,55 +3250,6 @@ fn maybe_run_in_app_watchdog_tick(cx: &mut App) {
         });
     })
     .detach();
-}
-
-fn toggle_watchdog_from_tray(cx: &mut App) {
-    toggle_watchdog_in_db(None, cx);
-}
-
-pub(crate) fn toggle_watchdog_in_db(
-    db_path: Option<&std::path::Path>,
-    cx: &mut App,
-) {
-    let db_opt = match db_path {
-        Some(path) => StorageDb::open(path).ok(),
-        None => StorageDb::open_default().ok(),
-    };
-    let prev_cfg = db_opt
-        .as_ref()
-        .and_then(|db| db.watchdog().ok())
-        .and_then(|svc| svc.load_config().ok())
-        .or_else(|| {
-            cx.try_global::<AppRuntime>()
-                .map(|rt| rt.watchdog_config.clone())
-        })
-        .unwrap_or_default();
-
-    let prev_enabled = prev_cfg.enabled;
-    let mut next_cfg = prev_cfg;
-    next_cfg.enabled = !prev_enabled;
-    next_cfg.updated_at_secs = now_unix_secs();
-    let next_cfg = next_cfg.normalized();
-
-    if let Some(ref db) = db_opt
-        && let Ok(svc) = db.watchdog()
-    {
-        let _ = svc.save_config(&next_cfg);
-        if !prev_enabled && next_cfg.enabled {
-            let mut st = svc.load_state().unwrap_or_default();
-            st.last_triggered_secs = None;
-            st.last_triggered_threshold_gb = None;
-            let _ = svc.save_state(&st);
-        }
-    }
-
-    notify_watchdog_config_saved(&next_cfg, next_cfg.enabled, cx);
-    update_open_main_window(cx, |app, cx| {
-        app.watchdog_config = next_cfg.clone();
-        app.watchdog_draft.enabled = next_cfg.enabled;
-        app.reload_watchdog_state();
-        cx.notify();
-    });
 }
 
 fn trigger_background_ai_analysis(cx: &mut App) {

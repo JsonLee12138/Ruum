@@ -415,6 +415,63 @@ pub fn run_once_with_db_and_context(
     notifier: &dyn NotificationAdapter,
     ai_context: AiExecutionContext,
 ) -> io::Result<ruum_watchdog::TickResult> {
+    run_once_with_db_and_context_inner(
+        db,
+        mount_path,
+        current_exe,
+        now_secs,
+        cmd_runner,
+        confirm_adapter,
+        notifier,
+        ai_context,
+        false,
+    )
+}
+
+/// Run a single `SQLite`-backed watchdog evaluation tick treating monitoring as
+/// active regardless of persisted `watchdog_config.enabled`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit adapter injection for deterministic tests"
+)]
+pub fn run_once_active_with_db_and_context(
+    db: &StorageDb,
+    mount_path: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    cmd_runner: &dyn CommandRunner,
+    confirm_adapter: &dyn CleanupConfirmAdapter,
+    notifier: &dyn NotificationAdapter,
+    ai_context: AiExecutionContext,
+) -> io::Result<ruum_watchdog::TickResult> {
+    run_once_with_db_and_context_inner(
+        db,
+        mount_path,
+        current_exe,
+        now_secs,
+        cmd_runner,
+        confirm_adapter,
+        notifier,
+        ai_context,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit adapter injection for deterministic tests"
+)]
+fn run_once_with_db_and_context_inner(
+    db: &StorageDb,
+    mount_path: &Path,
+    current_exe: &Path,
+    now_secs: u64,
+    cmd_runner: &dyn CommandRunner,
+    confirm_adapter: &dyn CleanupConfirmAdapter,
+    notifier: &dyn NotificationAdapter,
+    ai_context: AiExecutionContext,
+    force_active: bool,
+) -> io::Result<ruum_watchdog::TickResult> {
     let wd_service = db.watchdog()?;
     let handler = CoreWatchdogEventHandler::new(
         db,
@@ -424,13 +481,23 @@ pub fn run_once_with_db_and_context(
         notifier,
     )
     .with_ai_context(ai_context);
-    ruum_watchdog::run_once(
-        &wd_service,
-        mount_path,
-        now_secs,
-        &CoreSpaceProbe,
-        &handler,
-    )
+    if force_active {
+        ruum_watchdog::run_once_active(
+            &wd_service,
+            mount_path,
+            now_secs,
+            &CoreSpaceProbe,
+            &handler,
+        )
+    } else {
+        ruum_watchdog::run_once(
+            &wd_service,
+            mount_path,
+            now_secs,
+            &CoreSpaceProbe,
+            &handler,
+        )
+    }
 }
 
 /// Run the `SQLite`-backed watchdog polling loop via `ruum-watchdog` and

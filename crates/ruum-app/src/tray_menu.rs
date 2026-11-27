@@ -29,7 +29,6 @@ const ID_OPEN_REMOTE: &str = "ruum.tray.open_remote";
 const ID_OPEN_WATCHDOG: &str = "ruum.tray.open_watchdog";
 const ID_OPEN_SETTINGS: &str = "ruum.tray.open_settings";
 const ID_CHECK_UPDATES: &str = "ruum.tray.check_updates";
-const ID_TOGGLE_WATCHDOG: &str = "ruum.tray.toggle_watchdog";
 const ID_RUN_AI: &str = "ruum.tray.run_ai";
 const ID_REVIEW_PROPOSAL: &str = "ruum.tray.review_proposal";
 const ID_CLEANUP_PROGRESS: &str = "ruum.tray.cleanup_progress";
@@ -62,8 +61,6 @@ pub enum TrayAction {
     OpenSettings,
     /// Open update modal or check for updates in `Settings::Updates`.
     CheckForUpdates,
-    /// Toggle Watchdog monitoring on/off directly from the system tray.
-    ToggleWatchdog,
     /// Trigger an immediate AI cleanup analysis.
     RunAiAnalysisNow,
     /// Open the independent confirmation window for the latest proposal.
@@ -90,7 +87,6 @@ pub struct TrayMenu {
     gauge_adapter: Box<dyn TrayGaugeAdapter>,
     status_item: MenuItem,
     check_updates_item: MenuItem,
-    toggle_watchdog_item: MenuItem,
     review_proposal_item: MenuItem,
     cleanup_progress_item: MenuItem,
     last_visual: RefCell<TrayVisualSignature>,
@@ -120,7 +116,7 @@ impl Drop for TrayMenu {
 impl TrayMenu {
     /// Install the system tray icon and menu on the GUI main thread.
     pub fn install(locale: Locale) -> anyhow::Result<Self> {
-        let initial_status = format_status_label(None, false, locale);
+        let initial_status = format_status_label(None, locale);
         let status_item =
             MenuItem::with_id(ID_STATUS, initial_status, false, None);
         let open_item = MenuItem::with_id(
@@ -150,12 +146,6 @@ impl TrayMenu {
         let check_updates_item = MenuItem::with_id(
             ID_CHECK_UPDATES,
             common::tray_check_updates(locale),
-            true,
-            None,
-        );
-        let toggle_watchdog_item = MenuItem::with_id(
-            ID_TOGGLE_WATCHDOG,
-            format_toggle_watchdog_label(false, locale),
             true,
             None,
         );
@@ -197,7 +187,6 @@ impl TrayMenu {
             &settings_item,
             &check_updates_item,
             &sep2,
-            &toggle_watchdog_item,
             &run_ai_item,
             &review_proposal_item,
             &cleanup_progress_item,
@@ -249,7 +238,6 @@ impl TrayMenu {
             gauge_adapter,
             status_item,
             check_updates_item,
-            toggle_watchdog_item,
             review_proposal_item,
             cleanup_progress_item,
             last_visual: RefCell::new(initial_sig),
@@ -257,31 +245,19 @@ impl TrayMenu {
         })
     }
 
-    /// Refresh the disabled status line, watchdog toggle label, tooltip,
-    /// proposal availability, and (when enabled) the menu-bar/tray disk gauge.
+    /// Refresh the disabled status line, tooltip, proposal availability, and
+    /// (when enabled) the menu-bar/tray disk gauge.
     pub fn update_status(
         &self,
         space: Option<SpaceInfo>,
-        watchdog_enabled: bool,
         has_proposal: bool,
         show_disk_space: bool,
     ) {
         let free_bytes = space.map(|s| s.available);
-        let label =
-            format_status_label(free_bytes, watchdog_enabled, self.locale);
+        let label = format_status_label(free_bytes, self.locale);
         self.status_item.set_text(&label);
-        self.toggle_watchdog_item
-            .set_text(format_toggle_watchdog_label(
-                watchdog_enabled,
-                self.locale,
-            ));
         self.review_proposal_item.set_enabled(has_proposal);
-        let tooltip = format_tray_tooltip(
-            space,
-            watchdog_enabled,
-            show_disk_space,
-            self.locale,
-        );
+        let tooltip = format_tray_tooltip(space, show_disk_space, self.locale);
         let _ = self.tray.set_tooltip(Some(tooltip));
 
         let env = self.gauge_adapter.probe_env(&self.tray);
@@ -424,7 +400,6 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
         ID_OPEN_WATCHDOG => Some(TrayAction::OpenWatchdog),
         ID_OPEN_SETTINGS => Some(TrayAction::OpenSettings),
         ID_CHECK_UPDATES => Some(TrayAction::CheckForUpdates),
-        ID_TOGGLE_WATCHDOG => Some(TrayAction::ToggleWatchdog),
         ID_RUN_AI => Some(TrayAction::RunAiAnalysisNow),
         ID_REVIEW_PROPOSAL => Some(TrayAction::ReviewLatestProposal),
         ID_CLEANUP_PROGRESS => Some(TrayAction::ShowCleanupProgress),
@@ -435,21 +410,8 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
 
 /// Format the read-only disk space and watchdog status line for the tray menu.
 #[must_use]
-pub fn format_status_label(
-    free_bytes: Option<u64>,
-    watchdog_enabled: bool,
-    locale: Locale,
-) -> String {
-    common::tray_status_label(free_bytes, watchdog_enabled, locale)
-}
-
-/// Format the localized tray menu item label for toggling the Watchdog.
-#[must_use]
-pub const fn format_toggle_watchdog_label(
-    watchdog_enabled: bool,
-    locale: Locale,
-) -> &'static str {
-    common::tray_toggle_watchdog(watchdog_enabled, locale)
+pub fn format_status_label(free_bytes: Option<u64>, locale: Locale) -> String {
+    common::tray_status_label(free_bytes, locale)
 }
 
 /// Format the localized tray menu item label for active or idle cleanup.
@@ -486,7 +448,6 @@ pub fn format_check_updates_label(
 #[must_use]
 pub fn format_tray_tooltip(
     space: Option<SpaceInfo>,
-    watchdog_enabled: bool,
     show_disk_space: bool,
     locale: Locale,
 ) -> String {
@@ -494,7 +455,7 @@ pub fn format_tray_tooltip(
         let avail = human_bytes(sp.available);
         let total = human_bytes(sp.total);
         let used_pct = calc_used_percent(sp);
-        let watchdog = watchdog_short_label(watchdog_enabled, locale);
+        let watchdog = watchdog_active_label(locale);
         return match locale {
             Locale::En => format!(
                 "ruum \u{2014} Free: {avail} / {total} ({used_pct}% used) \u{00b7} {watchdog}"
@@ -510,29 +471,16 @@ pub fn format_tray_tooltip(
             ),
         };
     }
-    let label = format_status_label(
-        space.map(|s| s.available),
-        watchdog_enabled,
-        locale,
-    );
+    let label = format_status_label(space.map(|s| s.available), locale);
     format!("ruum \u{2014} {label}")
 }
 
-const fn watchdog_short_label(enabled: bool, locale: Locale) -> &'static str {
-    if enabled {
-        match locale {
-            Locale::En => "Watchdog On",
-            Locale::Zh => "\u{5b88}\u{62a4}\u{5df2}\u{5f00}\u{542f}",
-            Locale::Ja => "\u{76e3}\u{8996}\u{30aa}\u{30f3}",
-            Locale::Ko => "\u{c6cc}\u{ce58}\u{b3c5} \u{cf1c}\u{c9d0}",
-        }
-    } else {
-        match locale {
-            Locale::En => "Watchdog Off",
-            Locale::Zh => "\u{5b88}\u{62a4}\u{5df2}\u{5173}\u{95ed}",
-            Locale::Ja => "\u{76e3}\u{8996}\u{30aa}\u{30d5}",
-            Locale::Ko => "\u{c6cc}\u{ce58}\u{b3c5} \u{aec4}\u{c9d0}",
-        }
+const fn watchdog_active_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Watchdog Active",
+        Locale::Zh => "\u{7a7a}\u{95f4}\u{5b88}\u{62a4}\u{4e2d}",
+        Locale::Ja => "\u{76e3}\u{8996}\u{4e2d}",
+        Locale::Ko => "\u{c6cc}\u{ce58}\u{b3c5} \u{d65c}\u{c131}",
     }
 }
 
@@ -565,21 +513,20 @@ mod tests {
     #[test]
     fn status_label_formats_free_space_and_watchdog_state() {
         assert_eq!(
-            format_status_label(None, false, Locale::En),
-            "Free: \u{2014} \u{00b7} Watchdog Off"
+            format_status_label(None, Locale::En),
+            "Free: \u{2014} \u{00b7} Watchdog Active"
         );
         assert_eq!(
-            format_status_label(Some(1024 * 1024 * 1024), true, Locale::En),
-            "Free: 1.0 GiB \u{00b7} Watchdog On"
+            format_status_label(Some(1024 * 1024 * 1024), Locale::En),
+            "Free: 1.0 GiB \u{00b7} Watchdog Active"
         );
         for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
-            let off = format_status_label(None, false, locale);
-            let on =
-                format_status_label(Some(1024 * 1024 * 1024), true, locale);
-            assert!(off.contains('\u{2014}'));
-            assert!(on.contains("1.0 GiB"));
-            assert_ne!(off, on);
-            assert_ne!(off, format_status_label(None, false, Locale::En));
+            let empty = format_status_label(None, locale);
+            let filled = format_status_label(Some(1024 * 1024 * 1024), locale);
+            assert!(empty.contains('\u{2014}'));
+            assert!(filled.contains("1.0 GiB"));
+            assert_ne!(empty, filled);
+            assert_ne!(empty, format_status_label(None, Locale::En));
         }
     }
 
@@ -618,10 +565,7 @@ mod tests {
             action_for_menu_id(ID_CHECK_UPDATES),
             Some(TrayAction::CheckForUpdates)
         );
-        assert_eq!(
-            action_for_menu_id(ID_TOGGLE_WATCHDOG),
-            Some(TrayAction::ToggleWatchdog)
-        );
+        assert_eq!(action_for_menu_id("ruum.tray.toggle_watchdog"), None);
         assert_eq!(action_for_menu_id(ID_QUIT), Some(TrayAction::Quit));
         assert_eq!(action_for_menu_id(ID_STATUS), None);
         assert_eq!(action_for_menu_id("unknown"), None);
@@ -651,26 +595,6 @@ mod tests {
                 avail,
                 format_check_updates_label(Some("0.3.0"), Locale::En)
             );
-        }
-    }
-
-    #[test]
-    fn toggle_watchdog_label_formats_both_states_across_locales() {
-        assert_eq!(
-            format_toggle_watchdog_label(false, Locale::En),
-            "Enable Watchdog"
-        );
-        assert_eq!(
-            format_toggle_watchdog_label(true, Locale::En),
-            "Pause Watchdog"
-        );
-        for locale in [Locale::Zh, Locale::Ja, Locale::Ko] {
-            let enable = format_toggle_watchdog_label(false, locale);
-            let pause = format_toggle_watchdog_label(true, locale);
-            assert!(!enable.is_empty());
-            assert!(!pause.is_empty());
-            assert_ne!(enable, pause);
-            assert_ne!(enable, format_toggle_watchdog_label(false, Locale::En));
         }
     }
 
@@ -755,14 +679,13 @@ mod tests {
         };
 
         for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
-            let tip_on = format_tray_tooltip(Some(space), true, true, locale);
+            let tip_on = format_tray_tooltip(Some(space), true, locale);
             assert!(tip_on.contains("42 GiB"));
             assert!(tip_on.contains("500 GiB"));
             assert!(tip_on.contains("92%"));
             assert!(tip_on.encode_utf16().count() < 128);
 
-            let tip_off =
-                format_tray_tooltip(Some(space), false, false, locale);
+            let tip_off = format_tray_tooltip(Some(space), false, locale);
             assert!(tip_off.contains("42 GiB"));
             assert!(tip_off.starts_with("ruum \u{2014} "));
         }

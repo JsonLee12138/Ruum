@@ -189,10 +189,35 @@ pub fn run_once(
     sink: &dyn WatchdogEventSink,
 ) -> io::Result<TickResult> {
     let config = config_service.load_config()?;
+    run_once_inner(config_service, &config, mount_path, now_secs, probe, sink)
+}
+
+/// Execute a single watchdog evaluation treating monitoring as active even if
+/// the persisted `enabled` flag is `false`.
+pub fn run_once_active(
+    config_service: &WatchdogConfigService,
+    mount_path: &Path,
+    now_secs: u64,
+    probe: &dyn SpaceProbe,
+    sink: &dyn WatchdogEventSink,
+) -> io::Result<TickResult> {
+    let mut config = config_service.load_config()?;
+    config.enabled = true;
+    run_once_inner(config_service, &config, mount_path, now_secs, probe, sink)
+}
+
+fn run_once_inner(
+    config_service: &WatchdogConfigService,
+    config: &WatchdogConfig,
+    mount_path: &Path,
+    now_secs: u64,
+    probe: &dyn SpaceProbe,
+    sink: &dyn WatchdogEventSink,
+) -> io::Result<TickResult> {
     let mut state = config_service.load_state()?;
 
     state.last_checked_secs = Some(now_secs);
-    let tick = evaluate_tick(&config, &state, mount_path, now_secs, probe)?;
+    let tick = evaluate_tick(config, &state, mount_path, now_secs, probe)?;
 
     let TickResult::Breached {
         available_bytes,
@@ -706,5 +731,50 @@ mod tests {
             fs::write(&pid_path, "999999\n").unwrap();
         }
         assert_eq!(fs::read_to_string(&pid_path).unwrap().trim(), "999999");
+    }
+
+    #[test]
+    fn run_once_active_evaluates_and_emits_when_db_enabled_is_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ruum.db");
+        let svc = WatchdogConfigService::open(&db_path).unwrap();
+        svc.save_config(&WatchdogConfig {
+            enabled: false,
+            min_free_gb: 20,
+            cooldown_secs: 600,
+            ..WatchdogConfig::default()
+        })
+        .unwrap();
+
+        let mount = Path::new("/data");
+        let probe = FixedProbe::new(5 * BYTES_PER_GIB, 100 * BYTES_PER_GIB);
+        let sink = CapturingSink::default();
+
+        let disabled_tick =
+            run_once(&svc, mount, 1_000, &probe, &sink).unwrap();
+        assert_eq!(
+            disabled_tick,
+            TickResult::Ok {
+                available_bytes: 0,
+                total_bytes: 0,
+                threshold_bytes: 0,
+            }
+        );
+        assert!(sink.events().is_empty());
+
+        let active_tick =
+            run_once_active(&svc, mount, 2_000, &probe, &sink).unwrap();
+        assert_eq!(
+            active_tick,
+            TickResult::Breached {
+                available_bytes: 5 * BYTES_PER_GIB,
+                total_bytes: 100 * BYTES_PER_GIB,
+                threshold_bytes: 20 * BYTES_PER_GIB,
+            }
+        );
+        assert_eq!(sink.events().len(), 1);
+        let st = svc.load_state().unwrap();
+        assert_eq!(st.last_checked_secs, Some(2_000));
+        assert_eq!(st.last_triggered_secs, Some(2_000));
     }
 }

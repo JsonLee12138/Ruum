@@ -376,6 +376,23 @@ pub trait UpdateAdapter: Send + Sync + fmt::Debug {
         base_url: &str,
         manifest: Option<&Manifest>,
     ) -> String;
+    fn recommended_upgrade_command_with_channel(
+        &self,
+        env: &UpdateEnv,
+        kind: InstallKind,
+        channel: UpdateChannel,
+        base_url: &str,
+        manifest: Option<&Manifest>,
+    ) -> String {
+        recommended_upgrade_command_with_env(
+            self.os_kind(),
+            env,
+            kind,
+            channel,
+            base_url,
+            manifest,
+        )
+    }
     fn apply_update(
         &self,
         env: &UpdateEnv,
@@ -621,15 +638,16 @@ impl UpdateAdapter for MacOsUpdateAdapter {
 
     fn recommended_upgrade_command(
         &self,
-        _env: &UpdateEnv,
+        env: &UpdateEnv,
         kind: InstallKind,
         base_url: &str,
         manifest: Option<&Manifest>,
     ) -> String {
-        recommended_upgrade_command_for(
+        recommended_upgrade_command_with_env(
             UpdateOs::MacOs,
-            None,
+            env,
             kind,
+            UpdateChannel::Stable,
             base_url,
             manifest,
         )
@@ -1053,10 +1071,11 @@ impl UpdateAdapter for LinuxUpdateAdapter {
         base_url: &str,
         manifest: Option<&Manifest>,
     ) -> String {
-        recommended_upgrade_command_for(
+        recommended_upgrade_command_with_env(
             UpdateOs::Linux,
-            env.linux_os_release.as_deref(),
+            env,
             kind,
+            UpdateChannel::Stable,
             base_url,
             manifest,
         )
@@ -1350,15 +1369,16 @@ impl UpdateAdapter for WindowsUpdateAdapter {
 
     fn recommended_upgrade_command(
         &self,
-        _env: &UpdateEnv,
+        env: &UpdateEnv,
         kind: InstallKind,
         base_url: &str,
         manifest: Option<&Manifest>,
     ) -> String {
-        recommended_upgrade_command_for(
+        recommended_upgrade_command_with_env(
             UpdateOs::Windows,
-            None,
+            env,
             kind,
+            UpdateChannel::Stable,
             base_url,
             manifest,
         )
@@ -1944,12 +1964,24 @@ fn fetch_github_fallback_manifest(
 pub fn check_for_updates(
     req: &UpdateCheckRequest<'_>,
 ) -> io::Result<UpdateCheckResult> {
-    let agent = build_http_agent(REQUEST_TIMEOUT_SECS);
     let env_for_cmd = UpdateEnv {
         os: Some(req.os),
         arch: Some(req.arch),
         ..UpdateEnv::current()
     };
+    check_for_updates_with_env(req, &env_for_cmd)
+}
+
+/// Check for updates using an explicit [`UpdateEnv`] (for deterministic
+/// cross-OS testing of distro-specific asset & command selection).
+pub fn check_for_updates_with_env(
+    req: &UpdateCheckRequest<'_>,
+    env: &UpdateEnv,
+) -> io::Result<UpdateCheckResult> {
+    let agent = build_http_agent(REQUEST_TIMEOUT_SECS);
+    let mut env_for_cmd = env.clone();
+    env_for_cmd.os = Some(req.os);
+    env_for_cmd.arch = Some(req.arch);
     let adapter = UpdateFactory::create_for(req.os);
     let can_self_update =
         adapter.can_self_update(&env_for_cmd, req.install_kind);
@@ -1957,12 +1989,14 @@ pub fn check_for_updates(
     let (manifest, used_fallback) = match fetch_worker_manifest(&agent, req) {
         WorkerFetchResult::Verified(m) => (m, false),
         WorkerFetchResult::NoRelease => {
-            let upgrade_command = adapter.recommended_upgrade_command(
-                &env_for_cmd,
-                req.install_kind,
-                req.base_url,
-                None,
-            );
+            let upgrade_command = adapter
+                .recommended_upgrade_command_with_channel(
+                    &env_for_cmd,
+                    req.install_kind,
+                    req.channel,
+                    req.base_url,
+                    None,
+                );
             return Ok(UpdateCheckResult {
                 current_version: req.current_version.to_owned(),
                 latest_version: req.current_version.to_owned(),
@@ -1994,14 +2028,17 @@ pub fn check_for_updates(
 
     let update_available =
         is_newer_version(req.current_version, &manifest.version)?;
-    let selected_asset_key = req.install_kind.asset_key(req.os, req.arch);
-    let selected_asset = selected_asset_key
-        .as_ref()
-        .and_then(|k| manifest.assets.get(k))
-        .cloned();
-    let upgrade_command = adapter.recommended_upgrade_command(
+    let (selected_asset_key, selected_asset) = select_manifest_asset(
+        req.install_kind,
+        req.os,
+        req.arch,
+        env_for_cmd.linux_os_release.as_deref(),
+        &manifest,
+    );
+    let upgrade_command = adapter.recommended_upgrade_command_with_channel(
         &env_for_cmd,
         req.install_kind,
+        req.channel,
         req.base_url,
         Some(&manifest),
     );
@@ -2219,6 +2256,243 @@ where
     Ok(final_path)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxDistroFamily {
+    Arch,
+    Debian,
+    Fedora,
+    Other,
+}
+
+fn is_beta_release(
+    channel: UpdateChannel,
+    manifest: Option<&Manifest>,
+) -> bool {
+    channel == UpdateChannel::Beta
+        || manifest.is_some_and(|m| {
+            m.channel.trim().eq_ignore_ascii_case("beta")
+                || m.version.trim().contains('-')
+        })
+}
+
+fn is_shell_safe_url(raw: &str) -> bool {
+    if validate_update_url(raw).is_err() {
+        return false;
+    }
+    !raw.trim().bytes().any(|b| {
+        matches!(
+            b,
+            b'\''
+                | b'"'
+                | b'$'
+                | b'`'
+                | b';'
+                | b'&'
+                | b'|'
+                | b'('
+                | b')'
+                | b'<'
+                | b'>'
+                | b'*'
+                | b'?'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'\\'
+                | b'#'
+                | b'~'
+                | b'!'
+        )
+    })
+}
+
+fn sanitize_shell_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if is_shell_safe_url(trimmed) {
+        trimmed.to_owned()
+    } else {
+        DEFAULT_UPDATE_BASE_URL.to_owned()
+    }
+}
+
+fn is_shell_safe_filename(raw: &str) -> bool {
+    validate_safe_filename(raw).is_ok()
+        && raw.trim().bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
+
+fn validated_sha256_lower(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    (lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(lower)
+}
+
+fn classify_distro_token(token: &str) -> Option<LinuxDistroFamily> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "arch" | "omarchy" | "manjaro" | "endeavouros" | "cachyos"
+        | "garuda" | "artix" => Some(LinuxDistroFamily::Arch),
+        "debian" | "ubuntu" | "linuxmint" | "pop" | "kali" | "elementary"
+        | "zorin" | "raspbian" => Some(LinuxDistroFamily::Debian),
+        "fedora" | "rhel" | "centos" | "rocky" | "almalinux" | "ol"
+        | "nobara" => Some(LinuxDistroFamily::Fedora),
+        _ => None,
+    }
+}
+
+fn parse_os_release_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(key)
+            && let Some(val) = rest.strip_prefix('=')
+        {
+            let unquoted = val
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| {
+                    val.trim()
+                        .strip_prefix('\'')
+                        .and_then(|s| s.strip_suffix('\''))
+                })
+                .unwrap_or_else(|| val.trim());
+            if !unquoted.is_empty() {
+                return Some(unquoted);
+            }
+        }
+    }
+    None
+}
+
+fn parse_linux_distro_family(os_release: Option<&str>) -> LinuxDistroFamily {
+    let Some(raw) = os_release else {
+        return LinuxDistroFamily::Other;
+    };
+    if let Some(id_val) = parse_os_release_field(raw, "ID") {
+        for token in id_val.split_whitespace() {
+            if let Some(family) = classify_distro_token(token) {
+                return family;
+            }
+        }
+    }
+    if let Some(id_like) = parse_os_release_field(raw, "ID_LIKE") {
+        for token in id_like.split_whitespace() {
+            if let Some(family) = classify_distro_token(token) {
+                return family;
+            }
+        }
+    }
+    LinuxDistroFamily::Other
+}
+
+fn select_manifest_asset(
+    kind: InstallKind,
+    os: UpdateOs,
+    arch: UpdateArch,
+    linux_os_release: Option<&str>,
+    manifest: &Manifest,
+) -> (Option<String>, Option<ManifestAsset>) {
+    if os == UpdateOs::Linux && kind == InstallKind::LinuxSystemPackage {
+        let preferred_key = match parse_linux_distro_family(linux_os_release) {
+            LinuxDistroFamily::Debian => {
+                Some(format!("linux-{}-deb", arch.as_str()))
+            }
+            LinuxDistroFamily::Fedora => {
+                Some(format!("linux-{}-rpm", arch.as_str()))
+            }
+            LinuxDistroFamily::Arch | LinuxDistroFamily::Other => None,
+        };
+        if let Some(key) = preferred_key
+            && let Some(asset) = manifest.assets.get(&key).cloned()
+        {
+            return (Some(key), Some(asset));
+        }
+    }
+    let fallback_key = kind.asset_key(os, arch);
+    let fallback_asset = fallback_key
+        .as_ref()
+        .and_then(|k| manifest.assets.get(k))
+        .cloned();
+    (fallback_key, fallback_asset)
+}
+
+fn is_usr_local_unwritable(env: &UpdateEnv) -> bool {
+    let segs = normalized_segments(&env.exe_path);
+    let under_usr_local = segs.len() >= 2
+        && segs[0].eq_ignore_ascii_case("usr")
+        && segs[1].eq_ignore_ascii_case("local");
+    under_usr_local
+        && env
+            .exe_path
+            .parent()
+            .is_some_and(|p| !is_dir_writable(p, env.writable_override))
+}
+
+fn format_install_sh_command(
+    base: &str,
+    cli_only: bool,
+    is_beta: bool,
+    sudo_prefix: Option<&str>,
+) -> String {
+    let mut flags = Vec::new();
+    if cli_only {
+        flags.push("--cli-only");
+    }
+    if let Some(prefix) = sudo_prefix {
+        flags.push("--prefix");
+        flags.push(prefix);
+    }
+    if is_beta {
+        flags.push("--channel");
+        flags.push("beta");
+    }
+    let sh_cmd = if sudo_prefix.is_some() {
+        "sudo sh"
+    } else {
+        "sh"
+    };
+    if flags.is_empty() {
+        format!("curl -fsSL {base}/install.sh | {sh_cmd}")
+    } else {
+        format!(
+            "curl -fsSL {base}/install.sh | {sh_cmd} -s -- {}",
+            flags.join(" ")
+        )
+    }
+}
+
+fn build_linux_pkg_install_command(
+    base: &str,
+    asset: &ManifestAsset,
+    install_cmd: &str,
+) -> Option<String> {
+    let safe_path = validate_asset_path(&asset.path).ok()?;
+    if !is_shell_safe_url(&asset.fallback_url)
+        || !is_shell_safe_filename(&asset.filename)
+    {
+        return None;
+    }
+    let sha256 = validated_sha256_lower(&asset.sha256)?;
+    let primary_url = format!("{base}/v1/download/{safe_path}");
+    if !is_shell_safe_url(&primary_url) {
+        return None;
+    }
+    let filename = asset.filename.trim();
+    let fallback_url = asset.fallback_url.trim();
+    Some(format!(
+        "sh -c 'd=$(mktemp -d) && trap \"rm -rf \\\"$d\\\"\" EXIT && \
+         chmod 755 \"$d\" && f=\"$d/{filename}\" && \
+         (if command -v curl >/dev/null 2>&1; then \
+         curl -fsSL {primary_url} -o \"$f\" || \
+         curl -fsSL {fallback_url} -o \"$f\"; \
+         else wget -qO \"$f\" {primary_url} || \
+         wget -qO \"$f\" {fallback_url}; fi) && \
+         printf \"%s  %s\\n\" {sha256} \"$f\" | sha256sum -c - && \
+         {install_cmd} \"$f\"'"
+    ))
+}
+
 /// Format a one-line CLI / package-manager upgrade command for the given
 /// [`InstallKind`] and release channel.
 #[must_use]
@@ -2229,9 +2503,35 @@ pub fn recommended_upgrade_command_for(
     base_url: &str,
     manifest: Option<&Manifest>,
 ) -> String {
-    let base = base_url.trim().trim_end_matches('/');
-    let is_beta =
-        manifest.is_some_and(|m| m.channel.trim().eq_ignore_ascii_case("beta"));
+    let env = UpdateEnv {
+        os: Some(os),
+        arch: Some(UpdateArch::current()),
+        linux_os_release: linux_os_release.map(ToOwned::to_owned),
+        ..UpdateEnv::default()
+    };
+    recommended_upgrade_command_with_env(
+        os,
+        &env,
+        kind,
+        UpdateChannel::Stable,
+        base_url,
+        manifest,
+    )
+}
+
+/// Format a one-line upgrade command using full [`UpdateEnv`] and explicit
+/// [`UpdateChannel`].
+#[must_use]
+pub fn recommended_upgrade_command_with_env(
+    os: UpdateOs,
+    env: &UpdateEnv,
+    kind: InstallKind,
+    channel: UpdateChannel,
+    base_url: &str,
+    manifest: Option<&Manifest>,
+) -> String {
+    let base = sanitize_shell_base_url(base_url);
+    let is_beta = is_beta_release(channel, manifest);
 
     match kind {
         InstallKind::CliStandalone => match os {
@@ -2245,16 +2545,7 @@ pub fn recommended_upgrade_command_for(
                 }
             }
             UpdateOs::MacOs | UpdateOs::Linux => {
-                if is_beta {
-                    format!(
-                        "curl -fsSL {base}/install.sh | sh -s -- --cli-only \
-                         --channel beta"
-                    )
-                } else {
-                    format!(
-                        "curl -fsSL {base}/install.sh | sh -s -- --cli-only"
-                    )
-                }
+                format_install_sh_command(&base, true, is_beta, None)
             }
         },
         InstallKind::WindowsInno
@@ -2269,18 +2560,22 @@ pub fn recommended_upgrade_command_for(
             }
         }
         InstallKind::LinuxSystemPackage => {
-            linux_system_pkg_upgrade_command(linux_os_release, base, is_beta)
+            let arch = env.arch.unwrap_or_else(UpdateArch::current);
+            linux_system_pkg_upgrade_command(
+                env.linux_os_release.as_deref(),
+                arch,
+                &base,
+                is_beta,
+                manifest,
+            )
         }
-        InstallKind::MacAppBundle
-        | InstallKind::LinuxAppImage
-        | InstallKind::LinuxTarball => {
-            if is_beta {
-                format!(
-                    "curl -fsSL {base}/install.sh | sh -s -- --channel beta"
-                )
-            } else {
-                format!("curl -fsSL {base}/install.sh | sh")
-            }
+        InstallKind::LinuxTarball => {
+            let sudo_prefix =
+                is_usr_local_unwritable(env).then_some("/usr/local");
+            format_install_sh_command(&base, false, is_beta, sudo_prefix)
+        }
+        InstallKind::MacAppBundle | InstallKind::LinuxAppImage => {
+            format_install_sh_command(&base, false, is_beta, None)
         }
         InstallKind::Development => {
             "git pull && cargo build --release".to_owned()
@@ -2296,10 +2591,11 @@ pub fn recommended_upgrade_command(
     manifest: Option<&Manifest>,
 ) -> String {
     let env = UpdateEnv::current();
-    recommended_upgrade_command_for(
+    recommended_upgrade_command_with_env(
         UpdateFactory::current_os(),
-        env.linux_os_release.as_deref(),
+        &env,
         kind,
+        UpdateChannel::Stable,
         base_url,
         manifest,
     )
@@ -2307,33 +2603,49 @@ pub fn recommended_upgrade_command(
 
 fn linux_system_pkg_upgrade_command(
     os_release: Option<&str>,
+    arch: UpdateArch,
     base_url: &str,
     is_beta: bool,
+    manifest: Option<&Manifest>,
 ) -> String {
-    if let Some(raw) = os_release {
-        let lower = raw.to_ascii_lowercase();
-        if lower.contains("arch")
-            || lower.contains("omarchy")
-            || lower.contains("manjaro")
-            || lower.contains("endeavouros")
-        {
-            return "yay -S ruum-bin".to_owned();
+    let arch_s = arch.as_str();
+    match parse_linux_distro_family(os_release) {
+        LinuxDistroFamily::Arch => {
+            if is_beta {
+                format_install_sh_command(base_url, false, true, None)
+            } else {
+                "yay -S ruum-bin".to_owned()
+            }
         }
-        if lower.contains("debian") || lower.contains("ubuntu") {
-            return "sudo apt update && sudo apt install --only-upgrade ruum"
-                .to_owned();
+        LinuxDistroFamily::Debian => {
+            let key = format!("linux-{arch_s}-deb");
+            if let Some(asset) = manifest.and_then(|m| m.assets.get(&key))
+                && let Some(cmd) = build_linux_pkg_install_command(
+                    base_url,
+                    asset,
+                    "sudo apt install -y",
+                )
+            {
+                return cmd;
+            }
+            format_install_sh_command(base_url, false, is_beta, None)
         }
-        if lower.contains("fedora")
-            || lower.contains("rhel")
-            || lower.contains("centos")
-        {
-            return "sudo dnf upgrade ruum".to_owned();
+        LinuxDistroFamily::Fedora => {
+            let key = format!("linux-{arch_s}-rpm");
+            if let Some(asset) = manifest.and_then(|m| m.assets.get(&key))
+                && let Some(cmd) = build_linux_pkg_install_command(
+                    base_url,
+                    asset,
+                    "sudo dnf install -y",
+                )
+            {
+                return cmd;
+            }
+            format_install_sh_command(base_url, false, is_beta, None)
         }
-    }
-    if is_beta {
-        format!("curl -fsSL {base_url}/install.sh | sh -s -- --channel beta")
-    } else {
-        format!("curl -fsSL {base_url}/install.sh | sh")
+        LinuxDistroFamily::Other => {
+            format_install_sh_command(base_url, false, is_beta, None)
+        }
     }
 }
 
@@ -4263,8 +4575,272 @@ mod tests {
                 DEFAULT_UPDATE_BASE_URL,
                 Some(&manifest),
             ),
-            "sudo apt update && sudo apt install --only-upgrade ruum"
+            format!("curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | sh")
         );
+    }
+
+    #[test]
+    fn linux_upgrade_commands_handle_beta_distros_tarball_and_validation() {
+        let adapter = UpdateFactory::create_for(UpdateOs::Linux);
+        let mut deb_rpm_manifest = sample_manifest("0.4.0-beta.1", "beta");
+        deb_rpm_manifest.assets.insert(
+            "linux-x86_64-deb".to_owned(),
+            ManifestAsset {
+                filename: "ruum-0.4.0-beta.1-x86_64-linux.deb".to_owned(),
+                path:
+                    "releases/v0.4.0-beta.1/ruum-0.4.0-beta.1-x86_64-linux.deb"
+                        .to_owned(),
+                fallback_url: "https://github.com/JsonLee12138/Ruum/releases/\
+                               download/v0.4.0-beta.1/\
+                               ruum-0.4.0-beta.1-x86_64-linux.deb"
+                    .to_owned(),
+                sha256: "ABCDEF0123456789".repeat(4),
+                size: 2048,
+            },
+        );
+        deb_rpm_manifest.assets.insert(
+            "linux-x86_64-rpm".to_owned(),
+            ManifestAsset {
+                filename: "ruum-0.4.0-beta.1-x86_64-linux.rpm".to_owned(),
+                path:
+                    "releases/v0.4.0-beta.1/ruum-0.4.0-beta.1-x86_64-linux.rpm"
+                        .to_owned(),
+                fallback_url: "https://github.com/JsonLee12138/Ruum/releases/\
+                               download/v0.4.0-beta.1/\
+                               ruum-0.4.0-beta.1-x86_64-linux.rpm"
+                    .to_owned(),
+                sha256: "0123456789abcdef".repeat(4),
+                size: 4096,
+            },
+        );
+
+        // 1. Arch/Omarchy uses yay on stable and install.sh --channel beta on beta
+        //    (including when manifest is None and channel is Beta).
+        let arch_env = UpdateEnv {
+            os: Some(UpdateOs::Linux),
+            arch: Some(UpdateArch::X86_64),
+            exe_path: PathBuf::from("/usr/bin/ruum-gui"),
+            linux_os_release: Some("ID=omarchy\nID_LIKE=arch\n".to_owned()),
+            ..UpdateEnv::default()
+        };
+        assert_eq!(
+            adapter.recommended_upgrade_command_with_channel(
+                &arch_env,
+                InstallKind::LinuxSystemPackage,
+                UpdateChannel::Beta,
+                DEFAULT_UPDATE_BASE_URL,
+                None,
+            ),
+            format!(
+                "curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | \
+                 sh -s -- --channel beta"
+            )
+        );
+        assert_eq!(
+            adapter.recommended_upgrade_command_with_channel(
+                &arch_env,
+                InstallKind::LinuxSystemPackage,
+                UpdateChannel::Beta,
+                DEFAULT_UPDATE_BASE_URL,
+                Some(&deb_rpm_manifest),
+            ),
+            format!(
+                "curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | \
+                 sh -s -- --channel beta"
+            )
+        );
+
+        // 2. Debian/Ubuntu generates sh -c '...' one-liner with SHA-256 & apt.
+        let deb_env = UpdateEnv {
+            linux_os_release: Some("ID=ubuntu\nID_LIKE=debian\n".to_owned()),
+            ..arch_env.clone()
+        };
+        let deb_cmd = adapter.recommended_upgrade_command_with_channel(
+            &deb_env,
+            InstallKind::LinuxSystemPackage,
+            UpdateChannel::Beta,
+            DEFAULT_UPDATE_BASE_URL,
+            Some(&deb_rpm_manifest),
+        );
+        assert!(deb_cmd.starts_with("sh -c '"));
+        assert!(deb_cmd.ends_with('\''));
+        assert!(deb_cmd.contains("chmod 755"));
+        assert!(deb_cmd.contains("sha256sum -c -"));
+        assert!(deb_cmd.contains(&"abcdef0123456789".repeat(4)));
+        assert!(deb_cmd.contains("sudo apt install -y"));
+        assert!(deb_cmd.contains("ruum-0.4.0-beta.1-x86_64-linux.deb"));
+
+        // 3. Fedora/RHEL generates sh -c '...' one-liner with SHA-256 & dnf.
+        let fed_env = UpdateEnv {
+            linux_os_release: Some("ID=\"fedora\"\n".to_owned()),
+            ..arch_env.clone()
+        };
+        let fed_cmd = adapter.recommended_upgrade_command_with_channel(
+            &fed_env,
+            InstallKind::LinuxSystemPackage,
+            UpdateChannel::Beta,
+            DEFAULT_UPDATE_BASE_URL,
+            Some(&deb_rpm_manifest),
+        );
+        assert!(fed_cmd.starts_with("sh -c '"));
+        assert!(fed_cmd.contains("sudo dnf install -y"));
+        assert!(fed_cmd.contains("ruum-0.4.0-beta.1-x86_64-linux.rpm"));
+
+        // 4. Non-matching PRETTY_NAME substring ("Research") must NOT match Arch.
+        let other_env = UpdateEnv {
+            linux_os_release: Some(
+                "ID=alpine\nPRETTY_NAME=\"Research Linux\"\n".to_owned(),
+            ),
+            ..arch_env
+        };
+        assert_eq!(
+            adapter.recommended_upgrade_command_with_channel(
+                &other_env,
+                InstallKind::LinuxSystemPackage,
+                UpdateChannel::Stable,
+                DEFAULT_UPDATE_BASE_URL,
+                Some(&sample_manifest("0.4.0", "stable")),
+            ),
+            format!("curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | sh")
+        );
+
+        // 5. Non-writable /usr/local/bin LinuxTarball emits sudo sh --prefix.
+        let usr_local_ro = UpdateEnv {
+            os: Some(UpdateOs::Linux),
+            arch: Some(UpdateArch::X86_64),
+            exe_path: PathBuf::from("/usr/local/bin/ruum-gui"),
+            writable_override: Some(false),
+            ..UpdateEnv::default()
+        };
+        assert_eq!(
+            adapter.recommended_upgrade_command_with_channel(
+                &usr_local_ro,
+                InstallKind::LinuxTarball,
+                UpdateChannel::Beta,
+                DEFAULT_UPDATE_BASE_URL,
+                None,
+            ),
+            format!(
+                "curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | \
+                 sudo sh -s -- --prefix /usr/local --channel beta"
+            )
+        );
+        let usr_local_rw = UpdateEnv {
+            writable_override: Some(true),
+            ..usr_local_ro
+        };
+        assert_eq!(
+            adapter.recommended_upgrade_command_with_channel(
+                &usr_local_rw,
+                InstallKind::LinuxTarball,
+                UpdateChannel::Beta,
+                DEFAULT_UPDATE_BASE_URL,
+                None,
+            ),
+            format!(
+                "curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | \
+                 sh -s -- --channel beta"
+            )
+        );
+
+        // 6. Shell-unsafe fallback_url / filename falls back safely to install.sh.
+        let mut unsafe_manifest = deb_rpm_manifest.clone();
+        unsafe_manifest
+            .assets
+            .get_mut("linux-x86_64-deb")
+            .unwrap()
+            .fallback_url = "https://github.com/a/b;rm -rf /".to_owned();
+        assert_eq!(
+            adapter.recommended_upgrade_command_with_channel(
+                &deb_env,
+                InstallKind::LinuxSystemPackage,
+                UpdateChannel::Beta,
+                "https://evil.example/a'b",
+                Some(&unsafe_manifest),
+            ),
+            format!(
+                "curl -fsSL {DEFAULT_UPDATE_BASE_URL}/install.sh | \
+                 sh -s -- --channel beta"
+            )
+        );
+
+        // 7. check_for_updates_with_env selects .deb on Ubuntu and falls back both
+        //    key + asset to tarball when .deb is absent.
+        let (sk, pk_b64) = test_keypair();
+        let raw_deb = serde_json::to_vec_pretty(&deb_rpm_manifest).unwrap();
+        let sig_deb = sign_bytes(&sk, &raw_deb);
+        let mut tarball_only = sample_manifest("0.4.0-beta.1", "beta");
+        tarball_only.assets.insert(
+            "linux-x86_64-tarball".to_owned(),
+            ManifestAsset {
+                filename: "ruum-0.4.0-beta.1-x86_64-linux.tar.gz".to_owned(),
+                path: "releases/v0.4.0-beta.1/\
+                       ruum-0.4.0-beta.1-x86_64-linux.tar.gz"
+                    .to_owned(),
+                fallback_url: "https://github.com/JsonLee12138/Ruum/releases/\
+                               download/v0.4.0-beta.1/\
+                               ruum-0.4.0-beta.1-x86_64-linux.tar.gz"
+                    .to_owned(),
+                sha256: "b".repeat(64),
+                size: 8192,
+            },
+        );
+        let raw_tar = serde_json::to_vec_pretty(&tarball_only).unwrap();
+        let sig_tar = sign_bytes(&sk, &raw_tar);
+        let (port, srv) = spawn_scripted_http(vec![
+            (
+                "200 OK".to_owned(),
+                vec![
+                    ("Content-Type".to_owned(), "application/json".to_owned()),
+                    ("X-Ruum-Signature".to_owned(), sig_deb),
+                ],
+                raw_deb,
+            ),
+            (
+                "200 OK".to_owned(),
+                vec![
+                    ("Content-Type".to_owned(), "application/json".to_owned()),
+                    ("X-Ruum-Signature".to_owned(), sig_tar),
+                ],
+                raw_tar,
+            ),
+        ]);
+        let srv_base = format!("http://127.0.0.1:{port}");
+        let req = UpdateCheckRequest {
+            channel: UpdateChannel::Beta,
+            current_version: "0.3.0",
+            os: UpdateOs::Linux,
+            arch: UpdateArch::X86_64,
+            install_kind: InstallKind::LinuxSystemPackage,
+            lang: "en",
+            entry: "gui",
+            client_id: None,
+            base_url: &srv_base,
+            public_key_b64: &pk_b64,
+            github_repo: DEFAULT_GITHUB_REPO,
+            github_fallback_base: None,
+        };
+        let res_deb = check_for_updates_with_env(&req, &deb_env).unwrap();
+        assert_eq!(
+            res_deb.selected_asset_key.as_deref(),
+            Some("linux-x86_64-deb")
+        );
+        assert_eq!(
+            res_deb.selected_asset.as_ref().map(|a| a.filename.as_str()),
+            Some("ruum-0.4.0-beta.1-x86_64-linux.deb")
+        );
+        assert!(res_deb.upgrade_command.contains("sudo apt install -y"));
+
+        let res_tar = check_for_updates_with_env(&req, &deb_env).unwrap();
+        assert_eq!(
+            res_tar.selected_asset_key.as_deref(),
+            Some("linux-x86_64-tarball")
+        );
+        assert_eq!(
+            res_tar.selected_asset.as_ref().map(|a| a.filename.as_str()),
+            Some("ruum-0.4.0-beta.1-x86_64-linux.tar.gz")
+        );
+        let _ = srv.join().unwrap();
     }
 
     #[test]

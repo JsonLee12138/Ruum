@@ -751,6 +751,7 @@ mod tests {
             assert!(!pages::update_later(locale).is_empty());
             assert!(!pages::update_skip_version("0.9.0", locale).is_empty());
             assert!(!pages::update_copy_command(locale).is_empty());
+            assert!(!pages::update_run_command(locale).is_empty());
             assert!(!pages::update_open_release(locale).is_empty());
             assert!(!pages::update_open_github_release(locale).is_empty());
             assert!(!pages::update_hide(locale).is_empty());
@@ -760,6 +761,14 @@ mod tests {
             assert!(!pages::update_restart_warning_marks(2, locale).is_empty());
             assert!(!pages::update_restart_warning_scan(locale).is_empty());
             assert!(!messages::update_command_copied(locale).is_empty());
+            assert!(!messages::update_command_launched(locale).is_empty());
+            assert!(
+                !messages::update_command_launch_failed_copied(
+                    "not found",
+                    locale,
+                )
+                .is_empty()
+            );
             assert!(!messages::refreshing_cloud_entitlement(locale).is_empty());
             assert!(!messages::cloud_entitlement_refreshed(locale).is_empty());
             assert!(

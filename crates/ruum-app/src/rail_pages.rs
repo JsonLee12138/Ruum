@@ -6877,6 +6877,8 @@ pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                 div()
                     .flex()
                     .flex_col()
+                    .min_w_0()
+                    .overflow_x_hidden()
                     .gap(space::XS)
                     .p(space::SM)
                     .rounded(space::XS)
@@ -6895,6 +6897,8 @@ pub fn update_modal(app: &Ruum, cx: &Context<'_, Ruum>) -> impl IntoElement {
                     )
                     .child(
                         div()
+                            .min_w_0()
+                            .overflow_x_hidden()
                             .font_family(theme.mono_font.clone())
                             .text_size(text::CAPTION)
                             .text_color(theme.bright)
@@ -7319,6 +7323,7 @@ fn update_modal_footer(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
     let mut row = div()
         .flex()
         .flex_row()
+        .flex_wrap()
         .items_center()
         .justify_end()
         .gap(space::SM);
@@ -7380,6 +7385,15 @@ fn update_modal_footer(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                         ),
                 );
             } else {
+                let can_run_in_terminal =
+                    !info.upgrade_command.trim().is_empty()
+                        && info.install_kind
+                            != ruum_core::updater::InstallKind::Development;
+                let copy_variant = if can_run_in_terminal {
+                    ButtonVariant::Secondary
+                } else {
+                    ButtonVariant::Primary
+                };
                 row = row
                     .child(
                         div()
@@ -7409,7 +7423,7 @@ fn update_modal_footer(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                                     crate::i18n::pages::update_copy_command(
                                         locale,
                                     ),
-                                    ButtonVariant::Primary,
+                                    copy_variant,
                                     cx,
                                 )
                                 .on_click(
@@ -7419,6 +7433,29 @@ fn update_modal_footer(app: &Ruum, cx: &Context<'_, Ruum>) -> Div {
                                 ),
                             ),
                     );
+                if can_run_in_terminal {
+                    row = row.child(
+                        div()
+                            .debug_selector(|| "update-run-cmd-btn".into())
+                            .child(
+                                dialog_button(
+                                    "update-run-cmd-btn",
+                                    crate::i18n::pages::update_run_command(
+                                        locale,
+                                    ),
+                                    ButtonVariant::Primary,
+                                    cx,
+                                )
+                                .disabled(app.update_command_launching)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.run_update_command_in_terminal(cx);
+                                        this.apply_focus(window, cx);
+                                    }),
+                                ),
+                            ),
+                    );
+                }
             }
         }
         UpdateUiState::Downloading { .. } => {

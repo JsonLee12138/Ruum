@@ -6737,6 +6737,7 @@ fn remote_review_and_confirm_generate_script_dialog_and_pending_card_actions(
         path_var: Some(db_dir.path().as_os_str().to_os_string()),
         terminal_var: None,
         local_appdata: None,
+        ..TerminalEnv::default()
     };
 
     let pid_for_setup = profile_id.clone();
@@ -8076,8 +8077,8 @@ fn update_modal_renders_all_states_hideable_download_marks_warning_and_skip(
     assert!(cx.debug_bounds("update-later-btn").is_some());
     assert!(cx.debug_bounds("update-skip-btn").is_some());
 
-    // Guide-only install kind renders Copy Command + Open Release instead of
-    // Download & Update.
+    // Guide-only install kind renders Run in Terminal + Copy Command + Open
+    // Release instead of Download & Update.
     let pkg_info =
         mock_update_result("0.9.5", InstallKind::LinuxSystemPackage, false);
     update(&view, cx, |app, cx| {
@@ -8088,6 +8089,7 @@ fn update_modal_renders_all_states_hideable_download_marks_warning_and_skip(
     draw(cx);
     assert!(cx.debug_bounds("update-download-btn").is_none());
     assert!(cx.debug_bounds("update-copy-cmd-btn").is_some());
+    assert!(cx.debug_bounds("update-run-cmd-btn").is_some());
     assert!(cx.debug_bounds("update-open-release-btn").is_some());
 
     // Downloading state: progress bar + Hide keeps download running in bg.
@@ -8179,6 +8181,125 @@ fn update_modal_renders_all_states_hideable_download_marks_warning_and_skip(
     let db = StorageDb::open(&db_path).expect("reopen db");
     let saved = db.load_update_settings().expect("load saved");
     assert_eq!(saved.skipped_version.as_deref(), Some("0.9.5"));
+}
+
+#[gpui_kit::test]
+fn update_modal_runs_upgrade_command_in_terminal_and_falls_back_to_clipboard(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::Locale;
+    use crate::state::UpdateUiState;
+    use ruum_core::terminal_launcher::{TerminalEnv, TerminalOs};
+    use ruum_core::updater::InstallKind;
+
+    cx.update(init_test_theme);
+    let temp = fixture();
+    let cfg_dir = tempfile::tempdir().expect("isolated cfg dir");
+    let fake_term_dir = cfg_dir.path().join("bin");
+    std::fs::create_dir_all(&fake_term_dir).expect("bin dir");
+    let fake_kitty = fake_term_dir.join("kitty");
+    std::fs::write(&fake_kitty, b"#!/bin/sh\n").expect("write kitty");
+
+    let (view, cx) = view_over(temp.path(), cx);
+    let pkg_info = mock_update_result(
+        "0.9.5-beta.1",
+        InstallKind::LinuxSystemPackage,
+        false,
+    );
+    let expected_cmd = pkg_info.upgrade_command.clone();
+
+    // 1. All 4 locales render the 5-button wrapped footer cleanly.
+    update(&view, cx, |app, cx| {
+        app.update_install_kind = InstallKind::LinuxSystemPackage;
+        app.update_state = UpdateUiState::Available {
+            info: std::sync::Arc::clone(&pkg_info),
+        };
+        app.terminal_os_override = Some(TerminalOs::Linux);
+        app.terminal_env_override = Some(TerminalEnv {
+            path_var: Some(fake_term_dir.clone().into_os_string()),
+            home: Some(cfg_dir.path().to_path_buf()),
+            xdg_cache_home: Some(cfg_dir.path().join("cache")),
+            ..TerminalEnv::default()
+        });
+        app.open_update_modal(cx);
+    });
+    for locale in [Locale::En, Locale::Zh, Locale::Ja, Locale::Ko] {
+        update(&view, cx, |app, cx| {
+            app.set_locale(locale);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("update-run-cmd-btn").is_some());
+        assert!(cx.debug_bounds("update-copy-cmd-btn").is_some());
+    }
+
+    // 2. Clicking Run in Terminal records launch plan, writes 0o700 script,
+    //    closes the modal, and shows a success toast.
+    let run_btn = cx
+        .debug_bounds("update-run-cmd-btn")
+        .expect("run in terminal btn");
+    cx.simulate_click(run_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    assert!(!read(&view, cx, |app| app.update_modal_open));
+    let log = read(&view, cx, |app| app.terminal_launch_log.clone());
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].0, "update-command");
+    assert_eq!(log[0].1.program, fake_kitty);
+    let launcher = log[0].1.launcher_file.as_ref().expect("launcher script");
+    let body = std::fs::read_to_string(launcher).expect("read launcher");
+    assert!(body.contains(&expected_cmd));
+
+    let notice_ok = read(&view, cx, |app| app.notice.clone());
+    assert_eq!(
+        notice_ok.map(|(_, s)| s),
+        Some(gpui_omarchy::Status::Success)
+    );
+
+    // 3. Development install hides Run in Terminal and keeps Copy Command.
+    let dev_info = mock_update_result("0.9.5", InstallKind::Development, false);
+    update(&view, cx, |app, cx| {
+        app.update_install_kind = InstallKind::Development;
+        app.update_state = UpdateUiState::Available { info: dev_info };
+        app.open_update_modal(cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("update-copy-cmd-btn").is_some());
+    assert!(cx.debug_bounds("update-run-cmd-btn").is_none());
+
+    // 4. Missing terminal emulator keeps modal open, copies command to
+    //    clipboard, and emits an Error toast.
+    update(&view, cx, |app, cx| {
+        app.update_install_kind = InstallKind::LinuxSystemPackage;
+        app.update_state = UpdateUiState::Available {
+            info: std::sync::Arc::clone(&pkg_info),
+        };
+        app.terminal_env_override = Some(TerminalEnv {
+            path_var: Some(cfg_dir.path().join("missing").into_os_string()),
+            home: Some(cfg_dir.path().to_path_buf()),
+            ..TerminalEnv::default()
+        });
+        app.notice = None;
+        cx.notify();
+    });
+    draw(cx);
+    let fail_btn = cx
+        .debug_bounds("update-run-cmd-btn")
+        .expect("run in terminal btn");
+    cx.simulate_click(fail_btn.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+
+    assert!(read(&view, cx, |app| app.update_modal_open));
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("command copied as fallback");
+    assert_eq!(copied, expected_cmd);
+    let notice_err = read(&view, cx, |app| app.notice.clone());
+    assert_eq!(
+        notice_err.map(|(_, s)| s),
+        Some(gpui_omarchy::Status::Error)
+    );
 }
 
 #[gpui_kit::test]

@@ -1909,6 +1909,8 @@ pub struct Ruum {
     pub update_download_cancel: Option<Arc<AtomicBool>>,
     /// Most recent update check/download/install error message.
     pub update_last_error: Option<String>,
+    /// True while spawning a native terminal to execute an upgrade command.
+    pub update_command_launching: bool,
     /// Focus handle for the centered update modal dialog.
     pub update_focus: FocusHandle,
     #[cfg(test)]
@@ -2399,6 +2401,7 @@ impl Ruum {
             update_install_kind,
             update_download_cancel: None,
             update_last_error: None,
+            update_command_launching: false,
             update_focus: cx.focus_handle(),
             #[cfg(test)]
             cli_install_env: None,
@@ -6273,6 +6276,103 @@ impl Ruum {
             Status::Success,
             cx,
         );
+    }
+
+    /// Launch the recommended upgrade command in a visible native terminal,
+    /// falling back to clipboard copy with an error toast if launching fails.
+    pub fn run_update_command_in_terminal(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.update_command_launching {
+            return;
+        }
+        let Some(info) = self.update_state.info() else {
+            return;
+        };
+        if info.install_kind == InstallKind::Development
+            || info.upgrade_command.trim().is_empty()
+        {
+            return;
+        }
+        let cmd = info.upgrade_command.clone();
+        let (adapter, env) = self.terminal_adapter_and_env();
+
+        #[cfg(test)]
+        {
+            let locale = self.locale;
+            match adapter.build_run_command_plan(&env, &cmd, true) {
+                Ok(plan) => {
+                    self.terminal_launch_log
+                        .push(("update-command".to_owned(), plan));
+                    self.close_update_modal(cx);
+                    self.push_toast(
+                        crate::i18n::messages::update_command_launched(locale),
+                        Status::Success,
+                        cx,
+                    );
+                }
+                Err(err) => {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                        cmd,
+                    ));
+                    self.push_toast(
+                        crate::i18n::messages::update_command_launch_failed_copied(
+                            &err.to_string(),
+                            locale,
+                        ),
+                        Status::Error,
+                        cx,
+                    );
+                }
+            }
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        {
+            self.update_command_launching = true;
+            cx.notify();
+
+            let cmd_bg = cmd.clone();
+            let task = cx.background_executor().spawn(async move {
+                adapter
+                    .launch_run_command(&env, &cmd_bg, true)
+                    .map_err(|e| e.to_string())
+            });
+            cx.spawn(async move |this, cx| {
+                let res = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.update_command_launching = false;
+                    match res {
+                        Ok(_) => {
+                            this.close_update_modal(cx);
+                            this.push_toast(
+                                crate::i18n::messages::update_command_launched(
+                                    this.locale,
+                                ),
+                                Status::Success,
+                                cx,
+                            );
+                        }
+                        Err(err) => {
+                            cx.write_to_clipboard(
+                                gpui_kit::ClipboardItem::new_string(cmd),
+                            );
+                            this.push_toast(
+                                crate::i18n::messages::update_command_launch_failed_copied(
+                                    &err,
+                                    this.locale,
+                                ),
+                                Status::Error,
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// Resolve the release page URL for the current update state, falling

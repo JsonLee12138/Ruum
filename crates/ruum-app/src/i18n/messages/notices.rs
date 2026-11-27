@@ -956,6 +956,37 @@ pub const fn update_command_copied(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn update_command_launched(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Opened terminal to run upgrade command",
+        "\u{5df2}\u{5728}\u{7ec8}\u{7aef}\u{4e2d}\u{6253}\u{5f00}\u{5347}\u{7ea7}\u{547d}\u{4ee4}",
+        "\u{30bf}\u{30fc}\u{30df}\u{30ca}\u{30eb}\u{3067}\u{30a2}\u{30c3}\u{30d7}\u{30b0}\u{30ec}\u{30fc}\u{30c9}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{958b}\u{304d}\u{307e}\u{3057}\u{305f}",
+        "\u{d130}\u{bbf8}\u{b110}\u{c5d0}\u{c11c} \u{c5c5}\u{adf8}\u{b808}\u{c774}\u{b4dc} \u{ba85}\u{b839}\u{c744} \u{c5f4}\u{c5c8}\u{c2b5}\u{b2c8}\u{b2e4}",
+    )
+}
+
+pub fn update_command_launch_failed_copied(
+    err: &str,
+    locale: Locale,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "Failed to open terminal ({err}); upgrade command copied to \
+             clipboard"
+        ),
+        Locale::Zh => format!(
+            "\u{65e0}\u{6cd5}\u{6253}\u{5f00}\u{7ec8}\u{7aef}\u{ff08}{err}\u{ff09}\u{ff0c}\u{5df2}\u{5c06}\u{5347}\u{7ea7}\u{547d}\u{4ee4}\u{590d}\u{5236}\u{5230}\u{526a}\u{8d34}\u{677f}"
+        ),
+        Locale::Ja => format!(
+            "\u{30bf}\u{30fc}\u{30df}\u{30ca}\u{30eb}\u{3092}\u{958b}\u{3051}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{ff08}{err}\u{ff09}\u{3002}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3092}\u{30b3}\u{30d4}\u{30fc}\u{3057}\u{307e}\u{3057}\u{305f}"
+        ),
+        Locale::Ko => format!(
+            "\u{d130}\u{bbf8}\u{b110}\u{c744} \u{c5f4} \u{c218} \u{c5c6}\u{c2b5}\u{b2c8}\u{b2e4} ({err}). \u{ba85}\u{b839}\u{c744} \u{d074}\u{b9bd}\u{bcf4}\u{b4dc}\u{c5d0} \u{bcf5}\u{c0ac}\u{d588}\u{c2b5}\u{b2c8}\u{b2e4}"
+        ),
+    }
+}
+
 pub const fn refreshing_cloud_entitlement(locale: Locale) -> &'static str {
     pick(
         locale,

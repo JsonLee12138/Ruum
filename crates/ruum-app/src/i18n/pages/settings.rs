@@ -1016,6 +1016,16 @@ pub const fn update_copy_command(locale: Locale) -> &'static str {
     )
 }
 
+pub const fn update_run_command(locale: Locale) -> &'static str {
+    pick(
+        locale,
+        "Run in Terminal",
+        "\u{5728}\u{7ec8}\u{7aef}\u{6267}\u{884c}",
+        "\u{30bf}\u{30fc}\u{30df}\u{30ca}\u{30eb}\u{3067}\u{5b9f}\u{884c}",
+        "\u{d130}\u{bbf8}\u{b110}\u{c5d0}\u{c11c} \u{c2e4}\u{d589}",
+    )
+}
+
 pub const fn update_open_release(locale: Locale) -> &'static str {
     pick(
         locale,

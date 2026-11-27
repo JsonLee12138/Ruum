@@ -13,6 +13,7 @@ Hard-won guardrails from Ruum's tri-platform GitHub Actions (`CI` and `Release`)
   1. Push code changes to `main` first and wait until GitHub Actions `CI` passes across Linux, macOS, and Windows (`x86_64` & `aarch64`).
   2. Run `cargo xtask release-prep <version>` (updates `Cargo.toml` + `CHANGELOG.md`), sync `Cargo.lock`, and commit.
   3. Run `cargo xtask release-tag <version> --push` (validates SemVer, clean tree, `Cargo.toml` + `CHANGELOG.md`, `--locked`, `cargo xtask lint`, `cross-lint` when available, and `gh run list` green `CI` status walking back past release-only commits) to create and push `v<version>` safely.
+- **User-Facing Changelog & Release Notes (`CHANGELOG.md`)**: Release notes and `CHANGELOG.md` entries MUST only state **what new features were added (`Features`)** and **what bugs were fixed (`Fixes`)** from a user's perspective. Do **not** include internal framework, crate, refactor, architecture, or CI/build implementation details (such as crate/trait/adapter names or internal refactoring).
 
 ## 2. macOS Packaging (`xtask/src/bundle.rs` & `.github/workflows/release.yml`)
 - Guard `hdiutil create`, `.dmg` `codesign`, and `hdiutil verify` with exponential backoff retries (`HDIUTIL_BACKOFFS_MS` / `sleep` loop in `release.yml`) because Spotlight and `diskimagesiod` (`diskimages-helper`) on `macos-15` can hold transient exclusive locks (`Resource temporarily unavailable` / `EBUSY` / `EAGAIN`) for ~4–5s immediately after image creation.

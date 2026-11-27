@@ -2,6 +2,19 @@
 
 All notable changes to Ruum are documented in this file.
 
+## [0.2.5] - 2026-11-27
+
+### Features
+
+- Add **Ruum Cloud** AI provider with QR-code sign-in, model selection, and guided setup.
+- Add live AI analysis progress stages, cancellable analysis, and cached scan reuse for faster repeated inspections.
+- Add a **Run in Terminal** action alongside **Copy Command** in the software update modal (with automatic clipboard fallback when no terminal emulator is found), and support Beta-channel Linux upgrade commands across Arch/Omarchy, Debian/Ubuntu, Fedora/RHEL, and tarball installs.
+
+### Fixes
+
+- Unify disk-space monitoring with General background and login-autostart settings, remove the redundant Watchdog enable/disable toggle, and show the active tray or foreground monitoring status on the Watchdog page.
+- Fix model speed-test click propagation in AI settings and improve Windows long-path `node_modules` removal reliability.
+
 ## [0.2.5-beta.3] - 2026-11-27
 
 ### Features & Fixes
